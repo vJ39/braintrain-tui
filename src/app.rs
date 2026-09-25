@@ -26,6 +26,7 @@ use crate::game::{Difficulty, Game, GameResult};
 use crate::stats::store;
 use crate::ui::countdown::{self, CountdownState};
 use crate::ui::splash::{self, SplashRenderer};
+use crate::ui::typewriter::{self, Typewriter};
 
 const MENU_ITEMS: [&str; 14] = [
     "図形回転判定",
@@ -54,6 +55,28 @@ const RHYTHM_ITEM_INDEX: usize = 10;
 const QUICK_DRAW_ITEM_INDEX: usize = 11;
 const JUKEBOX_ITEM_INDEX: usize = MENU_ITEMS.len() - 2;
 const HISTORY_ITEM_INDEX: usize = MENU_ITEMS.len() - 1;
+
+/// メニュー各項目の一言説明。配列長をMENU_ITEMS.len()にして、項目の追加漏れをコンパイル時に検出する
+const MENU_DESCRIPTIONS: [&str; MENU_ITEMS.len()] = [
+    "回転させた図形が元と同じかを見分ける",
+    "鏡に映した図形かどうかを見分ける",
+    "文字の色と意味が一致するかを即答する",
+    "4択から計算の答えを素早く選ぶ",
+    "3x3の規則から空欄に入る図形を選ぶ",
+    "光ったパネルの順番を覚えて再現する",
+    "数列の法則を見抜いて次の数を当てる",
+    "完成形から2つ目のピースを当てる",
+    "数字の円を1から順にクリックする(マウス専用)",
+    "色ボタンで各列の一番下のブロックを消して盤面を空にする",
+    "矢印キーで曲に合わせてステップする",
+    "合図が出たら即座に反応する",
+    "BGMを選んで聴く",
+    "ゲームごとの反応時間の推移を見る",
+];
+
+/// メニュー画面のタイプライター表示の1文字あたりの間隔。メニューは全項目で400文字以上あり、
+/// 標準の間隔(typewriter::CHAR_INTERVAL)では流し切るのに10秒以上かかるため短くする
+const MENU_CHAR_INTERVAL: Duration = Duration::from_millis(10);
 
 pub enum Screen {
     /// 起動直後のタイトル画面。Enterを押すとMenuへ進む
@@ -99,6 +122,10 @@ pub struct App {
     /// メニューへ戻った直後にtrueになる。main.rsがtake_pending_scrollback_clear()で
     /// 検知して端末のスクロールバッファをクリアする(画像プロトコルの残留対策)
     pending_scrollback_clear: bool,
+    /// メニュー画面(各項目の名前・説明文)のタイプライター表示。enter_menuでリセットする
+    menu_typewriter: Typewriter,
+    /// リザルト画面のタイプライター表示。show_resultでリセットする
+    result_typewriter: Typewriter,
 }
 
 impl App {
@@ -121,14 +148,30 @@ impl App {
                 splash::TTR_FALLBACK,
             ),
             pending_scrollback_clear: false,
+            // 画面に入る時(enter_menu/show_result)にリセットするので、それまでは表示済みにしておく
+            menu_typewriter: Typewriter::completed(MENU_CHAR_INTERVAL),
+            result_typewriter: Typewriter::completed(typewriter::CHAR_INTERVAL),
         }
     }
 
     /// メニュー画面へ遷移する。既存の`self.screen = Screen::Menu`は全てこれに統一し、
-    /// メニューに戻るたびに端末側でのスクロールバッファのクリアを要求する
+    /// メニューに戻るたびに端末側でのスクロールバッファのクリアを要求する。
+    /// 項目の名前・説明文はここから改めてタイプライターで流す
     fn enter_menu(&mut self) {
         self.screen = Screen::Menu;
         self.pending_scrollback_clear = true;
+        let total = typewriter::char_count(&menu_item_lines(self.last_area));
+        self.menu_typewriter = Typewriter::with_interval(total, MENU_CHAR_INTERVAL);
+    }
+
+    /// 表示中の画面のタイプライター表示を全文字表示済みにする。キー入力・クリックの
+    /// 処理の最初に呼ぶだけで、入力自体は消費しない(その後の通常の操作もそのまま効く)
+    fn skip_typewriter(&mut self) {
+        match self.screen {
+            Screen::Menu => self.menu_typewriter.skip(),
+            Screen::Result(..) => self.result_typewriter.skip(),
+            _ => {}
+        }
     }
 
     /// メニューへ戻った直後に一度だけtrueを返す(呼ぶとフラグは消費されfalseに戻る)。
@@ -142,6 +185,7 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        self.skip_typewriter();
         // [q]はメニューでは終了確認を開き、それ以外の画面ではメニューへ戻る。
         // カウントダウン中も特例として受け付ける(カウントダウンを中断する)
         if key.code == KeyCode::Char('q') {
@@ -222,6 +266,7 @@ impl App {
         if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
             return;
         }
+        self.skip_typewriter();
         let area = self.last_area;
         match &mut self.screen {
             Screen::Splash => {
@@ -283,6 +328,12 @@ impl App {
             self.current_bgm = Some(name);
         }
         let save_error = store::append_result(&result).err().map(|e| e.to_string());
+        self.show_result(result, save_error);
+    }
+
+    /// リザルト画面を表示し、結果の本文をタイプライターで流し始める(履歴への保存はしない)
+    fn show_result(&mut self, result: GameResult, save_error: Option<String>) {
+        self.result_typewriter = Typewriter::new(typewriter::char_count(&result_lines(&result)));
         self.screen = Screen::Result(result, save_error);
     }
 
@@ -490,6 +541,8 @@ impl App {
                     self.screen = Screen::Playing(new_game(item, difficulty));
                 }
             }
+            Screen::Menu => self.menu_typewriter.tick(dt),
+            Screen::Result(..) => self.result_typewriter.tick(dt),
             _ => {}
         }
     }
@@ -501,7 +554,9 @@ impl App {
         match &mut self.screen {
             Screen::Splash => self.splash_renderer.render(frame, area),
             Screen::RhythmSplash => self.ttr_splash_renderer.render(frame, area),
-            Screen::Menu => render_menu(frame, area, &mut self.menu_state),
+            Screen::Menu => {
+                render_menu(frame, area, &mut self.menu_state, &mut self.menu_typewriter)
+            }
             Screen::SelectSong(selected) => render_song_select(frame, area, *selected),
             Screen::SelectDifficulty(item, song) => {
                 let title = match song.and_then(|s| SONGS.get(s)) {
@@ -512,13 +567,17 @@ impl App {
             }
             Screen::Countdown { state, .. } => countdown::render(frame, area, state),
             Screen::Playing(game) => game.render(frame, area),
-            Screen::Result(result, save_error) => {
-                render_result(frame, area, result, save_error.as_deref())
-            }
+            Screen::Result(result, save_error) => render_result(
+                frame,
+                area,
+                result,
+                save_error.as_deref(),
+                &mut self.result_typewriter,
+            ),
             Screen::History => render_history(frame, area),
             Screen::Jukebox(state) => render_jukebox(frame, area, state, current_bgm.as_deref()),
             Screen::ConfirmQuit => {
-                render_menu(frame, area, &mut self.menu_state);
+                render_menu(frame, area, &mut self.menu_state, &mut self.menu_typewriter);
                 render_confirm_quit(frame, area);
             }
         }
@@ -625,26 +684,9 @@ fn song_at_row(area: Rect, mouse_row: u16) -> Option<usize> {
     (relative < SONGS.len()).then_some(relative)
 }
 
-fn render_menu(frame: &mut Frame, area: Rect, state: &mut ListState) {
-    // 各項目の一言説明。配列長をMENU_ITEMS.len()にして、項目の追加漏れをコンパイル時に検出する
-    const DESCRIPTIONS: [&str; MENU_ITEMS.len()] = [
-        "回転させた図形が元と同じかを見分ける",
-        "鏡に映した図形かどうかを見分ける",
-        "文字の色と意味が一致するかを即答する",
-        "4択から計算の答えを素早く選ぶ",
-        "3x3の規則から空欄に入る図形を選ぶ",
-        "光ったパネルの順番を覚えて再現する",
-        "数列の法則を見抜いて次の数を当てる",
-        "完成形から2つ目のピースを当てる",
-        "数字の円を1から順にクリックする(マウス専用)",
-        "色ボタンで各列の一番下のブロックを消して盤面を空にする",
-        "矢印キーで曲に合わせてステップする",
-        "合図が出たら即座に反応する",
-        "BGMを選んで聴く",
-        "ゲームごとの反応時間の推移を見る",
-    ];
-
-    let block = theme::panel(Line::from(" ◆ BRAIN TRAIN ◆ ").centered())
+/// メニュー画面の外枠(見出し・操作説明つき)。タイプライター表示の対象外で、最初から出る
+fn menu_block() -> Block<'static> {
+    theme::panel(Line::from(" ◆ BRAIN TRAIN ◆ ").centered())
         .border_type(ratatui::widgets::BorderType::Double)
         .title(
             Line::from(Span::styled(
@@ -660,17 +702,25 @@ fn render_menu(frame: &mut Frame, area: Rect, state: &mut ListState) {
                 ("q", "終了"),
             ])
             .centered(),
-        );
+        )
+}
 
-    // menu_item_at_rowは枠の内側を項目数で等分(row_index)して判定するので、
-    // 1項目の高さもその等分に合わせ、見た目の位置とクリック位置をそろえる
-    let inner = block.inner(area);
-    let item_height = (inner.height / MENU_ITEMS.len() as u16).max(1) as usize;
-    let items: Vec<ListItem> = MENU_ITEMS
+/// メニュー1項目あたりの行数。menu_item_at_rowは枠の内側を項目数で等分(row_index)して
+/// 判定するので、1項目の高さもその等分に合わせ、見た目の位置とクリック位置をそろえる
+fn menu_item_height(area: Rect) -> usize {
+    let inner = menu_block().inner(area);
+    (inner.height / MENU_ITEMS.len() as u16).max(1) as usize
+}
+
+/// メニュー全項目の行を上から順に並べて返す(1項目ちょうどmenu_item_height(area)行ずつ)。
+/// タイプライター表示はこの並びの先頭から1文字ずつ流す
+fn menu_item_lines(area: Rect) -> Vec<Line<'static>> {
+    let item_height = menu_item_height(area);
+    MENU_ITEMS
         .iter()
-        .zip(DESCRIPTIONS)
+        .zip(MENU_DESCRIPTIONS)
         .enumerate()
-        .map(|(i, (name, description))| {
+        .flat_map(|(i, (name, description))| {
             let number = Span::styled(format!("{:02}  ", i + 1), Style::default().fg(theme::ACCENT));
             let name = Span::styled(
                 *name,
@@ -696,8 +746,23 @@ fn render_menu(frame: &mut Frame, area: Rect, state: &mut ListState) {
             let mut lines = vec![Line::from(""); top];
             lines.extend(content);
             lines.resize(item_height, Line::from(""));
-            ListItem::new(lines)
+            lines
         })
+        .collect()
+}
+
+fn render_menu(frame: &mut Frame, area: Rect, state: &mut ListState, typing: &mut Typewriter) {
+    let block = menu_block();
+    let inner = block.inner(area);
+    let item_height = menu_item_height(area);
+
+    // 画面サイズによって1項目の行数(=文字数)が変わるので、描画する内容に全文字数を合わせる
+    let lines = menu_item_lines(area);
+    typing.set_total_chars(typewriter::char_count(&lines));
+    let lines = typewriter::truncate_lines(&lines, typing.visible_chars());
+    let items: Vec<ListItem> = lines
+        .chunks(item_height)
+        .map(|item| ListItem::new(item.to_vec()))
         .collect();
 
     // 全項目が収まる大きさならスクロールさせない(以前の小さい画面での位置が残らないように)
@@ -783,10 +848,8 @@ fn menu_item_at_row(area: Rect, mouse_row: u16) -> Option<usize> {
     row_index(inner, mouse_row, MENU_ITEMS.len() as u16)
 }
 
-fn render_result(frame: &mut Frame, area: Rect, result: &GameResult, save_error: Option<&str>) {
-    // 保存(呼び出し側のenter_resultで1回だけ実施済み)に失敗していれば、
-    // その内容を結果の描画後に下端へ重ねて表示する
-
+/// リザルト画面の本文(カード内のテキスト)。タイプライター表示はこの並びの先頭から1文字ずつ流す
+fn result_lines(result: &GameResult) -> Vec<Line<'static>> {
     // game_idからメニュー上の表示名を引く(見つからなければgame_idをそのまま出す)
     let game_names = [
         (crate::game::shape_rotate::GAME_ID, 0),
@@ -814,17 +877,11 @@ fn render_result(frame: &mut Frame, area: Rect, result: &GameResult, save_error:
         result.correct * 100 / result.total
     };
 
-    let outer = theme::panel(Line::from(" ◆ RESULT ◆ ").centered()).title_bottom(
-        theme::hints_line(&[("Enter / Esc / クリック", "メニューに戻る")]).centered(),
-    );
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
-
     let label_style = Style::default().fg(theme::MUTED);
     let value_style = Style::default()
         .fg(theme::ACCENT_STRONG)
         .add_modifier(Modifier::BOLD);
-    let text = vec![
+    vec![
         Line::from(vec![
             Span::styled(game_name.to_string(), theme::title_style()),
             Span::styled("   ", label_style),
@@ -865,7 +922,30 @@ fn render_result(frame: &mut Frame, area: Rect, result: &GameResult, save_error:
             Span::styled(format!("{:.0}", result.avg_latency_ms), value_style),
             Span::styled(" ms", Style::default().fg(theme::TEXT)),
         ]),
-    ];
+    ]
+}
+
+fn render_result(
+    frame: &mut Frame,
+    area: Rect,
+    result: &GameResult,
+    save_error: Option<&str>,
+    typing: &mut Typewriter,
+) {
+    // 保存(呼び出し側のenter_resultで1回だけ実施済み)に失敗していれば、
+    // その内容を結果の描画後に下端へ重ねて表示する
+
+    // 外枠(見出し・操作説明)はタイプライター表示の対象外で、最初から出す
+    let outer = theme::panel(Line::from(" ◆ RESULT ◆ ").centered()).title_bottom(
+        theme::hints_line(&[("Enter / Esc / クリック", "メニューに戻る")]).centered(),
+    );
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let lines = result_lines(result);
+    typing.set_total_chars(typewriter::char_count(&lines));
+    // 中央寄せなので、まだ出していない部分を空白で埋めて行の位置がずれないようにする
+    let text = typewriter::truncate_lines_keep_width(&lines, typing.visible_chars());
     let content_height = text.len() as u16;
     let card = centered_rect(inner, inner.width.min(48), (content_height + 2).min(inner.height));
     let paragraph = Paragraph::new(text)
@@ -2263,5 +2343,298 @@ mod tests {
         let mut app = app_on_confirm_quit();
         app.update(Duration::from_secs(10));
         assert!(matches!(app.screen, Screen::ConfirmQuit));
+    }
+
+    // --- タイプライター表示(リザルト・メニュー) ---
+
+    use crate::ui::typewriter::{self, CHAR_INTERVAL};
+
+    /// タイプライターを最後まで流し切るのに十分な時間
+    const LONG_ENOUGH: Duration = Duration::from_secs(60);
+
+    fn sample_result() -> GameResult {
+        new_game(0, Difficulty::Beginner).result()
+    }
+
+    /// 空白を除いた描画テキスト(80x30)
+    fn rendered_compact(app: &mut App) -> String {
+        rendered_text(app).replace(' ', "")
+    }
+
+    /// タイトル画面からEnterでメニューへ入ったAppを作る(enter_menuを経由する)
+    fn app_entering_menu() -> App {
+        let mut app = App::new();
+        app.last_area = rect(0, 0, 80, 30);
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.screen, Screen::Menu));
+        app
+    }
+
+    /// リザルト画面へ入ったAppを作る(履歴ファイルへの保存は行わない)
+    fn app_showing_result() -> App {
+        let mut app = App::new();
+        app.show_result(sample_result(), None);
+        assert!(matches!(app.screen, Screen::Result(..)));
+        app
+    }
+
+    #[test]
+    fn result_screen_starts_empty_and_types_in_over_time() {
+        let mut app = app_showing_result();
+        assert_eq!(app.result_typewriter.visible_chars(), 0);
+        assert!(!app.result_typewriter.is_finished());
+        let before = rendered_compact(&mut app);
+        assert!(before.contains("RESULT"), "枠と見出しは最初から出る");
+        assert!(!before.contains("図形回"), "本文はまだ出ない");
+
+        app.update(CHAR_INTERVAL * 3);
+        assert_eq!(app.result_typewriter.visible_chars(), 3);
+        let mid = rendered_compact(&mut app);
+        assert!(mid.contains("図形回"), "先頭から3文字だけ出る");
+        assert!(!mid.contains("図形回転"));
+        assert!(!mid.contains("平均反応時間"), "後ろの行はまだ出ない");
+
+        app.update(LONG_ENOUGH);
+        assert!(app.result_typewriter.is_finished());
+        let after = rendered_compact(&mut app);
+        assert!(after.contains(MENU_ITEMS[0]));
+        assert!(after.contains("RANK"));
+        assert!(after.contains("平均反応時間"));
+    }
+
+    #[test]
+    fn result_typewriter_total_matches_the_result_text() {
+        let app = app_showing_result();
+        let Screen::Result(result, _) = &app.screen else {
+            unreachable!();
+        };
+        assert_eq!(
+            app.result_typewriter.total_chars(),
+            typewriter::char_count(&result_lines(result))
+        );
+    }
+
+    #[test]
+    fn showing_a_result_again_restarts_typing() {
+        let mut app = app_showing_result();
+        app.update(LONG_ENOUGH);
+        assert!(app.result_typewriter.is_finished());
+        app.show_result(sample_result(), None);
+        assert_eq!(app.result_typewriter.visible_chars(), 0);
+    }
+
+    #[test]
+    fn centered_result_lines_do_not_shift_while_typing() {
+        // 中央寄せの行が、文字が増えるたびに左右へずれないこと(先頭の文字の位置が変わらない)
+        let first_col = |app: &mut App| {
+            let rows = rendered_cells(app, 80, 30);
+            rows.iter()
+                .find_map(|r| r.iter().position(|c| c == "図"))
+                .expect("ゲーム名の先頭文字が描かれていること")
+        };
+        let mut app = app_showing_result();
+        app.update(CHAR_INTERVAL);
+        let early = first_col(&mut app);
+        app.update(LONG_ENOUGH);
+        assert_eq!(first_col(&mut app), early);
+    }
+
+    #[test]
+    fn menu_starts_empty_and_types_items_from_the_top() {
+        let mut app = app_entering_menu();
+        assert_eq!(app.menu_typewriter.visible_chars(), 0);
+        assert!(!app.menu_typewriter.is_finished());
+        let before = rendered_compact(&mut app);
+        assert!(before.contains("BRAINTRAIN"), "枠と見出しは最初から出る");
+        assert!(!before.contains(MENU_ITEMS[0]), "項目はまだ出ない");
+
+        // 「01  」の4文字+「図形」の2文字
+        app.update(MENU_CHAR_INTERVAL * 6);
+        let mid = rendered_compact(&mut app);
+        assert!(mid.contains("01図形"), "1項目目の名前が途中まで出る");
+        assert!(!mid.contains(MENU_ITEMS[0]));
+        assert!(!mid.contains(MENU_ITEMS[1]), "2項目目はまだ出ない");
+
+        app.update(LONG_ENOUGH);
+        assert!(app.menu_typewriter.is_finished());
+        let after = rendered_compact(&mut app);
+        for (name, description) in MENU_ITEMS.iter().zip(MENU_DESCRIPTIONS) {
+            assert!(after.contains(name), "{name}が出ること");
+            assert!(after.contains(description), "{description}が出ること");
+        }
+    }
+
+    #[test]
+    fn menu_items_appear_in_order_from_top_to_bottom() {
+        let mut app = app_entering_menu();
+        let mut shown = 0;
+        while !app.menu_typewriter.is_finished() {
+            app.update(MENU_CHAR_INTERVAL * 5);
+            let text = rendered_compact(&mut app);
+            let now = MENU_ITEMS.iter().take_while(|name| text.contains(*name)).count();
+            assert!(
+                MENU_ITEMS[now..].iter().all(|name| !text.contains(*name)),
+                "上の項目より先に下の項目が出ないこと"
+            );
+            assert!(now >= shown, "一度出た項目は消えない");
+            shown = now;
+        }
+        assert_eq!(shown, MENU_ITEMS.len());
+    }
+
+    #[test]
+    fn menu_typing_total_follows_the_screen_size() {
+        for height in [24u16, 30, 45] {
+            let mut app = App::new();
+            app.last_area = rect(0, 0, 80, height);
+            press(&mut app, KeyCode::Enter);
+            let expected = typewriter::char_count(&menu_item_lines(rect(0, 0, 80, height)));
+            assert_eq!(app.menu_typewriter.total_chars(), expected, "height={height}");
+            // 描画した画面サイズの内容に合わせて全文字数が更新される
+            rendered_rows_without_spaces(&mut app, 80, 30);
+            let resized = typewriter::char_count(&menu_item_lines(rect(0, 0, 80, 30)));
+            assert_eq!(app.menu_typewriter.total_chars(), resized, "height={height}→30");
+        }
+    }
+
+    #[test]
+    fn typed_menu_items_are_on_the_rows_that_click_to_them() {
+        // 途中まで流れている間も、見えている項目名の行をクリックするとその項目になる
+        for height in [24u16, 30] {
+            let mut app = App::new();
+            app.last_area = rect(0, 0, 80, height);
+            press(&mut app, KeyCode::Enter);
+            app.update(MENU_CHAR_INTERVAL * 120);
+            let rows = rendered_rows_without_spaces(&mut app, 80, height);
+            let area = rect(0, 0, 80, height);
+            let visible: Vec<usize> = (0..MENU_ITEMS.len())
+                .filter(|&i| rows.iter().any(|r| r.contains(MENU_ITEMS[i])))
+                .collect();
+            assert!(!visible.is_empty() && visible.len() < MENU_ITEMS.len(), "height={height}: 途中まで");
+            for i in visible {
+                let row = rows.iter().position(|r| r.contains(MENU_ITEMS[i])).unwrap();
+                assert_eq!(menu_item_at_row(area, row as u16), Some(i), "height={height}");
+            }
+        }
+    }
+
+    #[test]
+    fn key_while_menu_is_typing_finishes_it_and_still_moves_the_selection() {
+        let mut app = app_entering_menu();
+        press(&mut app, KeyCode::Down);
+        assert!(app.menu_typewriter.is_finished(), "キー入力で全文字表示済みになる");
+        assert_eq!(app.menu_state.selected(), Some(1), "上下キーの選択移動もそのまま効く");
+        assert!(rendered_compact(&mut app).contains(MENU_ITEMS[MENU_ITEMS.len() - 1]));
+    }
+
+    #[test]
+    fn enter_while_menu_is_typing_still_selects_the_item() {
+        let mut app = app_entering_menu();
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.screen, Screen::SelectDifficulty(0, None)));
+        assert!(app.menu_typewriter.is_finished());
+    }
+
+    #[test]
+    fn click_while_menu_is_typing_finishes_it_and_still_selects_the_item() {
+        let mut app = app_entering_menu();
+        let row = (0..30)
+            .find(|&row| menu_item_at_row(app.last_area, row) == Some(HISTORY_ITEM_INDEX))
+            .unwrap();
+        app.handle_mouse(left_click(row));
+        assert!(matches!(app.screen, Screen::History));
+        assert!(app.menu_typewriter.is_finished());
+    }
+
+    #[test]
+    fn mouse_move_does_not_skip_the_menu_typing() {
+        let mut app = app_entering_menu();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 5,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(!app.menu_typewriter.is_finished());
+    }
+
+    #[test]
+    fn q_while_menu_is_typing_shows_the_full_menu_behind_the_dialog() {
+        let mut app = app_entering_menu();
+        press(&mut app, KeyCode::Char('q'));
+        assert!(matches!(app.screen, Screen::ConfirmQuit));
+        assert!(app.menu_typewriter.is_finished());
+        let text = rendered_rows_without_spaces(&mut app, 80, 30).concat();
+        assert!(text.contains(MENU_ITEMS[0]));
+    }
+
+    #[test]
+    fn other_key_while_result_is_typing_finishes_it_without_leaving() {
+        let mut app = app_showing_result();
+        press(&mut app, KeyCode::Char(' '));
+        assert!(matches!(app.screen, Screen::Result(..)), "Enter/Esc以外では戻らない");
+        assert!(app.result_typewriter.is_finished());
+        assert!(rendered_compact(&mut app).contains("平均反応時間"));
+    }
+
+    #[test]
+    fn enter_or_esc_while_result_is_typing_still_returns_to_menu() {
+        for code in [KeyCode::Enter, KeyCode::Esc] {
+            let mut app = app_showing_result();
+            press(&mut app, code);
+            assert!(matches!(app.screen, Screen::Menu), "{code:?}でメニューに戻る");
+            assert!(
+                !app.menu_typewriter.is_finished(),
+                "{code:?}: 戻ったメニューは頭からタイプライターで流れる"
+            );
+        }
+    }
+
+    #[test]
+    fn click_while_result_is_typing_still_returns_to_menu() {
+        let mut app = app_showing_result();
+        app.last_area = rect(0, 0, 80, 30);
+        app.handle_mouse(left_click(5));
+        assert!(matches!(app.screen, Screen::Menu));
+    }
+
+    #[test]
+    fn returning_to_menu_restarts_the_menu_typing() {
+        let mut app = app_entering_menu();
+        app.update(LONG_ENOUGH);
+        app.select_menu_item(HISTORY_ITEM_INDEX);
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::Menu));
+        assert_eq!(app.menu_typewriter.visible_chars(), 0);
+    }
+
+    #[test]
+    fn typewriters_advance_only_on_their_own_screen() {
+        let mut app = app_showing_result();
+        app.screen = Screen::History;
+        app.update(CHAR_INTERVAL * 5);
+        assert_eq!(app.result_typewriter.visible_chars(), 0, "リザルト以外では進まない");
+
+        let mut app = app_entering_menu();
+        app.screen = Screen::History;
+        app.update(MENU_CHAR_INTERVAL * 5);
+        assert_eq!(app.menu_typewriter.visible_chars(), 0, "メニュー以外では進まない");
+
+        // 終了確認ダイアログの背後のメニューも、ダイアログ中は進めない
+        let mut app = app_entering_menu();
+        app.screen = Screen::ConfirmQuit;
+        app.update(LONG_ENOUGH);
+        assert_eq!(app.menu_typewriter.visible_chars(), 0);
+    }
+
+    #[test]
+    fn menu_char_interval_types_the_whole_menu_in_a_few_seconds() {
+        // 項目数が多いメニューは標準の間隔だと流し切るのに時間がかかりすぎるため、専用の間隔を使う
+        let total = typewriter::char_count(&menu_item_lines(rect(0, 0, 80, 30)));
+        let duration = MENU_CHAR_INTERVAL * total as u32;
+        assert!(
+            duration <= Duration::from_secs(6),
+            "メニュー全体が{duration:?}で流れ切る(全{total}文字)"
+        );
     }
 }
