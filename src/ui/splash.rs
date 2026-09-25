@@ -43,10 +43,17 @@ pub const TTR_FALLBACK: FallbackText = FallbackText {
 /// スプラッシュ画面が複数あっても端末への問い合わせはプロセス内で1回だけにする
 static PICKER: OnceLock<Option<Picker>> = OnceLock::new();
 
-fn picker() -> Option<&'static Picker> {
+/// 端末の画像プロトコル検出結果(プロセス内で1回だけ問い合わせる)。メニューのアイコンでも共用する
+pub(crate) fn picker() -> Option<&'static Picker> {
     PICKER
         .get_or_init(|| Picker::from_query_stdio().ok())
         .as_ref()
+}
+
+/// assets/image/に埋め込んだ画像を読み込んでデコードする。無い・デコードできなければNone
+pub(crate) fn load_embedded_image(image_path: &str) -> Option<image::DynamicImage> {
+    let file = ImageAssets::get(image_path)?;
+    image::load_from_memory(&file.data).ok()
 }
 
 /// スプラッシュ画面(画像1枚の全画面表示)の描画方式。端末が画像プロトコルに
