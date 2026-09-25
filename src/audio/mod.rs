@@ -252,6 +252,14 @@ mod tests {
     }
 
     #[test]
+    fn bgm_tracks_in_menu_has_two_tracks() {
+        let names = bgm_tracks_in(BgmCategory::Menu);
+        assert!(names.iter().any(|n| n == "Calculated_Play"));
+        assert!(names.iter().any(|n| n == "Primary_Thruster"));
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
     fn bgm_tracks_in_playing_includes_method_of_thought_only() {
         let names = bgm_tracks_in(BgmCategory::Playing);
         assert!(names.iter().any(|n| n == "Method_of_Thought"));
