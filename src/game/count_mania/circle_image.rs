@@ -287,6 +287,16 @@ impl CircleRenderer {
             self.ripple_encodes.set(self.ripple_encodes.get() + 1);
         }
         if let Some(cached) = cache.as_mut() {
+            // 盤面の画像は起点以外の全セルをskip(ratatuiの差分出力の対象外)にしており、
+            // ratatui-imageはパッチの起点セルに画像データを入れる時にskipを戻さない。
+            // そのままではパッチが端末へ一切出力されないので、パッチの範囲のskipを先に外す
+            // (起点以外はパッチの描画で再びskipになる)
+            let buffer = frame.buffer_mut();
+            for y in cached.rect.top()..cached.rect.bottom() {
+                for x in cached.rect.left()..cached.rect.right() {
+                    buffer[(x, y)].set_skip(false);
+                }
+            }
             frame.render_stateful_widget(
                 StatefulImage::default(),
                 cached.rect,
@@ -343,9 +353,11 @@ fn ring_thickness(cell_height: f64) -> f64 {
 }
 
 /// 波紋が広がり切るまでにリングが届く範囲(セル)。パッチはこの範囲を切り出す。
-/// ボードの中に収め、ボードの左端の列は含めない(盤面の画像はボード左上のセルを起点に描かれ、
-/// kittyでは各行の左端のセルが起点になる。そこにパッチを重ねると盤面の画像が描かれなくなるため)。
-/// 範囲が無い(ボードが1列しかない等)時は空のRect
+/// ボードの中に収め、ボードの左端の2列は含めない。盤面の画像はボード左上のセルを起点に描かれ、
+/// kittyでは各行の左端のセルが起点になる。そこにパッチを重ねると盤面の画像が描かれなくなる。
+/// また、ratatuiの差分処理は画像データの入ったセルの直後の1セルを出力しないため、
+/// 起点のすぐ右の列にパッチの起点を置くとパッチが端末へ送られない。
+/// 範囲が無い(ボードが2列以下等)時は空のRect
 fn ripple_patch_rect(board: Rect, font_size: (u16, u16), ripple: &Ripple) -> Rect {
     let cell_width = f64::from(font_size.0.max(1));
     let cell_height = f64::from(font_size.1.max(1));
@@ -356,7 +368,7 @@ fn ripple_patch_rect(board: Rect, font_size: (u16, u16), ripple: &Ripple) -> Rec
     let center_y = (f64::from(row) + 0.5) * cell_height;
     let left = ((center_x - reach) / cell_width)
         .floor()
-        .max(f64::from(board.x) + 1.0);
+        .max(f64::from(board.x) + 2.0);
     let right = ((center_x + reach) / cell_width)
         .ceil()
         .min(f64::from(board.right()));
@@ -855,17 +867,18 @@ mod tests {
     }
 
     #[test]
-    fn patch_rect_avoids_left_column_of_board() {
-        // 盤面画像の起点(左端の列)にパッチを重ねると盤面画像が描かれなくなるため、左端の列は含めない
+    fn patch_rect_avoids_two_left_columns_of_board() {
+        // 盤面画像の起点(左端の列)にパッチを重ねると盤面画像が描かれなくなり、
+        // そのすぐ右の列は差分処理が起点の画像データの表示幅ぶん出力を飛ばすため、左端の2列は含めない
         let board = Rect::new(2, 3, 20, 10);
         let corner = Ripple::new(2, 3);
         let rect = ripple_patch_rect(board, RIPPLE_FONT, &corner);
         assert!(!rect.is_empty());
-        assert_eq!(rect.x, board.x + 1);
+        assert_eq!(rect.x, board.x + 2);
         assert_eq!(rect.y, board.y);
         assert_eq!(rect.intersection(board), rect);
-        // 1列しかないボードではパッチを作らない
-        let narrow = Rect::new(0, 0, 1, 10);
+        // 2列以下のボードではパッチを作らない
+        let narrow = Rect::new(0, 0, 2, 10);
         assert!(ripple_patch_rect(narrow, RIPPLE_FONT, &Ripple::new(0, 5)).is_empty());
     }
 
@@ -1004,6 +1017,170 @@ mod tests {
         draw_image_board(&renderer, &mut terminal, &PATCH_CIRCLES[..1], Some(&ripple));
         assert_eq!(renderer.board_encode_count(), 2);
         assert_eq!(renderer.ripple_encode_count(), 2);
+    }
+
+    // --- 端末へ実際に送られる画像データ(main.rsと同じTerminal+ImageDedupBackend経由) ---
+
+    use crate::image_backend::{ImageDedupBackend, RecordingBackend};
+
+    const PIPE_W: u16 = 60;
+    const PIPE_H: u16 = 24;
+    const PIPE_FONT: (u16, u16) = (4, 8);
+    const PIPE_BOARD: Rect = Rect::new(0, 0, PIPE_W, PIPE_H);
+
+    /// 実際の端末と同じ画像プロトコル(セルにエスケープシーケンスを入れ、残りをskipにする)の描画器
+    fn protocol_renderer(protocol: ProtocolType) -> CircleRenderer {
+        let mut picker = Picker::from_fontsize(PIPE_FONT);
+        picker.set_protocol_type(protocol);
+        CircleRenderer::with_picker(picker)
+    }
+
+    fn pipeline_terminal() -> Terminal<ImageDedupBackend<RecordingBackend>> {
+        Terminal::new(ImageDedupBackend::new(RecordingBackend::new(
+            PIPE_W, PIPE_H,
+        )))
+        .unwrap()
+    }
+
+    /// 1フレーム描き、そのフレームで端末へ送られた画像データのセル位置を返す
+    fn draw_sent(
+        renderer: &CircleRenderer,
+        terminal: &mut Terminal<ImageDedupBackend<RecordingBackend>>,
+        ripple: Option<&Ripple>,
+    ) -> Vec<(u16, u16)> {
+        terminal
+            .draw(|frame| renderer.render_board(frame, frame.area(), &PATCH_CIRCLES, ripple))
+            .unwrap();
+        terminal.backend().inner().last_payload_positions()
+    }
+
+    /// 盤面画像の起点セル(sixel/iTerm2は盤面の左上1セルに画像データを入れる)
+    const BOARD_ORIGIN: (u16, u16) = (PIPE_BOARD.x, PIPE_BOARD.y);
+
+    #[test]
+    fn patch_origin_cell_is_not_left_skipped_by_board_image() {
+        // 原因の固定: 盤面の画像は起点以外の全セルをskip(差分出力の対象外)にする。
+        // その内側に重ねたパッチの起点セルがskipのままだと、画像データを入れても端末へ出力されない
+        let renderer = protocol_renderer(ProtocolType::Sixel);
+        let mut terminal = Terminal::new(TestBackend::new(PIPE_W, PIPE_H)).unwrap();
+        let ripple = Ripple::new(20, 8);
+        let patch = ripple_patch_rect(PIPE_BOARD, PIPE_FONT, &ripple);
+        let completed = terminal
+            .draw(|frame| renderer.render_board(frame, frame.area(), &PATCH_CIRCLES, Some(&ripple)))
+            .unwrap();
+        let origin = &completed.buffer[(patch.x, patch.y)];
+        assert!(
+            origin.symbol().starts_with('\x1b'),
+            "パッチの画像データが入る"
+        );
+        assert!(!origin.skip, "パッチの起点セルは出力の対象にする");
+        let inner = &completed.buffer[(patch.x + 1, patch.y)];
+        assert!(inner.skip, "パッチの起点以外は画像に覆われるのでskipのまま");
+    }
+
+    #[test]
+    fn ripple_patch_is_sent_to_terminal_on_every_ripple_frame() {
+        // 報告された症状の再現: 盤面の画像の内側に重ねたパッチの画像データが端末へ送られず、
+        // 波紋が全く表示されない
+        for protocol in [
+            ProtocolType::Sixel,
+            ProtocolType::Iterm2,
+            ProtocolType::Kitty,
+        ] {
+            let renderer = protocol_renderer(protocol);
+            let mut terminal = pipeline_terminal();
+            let mut ripple = Some(Ripple::new(20, 8));
+            let mut last_frame = None;
+            while let Some(r) = ripple {
+                let patch = ripple_patch_rect(PIPE_BOARD, PIPE_FONT, &r);
+                let origin = (patch.x, patch.y);
+                let sent = draw_sent(&renderer, &mut terminal, Some(&r));
+                if last_frame != Some(r.frame()) {
+                    assert!(
+                        sent.contains(&origin),
+                        "{protocol:?}: コマ{}のパッチ{patch:?}が端末へ送られていない: {sent:?}",
+                        r.frame()
+                    );
+                } else if protocol != ProtocolType::Kitty {
+                    // (kittyは画像の転送後に中身の無い配置だけのデータへ変わるため除く)
+                    assert!(
+                        !sent.contains(&origin),
+                        "{protocol:?}: コマが変わらない間はパッチを送り直さない"
+                    );
+                }
+                if protocol != ProtocolType::Kitty && last_frame.is_some() {
+                    assert!(
+                        !sent.contains(&BOARD_ORIGIN),
+                        "{protocol:?}: 盤面が変わらない間は盤面の画像を送り直さない"
+                    );
+                }
+                last_frame = Some(r.frame());
+                ripple = r.advanced(crate::TICK_RATE);
+            }
+        }
+    }
+
+    #[test]
+    fn only_board_is_sent_without_ripple_and_patch_follows_when_ripple_starts() {
+        for protocol in [ProtocolType::Sixel, ProtocolType::Iterm2] {
+            let renderer = protocol_renderer(protocol);
+            let mut terminal = pipeline_terminal();
+            let sent = draw_sent(&renderer, &mut terminal, None);
+            assert_eq!(
+                sent,
+                vec![BOARD_ORIGIN],
+                "{protocol:?}: 波紋が無ければ盤面だけ"
+            );
+            assert!(draw_sent(&renderer, &mut terminal, None).is_empty());
+            let ripple = Ripple::new(20, 8);
+            let patch = ripple_patch_rect(PIPE_BOARD, PIPE_FONT, &ripple);
+            let sent = draw_sent(&renderer, &mut terminal, Some(&ripple));
+            assert_eq!(
+                sent,
+                vec![(patch.x, patch.y)],
+                "{protocol:?}: 波紋が始まるとパッチだけを送る"
+            );
+        }
+    }
+
+    #[test]
+    fn clean_patch_is_sent_once_after_ripple_ends() {
+        // 波紋が消えたら、端末に残った最後のリングを消すため、リングの無いパッチを1回送る
+        let renderer = protocol_renderer(ProtocolType::Sixel);
+        let mut terminal = pipeline_terminal();
+        let ripple = Ripple::new(20, 8);
+        let patch = ripple_patch_rect(PIPE_BOARD, PIPE_FONT, &ripple);
+        draw_sent(&renderer, &mut terminal, Some(&ripple));
+        assert_eq!(
+            draw_sent(&renderer, &mut terminal, None),
+            vec![(patch.x, patch.y)]
+        );
+        assert!(draw_sent(&renderer, &mut terminal, None).is_empty());
+    }
+
+    #[test]
+    fn ripple_at_board_corner_is_sent_to_terminal() {
+        // 盤面の左上の隅をクリックした波紋。パッチが盤面画像の起点セルのすぐ右隣から始まると、
+        // ratatuiの差分処理が起点セルの画像データの表示幅ぶん後続セルの出力を飛ばすため送られない
+        for protocol in [
+            ProtocolType::Sixel,
+            ProtocolType::Iterm2,
+            ProtocolType::Kitty,
+        ] {
+            for center in [(0, 0), (1, 0), (2, 1), (0, 5)] {
+                let renderer = protocol_renderer(protocol);
+                let mut terminal = pipeline_terminal();
+                draw_sent(&renderer, &mut terminal, None);
+                let ripple = Ripple::new(center.0, center.1);
+                let patch = ripple_patch_rect(PIPE_BOARD, PIPE_FONT, &ripple);
+                assert!(!patch.is_empty());
+                let sent = draw_sent(&renderer, &mut terminal, Some(&ripple));
+                assert!(
+                    sent.contains(&(patch.x, patch.y)),
+                    "{protocol:?}: 中心{center:?}のパッチ{patch:?}が送られていない: {sent:?}"
+                );
+            }
+        }
     }
 
     #[test]
