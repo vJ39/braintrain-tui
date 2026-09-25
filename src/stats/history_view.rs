@@ -64,12 +64,17 @@ pub fn render(frame: &mut Frame, area: Rect) {
     }
 }
 
-fn render_game_history(frame: &mut Frame, area: Rect, game_id: &str, results: &[GameResult]) {
-    let latencies: Vec<f64> = results
+/// game_idに一致する記録だけを抽出する(render_game_historyの計算部分をテスト可能に切り出したもの)
+fn latencies_for(game_id: &str, results: &[GameResult]) -> Vec<f64> {
+    results
         .iter()
         .filter(|r| r.game_id == game_id)
         .map(|r| r.avg_latency_ms)
-        .collect();
+        .collect()
+}
+
+fn render_game_history(frame: &mut Frame, area: Rect, game_id: &str, results: &[GameResult]) {
+    let latencies = latencies_for(game_id, results);
 
     if latencies.is_empty() {
         let paragraph =
@@ -103,4 +108,52 @@ fn render_game_history(frame: &mut Frame, area: Rect, game_id: &str, results: &[
             }
         });
     frame.render_widget(canvas, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::Difficulty;
+    use chrono::Utc;
+
+    fn result(game_id: &str, avg_latency_ms: f64) -> GameResult {
+        GameResult {
+            game_id: game_id.to_string(),
+            difficulty: Difficulty::Beginner,
+            correct: 8,
+            total: 10,
+            avg_latency_ms,
+            played_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn game_ids_has_no_duplicates() {
+        let mut sorted = GAME_IDS.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), GAME_IDS.len(), "GAME_IDSに重複がある");
+    }
+
+    #[test]
+    fn game_ids_covers_all_nine_games() {
+        assert_eq!(GAME_IDS.len(), 9);
+    }
+
+    #[test]
+    fn latencies_for_filters_by_game_id_and_preserves_order() {
+        let results = vec![
+            result("shape_rotate", 100.0),
+            result("mirror_match", 200.0),
+            result("shape_rotate", 150.0),
+        ];
+        let latencies = latencies_for("shape_rotate", &results);
+        assert_eq!(latencies, vec![100.0, 150.0]);
+    }
+
+    #[test]
+    fn latencies_for_unknown_game_id_is_empty() {
+        let results = vec![result("shape_rotate", 100.0)];
+        assert!(latencies_for("no_such_game", &results).is_empty());
+    }
 }

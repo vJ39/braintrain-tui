@@ -149,4 +149,29 @@ mod tests {
         let shape = Shape::new(vec![(0.0, 0.0)]);
         assert!(shape.to_lines().is_empty());
     }
+
+    #[test]
+    fn base_shapes_has_eight_variations() {
+        assert_eq!(base_shapes().len(), 8);
+    }
+
+    #[test]
+    fn base_shapes_are_not_degenerate() {
+        for shape in base_shapes() {
+            assert!(
+                shape.points.len() >= 3,
+                "図形は多角形として描画できるよう3点以上必要"
+            );
+        }
+    }
+
+    #[test]
+    fn base_shapes_fit_within_normalized_bounds() {
+        for shape in base_shapes() {
+            for &(x, y) in &shape.points {
+                assert!((-1.0..=1.0).contains(&x), "x={x}が正規化範囲外");
+                assert!((-1.0..=1.0).contains(&y), "y={y}が正規化範囲外");
+            }
+        }
+    }
 }
