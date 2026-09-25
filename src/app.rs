@@ -557,7 +557,13 @@ impl App {
         self.last_area = area;
         let current_bgm = self.current_bgm.clone();
         match &mut self.screen {
-            Screen::Splash => self.splash_renderer.render(frame, area),
+            Screen::Splash => {
+                // メニューと同じ色・角丸の枠を画面いっぱいに描き、内側の中央にロゴを配置する
+                let block = theme::panel("");
+                let inner = block.inner(area);
+                frame.render_widget(block, area);
+                self.splash_renderer.render(frame, inner);
+            }
             Screen::Menu => render_menu(
                 frame,
                 area,
@@ -2167,6 +2173,28 @@ mod tests {
         let mut app = App::new();
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         assert!(matches!(app.screen, Screen::Menu));
+    }
+
+    #[test]
+    fn splash_screen_is_framed_by_a_full_screen_border() {
+        // メニューと同じ色(theme::ACCENT)の角丸枠(Rounded)が画面いっぱいに出る
+        let mut app = App::new();
+        let text = rendered_text(&mut app);
+        assert!(
+            text.contains('╭') && text.contains('╮') && text.contains('╰') && text.contains('╯'),
+            "画面いっぱいの角丸枠が出ること"
+        );
+        let buffer = {
+            let backend = ratatui::backend::TestBackend::new(80, 30);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            terminal.backend().buffer().clone()
+        };
+        assert_eq!(
+            buffer[(0, 0)].fg,
+            theme::ACCENT,
+            "枠の色はメニューと同じACCENT"
+        );
     }
 
     #[test]

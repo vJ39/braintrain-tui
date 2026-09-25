@@ -59,7 +59,11 @@ pub(crate) fn load_embedded_image(image_path: &str) -> Option<image::DynamicImag
 /// スプラッシュ画面(画像1枚の全画面表示)の描画方式。端末が画像プロトコルに
 /// 対応していない/検出に失敗した/画像を読めない場合はFallback(テキスト描画)になる
 pub enum SplashRenderer {
-    Image(Box<StatefulProtocol>),
+    Image {
+        protocol: Box<StatefulProtocol>,
+        /// 元画像の大きさ(px)。アスペクト比を保って中央に配置する計算に使う
+        size: (u32, u32),
+    },
     Fallback(FallbackText),
 }
 
@@ -67,28 +71,58 @@ impl SplashRenderer {
     /// image_pathはassets/image/からの相対パス。fallbackは画像を出せない時の表示
     pub fn new(image_path: &str, fallback: FallbackText) -> Self {
         match Self::try_load_image(image_path) {
-            Some(protocol) => SplashRenderer::Image(Box::new(protocol)),
+            Some((protocol, size)) => SplashRenderer::Image {
+                protocol: Box::new(protocol),
+                size,
+            },
             None => SplashRenderer::Fallback(fallback),
         }
     }
 
-    fn try_load_image(image_path: &str) -> Option<StatefulProtocol> {
+    fn try_load_image(image_path: &str) -> Option<(StatefulProtocol, (u32, u32))> {
         // 画像が無ければ端末への問い合わせ自体を行わない
         let file = ImageAssets::get(image_path)?;
         let picker = picker()?;
         let dyn_img = image::load_from_memory(&file.data).ok()?;
-        Some(picker.new_resize_protocol(dyn_img))
+        let size = (dyn_img.width(), dyn_img.height());
+        Some((picker.new_resize_protocol(dyn_img), size))
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         match self {
-            SplashRenderer::Image(protocol) => {
-                let image_widget = StatefulImage::default().resize(Resize::Crop(None));
-                frame.render_stateful_widget(image_widget, area, protocol.as_mut());
+            SplashRenderer::Image { protocol, size } => {
+                let font_size = picker().map_or((1, 1), Picker::font_size);
+                let target = centered_image_rect(area, *size, font_size);
+                let image_widget = StatefulImage::default().resize(Resize::Fit(None));
+                frame.render_stateful_widget(image_widget, target, protocol.as_mut());
             }
             SplashRenderer::Fallback(fallback) => render_fallback(frame, area, *fallback),
         }
     }
+}
+
+/// 画像(size, px)をareaの中央に、縦横比を保って収まる最大の大きさで配置するRect。
+/// areaが空なら空のRectを返す
+fn centered_image_rect(area: Rect, size: (u32, u32), font_size: (u16, u16)) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+    let (font_w, font_h) = (f64::from(font_size.0.max(1)), f64::from(font_size.1.max(1)));
+    let aspect = f64::from(size.0.max(1)) / f64::from(size.1.max(1));
+    // まず高さいっぱいで幅を求め、はみ出すなら幅いっぱいにして高さを縮める
+    let full_height_width = (f64::from(area.height) * font_h * aspect / font_w).round() as u16;
+    let (width, height) = if full_height_width <= area.width {
+        (full_height_width.max(1), area.height)
+    } else {
+        let height = (f64::from(area.width) * font_w / aspect / font_h).round() as u16;
+        (area.width, height.clamp(1, area.height))
+    };
+    Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    )
 }
 
 fn render_fallback(frame: &mut Frame, area: Rect, fallback: FallbackText) {
@@ -184,12 +218,55 @@ mod tests {
         assert_ne!(TITLE_FALLBACK.title, TTR_FALLBACK.title);
     }
 
+    // --- センタリング配置(centered_image_rect) ---
+
+    #[test]
+    fn wide_image_is_centered_vertically_with_full_width() {
+        // 横長画像(1600x900)を正方形寄りのareaに収める: 幅いっぱいにし、上下に余白ができて中央になる
+        let area = Rect::new(0, 0, 100, 100);
+        let rect = centered_image_rect(area, (1600, 900), (10, 20));
+        assert_eq!(rect.x, 0);
+        assert_eq!(rect.width, 100);
+        assert!(rect.height < 100, "上下に余白ができる");
+        // 上下の余白が均等(中央寄せ)
+        let bottom_margin = area.height - rect.y - rect.height;
+        assert!(
+            rect.y.abs_diff(bottom_margin) <= 1,
+            "上下の余白がほぼ均等: top={} bottom={}",
+            rect.y,
+            bottom_margin
+        );
+    }
+
+    #[test]
+    fn tall_image_is_centered_horizontally_with_full_height() {
+        // 縦長画像(900x1600)を横長のareaに収める: 高さいっぱいにし、左右に余白ができて中央になる
+        let area = Rect::new(0, 0, 200, 50);
+        let rect = centered_image_rect(area, (900, 1600), (10, 20));
+        assert_eq!(rect.y, 0);
+        assert_eq!(rect.height, 50);
+        assert!(rect.width < 200, "左右に余白ができる");
+        let right_margin = area.width - rect.x - rect.width;
+        assert!(
+            rect.x.abs_diff(right_margin) <= 1,
+            "左右の余白がほぼ均等: left={} right={}",
+            rect.x,
+            right_margin
+        );
+    }
+
+    #[test]
+    fn zero_size_area_yields_empty_rect_without_panicking() {
+        let rect = centered_image_rect(Rect::new(0, 0, 0, 0), (100, 100), (10, 20));
+        assert!(rect.width == 0 || rect.height == 0);
+    }
+
     #[test]
     fn missing_image_path_falls_back_to_text() {
         let renderer = SplashRenderer::new("does-not-exist.jpeg", TTR_FALLBACK);
         match renderer {
             SplashRenderer::Fallback(fallback) => assert_eq!(fallback, TTR_FALLBACK),
-            SplashRenderer::Image(_) => panic!("存在しない画像ではFallbackになるはず"),
+            SplashRenderer::Image { .. } => panic!("存在しない画像ではFallbackになるはず"),
         }
     }
 
