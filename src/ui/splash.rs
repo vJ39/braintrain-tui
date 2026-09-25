@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
-use ratatui_image::StatefulImage;
+use ratatui_image::{Resize, StatefulImage};
 use rust_embed::RustEmbed;
 
 #[derive(RustEmbed)]
@@ -39,7 +39,7 @@ impl SplashRenderer {
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         match self {
             SplashRenderer::Image(protocol) => {
-                let image_widget = StatefulImage::default();
+                let image_widget = StatefulImage::default().resize(Resize::Crop(None));
                 frame.render_stateful_widget(image_widget, area, protocol.as_mut());
             }
             SplashRenderer::Fallback => render_fallback(frame, area),
