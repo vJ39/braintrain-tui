@@ -224,6 +224,7 @@ impl CountManiaGame {
     }
 
     fn click_correct(&mut self) {
+        audio::play_se(SeKind::Correct);
         self.round.next += 1;
         if self.round.next > self.params.max_number {
             let latency_ms = self.round.elapsed.as_secs_f64() * 1000.0;
@@ -232,7 +233,6 @@ impl CountManiaGame {
                 true,
                 format!("CLEAR {:.1}秒", self.round.elapsed.as_secs_f64()),
             );
-            audio::play_se(SeKind::Correct);
             self.finish_round();
         }
     }
