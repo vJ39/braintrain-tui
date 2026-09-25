@@ -309,9 +309,11 @@ mod tests {
     }
 
     #[test]
-    fn bgm_tracks_in_rhythm_splash_has_overclocked_tempo_only() {
+    fn bgm_tracks_in_rhythm_splash_has_two_tracks() {
         let names = bgm_tracks_in(BgmCategory::RhythmSplash);
-        assert_eq!(names, vec!["Overclocked_Tempo".to_string()]);
+        assert!(names.iter().any(|n| n == "Overclocked_Tempo"));
+        assert!(names.iter().any(|n| n == "Under_the_Floodlights"));
+        assert_eq!(names.len(), 2);
     }
 
     #[test]

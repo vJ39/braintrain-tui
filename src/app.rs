@@ -1388,18 +1388,22 @@ mod tests {
     fn selecting_rhythm_menu_item_starts_the_ttr_splash_bgm() {
         let mut app = App::new();
         app.select_menu_item(RHYTHM_ITEM_INDEX);
-        assert_eq!(app.current_bgm.as_deref(), Some("Overclocked_Tempo"));
+        let tracks = audio::bgm_tracks_in(BgmCategory::RhythmSplash);
+        assert!(app
+            .current_bgm
+            .as_ref()
+            .is_some_and(|name| tracks.contains(name)));
     }
 
     #[test]
     fn ttr_splash_bgm_keeps_playing_through_song_select() {
         let mut app = App::new();
         app.select_menu_item(RHYTHM_ITEM_INDEX);
+        let started_bgm = app.current_bgm.clone();
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         assert!(matches!(app.screen, Screen::SelectSong(0)));
         assert_eq!(
-            app.current_bgm.as_deref(),
-            Some("Overclocked_Tempo"),
+            app.current_bgm, started_bgm,
             "曲選択画面でもTTR専用BGMのまま"
         );
     }
@@ -1408,12 +1412,13 @@ mod tests {
     fn ttr_splash_bgm_keeps_playing_through_difficulty_select() {
         let mut app = App::new();
         app.select_menu_item(RHYTHM_ITEM_INDEX);
+        let started_bgm = app.current_bgm.clone();
         app.select_song(1);
         assert!(matches!(
             app.screen,
             Screen::SelectDifficulty(RHYTHM_ITEM_INDEX, Some(1))
         ));
-        assert_eq!(app.current_bgm.as_deref(), Some("Overclocked_Tempo"));
+        assert_eq!(app.current_bgm, started_bgm);
     }
 
     #[test]
