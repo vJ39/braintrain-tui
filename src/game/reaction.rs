@@ -161,6 +161,10 @@ pub struct ReactionGame {
     elapsed_in_question: Duration,
     /// 直前の回答の正誤表示(描画専用)
     feedback: AnswerFeedback,
+    /// 回答した瞬間の背景色。フィードバック表示中はこの色を使い続ける
+    /// (advance_questionで即座に次の問題へ切り替わるため、currentの色をそのまま使うと
+    /// ◯/✗表示中に次の問題の背景色になってしまう)
+    answered_display_color: Option<Color>,
     /// 出題の文字の描画器(描画専用)
     label_renderer: LabelRenderer,
 }
@@ -176,6 +180,7 @@ impl ReactionGame {
             question_started_at: Instant::now(),
             elapsed_in_question: Duration::ZERO,
             feedback: AnswerFeedback::new(),
+            answered_display_color: None,
             label_renderer: LabelRenderer::new(),
         }
     }
@@ -198,6 +203,7 @@ impl ReactionGame {
         };
         self.feedback
             .record(is_correct, format!("こたえ: {answer}"));
+        self.answered_display_color = Some(self.current.display_color);
         audio::play_se(verdict_se(is_correct));
         if !self.tracker.is_session_finished() {
             self.next_question();
@@ -210,6 +216,15 @@ impl ReactionGame {
             Some(Verdict::Correct) => CORRECT_MARK,
             Some(Verdict::Incorrect) => INCORRECT_MARK,
             None => self.current.label,
+        }
+    }
+
+    /// 出題エリアの背景色。フィードバック表示中は回答した瞬間の色を維持し、
+    /// 表示が終わったら現在の出題の色に戻る
+    fn displayed_background_color(&self) -> Color {
+        match self.feedback.current() {
+            Some(_) => self.answered_display_color.unwrap_or(self.current.display_color),
+            None => self.current.display_color,
         }
     }
 }
@@ -282,20 +297,21 @@ impl Game for ReactionGame {
 
         // 出題の色は背景全面の塗りで示し、文字は黒で大きく表示する。
         // 画像表示の時は、画像の背景と周りのセルの背景が同じ色になるようRGBで塗る
+        let display_color = self.displayed_background_color();
         let image_bg = self
             .label_renderer
             .uses_image()
-            .then(|| background_rgb(self.current.display_color));
+            .then(|| background_rgb(display_color));
         let background = match image_bg {
             Some([r, g, b]) => Color::Rgb(r, g, b),
-            None => self.current.display_color,
+            None => display_color,
         };
 
         // 枠の色も出題の色そのもの(背景と同じ色になり枠が見えなくなっても構わない)
         let mut block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Thick)
-            .border_style(Style::default().fg(self.current.display_color))
+            .border_style(Style::default().fg(display_color))
             .style(Style::default().bg(background))
             .title(Line::from(" この背景色と文字の意味は一致？ ").style(theme::title_style()));
         if let Some(limit) = time_limit(self.difficulty) {
@@ -1331,8 +1347,8 @@ mod tests {
     #[test]
     fn fallback_shows_correct_mark_instead_of_label() {
         let mut game = ReactionGame::new(Difficulty::Beginner);
-        answer(&mut game, true);
         fixed_question(&mut game, "赤", Color::Blue);
+        answer(&mut game, true);
         let (buffer, inner) = render_game(&game, 40, 16);
         let text = inner_text(&buffer, inner);
         assert!(text.contains(CORRECT_MARK), "◯が描かれる: {text:?}");
@@ -1343,15 +1359,15 @@ mod tests {
             .find(|c| c.symbol() == CORRECT_MARK)
             .unwrap();
         assert_eq!(cell.fg, Color::Black, "記号も黒");
-        // 背景は出題の色のまま
+        // 回答後に次の問題へ切り替わっていても、背景は回答した瞬間の色のまま
         assert_eq!(buffer[(inner.x, inner.y)].bg, Color::Blue);
     }
 
     #[test]
     fn fallback_shows_incorrect_mark_instead_of_label() {
         let mut game = ReactionGame::new(Difficulty::Beginner);
-        answer(&mut game, false);
         fixed_question(&mut game, "青", Color::Red);
+        answer(&mut game, false);
         let (buffer, inner) = render_game(&game, 40, 16);
         let text = inner_text(&buffer, inner);
         assert!(text.contains(INCORRECT_MARK), "✗が描かれる: {text:?}");
@@ -1384,18 +1400,19 @@ mod tests {
         };
 
         for (correct, mark) in [(true, CORRECT_MARK), (false, INCORRECT_MARK)] {
-            answer(&mut game, correct);
             fixed_question(&mut game, "青", Color::Red);
+            answer(&mut game, correct);
             let (buffer, inner) = render_game(&game, 60, 20);
             let rgb = background_rgb(Color::Red);
-            assert_eq!(cached(&game), (mark, rgb), "正誤の記号を出題の背景色で描く");
+            assert_eq!(cached(&game), (mark, rgb), "正誤の記号を回答した瞬間の背景色で描く");
             let [r, g, b] = rgb;
             assert_eq!(buffer[(inner.x, inner.y)].bg, Color::Rgb(r, g, b));
 
-            // 表示時間が過ぎたら出題文字の画像に戻る
+            // 表示時間が過ぎたら、次の問題の画像に戻る(回答時点の色に引き戻されない)
+            fixed_question(&mut game, "緑", Color::Green);
             game.update(crate::game::feedback::FEEDBACK_HOLD);
             render_game(&game, 60, 20);
-            assert_eq!(cached(&game), ("青", rgb));
+            assert_eq!(cached(&game), ("緑", background_rgb(Color::Green)));
         }
     }
 
