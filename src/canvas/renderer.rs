@@ -135,6 +135,9 @@ struct Cached {
 pub struct ShapeCanvas {
     picker: Option<Picker>,
     cache: RefCell<Option<Cached>>,
+    /// テスト用: 画像を新規生成(ラスタライズ・エンコード)した回数
+    #[cfg(test)]
+    encode_count: std::cell::Cell<usize>,
 }
 
 impl ShapeCanvas {
@@ -145,10 +148,29 @@ impl ShapeCanvas {
                 ProtocolType::Sixel | ProtocolType::Kitty | ProtocolType::Iterm2
             )
         });
+        Self::with_picker(picker)
+    }
+
+    fn with_picker(picker: Option<Picker>) -> Self {
         Self {
             picker,
             cache: RefCell::new(None),
+            #[cfg(test)]
+            encode_count: std::cell::Cell::new(0),
         }
+    }
+
+    /// テスト用: 非TTYでも画像経路を通すため、sixel固定のPickerで作る
+    #[cfg(test)]
+    pub(crate) fn with_sixel_for_test() -> Self {
+        let mut picker = Picker::from_fontsize((8, 16));
+        picker.set_protocol_type(ProtocolType::Sixel);
+        Self::with_picker(Some(picker))
+    }
+
+    #[cfg(test)]
+    fn encode_count(&self) -> usize {
+        self.encode_count.get()
     }
 
     /// 1色1図形を描く(shape_rotate/mirror_matchのような単純な用途向け)
@@ -202,6 +224,8 @@ impl ShapeCanvas {
             let image = rasterize_many(&key.shapes, key.bounds, px_w, px_h);
             let protocol = picker.new_resize_protocol(image);
             *cache = Some(Cached { key, protocol });
+            #[cfg(test)]
+            self.encode_count.set(self.encode_count.get() + 1);
         }
 
         if let Some(cached) = cache.as_mut() {
@@ -341,6 +365,52 @@ mod tests {
             .collect();
         assert!(colors.contains(&[255, 0, 0, 255]), "1つ目の図形の色が描かれていること");
         assert!(colors.contains(&[0, 255, 0, 255]), "2つ目の図形の色が描かれていること");
+    }
+
+    fn draw_shape(
+        terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+        canvas: &ShapeCanvas,
+        shape: &Shape,
+    ) {
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                canvas.render(
+                    frame,
+                    area,
+                    Block::default(),
+                    shape,
+                    ([-1.0, 1.0], [-1.0, 1.0]),
+                    Color::White,
+                );
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn image_path_reuses_encoding_while_content_is_unchanged() {
+        // 同じ図形を何フレーム描いても、画像の新規生成は最初の1回だけ
+        let canvas = ShapeCanvas::with_sixel_for_test();
+        let shape = Shape::new(vec![(-0.5, -0.5), (0.5, -0.5), (0.0, 0.5)]);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 10)).unwrap();
+        for _ in 0..5 {
+            draw_shape(&mut terminal, &canvas, &shape);
+        }
+        assert_eq!(canvas.encode_count(), 1);
+    }
+
+    #[test]
+    fn image_path_reencodes_when_shape_changes() {
+        let canvas = ShapeCanvas::with_sixel_for_test();
+        let a = Shape::new(vec![(-0.5, -0.5), (0.5, -0.5), (0.0, 0.5)]);
+        let b = Shape::new(vec![(-0.3, -0.3), (0.3, -0.3), (0.0, 0.3)]);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 10)).unwrap();
+        draw_shape(&mut terminal, &canvas, &a);
+        draw_shape(&mut terminal, &canvas, &b);
+        draw_shape(&mut terminal, &canvas, &b);
+        assert_eq!(canvas.encode_count(), 2);
     }
 
     #[test]

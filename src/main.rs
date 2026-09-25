@@ -2,6 +2,7 @@ mod app;
 mod audio;
 mod canvas;
 mod game;
+mod image_backend;
 mod stats;
 mod ui;
 
@@ -17,6 +18,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use app::App;
+use image_backend::ImageDedupBackend;
 
 const TICK_RATE: Duration = Duration::from_millis(33);
 
@@ -24,7 +26,8 @@ fn main() -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
+    // 画像が2枚以上ある画面で、変わっていない画像を毎フレーム再送してチラつくのを防ぐ
+    let backend = ImageDedupBackend::new(CrosstermBackend::new(stdout));
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new();
