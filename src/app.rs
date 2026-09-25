@@ -203,6 +203,16 @@ impl App {
 
     /// Menu画面での項目決定(キー/クリック共通)。ゲーム/ジュークボックス/履歴へ振り分ける
     fn select_menu_item(&mut self, selected: usize) {
+        if selected == COLOR_STACK_ITEM_INDEX {
+            // カラーストックは難易度選択を挟まず、すぐにカウントダウンへ進む
+            // (カウントダウン最初の「3」の音が画面遷移の音を兼ねる)
+            self.start_playing(
+                COLOR_STACK_ITEM_INDEX,
+                crate::game::color_stack::SESSION_DIFFICULTY,
+                None,
+            );
+            return;
+        }
         audio::play_se(SeKind::Transition);
         if selected == HISTORY_ITEM_INDEX {
             self.screen = Screen::History;
@@ -425,7 +435,8 @@ fn new_game(item: usize, difficulty: Difficulty) -> Box<dyn Game> {
         6 => Box::new(SequenceGame::new(difficulty)),
         7 => Box::new(PuzzleConnectGame::new(difficulty)),
         COUNT_MANIA_ITEM_INDEX => Box::new(CountManiaGame::new(difficulty)),
-        COLOR_STACK_ITEM_INDEX => Box::new(ColorStackGame::new(difficulty)),
+        // カラーストックは難易度を持たず、ROUND1〜3が固定の内容で進む
+        COLOR_STACK_ITEM_INDEX => Box::new(ColorStackGame::new()),
         RHYTHM_ITEM_INDEX => unreachable!("rhythm is started via start_rhythm with a song"),
         _ => unreachable!("history is handled without creating a game"),
     }
@@ -893,28 +904,102 @@ mod tests {
 
     #[test]
     fn new_game_for_color_stack_item_creates_color_stack() {
-        let game = new_game(COLOR_STACK_ITEM_INDEX, Difficulty::Intermediate);
-        let result = game.result();
-        assert_eq!(result.game_id, crate::game::color_stack::GAME_ID);
-        assert_eq!(result.difficulty, Difficulty::Intermediate);
+        // カラーストックは難易度を持たないので、渡した難易度によらず固定の記録になる
+        for difficulty in [
+            Difficulty::Beginner,
+            Difficulty::Intermediate,
+            Difficulty::Advanced,
+        ] {
+            let game = new_game(COLOR_STACK_ITEM_INDEX, difficulty);
+            let result = game.result();
+            assert_eq!(result.game_id, crate::game::color_stack::GAME_ID);
+            assert_eq!(
+                result.difficulty,
+                crate::game::color_stack::SESSION_DIFFICULTY
+            );
+        }
     }
 
-    #[test]
-    fn selecting_color_stack_goes_to_difficulty_and_starts_it() {
-        let mut app = App::new();
-        app.select_menu_item(COLOR_STACK_ITEM_INDEX);
-        assert!(matches!(
-            app.screen,
-            Screen::SelectDifficulty(COLOR_STACK_ITEM_INDEX, None)
-        ));
-        app.handle_key(KeyEvent::from(KeyCode::Char('1')));
-        finish_countdown(&mut app);
+    /// カラーストックが始まり、ROUND1(4列)が表示されていることを確かめる
+    fn assert_color_stack_round1_is_playing(app: &mut App) {
+        finish_countdown(app);
         let Screen::Playing(game) = &app.screen else {
             panic!("Playing画面のはず");
         };
         assert_eq!(game.result().game_id, crate::game::color_stack::GAME_ID);
+        assert!(!game.is_finished());
         // 全角文字の2セル目は空白で埋まるため、空白を除いて比較する
-        assert!(rendered_text(&mut app).replace(' ', "").contains("カラーストック"));
+        let text = rendered_text(app).replace(' ', "");
+        assert!(text.contains("カラーストック"));
+        assert!(text.contains("ROUND1/3"), "ROUND1から始まる");
+    }
+
+    #[test]
+    fn selecting_color_stack_skips_difficulty_and_starts_round1_after_countdown() {
+        let mut app = App::new();
+        app.select_menu_item(COLOR_STACK_ITEM_INDEX);
+        let Screen::Countdown {
+            item,
+            difficulty,
+            state,
+        } = &app.screen
+        else {
+            panic!("難易度選択を挟まずカウントダウンになるはず");
+        };
+        assert_eq!(*item, COLOR_STACK_ITEM_INDEX);
+        assert_eq!(*difficulty, crate::game::color_stack::SESSION_DIFFICULTY);
+        assert_eq!(state.phase(), Some(Phase::Three), "3から始まる");
+        assert_color_stack_round1_is_playing(&mut app);
+    }
+
+    #[test]
+    fn enter_on_color_stack_in_menu_goes_straight_to_countdown() {
+        let mut app = App::new();
+        app.screen = Screen::Menu;
+        app.menu_state.select(Some(COLOR_STACK_ITEM_INDEX));
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(
+            app.screen,
+            Screen::Countdown {
+                item: COLOR_STACK_ITEM_INDEX,
+                ..
+            }
+        ));
+        assert_color_stack_round1_is_playing(&mut app);
+    }
+
+    #[test]
+    fn clicking_color_stack_in_menu_goes_straight_to_countdown() {
+        let mut app = App::new();
+        app.screen = Screen::Menu;
+        let height = 30;
+        app.last_area = rect(0, 0, 80, height);
+        let rows = rendered_rows_without_spaces(&mut app, 80, height);
+        let row = rows
+            .iter()
+            .position(|r| r.contains(MENU_ITEMS[COLOR_STACK_ITEM_INDEX]))
+            .expect("カラーストックが描かれていること");
+        app.handle_mouse(left_click(row as u16));
+        assert!(matches!(
+            app.screen,
+            Screen::Countdown {
+                item: COLOR_STACK_ITEM_INDEX,
+                ..
+            }
+        ));
+        assert_color_stack_round1_is_playing(&mut app);
+    }
+
+    #[test]
+    fn other_games_still_go_to_difficulty_select() {
+        for item in difficulty_select_game_items() {
+            let mut app = App::new();
+            app.select_menu_item(item);
+            assert!(
+                matches!(app.screen, Screen::SelectDifficulty(i, None) if i == item),
+                "item={item}: 難易度選択へ進む"
+            );
+        }
     }
 
     #[test]
@@ -1372,6 +1457,11 @@ mod tests {
         (0..JUKEBOX_ITEM_INDEX).filter(|&item| item != RHYTHM_ITEM_INDEX)
     }
 
+    /// 難易度選択画面を経由するゲームのメニュー項目一覧(DDRとカラーストック以外)
+    fn difficulty_select_game_items() -> impl Iterator<Item = usize> {
+        non_rhythm_game_items().filter(|&item| item != COLOR_STACK_ITEM_INDEX)
+    }
+
     fn left_click(row: u16) -> MouseEvent {
         MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -1388,7 +1478,8 @@ mod tests {
 
     #[test]
     fn starting_any_non_rhythm_game_goes_through_countdown() {
-        for item in non_rhythm_game_items() {
+        // カラーストックは難易度選択を経由しないので別のテストで確認する
+        for item in difficulty_select_game_items() {
             let mut app = App::new();
             app.screen = Screen::SelectDifficulty(item, None);
             app.handle_key(KeyEvent::from(KeyCode::Char('2')));
@@ -1464,7 +1555,8 @@ mod tests {
 
     #[test]
     fn countdown_finishes_into_the_selected_game_for_every_item() {
-        for item in non_rhythm_game_items() {
+        // カラーストックは難易度選択を経由しないので別のテストで確認する
+        for item in difficulty_select_game_items() {
             let mut app = App::new();
             app.screen = Screen::SelectDifficulty(item, None);
             app.handle_key(KeyEvent::from(KeyCode::Char('3')));
