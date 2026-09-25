@@ -15,6 +15,8 @@ use ratatui::layout::Rect;
 /// 円のサイズ段階
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CircleSize {
+    /// 大よりさらに一回り大きい円
+    Huge,
     Large,
     Medium,
     Small,
@@ -28,9 +30,15 @@ pub struct Placement {
 }
 
 /// サイズ段階ごとの高さ(セル数)の候補。大きい組から順に試し、プレイエリアに収まらなければ
-/// 1段小さい組に落とす。どの組でも 大 > 中 > 小 を保ち、サイズ段階の違いが見えるようにする。
-/// 幅は高さの2倍にする
-const SIZE_TIERS: [[u16; 3]; 5] = [[7, 5, 3], [6, 4, 3], [5, 4, 2], [4, 3, 2], [3, 2, 1]];
+/// 1段小さい組に落とす。各組は[特大, 大, 中, 小]の高さで、どの組でも 特大 > 大 > 中 > 小 を保ち、
+/// サイズ段階の違いが見えるようにする。幅は高さの2倍にする
+const SIZE_TIERS: [[u16; 4]; 5] = [
+    [9, 7, 5, 3],
+    [8, 6, 4, 3],
+    [7, 5, 4, 2],
+    [5, 4, 3, 2],
+    [4, 3, 2, 1],
+];
 
 /// 1つの組・配置領域で配置をやり直す回数(ランダムな置き方の運で失敗することがあるため)
 const ATTEMPTS_PER_TIER: usize = 3;
@@ -56,9 +64,10 @@ const DIGIT_HEIGHT_RATIO: f64 = 0.4;
 pub fn size_dims(tier: usize, size: CircleSize) -> (u16, u16) {
     let heights = SIZE_TIERS[tier.min(SIZE_TIERS.len() - 1)];
     let height = match size {
-        CircleSize::Large => heights[0],
-        CircleSize::Medium => heights[1],
-        CircleSize::Small => heights[2],
+        CircleSize::Huge => heights[0],
+        CircleSize::Large => heights[1],
+        CircleSize::Medium => heights[2],
+        CircleSize::Small => heights[3],
     };
     (height * 2, height)
 }
@@ -311,12 +320,18 @@ mod tests {
             .collect()
     }
 
-    const ALL: [CircleSize; 3] = [CircleSize::Large, CircleSize::Medium, CircleSize::Small];
-    const LARGE_MEDIUM: [CircleSize; 2] = [CircleSize::Large, CircleSize::Medium];
+    const ALL: [CircleSize; 4] = [
+        CircleSize::Huge,
+        CircleSize::Large,
+        CircleSize::Medium,
+        CircleSize::Small,
+    ];
+    const HUGE_LARGE_MEDIUM: [CircleSize; 3] =
+        [CircleSize::Huge, CircleSize::Large, CircleSize::Medium];
 
     /// 難易度ごとの(円の数, サイズ段階, 密集配置)の組み合わせ
     const CONFIGS: [(u8, &[CircleSize], bool); 3] = [
-        (10, &LARGE_MEDIUM, false),
+        (10, &HUGE_LARGE_MEDIUM, false),
         (14, &ALL, false),
         (20, &ALL, true),
     ];
@@ -404,15 +419,37 @@ mod tests {
     // --- サイズ段階 ---
 
     #[test]
-    fn size_dims_keep_large_medium_small_order_in_every_tier() {
+    fn size_dims_keep_huge_large_medium_small_order_in_every_tier() {
         for tier in 0..SIZE_TIERS.len() {
+            let (hw, hh) = size_dims(tier, CircleSize::Huge);
             let (lw, lh) = size_dims(tier, CircleSize::Large);
             let (mw, mh) = size_dims(tier, CircleSize::Medium);
             let (sw, sh) = size_dims(tier, CircleSize::Small);
-            assert!(lh > mh && mh > sh, "tier={tier}: 大>中>小");
+            assert!(hh > lh && lh > mh && mh > sh, "tier={tier}: 特大>大>中>小");
             assert!(sh >= 1);
             // 幅は高さの2倍(セルの縦横比を考えてほぼ正円に見せる)
-            assert_eq!((lw, mw, sw), (lh * 2, mh * 2, sh * 2));
+            assert_eq!((hw, lw, mw, sw), (hh * 2, lh * 2, mh * 2, sh * 2));
+        }
+    }
+
+    #[test]
+    fn size_dims_huge_is_larger_than_large_in_width_and_height_in_every_tier() {
+        for tier in 0..SIZE_TIERS.len() {
+            let (hw, hh) = size_dims(tier, CircleSize::Huge);
+            let (lw, lh) = size_dims(tier, CircleSize::Large);
+            assert!(hw > lw, "tier={tier}: 特大の幅{hw} > 大の幅{lw}");
+            assert!(hh > lh, "tier={tier}: 特大の高さ{hh} > 大の高さ{lh}");
+        }
+    }
+
+    #[test]
+    fn size_dims_keep_existing_large_medium_small_heights() {
+        // 特大を足しても、既存の大・中・小の高さは変えない
+        let existing: [[u16; 3]; 5] = [[7, 5, 3], [6, 4, 3], [5, 4, 2], [4, 3, 2], [3, 2, 1]];
+        for (tier, [l, m, s]) in existing.into_iter().enumerate() {
+            assert_eq!(size_dims(tier, CircleSize::Large).1, l, "tier={tier}");
+            assert_eq!(size_dims(tier, CircleSize::Medium).1, m, "tier={tier}");
+            assert_eq!(size_dims(tier, CircleSize::Small).1, s, "tier={tier}");
         }
     }
 
@@ -476,7 +513,7 @@ mod tests {
 
     #[test]
     fn layout_keeps_size_order_between_levels() {
-        // 同じ配置の中では、大の円は中より、中の円は小より大きい
+        // 同じ配置の中では、特大の円は大より、大の円は中より、中の円は小より大きい
         let area = Rect::new(0, 0, 120, 40);
         let mut rng = StdRng::seed_from_u64(7);
         let input = circles(14, &ALL);
@@ -490,12 +527,13 @@ mod tests {
                 .rect
                 .height
         };
-        let (l, m, s) = (
+        let (h, l, m, s) = (
+            height_of(CircleSize::Huge),
             height_of(CircleSize::Large),
             height_of(CircleSize::Medium),
             height_of(CircleSize::Small),
         );
-        assert!(l > m && m > s, "大{l} > 中{m} > 小{s}");
+        assert!(h > l && l > m && m > s, "特大{h} > 大{l} > 中{m} > 小{s}");
     }
 
     #[test]

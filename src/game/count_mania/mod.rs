@@ -83,25 +83,25 @@ pub struct DifficultyParams {
 }
 
 pub fn params(difficulty: Difficulty) -> DifficultyParams {
-    use CircleSize::{Large, Medium, Small};
+    use CircleSize::{Huge, Large, Medium, Small};
     match difficulty {
         Difficulty::Beginner => DifficultyParams {
             max_number: 10,
-            size_levels: &[Large, Medium],
+            size_levels: &[Huge, Large, Medium],
             lives: 3,
             dense: false,
             fail_latency_ms: 30_000.0,
         },
         Difficulty::Intermediate => DifficultyParams {
             max_number: 14,
-            size_levels: &[Large, Medium, Small],
+            size_levels: &[Huge, Large, Medium, Small],
             lives: 2,
             dense: false,
             fail_latency_ms: 45_000.0,
         },
         Difficulty::Advanced => DifficultyParams {
             max_number: 20,
-            size_levels: &[Large, Medium, Small],
+            size_levels: &[Huge, Large, Medium, Small],
             lives: 2,
             dense: true,
             fail_latency_ms: 60_000.0,
@@ -636,21 +636,35 @@ mod tests {
         use CircleSize::*;
         let beginner = params(Difficulty::Beginner);
         assert_eq!(beginner.max_number, 10);
-        assert_eq!(beginner.size_levels, &[Large, Medium]);
+        assert_eq!(beginner.size_levels, &[Huge, Large, Medium]);
         assert_eq!(beginner.lives, 3);
         assert!(!beginner.dense);
 
         let intermediate = params(Difficulty::Intermediate);
         assert_eq!(intermediate.max_number, 14);
-        assert_eq!(intermediate.size_levels, &[Large, Medium, Small]);
+        assert_eq!(intermediate.size_levels, &[Huge, Large, Medium, Small]);
         assert_eq!(intermediate.lives, 2);
         assert!(!intermediate.dense);
 
         let advanced = params(Difficulty::Advanced);
         assert_eq!(advanced.max_number, 20);
-        assert_eq!(advanced.size_levels, &[Large, Medium, Small]);
+        assert_eq!(advanced.size_levels, &[Huge, Large, Medium, Small]);
         assert_eq!(advanced.lives, 2);
         assert!(advanced.dense, "上級は密集配置");
+    }
+
+    #[test]
+    fn every_difficulty_uses_huge_circles() {
+        for difficulty in [
+            Difficulty::Beginner,
+            Difficulty::Intermediate,
+            Difficulty::Advanced,
+        ] {
+            assert!(
+                params(difficulty).size_levels.contains(&CircleSize::Huge),
+                "{difficulty:?}: 特大の円を使う"
+            );
+        }
     }
 
     #[test]
