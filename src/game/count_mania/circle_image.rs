@@ -20,7 +20,9 @@ use ratatui_image::StatefulImage;
 use rust_embed::RustEmbed;
 
 use super::layout::{circle_contains, label_area};
-use super::ripple::{ring_image, Ripple, RIPPLE_COLOR, RIPPLE_THICKNESS_CELLS};
+use super::ripple::{
+    ring_image, Ripple, RIPPLE_COLOR, RIPPLE_MAX_RADIUS_CELLS, RIPPLE_THICKNESS_CELLS,
+};
 
 #[derive(RustEmbed)]
 #[folder = "assets/image/count_mania/"]
@@ -85,33 +87,74 @@ pub struct BoardCircle {
     pub color: [u8; 3],
 }
 
-/// 直前に作ったボード画像。描画エリア・円の並び・波紋が同じなら再エンコードを省く
+/// 直前に作った盤面の画像(円だけ。波紋は含まない)。描画エリア・円の並びが同じなら再エンコードを省く
 struct BoardCache {
     board: Rect,
     circles: Vec<BoardCircle>,
-    /// circlesと同じ並びの、色を塗り替えた円の画像。波紋だけが変わったフレームでは
-    /// これを使い回し、画像の読み込み・塗り替えをやり直さない
-    images: Vec<RgbaImage>,
-    ripple: Option<Ripple>,
+    /// エンコード前の合成画像。波紋のパッチはここから切り出す
+    composed: RgbaImage,
+    protocol: StatefulProtocol,
+}
+
+/// 直前に作った波紋のパッチ(盤面の一部を切り出してリングを重ねた画像)
+struct RippleCache {
+    /// パッチを置くセル範囲
+    rect: Rect,
+    /// 描いた波紋の(中心, コマ)。Noneは波紋が消えた後の、リングの無い切り出し
+    key: Option<((u16, u16), u32)>,
     protocol: StatefulProtocol,
 }
 
 /// 数字付き円の描画器。画像プロトコルが使える端末では、ボード上の全ての円を1枚の画像に
 /// 重ね合わせてから表示する(円ごとに別の画像にすると、重なった所で手前の画像が矩形ごと
 /// 奥の画像を消したり、押して消えた円の画像が画面に残ったりするため)。
-/// 正解クリックの波紋も同じ画像に1枚のレイヤーとして円の手前に重ねる。
-/// 描画エリアか円の並び(押して消えた円・色・位置)か波紋が変わった時だけ作り直す
+/// 盤面の画像は描画エリアか円の並び(押して消えた円・色・位置)が変わった時だけ作り直す。
+///
+/// 正解クリックの波紋は、盤面の画像から波紋の届く範囲だけを切り出してリングを重ねた
+/// 小さな画像(パッチ)にし、盤面の画像の上に重ねて描く。波紋は毎コマ見た目が変わるが、
+/// 盤面全体を作り直すと画像のエンコード・端末への送信が1回あたり数十〜数百msかかり
+/// (sixelでは盤面全体で約230ms)、tick(33ms)に間に合わずちらつくため。
+/// パッチはコマ(RIPPLE_FRAME_INTERVAL)が変わった時だけ作り直す。
+/// 波紋が消えた後は、端末に残った最後のリングを消すため、リングの無い切り出しを1回描いて置いておく
 pub struct CircleRenderer {
     picker: Option<Picker>,
-    cache: RefCell<Option<BoardCache>>,
+    board: RefCell<Option<BoardCache>>,
+    ripple: RefCell<Option<RippleCache>>,
+    /// テスト用: 盤面の画像を作り直した回数
+    #[cfg(test)]
+    board_encodes: std::cell::Cell<usize>,
+    /// テスト用: 波紋のパッチを作り直した回数
+    #[cfg(test)]
+    ripple_encodes: std::cell::Cell<usize>,
 }
 
 impl CircleRenderer {
     pub fn new() -> Self {
+        Self::from_picker(detect_picker())
+    }
+
+    fn from_picker(picker: Option<Picker>) -> Self {
         Self {
-            picker: detect_picker(),
-            cache: RefCell::new(None),
+            picker,
+            board: RefCell::new(None),
+            ripple: RefCell::new(None),
+            #[cfg(test)]
+            board_encodes: std::cell::Cell::new(0),
+            #[cfg(test)]
+            ripple_encodes: std::cell::Cell::new(0),
         }
+    }
+
+    /// テスト用: 盤面の画像を作り直した回数
+    #[cfg(test)]
+    pub fn board_encode_count(&self) -> usize {
+        self.board_encodes.get()
+    }
+
+    /// テスト用: 波紋のパッチを作り直した回数
+    #[cfg(test)]
+    pub fn ripple_encode_count(&self) -> usize {
+        self.ripple_encodes.get()
     }
 
     /// 画像プロトコルを使うか(false=丸囲み数字のテキスト表示)。テストでの確認用
@@ -123,10 +166,7 @@ impl CircleRenderer {
     /// 画像プロトコルを指定して作る。テストで画像表示の経路を通すため
     #[cfg(test)]
     pub fn with_picker(picker: Picker) -> Self {
-        Self {
-            picker: Some(picker),
-            cache: RefCell::new(None),
-        }
+        Self::from_picker(Some(picker))
     }
 
     /// board内にcirclesを並び順に描く。後の円ほど手前に重なる。
@@ -168,37 +208,91 @@ impl CircleRenderer {
         if circles.is_empty() && ripple.is_none() {
             return true;
         }
-        let mut cache = self.cache.borrow_mut();
-        let same_circles = matches!(
+        let mut cache = self.board.borrow_mut();
+        let same_board = matches!(
             cache.as_ref(),
             Some(cached) if cached.board == board && cached.circles == circles
         );
-        let same_ripple =
-            matches!(cache.as_ref(), Some(cached) if cached.ripple.as_ref() == ripple);
-        if !(same_circles && same_ripple) {
-            let images = if same_circles {
-                cache.take().map(|cached| cached.images)
-            } else {
-                recolored_images(circles)
-            };
-            let Some(images) = images else {
+        if !same_board {
+            let Some(images) = recolored_images(circles) else {
                 return false;
             };
-            let composed = compose_layers(board, picker.font_size(), circles, &images, ripple);
-            let protocol = picker.new_resize_protocol(DynamicImage::ImageRgba8(composed));
+            let composed = compose_circles(board, picker.font_size(), circles, &images);
+            let protocol = picker.new_resize_protocol(DynamicImage::ImageRgba8(composed.clone()));
             *cache = Some(BoardCache {
                 board,
                 circles: circles.to_vec(),
-                images,
-                ripple: ripple.copied(),
+                composed,
                 protocol,
             });
+            // 盤面の画像がパッチの範囲も描き直すので、パッチは新しい盤面から作り直す
+            *self.ripple.borrow_mut() = None;
+            #[cfg(test)]
+            self.board_encodes.set(self.board_encodes.get() + 1);
         }
         let Some(cached) = cache.as_mut() else {
             return false;
         };
         frame.render_stateful_widget(StatefulImage::default(), board, &mut cached.protocol);
+        // パッチは盤面の画像より後に描き、盤面の上に重ねる
+        self.render_ripple_patch(frame, picker, cached, ripple);
         true
+    }
+
+    /// 波紋の周りを切り出したパッチを盤面の上に描く。コマが変わった時だけ作り直す。
+    /// 波紋が消えた後は、リングの無い切り出しを同じ範囲に描き続ける
+    /// (描くのをやめると端末に最後のリングが残るため。盤面が変わった時に破棄する)
+    fn render_ripple_patch(
+        &self,
+        frame: &mut Frame,
+        picker: &Picker,
+        board: &BoardCache,
+        ripple: Option<&Ripple>,
+    ) {
+        let font_size = picker.font_size();
+        let mut cache = self.ripple.borrow_mut();
+        let (rect, key) = match ripple {
+            Some(ripple) => {
+                let own = ripple_patch_rect(board.board, font_size, ripple);
+                // 盤面が同じまま波紋の位置が変わった時は、前のパッチの範囲も含めて描き直し、
+                // 前のリングを端末に残さない
+                let rect = match cache.as_ref() {
+                    Some(cached) if !cached.rect.is_empty() && !own.is_empty() => {
+                        cached.rect.union(own)
+                    }
+                    Some(cached) if own.is_empty() => cached.rect,
+                    _ => own,
+                };
+                (rect, Some((ripple.center(), ripple.frame())))
+            }
+            None => match cache.as_ref() {
+                Some(cached) => (cached.rect, None),
+                None => return,
+            },
+        };
+        if rect.is_empty() {
+            return;
+        }
+        let same =
+            matches!(cache.as_ref(), Some(cached) if cached.rect == rect && cached.key == key);
+        if !same {
+            let patch = ripple_patch(&board.composed, board.board, font_size, rect, ripple);
+            let protocol = picker.new_resize_protocol(DynamicImage::ImageRgba8(patch));
+            *cache = Some(RippleCache {
+                rect,
+                key,
+                protocol,
+            });
+            #[cfg(test)]
+            self.ripple_encodes.set(self.ripple_encodes.get() + 1);
+        }
+        if let Some(cached) = cache.as_mut() {
+            frame.render_stateful_widget(
+                StatefulImage::default(),
+                cached.rect,
+                &mut cached.protocol,
+            );
+        }
     }
 }
 
@@ -212,7 +306,7 @@ fn recolored_images(circles: &[BoardCircle]) -> Option<Vec<RgbaImage>> {
 
 /// ボード全体の画像を作る。円を並び順に重ね、rippleがあればその手前にリングを重ねる。
 /// font_sizeは1セルのピクセル数(幅, 高さ)。円の画像が読めない場合はNone。
-/// 描画ではキャッシュした円画像でcompose_layersを直接呼ぶため、合成結果の確認用にテストでだけ使う
+/// 描画では盤面(円だけ)とパッチを別々に作るため、合成結果の確認用にテストでだけ使う
 #[cfg(test)]
 pub fn build_board_image(
     board: Rect,
@@ -221,47 +315,115 @@ pub fn build_board_image(
     ripple: Option<&Ripple>,
 ) -> Option<RgbaImage> {
     let images = recolored_images(circles)?;
-    Some(compose_layers(board, font_size, circles, &images, ripple))
+    let mut image = compose_circles(board, font_size, circles, &images);
+    if let Some(ripple) = ripple {
+        add_ripple(&mut image, board, font_size, ripple);
+    }
+    Some(image)
 }
 
-/// 円の画像(circlesと同じ並び)と波紋のリングを、compose_boardで1枚に重ねる
-fn compose_layers(
+/// 円の画像(circlesと同じ並び)を、compose_boardでボード全体の1枚に重ねる
+fn compose_circles(
     board: Rect,
     font_size: (u16, u16),
     circles: &[BoardCircle],
     images: &[RgbaImage],
-    ripple: Option<&Ripple>,
 ) -> RgbaImage {
-    let ring = ripple.map(|ripple| ripple_layer(board, font_size, ripple));
-    let mut layers: Vec<(Rect, &RgbaImage)> = circles
+    let layers: Vec<(Rect, &RgbaImage)> = circles
         .iter()
         .zip(images)
         .map(|(c, image)| (c.rect, image))
         .collect();
-    // リングはボードと同じ大きさの画像なので、ボード全体の枠に等倍で重なる
-    if let Some(ring) = &ring {
-        layers.push((board, ring));
-    }
     compose_board(board, font_size, &layers)
 }
 
-/// 波紋のいまの状態を、ボードと同じ大きさ(ピクセル)のリング画像にする。
+/// リングの線の太さ(ピクセル)。細くなりすぎて消えないよう1ピクセル以上にする
+fn ring_thickness(cell_height: f64) -> f64 {
+    (RIPPLE_THICKNESS_CELLS * cell_height).max(1.0)
+}
+
+/// 波紋が広がり切るまでにリングが届く範囲(セル)。パッチはこの範囲を切り出す。
+/// ボードの中に収め、ボードの左端の列は含めない(盤面の画像はボード左上のセルを起点に描かれ、
+/// kittyでは各行の左端のセルが起点になる。そこにパッチを重ねると盤面の画像が描かれなくなるため)。
+/// 範囲が無い(ボードが1列しかない等)時は空のRect
+fn ripple_patch_rect(board: Rect, font_size: (u16, u16), ripple: &Ripple) -> Rect {
+    let cell_width = f64::from(font_size.0.max(1));
+    let cell_height = f64::from(font_size.1.max(1));
+    // 中心からリングの外側の端までの距離(ピクセル)。丸め誤差の分として1ピクセル足す
+    let reach = RIPPLE_MAX_RADIUS_CELLS * cell_height + ring_thickness(cell_height) / 2.0 + 1.0;
+    let (column, row) = ripple.center();
+    let center_x = (f64::from(column) + 0.5) * cell_width;
+    let center_y = (f64::from(row) + 0.5) * cell_height;
+    let left = ((center_x - reach) / cell_width)
+        .floor()
+        .max(f64::from(board.x) + 1.0);
+    let right = ((center_x + reach) / cell_width)
+        .ceil()
+        .min(f64::from(board.right()));
+    let top = ((center_y - reach) / cell_height)
+        .floor()
+        .max(f64::from(board.y));
+    let bottom = ((center_y + reach) / cell_height)
+        .ceil()
+        .min(f64::from(board.bottom()));
+    if right <= left || bottom <= top {
+        return Rect::default();
+    }
+    Rect::new(
+        left as u16,
+        top as u16,
+        (right - left) as u16,
+        (bottom - top) as u16,
+    )
+}
+
+/// 盤面の画像(円だけ)からセル範囲rectを切り出し、rippleがあればリングを重ねたパッチを作る
+fn ripple_patch(
+    board_image: &RgbaImage,
+    board: Rect,
+    font_size: (u16, u16),
+    rect: Rect,
+    ripple: Option<&Ripple>,
+) -> RgbaImage {
+    let cell_width = u32::from(font_size.0.max(1));
+    let cell_height = u32::from(font_size.1.max(1));
+    let mut patch = imageops::crop_imm(
+        board_image,
+        u32::from(rect.x.saturating_sub(board.x)) * cell_width,
+        u32::from(rect.y.saturating_sub(board.y)) * cell_height,
+        u32::from(rect.width) * cell_width,
+        u32::from(rect.height) * cell_height,
+    )
+    .to_image();
+    if let Some(ripple) = ripple {
+        add_ripple(&mut patch, rect, font_size, ripple);
+    }
+    patch
+}
+
+/// area(セル範囲)を写したimageに、波紋のいまのリングを重ねる
+fn add_ripple(image: &mut RgbaImage, area: Rect, font_size: (u16, u16), ripple: &Ripple) {
+    let ring = ripple_layer(area, font_size, ripple);
+    imageops::overlay(image, &ring, 0, 0);
+}
+
+/// 波紋のいまの状態を、area(セル範囲)と同じ大きさ(ピクセル)のリング画像にする。
 /// 半径・線の太さはセルの高さを単位にし、ピクセル上で真円になるようにする
-fn ripple_layer(board: Rect, font_size: (u16, u16), ripple: &Ripple) -> RgbaImage {
+fn ripple_layer(area: Rect, font_size: (u16, u16), ripple: &Ripple) -> RgbaImage {
     let cell_width = f64::from(font_size.0.max(1));
     let cell_height = f64::from(font_size.1.max(1));
     let (column, row) = ripple.center();
     // クリックしたセルの中央を中心にする
     let center = (
-        (f64::from(column) - f64::from(board.x) + 0.5) * cell_width,
-        (f64::from(row) - f64::from(board.y) + 0.5) * cell_height,
+        (f64::from(column) - f64::from(area.x) + 0.5) * cell_width,
+        (f64::from(row) - f64::from(area.y) + 0.5) * cell_height,
     );
     ring_image(
-        u32::from(board.width) * cell_width as u32,
-        u32::from(board.height) * cell_height as u32,
+        u32::from(area.width) * cell_width as u32,
+        u32::from(area.height) * cell_height as u32,
         center,
         ripple.radius_cells() * cell_height,
-        (RIPPLE_THICKNESS_CELLS * cell_height).max(1.0),
+        ring_thickness(cell_height),
         ripple.opacity(),
         RIPPLE_COLOR,
     )
@@ -637,6 +799,211 @@ mod tests {
         let mut tiny = Terminal::new(TestBackend::new(1, 1)).unwrap();
         tiny.draw(|frame| renderer.render_board(frame, frame.area(), &[circle], Some(&edge)))
             .unwrap();
+    }
+
+    // --- 波紋の部分画像(パッチ) ---
+
+    /// ボード画像のうち、セル範囲rectに当たる部分を切り出す
+    fn crop_cells(image: &RgbaImage, board: Rect, font: (u16, u16), rect: Rect) -> RgbaImage {
+        let (cw, ch) = (u32::from(font.0), u32::from(font.1));
+        imageops::crop_imm(
+            image,
+            u32::from(rect.x - board.x) * cw,
+            u32::from(rect.y - board.y) * ch,
+            u32::from(rect.width) * cw,
+            u32::from(rect.height) * ch,
+        )
+        .to_image()
+    }
+
+    /// 持続時間の終わる直前(半径が最大)の、セル(10, 5)中心の波紋
+    fn widest_ripple() -> Ripple {
+        Ripple::new(10, 5)
+            .advanced(RIPPLE_DURATION - std::time::Duration::from_millis(1))
+            .unwrap()
+    }
+
+    #[test]
+    fn patch_rect_covers_whole_ring_inside_board() {
+        let ripple = widest_ripple();
+        let rect = ripple_patch_rect(RIPPLE_BOARD, RIPPLE_FONT, &ripple);
+        assert_eq!(
+            rect.intersection(RIPPLE_BOARD),
+            rect,
+            "ボードからはみ出さない"
+        );
+        assert!(
+            rect.width < RIPPLE_BOARD.width && rect.height < RIPPLE_BOARD.height,
+            "ボード全体より小さい: {rect:?}"
+        );
+        // 広がり切ったリングの全ピクセルがパッチの中に入る
+        let full = build_board_image(RIPPLE_BOARD, RIPPLE_FONT, &[], Some(&ripple)).unwrap();
+        let (cw, ch) = (u32::from(RIPPLE_FONT.0), u32::from(RIPPLE_FONT.1));
+        let inside = |x: u32, y: u32| {
+            (u32::from(rect.x) * cw..u32::from(rect.right()) * cw).contains(&x)
+                && (u32::from(rect.y) * ch..u32::from(rect.bottom()) * ch).contains(&y)
+        };
+        let ring: Vec<(u32, u32)> = full
+            .enumerate_pixels()
+            .filter(|(_, _, p)| p.0[3] > 0)
+            .map(|(x, y, _)| (x, y))
+            .collect();
+        assert!(!ring.is_empty());
+        for (x, y) in ring {
+            assert!(inside(x, y), "リングの({x},{y})がパッチ{rect:?}の外にある");
+        }
+    }
+
+    #[test]
+    fn patch_rect_avoids_left_column_of_board() {
+        // 盤面画像の起点(左端の列)にパッチを重ねると盤面画像が描かれなくなるため、左端の列は含めない
+        let board = Rect::new(2, 3, 20, 10);
+        let corner = Ripple::new(2, 3);
+        let rect = ripple_patch_rect(board, RIPPLE_FONT, &corner);
+        assert!(!rect.is_empty());
+        assert_eq!(rect.x, board.x + 1);
+        assert_eq!(rect.y, board.y);
+        assert_eq!(rect.intersection(board), rect);
+        // 1列しかないボードではパッチを作らない
+        let narrow = Rect::new(0, 0, 1, 10);
+        assert!(ripple_patch_rect(narrow, RIPPLE_FONT, &Ripple::new(0, 5)).is_empty());
+    }
+
+    #[test]
+    fn patch_pixels_match_board_image_with_ring() {
+        // パッチ=「円と波紋を重ねたボード画像」の同じ範囲の切り出しと一致する
+        let ripple = half_way_ripple();
+        let big = BoardCircle {
+            rect: RIPPLE_BOARD,
+            number: 2,
+            color: [0, 0, 255],
+        };
+        let images = recolored_images(&[big]).unwrap();
+        let circles_only = compose_circles(RIPPLE_BOARD, RIPPLE_FONT, &[big], &images);
+        let rect = ripple_patch_rect(RIPPLE_BOARD, RIPPLE_FONT, &ripple);
+        let patch = ripple_patch(
+            &circles_only,
+            RIPPLE_BOARD,
+            RIPPLE_FONT,
+            rect,
+            Some(&ripple),
+        );
+        let full = build_board_image(RIPPLE_BOARD, RIPPLE_FONT, &[big], Some(&ripple)).unwrap();
+        assert_eq!(patch, crop_cells(&full, RIPPLE_BOARD, RIPPLE_FONT, rect));
+        assert_ne!(
+            patch,
+            crop_cells(&circles_only, RIPPLE_BOARD, RIPPLE_FONT, rect),
+            "リングが重なっている"
+        );
+        // 波紋が消えた後のパッチはリングの無いボードの切り出し
+        let clean = ripple_patch(&circles_only, RIPPLE_BOARD, RIPPLE_FONT, rect, None);
+        assert_eq!(
+            clean,
+            crop_cells(&circles_only, RIPPLE_BOARD, RIPPLE_FONT, rect)
+        );
+    }
+
+    /// 画像表示の描画器で、circlesと波紋を描いたバッファを返す
+    fn draw_image_board(
+        renderer: &CircleRenderer,
+        terminal: &mut Terminal<TestBackend>,
+        circles: &[BoardCircle],
+        ripple: Option<&Ripple>,
+    ) -> ratatui::buffer::Buffer {
+        terminal
+            .draw(|frame| renderer.render_board(frame, frame.area(), circles, ripple))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    const PATCH_CIRCLES: [BoardCircle; 2] = [
+        BoardCircle {
+            rect: Rect::new(2, 1, 12, 6),
+            number: 3,
+            color: [200, 100, 50],
+        },
+        BoardCircle {
+            rect: Rect::new(30, 10, 12, 6),
+            number: 4,
+            color: [50, 100, 200],
+        },
+    ];
+
+    #[test]
+    fn ripple_animation_reencodes_only_patch_once_per_frame() {
+        let renderer = image_renderer();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        let mut ripple = Some(Ripple::new(20, 8));
+        let mut frames = std::collections::BTreeSet::new();
+        let mut ticks = 0;
+        while let Some(r) = ripple {
+            frames.insert(r.frame());
+            draw_image_board(&renderer, &mut terminal, &PATCH_CIRCLES, ripple.as_ref());
+            ripple = r.advanced(crate::TICK_RATE);
+            ticks += 1;
+        }
+        assert_eq!(renderer.board_encode_count(), 1, "盤面全体は最初の1回だけ");
+        assert_eq!(
+            renderer.ripple_encode_count(),
+            frames.len(),
+            "パッチはコマが変わった時だけ作り直す"
+        );
+        assert_eq!(
+            frames.len() as u128,
+            RIPPLE_DURATION.as_millis() / super::super::ripple::RIPPLE_FRAME_INTERVAL.as_millis()
+        );
+        assert!(frames.len() < ticks, "毎tickは作り直さない: {ticks}tick");
+        // 波紋が消えたら、リングの無いパッチを1回だけ描き直して残りを消す
+        for _ in 0..3 {
+            draw_image_board(&renderer, &mut terminal, &PATCH_CIRCLES, None);
+        }
+        assert_eq!(renderer.board_encode_count(), 1);
+        assert_eq!(renderer.ripple_encode_count(), frames.len() + 1);
+    }
+
+    #[test]
+    fn ripple_patch_only_changes_cells_inside_patch() {
+        let ripple = Ripple::new(20, 8).advanced(RIPPLE_DURATION / 2).unwrap();
+        let rect = ripple_patch_rect(Rect::new(0, 0, 60, 24), (4, 8), &ripple);
+        let with = draw_image_board(
+            &image_renderer(),
+            &mut Terminal::new(TestBackend::new(60, 24)).unwrap(),
+            &PATCH_CIRCLES,
+            Some(&ripple),
+        );
+        let without = draw_image_board(
+            &image_renderer(),
+            &mut Terminal::new(TestBackend::new(60, 24)).unwrap(),
+            &PATCH_CIRCLES,
+            None,
+        );
+        let mut changed = 0;
+        for y in 0..24 {
+            for x in 0..60 {
+                if rect.contains(ratatui::layout::Position::new(x, y)) {
+                    changed += usize::from(with[(x, y)] != without[(x, y)]);
+                } else {
+                    assert_eq!(
+                        with[(x, y)],
+                        without[(x, y)],
+                        "パッチの外({x},{y})は変わらない"
+                    );
+                }
+            }
+        }
+        assert!(changed > 0, "パッチの中にリングが描かれる");
+    }
+
+    #[test]
+    fn board_change_rebuilds_board_and_patch() {
+        let renderer = image_renderer();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        let ripple = Ripple::new(20, 8);
+        draw_image_board(&renderer, &mut terminal, &PATCH_CIRCLES, Some(&ripple));
+        // 円が1つ消えると、同じコマの波紋でも下地が変わるので両方作り直す
+        draw_image_board(&renderer, &mut terminal, &PATCH_CIRCLES[..1], Some(&ripple));
+        assert_eq!(renderer.board_encode_count(), 2);
+        assert_eq!(renderer.ripple_encode_count(), 2);
     }
 
     #[test]

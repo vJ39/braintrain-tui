@@ -1100,4 +1100,39 @@ mod tests {
         rendered_text(&game, 20, 6);
         rendered_text(&game, 1, 1);
     }
+
+    #[test]
+    fn ripple_animation_does_not_reencode_whole_board_every_tick() {
+        // 実際のゲームループと同じく、tickごとにupdateして描く
+        use ratatui_image::picker::{Picker, ProtocolType};
+        let mut game = CountManiaGame::new(Difficulty::Advanced);
+        let mut picker = Picker::from_fontsize((4, 8));
+        picker.set_protocol_type(ProtocolType::Halfblocks);
+        game.renderer = CircleRenderer::with_picker(picker);
+        rendered_text(&game, AREA.width, AREA.height);
+        click_circle(&mut game, 1);
+        rendered_text(&game, AREA.width, AREA.height);
+        let boards = game.renderer.board_encode_count();
+        let patches = game.renderer.ripple_encode_count();
+        let mut ticks = 0;
+        while game.ripple.is_some() {
+            game.update(crate::TICK_RATE);
+            rendered_text(&game, AREA.width, AREA.height);
+            ticks += 1;
+        }
+        assert_eq!(
+            game.renderer.board_encode_count(),
+            boards,
+            "波紋のアニメーション中は盤面全体を作り直さない"
+        );
+        let redrawn = game.renderer.ripple_encode_count() - patches;
+        let frames = (ripple::RIPPLE_DURATION.as_millis()
+            / ripple::RIPPLE_FRAME_INTERVAL.as_millis()) as usize;
+        // コマの切り替わり(最初のコマは描画済み) + 消えた後のリング無しの描き直し1回
+        assert!(
+            redrawn <= frames,
+            "パッチの作り直しはコマの数まで: {redrawn}"
+        );
+        assert!(redrawn < ticks, "毎tickは作り直さない: {redrawn}/{ticks}");
+    }
 }

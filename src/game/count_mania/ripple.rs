@@ -2,7 +2,7 @@
 //!
 //! 正解の円をクリックした位置(セル座標)を中心に、リングが広がりながら薄くなって消える。
 //! ここでは波紋の状態(中心と経過時間)と、ある時点のリングを描いたRGBA画像の生成を持つ。
-//! 画面への合成は数字付き円と同じくcircle_imageのボード画像に1枚のレイヤーとして重ねる。
+//! 画面への合成はcircle_imageが行う(波紋の周りだけを切り出した小さな画像を、盤面の画像の上に重ねる)。
 //! 判定・スコアには関与しない、見た目だけの状態。
 
 use std::time::Duration;
@@ -11,6 +11,9 @@ use image::{Rgba, RgbaImage};
 
 /// 波紋が広がり切って消えるまでの時間
 pub const RIPPLE_DURATION: Duration = Duration::from_millis(500);
+/// 波紋の画像を作り直す間隔(1コマの長さ)。画像プロトコルのエンコード・端末への送信は重いため、
+/// 毎tick(33ms)ではなくこの間隔ごとにだけ作り直す
+pub const RIPPLE_FRAME_INTERVAL: Duration = Duration::from_millis(50);
 /// 広がり切った時の半径。1セルの高さ(ピクセル)に対する倍率
 pub const RIPPLE_MAX_RADIUS_CELLS: f64 = 3.0;
 /// リングの線の太さ。1セルの高さ(ピクセル)に対する倍率
@@ -45,6 +48,12 @@ impl Ripple {
     pub fn advanced(self, dt: Duration) -> Option<Self> {
         let elapsed = self.elapsed + dt;
         (elapsed < RIPPLE_DURATION).then_some(Self { elapsed, ..self })
+    }
+
+    /// いま何コマ目か(RIPPLE_FRAME_INTERVALごとに1ずつ増える)。
+    /// 描画側はコマが変わった時だけ画像を作り直す
+    pub fn frame(&self) -> u32 {
+        (self.elapsed.as_millis() / RIPPLE_FRAME_INTERVAL.as_millis()) as u32
     }
 
     /// 進み具合(0.0=開始直後, 1.0=消える時)
@@ -208,6 +217,31 @@ mod tests {
             "持続時間で消える"
         );
         assert!(ripple.advanced(RIPPLE_DURATION * 3).is_none());
+    }
+
+    // --- 画像を作り直すコマ ---
+
+    #[test]
+    fn frame_advances_once_per_frame_interval() {
+        let ripple = Ripple::new(0, 0);
+        assert_eq!(ripple.frame(), 0);
+        let just_before = ripple
+            .advanced(RIPPLE_FRAME_INTERVAL - Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(just_before.frame(), 0, "コマの間隔に届くまでは同じコマ");
+        assert_eq!(ripple.advanced(RIPPLE_FRAME_INTERVAL).unwrap().frame(), 1);
+        let last = ripple
+            .advanced(RIPPLE_DURATION - Duration::from_millis(1))
+            .unwrap();
+        let frames = (RIPPLE_DURATION.as_millis() / RIPPLE_FRAME_INTERVAL.as_millis()) as u32;
+        assert_eq!(last.frame(), frames - 1, "持続時間の中のコマ数");
+    }
+
+    #[test]
+    fn frame_interval_is_coarser_than_tick() {
+        // 毎tick作り直さないよう、コマの間隔はtickより長くする
+        assert!(RIPPLE_FRAME_INTERVAL > crate::TICK_RATE);
+        assert!(RIPPLE_FRAME_INTERVAL < RIPPLE_DURATION);
     }
 
     #[test]
