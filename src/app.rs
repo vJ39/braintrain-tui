@@ -67,7 +67,9 @@ pub enum Screen {
         state: CountdownState,
     },
     Playing(Box<dyn Game>),
-    Result(GameResult),
+    /// (結果, 履歴への保存に失敗していればそのエラー文字列)。
+    /// 保存はここへ遷移する時に1回だけ行い、描画のたびに保存し直さない
+    Result(GameResult, Option<String>),
     History,
     Jukebox(ListState),
     /// メニュー画面で[q]を押した時の終了確認ダイアログ。メニューの上に重ねて描く
@@ -145,7 +147,7 @@ impl App {
                     self.enter_result(result);
                 }
             }
-            Screen::Result(_) | Screen::History => {
+            Screen::Result(..) | Screen::History => {
                 if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
                     self.return_to_menu();
                 }
@@ -214,7 +216,7 @@ impl App {
                     self.enter_result(result);
                 }
             }
-            Screen::Result(_) | Screen::History => {
+            Screen::Result(..) | Screen::History => {
                 self.return_to_menu();
             }
             // 終了確認中はクリックで背後のメニュー項目を選ばないよう無視する
@@ -228,13 +230,15 @@ impl App {
         self.screen = Screen::Menu;
     }
 
-    /// ゲーム終了後、リザルト画面へ進む(キー/クリック共通)。リザルト用BGMに切り替える
+    /// ゲーム終了後、リザルト画面へ進む(キー/クリック共通)。リザルト用BGMに切り替える。
+    /// 履歴への保存はここで1回だけ行う(描画のたびに保存し直さない)
     fn enter_result(&mut self, result: GameResult) {
         if let Some(name) = audio::random_bgm_track(BgmCategory::Result) {
             audio::play_bgm_track(&name);
             self.current_bgm = Some(name);
         }
-        self.screen = Screen::Result(result);
+        let save_error = store::append_result(&result).err().map(|e| e.to_string());
+        self.screen = Screen::Result(result, save_error);
     }
 
     /// Menu画面での項目決定(キー/クリック共通)。ゲーム/ジュークボックス/履歴へ振り分ける
@@ -461,7 +465,9 @@ impl App {
             }
             Screen::Countdown { state, .. } => countdown::render(frame, area, state),
             Screen::Playing(game) => game.render(frame, area),
-            Screen::Result(result) => render_result(frame, area, result),
+            Screen::Result(result, save_error) => {
+                render_result(frame, area, result, save_error.as_deref())
+            }
             Screen::History => render_history(frame, area),
             Screen::Jukebox(state) => render_jukebox(frame, area, state, current_bgm.as_deref()),
             Screen::ConfirmQuit => {
@@ -728,9 +734,9 @@ fn menu_item_at_row(area: Rect, mouse_row: u16) -> Option<usize> {
     row_index(inner, mouse_row, MENU_ITEMS.len() as u16)
 }
 
-fn render_result(frame: &mut Frame, area: Rect, result: &GameResult) {
-    // 保存に失敗しても画面表示は続ける。エラー内容は結果の描画後に下端へ重ねて表示する
-    let save_error = store::append_result(result).err();
+fn render_result(frame: &mut Frame, area: Rect, result: &GameResult, save_error: Option<&str>) {
+    // 保存(呼び出し側のenter_resultで1回だけ実施済み)に失敗していれば、
+    // その内容を結果の描画後に下端へ重ねて表示する
 
     // game_idからメニュー上の表示名を引く(見つからなければgame_idをそのまま出す)
     let game_names = [
@@ -1289,8 +1295,35 @@ mod tests {
         for _ in 0..crate::game::QUESTIONS_PER_SESSION {
             app.handle_key(KeyEvent::from(KeyCode::Left));
         }
-        assert!(matches!(app.screen, Screen::Result(_)));
+        assert!(matches!(app.screen, Screen::Result(..)));
         assert_eq!(app.current_bgm.as_deref(), Some("New_Personal_Best"));
+    }
+
+    #[test]
+    fn rendering_the_result_screen_repeatedly_does_not_re_save_history() {
+        // 履歴への保存はenter_resultで1回だけ行い、render()を繰り返しても再実行しない
+        // (以前はrender_resultがappend_resultを呼んでいて、描画のたびに重複保存されていた)
+        let mut app = App::new();
+        app.select_menu_item(0); // shape_rotate
+        app.handle_key(KeyEvent::from(KeyCode::Char('1')));
+        finish_countdown(&mut app);
+        for _ in 0..crate::game::QUESTIONS_PER_SESSION {
+            app.handle_key(KeyEvent::from(KeyCode::Left));
+        }
+        let Screen::Result(_, save_error_after_enter) = &app.screen else {
+            panic!("リザルト画面のはず");
+        };
+        let save_error_after_enter = save_error_after_enter.clone();
+        for _ in 0..5 {
+            rendered_text(&mut app);
+        }
+        let Screen::Result(_, save_error_after_render) = &app.screen else {
+            panic!("リザルト画面のはず");
+        };
+        assert_eq!(
+            &save_error_after_enter, save_error_after_render,
+            "描画を繰り返しても保存処理は再実行されない"
+        );
     }
 
     #[test]
@@ -1707,7 +1740,7 @@ mod tests {
         for _ in 0..crate::game::QUESTIONS_PER_SESSION {
             app.handle_key(KeyEvent::from(KeyCode::Left));
         }
-        let Screen::Result(result) = &app.screen else {
+        let Screen::Result(result, _) = &app.screen else {
             panic!("全問回答したらリザルト画面になるはず");
         };
         assert_eq!(result.total, crate::game::QUESTIONS_PER_SESSION);
@@ -1768,7 +1801,7 @@ mod tests {
         apps.push(("Playing(リズム)", app));
 
         let mut app = App::new();
-        app.screen = Screen::Result(new_game(0, Difficulty::Beginner).result());
+        app.screen = Screen::Result(new_game(0, Difficulty::Beginner).result(), None);
         apps.push(("Result", app));
 
         let mut app = App::new();
