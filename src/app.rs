@@ -36,7 +36,7 @@ const MENU_ITEMS: [&str; 13] = [
     "組み合わせパズル",
     "カウントマニア",
     "カラーストック",
-    "リズム(DDR風)",
+    "TTR",
     "ジュークボックス",
     "履歴",
 ];
@@ -1195,7 +1195,7 @@ mod tests {
 
     #[test]
     fn rhythm_item_index_points_at_rhythm_menu_item() {
-        assert_eq!(MENU_ITEMS[RHYTHM_ITEM_INDEX], "リズム(DDR風)");
+        assert_eq!(MENU_ITEMS[RHYTHM_ITEM_INDEX], "TTR");
     }
 
     #[test]
