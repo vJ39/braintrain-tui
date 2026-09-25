@@ -6,6 +6,7 @@ pub mod mental_calc;
 pub mod mirror_match;
 pub mod pattern_fill;
 pub mod puzzle_connect;
+pub mod quick_draw;
 pub mod reaction;
 pub mod rhythm;
 pub mod sequence;

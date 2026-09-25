@@ -11,6 +11,7 @@ use crate::game::mental_calc::GAME_ID as MENTAL_CALC_ID;
 use crate::game::mirror_match::GAME_ID as MIRROR_MATCH_ID;
 use crate::game::pattern_fill::GAME_ID as PATTERN_FILL_ID;
 use crate::game::puzzle_connect::GAME_ID as PUZZLE_CONNECT_ID;
+use crate::game::quick_draw::GAME_ID as QUICK_DRAW_ID;
 use crate::game::reaction::GAME_ID as REACTION_ID;
 use crate::game::rhythm::GAME_ID as RHYTHM_ID;
 use crate::game::sequence::GAME_ID as SEQUENCE_ID;
@@ -18,7 +19,7 @@ use crate::game::shape_rotate::GAME_ID as SHAPE_ROTATE_ID;
 use crate::game::GameResult;
 use crate::stats::store;
 
-const GAME_IDS: [&str; 11] = [
+const GAME_IDS: [&str; 12] = [
     SHAPE_ROTATE_ID,
     MIRROR_MATCH_ID,
     REACTION_ID,
@@ -30,6 +31,7 @@ const GAME_IDS: [&str; 11] = [
     COUNT_MANIA_ID,
     COLOR_STACK_ID,
     RHYTHM_ID,
+    QUICK_DRAW_ID,
 ];
 
 /// 履歴グラフを並べるグリッドの列数・行数。GAME_IDSが全部入る大きさにする
@@ -136,8 +138,9 @@ mod tests {
     }
 
     #[test]
-    fn game_ids_covers_all_eleven_games() {
-        assert_eq!(GAME_IDS.len(), 11);
+    fn game_ids_covers_all_twelve_games() {
+        assert_eq!(GAME_IDS.len(), 12);
+        assert!(GAME_IDS.contains(&QUICK_DRAW_ID), "反射神経も履歴に出す");
         assert!(
             GAME_IDS.contains(&COUNT_MANIA_ID),
             "カウントマニアも履歴に出す"

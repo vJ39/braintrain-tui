@@ -15,6 +15,7 @@ use crate::game::mental_calc::MentalCalcGame;
 use crate::game::mirror_match::MirrorMatchGame;
 use crate::game::pattern_fill::PatternFillGame;
 use crate::game::puzzle_connect::PuzzleConnectGame;
+use crate::game::quick_draw::QuickDrawGame;
 use crate::game::reaction::ReactionGame;
 use crate::game::rhythm::{RhythmGame, SONGS};
 use crate::game::row_index;
@@ -26,7 +27,7 @@ use crate::stats::store;
 use crate::ui::countdown::{self, CountdownState};
 use crate::ui::splash::{self, SplashRenderer};
 
-const MENU_ITEMS: [&str; 13] = [
+const MENU_ITEMS: [&str; 14] = [
     "図形回転判定",
     "鏡像判定",
     "イロピッタン",
@@ -38,6 +39,7 @@ const MENU_ITEMS: [&str; 13] = [
     "カウントマニア",
     "カラーストック",
     "TTR",
+    "反射神経",
     "ジュークボックス",
     "履歴",
 ];
@@ -48,6 +50,8 @@ const COUNT_MANIA_ITEM_INDEX: usize = 8;
 const COLOR_STACK_ITEM_INDEX: usize = 9;
 /// リズムゲームだけは難易度選択の前に曲選択を挟む
 const RHYTHM_ITEM_INDEX: usize = 10;
+/// 反射神経
+const QUICK_DRAW_ITEM_INDEX: usize = 11;
 const JUKEBOX_ITEM_INDEX: usize = MENU_ITEMS.len() - 2;
 const HISTORY_ITEM_INDEX: usize = MENU_ITEMS.len() - 1;
 
@@ -567,6 +571,7 @@ fn new_game(item: usize, difficulty: Difficulty) -> Box<dyn Game> {
         // カラーストックは難易度を持たず、ROUND1〜3が固定の内容で進む
         COLOR_STACK_ITEM_INDEX => Box::new(ColorStackGame::new()),
         RHYTHM_ITEM_INDEX => unreachable!("rhythm is started via start_rhythm with a song"),
+        QUICK_DRAW_ITEM_INDEX => Box::new(QuickDrawGame::new(difficulty)),
         _ => unreachable!("history is handled without creating a game"),
     }
 }
@@ -634,6 +639,7 @@ fn render_menu(frame: &mut Frame, area: Rect, state: &mut ListState) {
         "数字の円を1から順にクリックする(マウス専用)",
         "色ボタンで各列の一番下のブロックを消して盤面を空にする",
         "矢印キーで曲に合わせてステップする",
+        "合図が出たら即座に反応する",
         "BGMを選んで聴く",
         "ゲームごとの反応時間の推移を見る",
     ];
@@ -794,6 +800,7 @@ fn render_result(frame: &mut Frame, area: Rect, result: &GameResult, save_error:
         (crate::game::count_mania::GAME_ID, COUNT_MANIA_ITEM_INDEX),
         (crate::game::color_stack::GAME_ID, COLOR_STACK_ITEM_INDEX),
         (crate::game::rhythm::GAME_ID, RHYTHM_ITEM_INDEX),
+        (crate::game::quick_draw::GAME_ID, QUICK_DRAW_ITEM_INDEX),
     ];
     let game_name = game_names
         .iter()
@@ -1222,6 +1229,64 @@ mod tests {
     #[test]
     fn rhythm_item_index_points_at_rhythm_menu_item() {
         assert_eq!(MENU_ITEMS[RHYTHM_ITEM_INDEX], "TTR");
+    }
+
+    // --- 反射神経 ---
+
+    #[test]
+    fn quick_draw_comes_right_after_ttr_and_before_jukebox() {
+        assert_eq!(MENU_ITEMS[QUICK_DRAW_ITEM_INDEX], "反射神経");
+        assert_eq!(RHYTHM_ITEM_INDEX + 1, QUICK_DRAW_ITEM_INDEX);
+        assert_eq!(QUICK_DRAW_ITEM_INDEX + 1, JUKEBOX_ITEM_INDEX);
+        // 先頭側の既存インデックスはずれない
+        assert_eq!(MENU_ITEMS[COUNT_MANIA_ITEM_INDEX], "カウントマニア");
+        assert_eq!(MENU_ITEMS[COLOR_STACK_ITEM_INDEX], "カラーストック");
+    }
+
+    #[test]
+    fn new_game_for_quick_draw_item_creates_quick_draw() {
+        let game = new_game(QUICK_DRAW_ITEM_INDEX, Difficulty::Advanced);
+        let result = game.result();
+        assert_eq!(result.game_id, crate::game::quick_draw::GAME_ID);
+        assert_eq!(result.difficulty, Difficulty::Advanced);
+    }
+
+    #[test]
+    fn selecting_quick_draw_goes_to_difficulty_then_countdown_then_playing() {
+        let mut app = App::new();
+        app.select_menu_item(QUICK_DRAW_ITEM_INDEX);
+        assert!(matches!(
+            app.screen,
+            Screen::SelectDifficulty(QUICK_DRAW_ITEM_INDEX, None)
+        ));
+        app.handle_key(KeyEvent::from(KeyCode::Char('3')));
+        assert!(
+            matches!(
+                app.screen,
+                Screen::Countdown {
+                    item: QUICK_DRAW_ITEM_INDEX,
+                    difficulty: Difficulty::Advanced,
+                    ..
+                }
+            ),
+            "反射神経も通常のカウントダウンを経由する"
+        );
+        finish_countdown(&mut app);
+        let Screen::Playing(game) = &app.screen else {
+            panic!("Playing画面のはず");
+        };
+        assert_eq!(game.result().game_id, crate::game::quick_draw::GAME_ID);
+        assert!(rendered_text(&mut app).replace(' ', "").contains("まだ待て"));
+    }
+
+    #[test]
+    fn result_screen_shows_quick_draw_menu_name() {
+        let mut app = App::new();
+        app.screen = Screen::Result(
+            new_game(QUICK_DRAW_ITEM_INDEX, Difficulty::Beginner).result(),
+            None,
+        );
+        assert!(rendered_text(&mut app).replace(' ', "").contains("反射神経"));
     }
 
     #[test]
