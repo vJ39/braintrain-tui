@@ -4,19 +4,24 @@ use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKin
 use rand::seq::SliceRandom;
 use rand::Rng;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::text::Line;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::audio::{self, SeKind};
+use crate::game::feedback::AnswerFeedback;
+use crate::game::theme;
 use crate::game::{contains, row_index, Difficulty, Game, GameResult, ScoreTracker};
 
 pub const GAME_ID: &str = "sequence";
 
 const CHOICE_COUNT: usize = 4;
 
-/// 描画エリアを「数列表示」「選択肢」「フッター」に分割する
+/// 描画エリアを「数列表示」「選択肢」「フッター」に分割する。
+/// 上端のHUD(theme::split_hud)を除いた残りを分ける。renderはHUDを同じsplit_hudで切り出す
 fn split_areas(area: Rect) -> (Rect, Rect, Rect) {
+    let (_, body) = theme::split_hud(area);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -24,7 +29,7 @@ fn split_areas(area: Rect) -> (Rect, Rect, Rect) {
             Constraint::Min(CHOICE_COUNT as u16 + 2),
             Constraint::Length(3),
         ])
-        .split(area);
+        .split(body);
     (rows[0], rows[1], rows[2])
 }
 
@@ -180,6 +185,8 @@ pub struct SequenceGame {
     tracker: ScoreTracker,
     current: Question,
     question_started_at: Instant,
+    /// 直前の回答の正誤表示(描画専用)
+    feedback: AnswerFeedback,
 }
 
 impl SequenceGame {
@@ -190,6 +197,7 @@ impl SequenceGame {
             tracker: ScoreTracker::new(),
             current: generate_question(&mut rng, difficulty),
             question_started_at: Instant::now(),
+            feedback: AnswerFeedback::new(),
         }
     }
 
@@ -197,6 +205,8 @@ impl SequenceGame {
         let is_correct = answered_index == self.current.correct_index;
         let latency_ms = self.question_started_at.elapsed().as_millis() as f64;
         self.tracker.record(is_correct, latency_ms);
+        let answer = self.current.choices[self.current.correct_index];
+        self.feedback.record(is_correct, format!("こたえ: {answer}"));
         audio::play_se(if is_correct {
             SeKind::Correct
         } else {
@@ -238,46 +248,51 @@ impl Game for SequenceGame {
         }
     }
 
-    fn update(&mut self, _dt: Duration) {}
+    fn update(&mut self, dt: Duration) {
+        self.feedback.tick(dt);
+    }
 
     fn render(&self, frame: &mut Frame, area: Rect) {
+        let (hud_area, _) = theme::split_hud(area);
         let (sequence_area, choices_area, footer_area) = split_areas(area);
+        theme::render_hud(
+            frame,
+            hud_area,
+            "数列予測",
+            self.difficulty,
+            self.tracker.total(),
+            &self.feedback,
+        );
 
-        let mut sequence_text = self
-            .current
-            .sequence
-            .iter()
-            .map(|n| n.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        sequence_text.push_str(", ?");
-
-        let sequence_paragraph = Paragraph::new(Line::from(sequence_text))
+        // 数列は項ごとに強調し、最後の「?」を注目色にする
+        let term_style = Style::default()
+            .fg(theme::ACCENT_STRONG)
+            .add_modifier(Modifier::BOLD);
+        let separator_style = Style::default().fg(theme::MUTED);
+        let mut spans = Vec::new();
+        for n in &self.current.sequence {
+            spans.push(Span::styled(n.to_string(), term_style));
+            spans.push(Span::styled("  →  ", separator_style));
+        }
+        spans.push(Span::styled(
+            "?",
+            Style::default()
+                .fg(theme::HIGHLIGHT)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let sequence_paragraph = Paragraph::new(Line::from(spans))
             .alignment(Alignment::Center)
-            .block(Block::default().borders(Borders::ALL).title("次に来る数字は？"));
+            .block(theme::focus_panel(" 次に来る数字は？ ", self.feedback.current()));
         frame.render_widget(sequence_paragraph, sequence_area);
 
-        let choice_lines: Vec<Line> = self
-            .current
-            .choices
-            .iter()
-            .enumerate()
-            .map(|(i, value)| Line::from(format!(" {}: {value} ", i + 1)))
-            .collect();
-        let choices_paragraph = Paragraph::new(choice_lines)
-            .alignment(Alignment::Center)
-            .block(Block::default().borders(Borders::ALL));
-        frame.render_widget(choices_paragraph, choices_area);
+        // 選択肢はクリック判定(row_index)と同じ帯に1つずつ描く
+        let choices_block = theme::panel(" こたえを選ぶ ");
+        let choices_inner = choices_block.inner(choices_area);
+        frame.render_widget(choices_block, choices_area);
+        let texts: Vec<String> = self.current.choices.iter().map(|v| v.to_string()).collect();
+        theme::render_choice_rows(frame, choices_inner, &texts);
 
-        let progress = format!(
-            "{} / {}問",
-            self.tracker.total(),
-            crate::game::QUESTIONS_PER_SESSION
-        );
-        let footer = Paragraph::new(format!("数字キー1〜4で回答   {progress}"))
-            .alignment(Alignment::Center)
-            .block(Block::default().borders(Borders::ALL));
-        frame.render_widget(footer, footer_area);
+        theme::render_hint_footer(frame, footer_area, &[("1〜4", "回答"), ("q", "終了")]);
     }
 
     fn is_finished(&self) -> bool {
@@ -452,5 +467,53 @@ mod tests {
         let (sequence_area, _, _) = split_areas(area);
         game.handle_mouse(left_click(sequence_area.x, sequence_area.y), area);
         assert_eq!(game.tracker.total(), 0);
+    }
+
+    #[test]
+    fn answering_shows_feedback_with_the_correct_answer() {
+        let mut game = SequenceGame::new(Difficulty::Beginner);
+        let answer = game.current.choices[game.current.correct_index];
+        game.advance_question(game.current.correct_index);
+        let flash = game.feedback.current().expect("回答直後は正誤を表示する");
+        assert_eq!(flash.verdict, crate::game::feedback::Verdict::Correct);
+        assert_eq!(flash.detail, format!("こたえ: {answer}"));
+        assert_eq!(game.feedback.streak(), 1);
+        game.update(crate::game::feedback::FEEDBACK_HOLD);
+        assert!(game.feedback.current().is_none());
+    }
+
+    /// 描画結果の各行を文字列にして返す
+    fn rendered_rows(game: &SequenceGame, area: Rect) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| game.render(frame, area)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn clicking_the_row_where_a_choice_is_drawn_selects_it_even_on_tall_terminal() {
+        let area = Rect::new(0, 0, 60, 30);
+        let mut game = SequenceGame::new(Difficulty::Beginner);
+        // 帯の位置ずれが最も大きく出る最後の選択肢を正解扱いにする
+        game.current.correct_index = CHOICE_COUNT - 1;
+        let correct = game.current.correct_index;
+        let label = format!(" {}   {}", correct + 1, game.current.choices[correct]);
+        let (_, choices_area, _) = split_areas(area);
+        let inner = Block::default().borders(Borders::ALL).inner(choices_area);
+        let rows = rendered_rows(&game, area);
+        let row = (inner.y..inner.y + inner.height)
+            .find(|&y| rows[y as usize].contains(&label))
+            .expect("正解の選択肢が選択肢エリア内に描かれていること");
+        game.handle_mouse(left_click(inner.x, row), area);
+        let result = game.tracker.to_result(GAME_ID, game.difficulty);
+        assert_eq!(result.total, 1);
+        assert_eq!(result.correct, 1);
     }
 }

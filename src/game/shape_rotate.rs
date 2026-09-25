@@ -4,13 +4,14 @@ use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKin
 use rand::Rng;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Color;
-use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Block;
 use ratatui::Frame;
 
 use crate::audio::{self, SeKind};
 use crate::canvas::shapes::{base_shapes, Shape};
+use crate::game::feedback::AnswerFeedback;
+use crate::game::theme;
 use crate::game::{column_index, contains, Difficulty, Game, GameResult, ScoreTracker};
 
 /// このゲームの描画エリアを「図形表示」と「選択肢フッター」に分割する
@@ -73,6 +74,8 @@ pub struct ShapeRotateGame {
     tracker: ScoreTracker,
     current: Question,
     question_started_at: Instant,
+    /// 直前の回答の正誤表示(描画専用)
+    feedback: AnswerFeedback,
 }
 
 impl ShapeRotateGame {
@@ -83,6 +86,7 @@ impl ShapeRotateGame {
             tracker: ScoreTracker::new(),
             current: generate_question(&mut rng, difficulty),
             question_started_at: Instant::now(),
+            feedback: AnswerFeedback::new(),
         }
     }
 
@@ -90,6 +94,8 @@ impl ShapeRotateGame {
         let is_correct = answered_same == self.current.is_same;
         let latency_ms = self.question_started_at.elapsed().as_millis() as f64;
         self.tracker.record(is_correct, latency_ms);
+        let answer = if self.current.is_same { "同じ" } else { "違う" };
+        self.feedback.record(is_correct, format!("こたえ: {answer}"));
         audio::play_se(if is_correct {
             SeKind::Correct
         } else {
@@ -131,28 +137,44 @@ impl Game for ShapeRotateGame {
         }
     }
 
-    fn update(&mut self, _dt: Duration) {}
+    fn update(&mut self, dt: Duration) {
+        self.feedback.tick(dt);
+    }
 
     fn render(&self, frame: &mut Frame, area: Rect) {
         let (shapes_area, footer_area) = split_areas(area);
+        // HUDはクリック判定の無い図形エリアの上端から切り出す(フッターの位置は変えない)
+        let (hud_area, shapes_area) = theme::split_hud(shapes_area);
+        theme::render_hud(
+            frame,
+            hud_area,
+            "図形回転判定",
+            self.difficulty,
+            self.tracker.total(),
+            &self.feedback,
+        );
+
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(shapes_area);
-
-        draw_shape(frame, cols[0], "元の図形", &self.current.original);
-        draw_shape(frame, cols[1], "比較図形", &self.current.transformed);
-
-        let progress = format!(
-            "{} / {}問",
-            self.tracker.total(),
-            crate::game::QUESTIONS_PER_SESSION
+        draw_shape(
+            frame,
+            cols[0],
+            theme::panel(" 元の図形 "),
+            &self.current.original,
+            theme::ACCENT_STRONG,
         );
-        let line = Line::from(vec![Span::raw(format!(
-            "← 同じ    違う →   {progress}"
-        ))]);
-        let paragraph = Paragraph::new(line).block(Block::default().borders(Borders::ALL));
-        frame.render_widget(paragraph, footer_area);
+        draw_shape(
+            frame,
+            cols[1],
+            theme::focus_panel(" 比較図形: 回転させると同じ？ ", self.feedback.current()),
+            &self.current.transformed,
+            Color::LightGreen,
+        );
+
+        // フッターはcolumn_index(2列)と同じ分割の2ボタン
+        theme::render_choice_buttons(frame, footer_area, &[("←", "同じ"), ("→", "違う")]);
     }
 
     fn is_finished(&self) -> bool {
@@ -164,10 +186,10 @@ impl Game for ShapeRotateGame {
     }
 }
 
-fn draw_shape(frame: &mut Frame, area: Rect, title: &str, shape: &Shape) {
+fn draw_shape(frame: &mut Frame, area: Rect, block: Block, shape: &Shape, color: Color) {
     let lines = shape.to_lines();
     let canvas = Canvas::default()
-        .block(Block::default().borders(Borders::ALL).title(title.to_string()))
+        .block(block)
         .x_bounds([-1.0, 1.0])
         .y_bounds([-1.0, 1.0])
         .paint(move |ctx| {
@@ -177,7 +199,7 @@ fn draw_shape(frame: &mut Frame, area: Rect, title: &str, shape: &Shape) {
                     y1: p1.1,
                     x2: p2.0,
                     y2: p2.1,
-                    color: Color::Green,
+                    color,
                 });
             }
         });
@@ -284,6 +306,19 @@ mod tests {
         let (shapes_area, _) = split_areas(area);
         game.handle_mouse(left_click(shapes_area.x, shapes_area.y), area);
         assert_eq!(game.tracker.total(), 0);
+    }
+
+    #[test]
+    fn answering_shows_feedback_with_the_correct_answer_until_hold_time() {
+        let mut game = ShapeRotateGame::new(Difficulty::Beginner);
+        game.current.is_same = false;
+        game.advance_question(true);
+        let flash = game.feedback.current().expect("回答直後は正誤を表示する");
+        assert_eq!(flash.verdict, crate::game::feedback::Verdict::Incorrect);
+        assert_eq!(flash.detail, "こたえ: 違う");
+        assert_eq!(game.feedback.streak(), 0);
+        game.update(crate::game::feedback::FEEDBACK_HOLD);
+        assert!(game.feedback.current().is_none());
     }
 
     #[test]

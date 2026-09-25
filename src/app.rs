@@ -18,6 +18,7 @@ use crate::game::rhythm::{RhythmGame, SONGS};
 use crate::game::row_index;
 use crate::game::sequence::SequenceGame;
 use crate::game::shape_rotate::ShapeRotateGame;
+use crate::game::theme;
 use crate::game::{Difficulty, Game, GameResult};
 use crate::stats::store;
 
@@ -358,27 +359,38 @@ fn new_game(item: usize, difficulty: Difficulty) -> Box<dyn Game> {
 const SONG_ROWS_OFFSET: u16 = 2;
 
 fn render_song_select(frame: &mut Frame, area: Rect, selected: usize) {
+    // 行の並びはsong_at_rowと一致させる(1行目=見出し、2行目=空行、3行目以降=曲)
     let mut text = vec![
-        Line::from(Span::raw(format!(
-            "{} - 曲を選択",
-            MENU_ITEMS[RHYTHM_ITEM_INDEX]
-        ))),
+        Line::from(vec![
+            Span::styled("♪ ", Style::default().fg(theme::ACCENT)),
+            Span::styled(MENU_ITEMS[RHYTHM_ITEM_INDEX], theme::title_style()),
+            Span::styled("  曲を選択", Style::default().fg(theme::TEXT)),
+        ]),
         Line::from(""),
     ];
     for (i, song) in SONGS.iter().enumerate() {
         let label = format!("{}: {}", i + 1, song.display_name);
-        let style = if i == selected {
-            Style::default().add_modifier(Modifier::REVERSED)
+        let line = if i == selected {
+            Line::from(Span::styled(format!(" ▶ {label} "), theme::selected_style()))
         } else {
-            Style::default()
+            Line::from(Span::styled(
+                format!("   {label} "),
+                Style::default().fg(theme::TEXT),
+            ))
         };
-        text.push(Line::from(Span::styled(label, style)));
+        text.push(line);
     }
-    text.push(Line::from(""));
-    text.push(Line::from("(↑↓で選択 Enter/数字キーで決定 Escで戻る)"));
+    let block = theme::panel(" ◆ BRAIN TRAIN ◆ ").title_bottom(
+        theme::hints_line(&[
+            ("↑↓", "選択"),
+            ("Enter / 数字", "決定"),
+            ("Esc", "戻る"),
+        ])
+        .centered(),
+    );
     let paragraph = Paragraph::new(text)
         .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL));
+        .block(block);
     frame.render_widget(paragraph, area);
 }
 
@@ -392,10 +404,85 @@ fn song_at_row(area: Rect, mouse_row: u16) -> Option<usize> {
 }
 
 fn render_menu(frame: &mut Frame, area: Rect, state: &mut ListState) {
-    let items: Vec<ListItem> = MENU_ITEMS.iter().map(|s| ListItem::new(*s)).collect();
+    // 各項目の一言説明。配列長をMENU_ITEMS.len()にして、項目の追加漏れをコンパイル時に検出する
+    const DESCRIPTIONS: [&str; MENU_ITEMS.len()] = [
+        "回転させた図形が元と同じかを見分ける",
+        "鏡に映した図形かどうかを見分ける",
+        "文字の色と意味が一致するかを即答する",
+        "4択から計算の答えを素早く選ぶ",
+        "3x3の規則から空欄に入る図形を選ぶ",
+        "光ったパネルの順番を覚えて再現する",
+        "数列の法則を見抜いて次の数を当てる",
+        "完成形から2つ目のピースを当てる",
+        "矢印キーで曲に合わせてステップする",
+        "BGMを選んで聴く",
+        "ゲームごとの反応時間の推移を見る",
+    ];
+
+    let block = theme::panel(Line::from(" ◆ BRAIN TRAIN ◆ ").centered())
+        .border_type(ratatui::widgets::BorderType::Double)
+        .title(
+            Line::from(Span::styled(
+                " 脳トレ ゲーム集 ",
+                Style::default().fg(theme::ACCENT),
+            ))
+            .right_aligned(),
+        )
+        .title_bottom(
+            theme::hints_line(&[
+                ("↑↓", "選択"),
+                ("Enter / クリック", "決定"),
+                ("q", "終了"),
+            ])
+            .centered(),
+        );
+
+    // menu_item_at_rowは枠の内側を項目数で等分(row_index)して判定するので、
+    // 1項目の高さもその等分に合わせ、見た目の位置とクリック位置をそろえる
+    let inner = block.inner(area);
+    let item_height = (inner.height / MENU_ITEMS.len() as u16).max(1) as usize;
+    let items: Vec<ListItem> = MENU_ITEMS
+        .iter()
+        .zip(DESCRIPTIONS)
+        .enumerate()
+        .map(|(i, (name, description))| {
+            let number = Span::styled(format!("{:02}  ", i + 1), Style::default().fg(theme::ACCENT));
+            let name = Span::styled(
+                *name,
+                Style::default()
+                    .fg(theme::TEXT)
+                    .add_modifier(Modifier::BOLD),
+            );
+            let description_style = Style::default().fg(theme::MUTED);
+            let content: Vec<Line> = if item_height >= 2 {
+                vec![
+                    Line::from(vec![number, name]),
+                    Line::from(Span::styled(format!("    {description}"), description_style)),
+                ]
+            } else {
+                vec![Line::from(vec![
+                    number,
+                    name,
+                    Span::styled(format!("   {description}"), description_style),
+                ])]
+            };
+            // 帯の中で縦中央に置き、残りは空行で埋めて帯の高さちょうどにする
+            let top = (item_height - content.len()) / 2;
+            let mut lines = vec![Line::from(""); top];
+            lines.extend(content);
+            lines.resize(item_height, Line::from(""));
+            ListItem::new(lines)
+        })
+        .collect();
+
+    // 全項目が収まる大きさならスクロールさせない(以前の小さい画面での位置が残らないように)
+    if inner.height as usize >= item_height * MENU_ITEMS.len() {
+        *state.offset_mut() = 0;
+    }
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("braintrain-tui"))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        .block(block)
+        .highlight_style(theme::selected_style())
+        .highlight_symbol(" ▶ ");
     frame.render_stateful_widget(list, area, state);
 }
 
@@ -404,18 +491,52 @@ fn render_menu(frame: &mut Frame, area: Rect, state: &mut ListState) {
 const DIFFICULTY_ROWS_OFFSET: u16 = 2;
 
 fn render_difficulty_select(frame: &mut Frame, area: Rect, game_name: &str) {
-    let text = vec![
-        Line::from(Span::raw(format!("{game_name} - 難易度を選択"))),
+    // 行の並びはdifficulty_at_rowと一致させる(1行目=見出し、2行目=空行、3〜5行目=初級/中級/上級)
+    let mut text = vec![
+        Line::from(vec![
+            Span::styled("◆ ", Style::default().fg(theme::ACCENT)),
+            Span::styled(game_name.to_string(), theme::title_style()),
+            Span::styled("  難易度を選択", Style::default().fg(theme::TEXT)),
+        ]),
         Line::from(""),
-        Line::from("1: 初級"),
-        Line::from("2: 中級"),
-        Line::from("3: 上級"),
-        Line::from(""),
-        Line::from("(Escで戻る)"),
     ];
+    let options = [
+        ("1", Difficulty::Beginner, "まずは肩ならし"),
+        ("2", Difficulty::Intermediate, "ほどよい手ごたえ"),
+        ("3", Difficulty::Advanced, "腕に自信がある人向け"),
+    ];
+    // 説明文は全角文字だけなので、最長に合わせて全角空白で埋めると中央寄せでも行頭がそろう
+    let note_width = options.iter().map(|(_, _, n)| n.chars().count()).max().unwrap_or(0);
+    for (key, difficulty, note) in options {
+        let (label, color) = theme::difficulty_label(difficulty);
+        let note = format!("{note}{}", "　".repeat(note_width - note.chars().count()));
+        text.push(Line::from(vec![
+            Span::styled(
+                format!(" {key} "),
+                Style::default()
+                    .fg(ratatui::style::Color::Black)
+                    .bg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                label,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("   {note}"), Style::default().fg(theme::MUTED)),
+        ]));
+    }
+    text.push(Line::from(""));
+    text.push(Line::from(Span::styled(
+        "(Escで戻る)",
+        Style::default().fg(theme::MUTED),
+    )));
+    let block = theme::panel(" ◆ BRAIN TRAIN ◆ ").title_bottom(
+        theme::hints_line(&[("1〜3 / クリック", "開始"), ("Esc", "戻る")]).centered(),
+    );
     let paragraph = Paragraph::new(text)
         .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL));
+        .block(block);
     frame.render_widget(paragraph, area);
 }
 
@@ -438,54 +559,177 @@ fn menu_item_at_row(area: Rect, mouse_row: u16) -> Option<usize> {
 }
 
 fn render_result(frame: &mut Frame, area: Rect, result: &GameResult) {
-    if let Err(e) = store::append_result(result) {
-        // 保存に失敗しても画面表示は続ける。エラー内容だけ表示する
-        let error_area = centered_rect(area, 60, 3);
-        let paragraph = Paragraph::new(format!("履歴の保存に失敗: {e}"))
-            .alignment(Alignment::Center);
-        frame.render_widget(paragraph, error_area);
-    }
+    // 保存に失敗しても画面表示は続ける。エラー内容は結果の描画後に下端へ重ねて表示する
+    let save_error = store::append_result(result).err();
 
-    let text = vec![
-        Line::from(format!("正解: {} / {}", result.correct, result.total)),
-        Line::from(format!("平均反応時間: {:.0}ms", result.avg_latency_ms)),
-        Line::from(""),
-        Line::from("Enterでメニューに戻る"),
+    // game_idからメニュー上の表示名を引く(見つからなければgame_idをそのまま出す)
+    let game_names = [
+        (crate::game::shape_rotate::GAME_ID, 0),
+        (crate::game::mirror_match::GAME_ID, 1),
+        (crate::game::reaction::GAME_ID, 2),
+        (crate::game::mental_calc::GAME_ID, 3),
+        (crate::game::pattern_fill::GAME_ID, 4),
+        (crate::game::memory::GAME_ID, 5),
+        (crate::game::sequence::GAME_ID, 6),
+        (crate::game::puzzle_connect::GAME_ID, 7),
+        (crate::game::rhythm::GAME_ID, RHYTHM_ITEM_INDEX),
     ];
+    let game_name = game_names
+        .iter()
+        .find(|(id, _)| *id == result.game_id)
+        .map_or(result.game_id.as_str(), |(_, index)| MENU_ITEMS[*index]);
+    let (difficulty_text, difficulty_color) = theme::difficulty_label(result.difficulty);
+    let (rank, rank_color) = theme::rank_for(result.correct, result.total);
+    let percent = if result.total == 0 {
+        0
+    } else {
+        result.correct * 100 / result.total
+    };
+
+    let outer = theme::panel(Line::from(" ◆ RESULT ◆ ").centered()).title_bottom(
+        theme::hints_line(&[("Enter / Esc / クリック", "メニューに戻る")]).centered(),
+    );
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let label_style = Style::default().fg(theme::MUTED);
+    let value_style = Style::default()
+        .fg(theme::ACCENT_STRONG)
+        .add_modifier(Modifier::BOLD);
+    let text = vec![
+        Line::from(vec![
+            Span::styled(game_name.to_string(), theme::title_style()),
+            Span::styled("   ", label_style),
+            Span::styled(
+                difficulty_text,
+                Style::default()
+                    .fg(difficulty_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("RANK  ", label_style),
+            Span::styled(
+                format!("  {rank}  "),
+                Style::default()
+                    .fg(ratatui::style::Color::Black)
+                    .bg(rank_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("正解  ", label_style),
+            Span::styled(
+                format!("{} / {}", result.correct, result.total),
+                value_style,
+            ),
+            Span::styled(format!("  ({percent}%)"), Style::default().fg(theme::TEXT)),
+        ]),
+        Line::from(Span::styled(
+            theme::progress_bar(result.correct, result.total, 20),
+            Style::default().fg(rank_color),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("平均反応時間  ", label_style),
+            Span::styled(format!("{:.0}", result.avg_latency_ms), value_style),
+            Span::styled(" ms", Style::default().fg(theme::TEXT)),
+        ]),
+    ];
+    let content_height = text.len() as u16;
+    let card = centered_rect(inner, inner.width.min(48), (content_height + 2).min(inner.height));
     let paragraph = Paragraph::new(text)
         .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).title("結果"));
-    frame.render_widget(paragraph, area);
+        .block(theme::sub_panel());
+    frame.render_widget(paragraph, card);
+
+    if let Some(e) = save_error {
+        let error_area = Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(1),
+            inner.width,
+            inner.height.min(1),
+        );
+        let paragraph = Paragraph::new(format!("履歴の保存に失敗: {e}"))
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme::INCORRECT));
+        frame.render_widget(paragraph, error_area);
+    }
 }
 
 fn render_jukebox(frame: &mut Frame, area: Rect, state: &mut ListState, playing: Option<&str>) {
+    // 「再生中の曲」「曲リスト」「操作説明」の3段
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    let now_playing = match playing {
+        Some(name) => Line::from(vec![
+            Span::styled("♪ 再生中  ", Style::default().fg(theme::ACCENT)),
+            Span::styled(name.to_string(), theme::title_style()),
+        ]),
+        None => Line::from(Span::styled("■ 停止中", Style::default().fg(theme::MUTED))),
+    };
+    frame.render_widget(
+        Paragraph::new(now_playing)
+            .alignment(Alignment::Center)
+            .block(theme::panel(" ◆ ジュークボックス ◆ ")),
+        rows[0],
+    );
+
     let tracks = audio::bgm_track_names();
     let items: Vec<ListItem> = if tracks.is_empty() {
-        vec![ListItem::new("(曲がありません)")]
+        vec![ListItem::new(Span::styled(
+            "(曲がありません)",
+            Style::default().fg(theme::MUTED),
+        ))]
     } else {
         tracks
             .iter()
             .map(|name| {
                 if Some(name.as_str()) == playing {
-                    ListItem::new(format!("♪ {name} (再生中)"))
+                    ListItem::new(Span::styled(
+                        format!("♪ {name} (再生中)"),
+                        Style::default()
+                            .fg(theme::ACCENT_STRONG)
+                            .add_modifier(Modifier::BOLD),
+                    ))
                 } else {
-                    ListItem::new(name.clone())
+                    ListItem::new(Span::styled(
+                        format!("  {name}"),
+                        Style::default().fg(theme::TEXT),
+                    ))
                 }
             })
             .collect()
     };
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("ジュークボックス (Enter:再生 S:停止 Esc:戻る)"),
-        )
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    frame.render_stateful_widget(list, area, state);
+        .block(theme::panel(" 曲リスト "))
+        .highlight_style(theme::selected_style())
+        .highlight_symbol(" ▶ ");
+    frame.render_stateful_widget(list, rows[1], state);
+
+    theme::render_hint_footer(
+        frame,
+        rows[2],
+        &[("↑↓", "選択"), ("Enter", "再生"), ("S", "停止"), ("Esc", "戻る")],
+    );
 }
 
 fn render_history(frame: &mut Frame, area: Rect) {
-    crate::stats::history_view::render(frame, area);
+    let block = theme::panel(" ◆ 履歴: ゲームごとの平均反応時間の推移 ◆ ").title_bottom(
+        theme::hints_line(&[("Enter / Esc / クリック", "メニューに戻る")]).centered(),
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    crate::stats::history_view::render(frame, inner);
 }
 
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
@@ -825,5 +1069,80 @@ mod tests {
         app.screen = Screen::Jukebox(app.jukebox_list_state());
         app.handle_jukebox_key(KeyEvent::from(KeyCode::Esc));
         assert!(matches!(app.screen, Screen::Menu));
+    }
+
+    // --- 描画位置とクリック判定の一致 ---
+
+    /// 画面を描画し、各行を空白抜きの文字列にして返す
+    /// (全角文字の2セル目は空白で埋まるため、空白を除いて比較する)
+    fn rendered_rows_without_spaces(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .replace(' ', "")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn menu_items_are_drawn_on_the_rows_that_click_to_them() {
+        // 画面の高さによって1項目の高さが変わっても、項目名が見えている行をクリックすればその項目になること
+        for height in [24u16, 30, 45] {
+            let mut app = App::new();
+            let rows = rendered_rows_without_spaces(&mut app, 80, height);
+            let area = rect(0, 0, 80, height);
+            for (i, name) in MENU_ITEMS.iter().enumerate() {
+                let row = rows
+                    .iter()
+                    .position(|r| r.contains(name))
+                    .unwrap_or_else(|| panic!("height={height}: {name}が描かれていること"));
+                assert_eq!(
+                    menu_item_at_row(area, row as u16),
+                    Some(i),
+                    "height={height}: {name}の行"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn difficulty_rows_are_drawn_where_difficulty_at_row_expects() {
+        let mut app = App::new();
+        app.screen = Screen::SelectDifficulty(0, None);
+        let rows = rendered_rows_without_spaces(&mut app, 80, 24);
+        let area = rect(0, 0, 80, 24);
+        for (label, expected) in [
+            ("初級", Difficulty::Beginner),
+            ("中級", Difficulty::Intermediate),
+            ("上級", Difficulty::Advanced),
+        ] {
+            let row = rows
+                .iter()
+                .position(|r| r.contains(label))
+                .unwrap_or_else(|| panic!("{label}が描かれていること"));
+            assert_eq!(difficulty_at_row(area, row as u16), Some(expected), "{label}の行");
+        }
+    }
+
+    #[test]
+    fn song_rows_are_drawn_where_song_at_row_expects() {
+        let mut app = App::new();
+        app.screen = Screen::SelectSong(0);
+        let rows = rendered_rows_without_spaces(&mut app, 80, 24);
+        let area = rect(0, 0, 80, 24);
+        for (i, song) in SONGS.iter().enumerate() {
+            let name = song.display_name.replace(' ', "");
+            let row = rows
+                .iter()
+                .position(|r| r.contains(&name))
+                .unwrap_or_else(|| panic!("{}が描かれていること", song.display_name));
+            assert_eq!(song_at_row(area, row as u16), Some(i));
+        }
     }
 }

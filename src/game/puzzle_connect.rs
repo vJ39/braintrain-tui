@@ -3,15 +3,17 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use rand::seq::SliceRandom;
 use rand::Rng;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::Color;
-use ratatui::text::Line;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders};
 use ratatui::Frame;
 
 use crate::audio::{self, SeKind};
 use crate::canvas::shapes::{base_shapes, Shape};
+use crate::game::feedback::{AnswerFeedback, Flash};
+use crate::game::theme;
 use crate::game::{contains, row_index, Difficulty, Game, GameResult, ScoreTracker};
 
 pub const GAME_ID: &str = "puzzle_connect";
@@ -128,6 +130,8 @@ pub struct PuzzleConnectGame {
     tracker: ScoreTracker,
     current: Question,
     question_started_at: Instant,
+    /// 直前の回答の正誤表示(描画専用)
+    feedback: AnswerFeedback,
 }
 
 impl PuzzleConnectGame {
@@ -138,6 +142,7 @@ impl PuzzleConnectGame {
             tracker: ScoreTracker::new(),
             current: generate_question(&mut rng, difficulty),
             question_started_at: Instant::now(),
+            feedback: AnswerFeedback::new(),
         }
     }
 
@@ -145,6 +150,8 @@ impl PuzzleConnectGame {
         let is_correct = answered_position == self.current.correct_choice_position;
         let latency_ms = self.question_started_at.elapsed().as_millis() as f64;
         self.tracker.record(is_correct, latency_ms);
+        let answer = SHAPE_NAMES[self.current.choices[self.current.correct_choice_position]];
+        self.feedback.record(is_correct, format!("こたえ: {answer}"));
         audio::play_se(if is_correct {
             SeKind::Correct
         } else {
@@ -186,40 +193,44 @@ impl Game for PuzzleConnectGame {
         }
     }
 
-    fn update(&mut self, _dt: Duration) {}
+    fn update(&mut self, dt: Duration) {
+        self.feedback.tick(dt);
+    }
 
     fn render(&self, frame: &mut Frame, area: Rect) {
         let (demo_area, choices_area, footer_area) = split_areas(area);
+        // HUDはクリック判定の無いお手本エリアの上端から切り出す(選択肢の位置は変えない)
+        let (hud_area, demo_area) = theme::split_hud(demo_area);
+        theme::render_hud(
+            frame,
+            hud_area,
+            "組み合わせパズル",
+            self.difficulty,
+            self.tracker.total(),
+            &self.feedback,
+        );
 
-        draw_demo(frame, demo_area, &self.current.demo_piece_a, &self.current.demo_piece_b);
+        draw_demo(
+            frame,
+            demo_area,
+            &self.current.demo_piece_a,
+            &self.current.demo_piece_b,
+            self.feedback.current(),
+        );
 
-        let choice_lines: Vec<Line> = self
+        // 選択肢はクリック判定(row_index)と同じ帯に1つずつ描く
+        let choices_block = theme::panel(" 2つ目のピースはどれ？ ");
+        let choices_inner = choices_block.inner(choices_area);
+        frame.render_widget(choices_block, choices_area);
+        let texts: Vec<String> = self
             .current
             .choices
             .iter()
-            .enumerate()
-            .map(|(i, &shape_idx)| {
-                Line::from(format!(" 候補{}: {} ", i + 1, SHAPE_NAMES[shape_idx]))
-            })
+            .map(|&shape_idx| SHAPE_NAMES[shape_idx].to_string())
             .collect();
-        let choices_paragraph = Paragraph::new(choice_lines)
-            .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("2つ目のピースはどれ？"),
-            );
-        frame.render_widget(choices_paragraph, choices_area);
+        theme::render_choice_rows(frame, choices_inner, &texts);
 
-        let progress = format!(
-            "{} / {}問",
-            self.tracker.total(),
-            crate::game::QUESTIONS_PER_SESSION
-        );
-        let footer = Paragraph::new(format!("数字キー1〜4で回答   {progress}"))
-            .alignment(Alignment::Center)
-            .block(Block::default().borders(Borders::ALL));
-        frame.render_widget(footer, footer_area);
+        theme::render_hint_footer(frame, footer_area, &[("1〜4", "回答"), ("q", "終了")]);
     }
 
     fn is_finished(&self) -> bool {
@@ -231,7 +242,18 @@ impl Game for PuzzleConnectGame {
     }
 }
 
-fn draw_demo(frame: &mut Frame, area: Rect, piece_a: &Shape, piece_b: &Shape) {
+/// お手本で1つ目のピースを描く色
+const PIECE_A_COLOR: Color = theme::ACCENT_STRONG;
+/// お手本で2つ目のピース(=探す対象)を描く色
+const PIECE_B_COLOR: Color = theme::HIGHLIGHT;
+
+fn draw_demo(
+    frame: &mut Frame,
+    area: Rect,
+    piece_a: &Shape,
+    piece_b: &Shape,
+    flash: Option<&Flash>,
+) {
     let min_x = shape_min_x(piece_a).min(shape_min_x(piece_b)) - 0.2;
     let max_x = shape_max_x(piece_a).max(shape_max_x(piece_b)) + 0.2;
     let min_y = piece_a
@@ -251,11 +273,17 @@ fn draw_demo(frame: &mut Frame, area: Rect, piece_a: &Shape, piece_b: &Shape) {
 
     let lines_a = piece_a.to_lines();
     let lines_b = piece_b.to_lines();
+    // 色の凡例を枠の下辺に出す
+    let legend = Line::from(vec![
+        Span::styled(" ━ ", Style::default().fg(PIECE_A_COLOR)),
+        Span::styled("1つ目   ", Style::default().fg(theme::TEXT)),
+        Span::styled("━ ", Style::default().fg(PIECE_B_COLOR)),
+        Span::styled("2つ目(これを探す) ", Style::default().fg(theme::TEXT)),
+    ]);
     let canvas = Canvas::default()
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("お手本(この2つを組み合わせた完成形)"),
+            theme::focus_panel(" お手本: この2つを組み合わせた完成形 ", flash)
+                .title_bottom(legend.centered()),
         )
         .x_bounds([min_x, max_x])
         .y_bounds([min_y, max_y])
@@ -266,7 +294,7 @@ fn draw_demo(frame: &mut Frame, area: Rect, piece_a: &Shape, piece_b: &Shape) {
                     y1: p1.1,
                     x2: p2.0,
                     y2: p2.1,
-                    color: Color::Green,
+                    color: PIECE_A_COLOR,
                 });
             }
             for (p1, p2) in &lines_b {
@@ -275,7 +303,7 @@ fn draw_demo(frame: &mut Frame, area: Rect, piece_a: &Shape, piece_b: &Shape) {
                     y1: p1.1,
                     x2: p2.0,
                     y2: p2.1,
-                    color: Color::Yellow,
+                    color: PIECE_B_COLOR,
                 });
             }
         });
@@ -401,5 +429,45 @@ mod tests {
         let (demo_area, _, _) = split_areas(area);
         game.handle_mouse(left_click(demo_area.x, demo_area.y), area);
         assert_eq!(game.tracker.total(), 0);
+    }
+
+    #[test]
+    fn answering_shows_feedback_with_the_correct_shape_name() {
+        let mut game = PuzzleConnectGame::new(Difficulty::Beginner);
+        let correct = game.current.correct_choice_position;
+        let answer = SHAPE_NAMES[game.current.choices[correct]];
+        game.advance_question((correct + 1) % CHOICE_COUNT);
+        let flash = game.feedback.current().expect("回答直後は正誤を表示する");
+        assert_eq!(flash.verdict, crate::game::feedback::Verdict::Incorrect);
+        assert_eq!(flash.detail, format!("こたえ: {answer}"));
+        game.update(crate::game::feedback::FEEDBACK_HOLD);
+        assert!(game.feedback.current().is_none());
+    }
+
+    #[test]
+    fn every_choice_name_is_drawn_on_its_click_row() {
+        // 選択肢エリアの各行に描かれた図形名と、その行をクリックした時の選択が一致すること
+        let area = Rect::new(0, 0, 50, 24);
+        let game = PuzzleConnectGame::new(Difficulty::Beginner);
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| game.render(frame, area)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let (_, choices_area, _) = split_areas(area);
+        let inner = Block::default().borders(Borders::ALL).inner(choices_area);
+        for (i, &shape_idx) in game.current.choices.iter().enumerate() {
+            // 全角文字の2セル目は空白で埋まるため、空白を除いた文字列で比較する
+            let label = format!("{}{}", i + 1, SHAPE_NAMES[shape_idx]);
+            let row = (inner.y..inner.y + inner.height)
+                .find(|&y| {
+                    let text: String = (0..area.width)
+                        .map(|x| buffer[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                        .replace(' ', "");
+                    text.contains(&label)
+                })
+                .unwrap_or_else(|| panic!("候補{}が描かれていること", i + 1));
+            assert_eq!(row_index(inner, row, CHOICE_COUNT as u16), Some(i));
+        }
     }
 }

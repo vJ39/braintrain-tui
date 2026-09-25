@@ -4,21 +4,25 @@ use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKin
 use rand::Rng;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::audio::{self, SeKind};
+use crate::game::feedback::AnswerFeedback;
+use crate::game::theme;
 use crate::game::{contains, Difficulty, Game, GameResult, ScoreTracker};
 
 pub const GAME_ID: &str = "memory";
 
-/// 描画エリアを「2x2パネル」「フッター」に分割する
+/// 描画エリアを「2x2パネル」「フッター」に分割する。
+/// 上端のHUD(theme::split_hud)を除いた残りを分ける。renderはHUDを同じsplit_hudで切り出す
 fn split_areas(area: Rect) -> (Rect, Rect) {
+    let (_, body) = theme::split_hud(area);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(7), Constraint::Length(3)])
-        .split(area);
+        .split(body);
     (rows[0], rows[1])
 }
 
@@ -112,6 +116,8 @@ pub struct MemoryGame {
     /// 直近で光っている/入力されたパネル。描画用
     active_panel: Option<usize>,
     input_started_at: Instant,
+    /// 正解数・連続正解のHUD表示用(描画専用)
+    feedback: AnswerFeedback,
 }
 
 impl MemoryGame {
@@ -131,6 +137,7 @@ impl MemoryGame {
             },
             active_panel,
             input_started_at: Instant::now(),
+            feedback: AnswerFeedback::new(),
         }
     }
 
@@ -149,6 +156,7 @@ impl MemoryGame {
     fn finish_question(&mut self, is_correct: bool) {
         let latency_ms = self.input_started_at.elapsed().as_millis() as f64;
         self.tracker.record(is_correct, latency_ms);
+        self.feedback.record(is_correct, "");
         audio::play_se(if is_correct {
             SeKind::Correct
         } else {
@@ -216,6 +224,7 @@ impl Game for MemoryGame {
         if self.tracker.is_session_finished() {
             return;
         }
+        self.feedback.tick(dt);
         match &mut self.phase {
             Phase::Showing {
                 shown,
@@ -260,48 +269,88 @@ impl Game for MemoryGame {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect) {
+        let (hud_area, _) = theme::split_hud(area);
         let (grid_area, footer_area) = split_areas(area);
+        theme::render_hud(
+            frame,
+            hud_area,
+            "記憶(位置と色)",
+            self.difficulty,
+            self.tracker.total(),
+            &self.feedback,
+        );
 
+        let is_showing = matches!(self.phase, Phase::Showing { .. });
         for (panel, panel_area) in panel_areas(grid_area) {
             let is_active = self.active_panel == Some(panel);
             let color = panel_color(panel);
-            let style = if is_active {
-                Style::default()
-                    .bg(color)
-                    .fg(Color::Black)
-                    .add_modifier(Modifier::BOLD)
+            // 点灯中=太枠+塗りつぶし。提示中の消灯パネルは暗くして点灯パネルを際立たせる
+            let (border_type, border_color, style) = if is_active {
+                (
+                    BorderType::Thick,
+                    color,
+                    Style::default()
+                        .bg(color)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else if is_showing {
+                (BorderType::Rounded, theme::MUTED, Style::default().fg(theme::MUTED))
             } else {
-                Style::default().fg(color)
+                (BorderType::Rounded, color, Style::default().fg(color))
             };
             let block = Block::default()
                 .borders(Borders::ALL)
-                .title(format!("{panel}"))
+                .border_type(border_type)
+                .border_style(Style::default().fg(border_color))
                 .style(style);
-            frame.render_widget(Paragraph::new("").block(block), panel_area);
+            let inner = block.inner(panel_area);
+            frame.render_widget(block, panel_area);
+            let number = Paragraph::new(Line::from(Span::styled(
+                format!(" {panel} "),
+                Style::default().add_modifier(Modifier::BOLD),
+            )))
+            .alignment(Alignment::Center);
+            frame.render_widget(number, theme::vertical_center(inner, 1));
         }
 
-        let status = match &self.phase {
-            Phase::Showing { .. } => "提示中… 順番を覚えてください".to_string(),
-            Phase::Input { entered } => format!(
-                "入力中: 数字キー1〜4で再現(残り{}手)",
-                self.sequence.len() - entered
+        let (status, status_color) = match &self.phase {
+            Phase::Showing { shown, .. } => (
+                format!(
+                    "提示中… 順番を覚えてください  ({}/{})",
+                    (*shown + 1).min(self.sequence.len()),
+                    self.sequence.len()
+                ),
+                theme::ACCENT_STRONG,
+            ),
+            Phase::Input { entered } => (
+                format!(
+                    "入力中: 数字キー1〜4で再現  残り{}手  {}",
+                    self.sequence.len() - entered,
+                    theme::progress_bar(
+                        *entered as u32,
+                        self.sequence.len() as u32,
+                        self.sequence.len()
+                    )
+                ),
+                theme::HIGHLIGHT,
             ),
             Phase::Interval { is_correct, .. } => {
                 if *is_correct {
-                    "せいかい！   つぎいくよ…".to_string()
+                    ("せいかい！   つぎいくよ…".to_string(), theme::CORRECT)
                 } else {
-                    "ざんねん…   つぎいくよ…".to_string()
+                    ("ざんねん…   つぎいくよ…".to_string(), theme::INCORRECT)
                 }
             }
         };
-        let progress = format!(
-            "{} / {}問",
-            self.tracker.total(),
-            crate::game::QUESTIONS_PER_SESSION
-        );
-        let footer = Paragraph::new(Line::from(format!("{status}   {progress}")))
-            .alignment(Alignment::Center)
-            .block(Block::default().borders(Borders::ALL));
+        let footer = Paragraph::new(Line::from(Span::styled(
+            status,
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center)
+        .block(theme::sub_panel().border_style(Style::default().fg(status_color)));
         frame.render_widget(footer, footer_area);
     }
 
@@ -481,6 +530,29 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn finishing_a_sequence_updates_hud_feedback() {
+        let mut game = MemoryGame::new(Difficulty::Beginner);
+        let len = game.sequence.len();
+        for _ in 0..len {
+            advance_one_step(&mut game);
+        }
+        let sequence = game.sequence.clone();
+        for &panel in &sequence {
+            game.handle_key(KeyEvent::from(KeyCode::Char(
+                std::char::from_digit(panel as u32, 10).unwrap(),
+            )));
+        }
+        let flash = game.feedback.current().expect("正誤確定直後は表示する");
+        assert_eq!(flash.verdict, crate::game::feedback::Verdict::Correct);
+        assert_eq!(game.feedback.correct(), 1);
+        assert_eq!(game.feedback.streak(), 1);
+        // 表示時間が過ぎると正誤表示は消えるが、正解数は残る
+        game.update(crate::game::feedback::FEEDBACK_HOLD);
+        assert!(game.feedback.current().is_none());
+        assert_eq!(game.feedback.correct(), 1);
     }
 
     #[test]
