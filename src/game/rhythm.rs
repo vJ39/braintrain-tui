@@ -25,8 +25,9 @@ pub enum Lane {
 }
 
 impl Lane {
+    /// DDR標準のレーン並び(画面左から ←↓↑→)
     fn all() -> [Lane; 4] {
-        [Lane::Up, Lane::Down, Lane::Left, Lane::Right]
+        [Lane::Left, Lane::Down, Lane::Up, Lane::Right]
     }
 }
 
@@ -164,6 +165,7 @@ impl Game for RhythmGame {
         let interval = note_interval(self.difficulty);
         let lanes = Lane::all();
 
+        // grid[0]が判定ライン直前(最も近い)、添字が大きいほどまだ遠い(画面下方)ノーツ
         let mut grid = [[' '; 4]; VISIBLE_ROWS];
         for note in &self.notes {
             if note.judged {
@@ -174,20 +176,23 @@ impl Game for RhythmGame {
             let interval_ms = interval.as_millis().max(1);
             let steps_ahead = (remaining.as_millis() / interval_ms) as usize;
             if steps_ahead < VISIBLE_ROWS {
-                let row = VISIBLE_ROWS - 1 - steps_ahead;
-                grid[row][lane_idx] = '●';
+                grid[steps_ahead][lane_idx] = '●';
             }
         }
 
-        let mut lines = vec![Line::from(Span::raw("   ↑      ↓      ←      →   "))];
+        // DDR同様、判定ラインを上部に固定し、ノーツは画面下方から出現して
+        // 判定ラインに向かって上昇してくるように見せる
+        let mut lines = vec![
+            Line::from(Span::raw("   ←      ↓      ↑      →   ")),
+            Line::from(Span::styled(
+                "=============================",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+        ];
         for row in grid.iter() {
             let text: String = row.iter().map(|c| format!("   {c}   ")).collect();
             lines.push(Line::from(Span::raw(text)));
         }
-        lines.push(Line::from(Span::styled(
-            "=============================",
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
 
         let progress = format!(
             "{} / {}問",
