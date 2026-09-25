@@ -23,6 +23,7 @@ use crate::game::shape_rotate::ShapeRotateGame;
 use crate::game::theme;
 use crate::game::{Difficulty, Game, GameResult};
 use crate::stats::store;
+use crate::ui::background::BackgroundRenderer;
 use crate::ui::countdown::{self, CountdownState};
 use crate::ui::menu_icons::MenuIcons;
 use crate::ui::splash::{self, SplashRenderer};
@@ -145,6 +146,8 @@ pub struct App {
     result_typewriter: Typewriter,
     /// メニュー画面の各カードのアイコン画像。起動時に1回だけ読み込み、以後は使い回す
     menu_icons: MenuIcons,
+    /// TTR(曲選択)・プレイ中以外の画面に共通で敷く背景画像。起動時に1回だけ読み込み、以後は使い回す
+    background: BackgroundRenderer,
 }
 
 impl App {
@@ -169,6 +172,7 @@ impl App {
             menu_typewriter: Typewriter::completed(MENU_CHAR_INTERVAL),
             result_typewriter: Typewriter::completed(typewriter::CHAR_INTERVAL),
             menu_icons: MenuIcons::new(&MENU_ICON_PATHS),
+            background: BackgroundRenderer::new(),
         }
     }
 
@@ -178,7 +182,7 @@ impl App {
     fn enter_menu(&mut self) {
         self.screen = Screen::Menu;
         self.pending_scrollback_clear = true;
-        let total = typewriter::char_count(&menu_item_lines(self.last_area));
+        let total = typewriter::char_count(&menu_item_lines(screen_rect(self.last_area)));
         self.menu_typewriter = Typewriter::with_interval(total, MENU_CHAR_INTERVAL);
     }
 
@@ -281,13 +285,15 @@ impl App {
         }
         self.skip_typewriter();
         let area = self.last_area;
+        // 背景を敷く画面は、描画(render)と同じく余白を除いた中央の範囲を基準に判定する
+        let screen = screen_rect(area);
         match &mut self.screen {
             Screen::Splash => {
                 self.leave_splash();
             }
             Screen::Menu => {
                 let offset = self.menu_state.row_offset;
-                if let Some(index) = menu_card_at(area, offset, mouse.column, mouse.row) {
+                if let Some(index) = menu_card_at(screen, offset, mouse.column, mouse.row) {
                     self.menu_state.select(index);
                     self.select_menu_item(index);
                 }
@@ -299,7 +305,7 @@ impl App {
             }
             Screen::SelectDifficulty(item, _) => {
                 let item = *item;
-                if let Some(difficulty) = difficulty_at_row(area, mouse.row) {
+                if let Some(difficulty) = difficulty_at_row(screen, mouse.row) {
                     self.start_playing(item, difficulty);
                 }
             }
@@ -441,7 +447,7 @@ impl App {
             KeyCode::Enter => return self.select_menu_item(selected),
             _ => return,
         };
-        let columns = menu_grid(self.last_area).columns;
+        let columns = menu_grid(screen_rect(self.last_area)).columns;
         self.menu_state
             .select(grid_move(selected, direction, columns, MENU_ITEMS.len()));
     }
@@ -556,21 +562,28 @@ impl App {
         let area = frame.area();
         self.last_area = area;
         let current_bgm = self.current_bgm.clone();
+        // TTR(曲選択)・プレイ中以外の画面は、共通の背景を画面全体に敷き、
+        // その上の四辺に余白を残した中央の範囲(screen)に各画面を描く
+        let background = &mut self.background;
         match &mut self.screen {
             Screen::Splash => {
+                let screen = render_background(frame, background, area);
                 // メニューと同じ色・角丸の枠を画面いっぱいに描き、内側の中央にロゴを配置する
                 let block = theme::panel("");
-                let inner = block.inner(area);
-                frame.render_widget(block, area);
+                let inner = block.inner(screen);
+                frame.render_widget(block, screen);
                 self.splash_renderer.render(frame, inner);
             }
-            Screen::Menu => render_menu(
-                frame,
-                area,
-                &mut self.menu_state,
-                &mut self.menu_typewriter,
-                &mut self.menu_icons,
-            ),
+            Screen::Menu => {
+                let screen = render_background(frame, background, area);
+                render_menu(
+                    frame,
+                    screen,
+                    &mut self.menu_state,
+                    &mut self.menu_typewriter,
+                    &mut self.menu_icons,
+                );
+            }
             Screen::SelectSong(selected) => {
                 // TTRスプラッシュ画像を全画面に描いてから、その上に曲リストのパネルを重ねる
                 self.ttr_splash_renderer.render(frame, area);
@@ -581,31 +594,78 @@ impl App {
                     Some(song) => format!("{} / {}", MENU_ITEMS[*item], song.display_name),
                     None => MENU_ITEMS[*item].to_string(),
                 };
-                render_difficulty_select(frame, area, &title)
+                let screen = render_background(frame, background, area);
+                render_difficulty_select(frame, screen, &title)
             }
-            Screen::Countdown { state, .. } => countdown::render(frame, area, state),
+            Screen::Countdown { state, .. } => {
+                let screen = render_background(frame, background, area);
+                countdown::render(frame, screen, state)
+            }
             Screen::Playing(game) => game.render(frame, area),
-            Screen::Result(result, save_error) => render_result(
-                frame,
-                area,
-                result,
-                save_error.as_deref(),
-                &mut self.result_typewriter,
-            ),
-            Screen::History => render_history(frame, area),
-            Screen::Jukebox(state) => render_jukebox(frame, area, state, current_bgm.as_deref()),
+            Screen::Result(result, save_error) => {
+                let screen = render_background(frame, background, area);
+                render_result(
+                    frame,
+                    screen,
+                    result,
+                    save_error.as_deref(),
+                    &mut self.result_typewriter,
+                )
+            }
+            Screen::History => {
+                let screen = render_background(frame, background, area);
+                render_history(frame, screen)
+            }
+            Screen::Jukebox(state) => {
+                let screen = render_background(frame, background, area);
+                render_jukebox(frame, screen, state, current_bgm.as_deref())
+            }
             Screen::ConfirmQuit => {
+                let screen = render_background(frame, background, area);
                 render_menu(
                     frame,
-                    area,
+                    screen,
                     &mut self.menu_state,
                     &mut self.menu_typewriter,
                     &mut self.menu_icons,
                 );
-                render_confirm_quit(frame, area);
+                render_confirm_quit(frame, screen);
             }
         }
     }
+}
+
+/// 画面の四辺に残す余白(左右・上下のセル数)。この余白に背景画像が見える。
+/// 端末の1セルは縦長(おおむね横:縦=1:2)なので、左右は上下の倍にして見た目の太さをそろえる
+const SCREEN_MARGIN_X: u16 = 4;
+const SCREEN_MARGIN_Y: u16 = 2;
+
+/// 画面全体(area)から四辺に余白を持たせた中央のRect。この余白に背景画像を見せる。
+/// 余白を引くと幅・高さが0以下になるほど小さい画面では、余白なし(area全体)にする
+fn screen_rect(area: Rect) -> Rect {
+    if area.width <= 2 * SCREEN_MARGIN_X || area.height <= 2 * SCREEN_MARGIN_Y {
+        return area;
+    }
+    Rect::new(
+        area.x + SCREEN_MARGIN_X,
+        area.y + SCREEN_MARGIN_Y,
+        area.width - 2 * SCREEN_MARGIN_X,
+        area.height - 2 * SCREEN_MARGIN_Y,
+    )
+}
+
+/// 共通の背景画像を画面全体(area)に敷き、各画面を描く中央の範囲(screen_rect)を返す。
+/// 画像プロトコルは画像の範囲の左上以外のセルを「端末へ出力しない」(skip)にするため、
+/// 各画面を描く範囲はClearでskipを外してから返す(外さないとその上に描いた枠・文字が
+/// 端末に出ない)。余白のセルはskipのまま残り、端末上では背景画像だけが見える。
+/// 余白が取れない小さい画面では背景を描かない
+fn render_background(frame: &mut Frame, background: &mut BackgroundRenderer, area: Rect) -> Rect {
+    let screen = screen_rect(area);
+    if screen != area {
+        background.render(frame, area);
+        frame.render_widget(ratatui::widgets::Clear, screen);
+    }
+    screen
 }
 
 /// 終了確認ダイアログ。背景のメニューが見えるよう、中央に小さなパネルを重ねて描く
@@ -1604,7 +1664,7 @@ mod tests {
         let mut app = App::new();
         app.screen = Screen::Menu;
         app.last_area = rect(0, 0, 200, 60);
-        let columns = menu_grid(app.last_area).columns;
+        let columns = menu_grid(screen_rect(app.last_area)).columns;
         assert!(columns >= 3);
         press(&mut app, KeyCode::Right);
         assert_eq!(app.menu_state.selected(), 1);
@@ -2177,7 +2237,7 @@ mod tests {
 
     #[test]
     fn splash_screen_is_framed_by_a_full_screen_border() {
-        // メニューと同じ色(theme::ACCENT)の角丸枠(Rounded)が画面いっぱいに出る
+        // メニューと同じ色(theme::ACCENT)の角丸枠(Rounded)が、背景の余白を残した画面いっぱいに出る
         let mut app = App::new();
         let text = rendered_text(&mut app);
         assert!(
@@ -2190,8 +2250,10 @@ mod tests {
             terminal.draw(|frame| app.render(frame)).unwrap();
             terminal.backend().buffer().clone()
         };
+        let screen = screen_rect(rect(0, 0, 80, 30));
+        assert_eq!(buffer[(screen.x, screen.y)].symbol(), "╭", "枠の左上はscreen_rectの左上");
         assert_eq!(
-            buffer[(0, 0)].fg,
+            buffer[(screen.x, screen.y)].fg,
             theme::ACCENT,
             "枠の色はメニューと同じACCENT"
         );
@@ -2323,7 +2385,7 @@ mod tests {
                     continue;
                 };
                 drawn += 1;
-                let area = rect(0, 0, width, height);
+                let area = screen_rect(rect(0, 0, width, height));
                 assert_eq!(
                     menu_card_at(area, app.menu_state.row_offset, x, y),
                     Some(i),
@@ -2352,7 +2414,7 @@ mod tests {
             .iter()
             .map(|name| drawn_position_of(&mut app, name, 200, 60).unwrap())
             .collect();
-        let columns = menu_grid(rect(0, 0, 200, 60)).columns;
+        let columns = menu_grid(screen_rect(rect(0, 0, 200, 60))).columns;
         assert_eq!(positions[0].1, positions[1].1, "1枚目と2枚目は同じ行");
         assert!(positions[0].0 < positions[1].0, "2枚目は1枚目の右");
         assert!(positions[columns].1 > positions[0].1, "列数ぶん進むと次の行");
@@ -2363,7 +2425,7 @@ mod tests {
         let (width, height) = (80u16, 24u16);
         let mut app = app_on_menu();
         rendered_cells(&mut app, width, height);
-        let grid = menu_grid(rect(0, 0, width, height));
+        let grid = menu_grid(screen_rect(rect(0, 0, width, height)));
         assert!(grid.visible_rows < grid.rows, "この大きさでは全行は収まらない");
         // 同じ列を最下行まで下がる
         let last = (grid.rows - 1) * grid.columns;
@@ -2390,7 +2452,7 @@ mod tests {
         let (width, height) = (80u16, 24u16);
         let mut app = app_on_menu();
         rendered_cells(&mut app, width, height);
-        let columns = menu_grid(rect(0, 0, width, height)).columns;
+        let columns = menu_grid(screen_rect(rect(0, 0, width, height))).columns;
         // 履歴のカードが見えるまで下へ移動する
         while app.menu_state.selected() / columns != HISTORY_ITEM_INDEX / columns {
             press(&mut app, KeyCode::Down);
@@ -2488,7 +2550,7 @@ mod tests {
 
     /// カードのアイコン部分(枠の内側でゲーム名より上)のセル
     fn icon_cells(app: &mut App, index: usize) -> Vec<String> {
-        let grid = menu_grid(rect(0, 0, 200, 60));
+        let grid = menu_grid(screen_rect(rect(0, 0, 200, 60)));
         let card = grid.card_rect(index, app.menu_state.row_offset).unwrap();
         let rows = rendered_cells(app, 200, 60);
         (card.y + 1..card.y + 1 + MENU_ICON_ROWS)
@@ -2529,7 +2591,7 @@ mod tests {
         let mut app = App::new();
         app.screen = Screen::SelectDifficulty(0, None);
         let rows = rendered_rows_without_spaces(&mut app, 80, 24);
-        let area = rect(0, 0, 80, 24);
+        let area = screen_rect(rect(0, 0, 80, 24));
         for (label, expected) in [
             ("初級", Difficulty::Beginner),
             ("中級", Difficulty::Intermediate),
@@ -2628,7 +2690,7 @@ mod tests {
         app.last_area = rect(0, 0, 80, 24);
         let inner_top = Block::default()
             .borders(Borders::ALL)
-            .inner(app.last_area)
+            .inner(screen_rect(app.last_area))
             .y;
         app.handle_mouse(left_click(inner_top + DIFFICULTY_ROWS_OFFSET + 2));
         assert!(matches!(
@@ -3182,7 +3244,7 @@ mod tests {
     /// 200x60で描画した時の、index番目のカードの中身(枠を除き空白を詰めた文字列)
     fn card_text(app: &mut App, index: usize) -> String {
         let rows = rendered_cells(app, 200, 60);
-        let card = menu_grid(rect(0, 0, 200, 60))
+        let card = menu_grid(screen_rect(rect(0, 0, 200, 60)))
             .card_rect(index, app.menu_state.row_offset)
             .expect("カードが見えていること");
         (card.y + 1..card.bottom() - 1)
@@ -3215,11 +3277,12 @@ mod tests {
             let mut app = App::new();
             app.last_area = rect(0, 0, width, height);
             press(&mut app, KeyCode::Enter);
-            let expected = typewriter::char_count(&menu_item_lines(rect(0, 0, width, height)));
+            let expected =
+                typewriter::char_count(&menu_item_lines(screen_rect(rect(0, 0, width, height))));
             assert_eq!(app.menu_typewriter.total_chars(), expected, "{width}x{height}");
             // 描画した画面サイズの内容に合わせて全文字数が更新される
             rendered_rows_without_spaces(&mut app, 80, 30);
-            let resized = typewriter::char_count(&menu_item_lines(rect(0, 0, 80, 30)));
+            let resized = typewriter::char_count(&menu_item_lines(screen_rect(rect(0, 0, 80, 30))));
             assert_eq!(app.menu_typewriter.total_chars(), resized, "{width}x{height}→80x30");
         }
     }
@@ -3251,7 +3314,7 @@ mod tests {
             app.last_area = rect(0, 0, width, height);
             press(&mut app, KeyCode::Enter);
             app.update(MENU_CHAR_INTERVAL * 120);
-            let area = rect(0, 0, width, height);
+            let area = screen_rect(rect(0, 0, width, height));
             let visible: Vec<(usize, (u16, u16))> = (0..MENU_ITEMS.len())
                 .filter_map(|i| drawn_position_of(&mut app, MENU_ITEMS[i], width, height).map(|p| (i, p)))
                 .collect();
@@ -3270,7 +3333,7 @@ mod tests {
         assert!(app.menu_typewriter.is_finished(), "キー入力で全文字表示済みになる");
         assert_eq!(
             app.menu_state.selected(),
-            menu_grid(app.last_area).columns,
+            menu_grid(screen_rect(app.last_area)).columns,
             "上下キーの選択移動もそのまま効く(1つ下の行へ)"
         );
         let text = rendered_compact(&mut app);
@@ -3312,7 +3375,9 @@ mod tests {
             .last_area
             .positions()
             .map(|p| (p.x, p.y))
-            .find(|&(x, y)| menu_card_at(app.last_area, 0, x, y) == Some(HISTORY_ITEM_INDEX))
+            .find(|&(x, y)| {
+                menu_card_at(screen_rect(app.last_area), 0, x, y) == Some(HISTORY_ITEM_INDEX)
+            })
             .unwrap();
         app.handle_mouse(left_click_at(x, y));
         assert!(matches!(app.screen, Screen::History));
@@ -3403,11 +3468,322 @@ mod tests {
     #[test]
     fn menu_char_interval_types_the_whole_menu_in_a_few_seconds() {
         // 項目数が多いメニューは標準の間隔だと流し切るのに時間がかかりすぎるため、専用の間隔を使う
-        let total = typewriter::char_count(&menu_item_lines(rect(0, 0, 80, 30)));
+        let total = typewriter::char_count(&menu_item_lines(screen_rect(rect(0, 0, 80, 30))));
         let duration = MENU_CHAR_INTERVAL * total as u32;
         assert!(
             duration <= Duration::from_secs(6),
             "メニュー全体が{duration:?}で流れ切る(全{total}文字)"
         );
+    }
+
+    // --- 全画面共通の背景画像(画面全体に余白を持たせて中央配置) ---
+
+    use crate::ui::background::BackgroundRenderer;
+    use ratatui_image::picker::{Picker, ProtocolType};
+
+    /// 端末に問い合わせないpicker(1セル10x20px)
+    fn test_picker(protocol: ProtocolType) -> Picker {
+        let mut picker = Picker::from_fontsize((10, 20));
+        picker.set_protocol_type(protocol);
+        picker
+    }
+
+    /// 背景画像を描けるBackgroundRenderer(ハーフブロック描画)。デバッグビルドでは背景画像の
+    /// デコードに時間がかかるため、テスト内では1つを作ってswap_backgroundで使い回す
+    fn halfblocks_background() -> BackgroundRenderer {
+        BackgroundRenderer::with_picker(Some(test_picker(ProtocolType::Halfblocks)))
+    }
+
+    /// appの背景をbackgroundに差し替え、それまでの背景を返す
+    fn swap_background(app: &mut App, background: BackgroundRenderer) -> BackgroundRenderer {
+        std::mem::replace(&mut app.background, background)
+    }
+
+    #[test]
+    fn screen_rect_is_smaller_and_centered_with_margins_on_every_side() {
+        for (width, height) in [(80u16, 24u16), (80, 30), (120, 40), (200, 60), (40, 12)] {
+            let area = rect(0, 0, width, height);
+            let screen = screen_rect(area);
+            assert!(screen.width < area.width && screen.height < area.height, "{width}x{height}: 一回り小さい");
+            assert_eq!(screen.intersection(area), screen, "{width}x{height}: areaの内側");
+            let (left, right) = (screen.x - area.x, area.right() - screen.right());
+            let (top, bottom) = (screen.y - area.y, area.bottom() - screen.bottom());
+            assert!(left > 0 && top > 0, "{width}x{height}: 四辺に余白がある");
+            assert_eq!(left, right, "{width}x{height}: 左右の余白が同じ");
+            assert_eq!(top, bottom, "{width}x{height}: 上下の余白が同じ");
+        }
+    }
+
+    #[test]
+    fn screen_rect_follows_the_position_of_the_area() {
+        let base = screen_rect(rect(0, 0, 80, 24));
+        let moved = screen_rect(rect(3, 5, 80, 24));
+        assert_eq!((moved.x, moved.y), (base.x + 3, base.y + 5));
+        assert_eq!((moved.width, moved.height), (base.width, base.height));
+    }
+
+    #[test]
+    fn screen_rect_of_a_too_small_screen_is_the_whole_area() {
+        for (width, height) in [(0u16, 0u16), (1, 1), (4, 30), (80, 2), (8, 4), (0, 30), (80, 0)] {
+            let area = rect(0, 0, width, height);
+            assert_eq!(screen_rect(area), area, "{width}x{height}: 余白なし");
+        }
+    }
+
+    #[test]
+    fn screen_rect_never_becomes_empty_for_a_non_empty_area() {
+        for width in 0..60u16 {
+            for height in 0..30u16 {
+                let area = rect(0, 0, width, height);
+                let screen = screen_rect(area);
+                assert_eq!(screen.intersection(area), screen, "{width}x{height}");
+                if !area.is_empty() {
+                    assert!(screen.width > 0 && screen.height > 0, "{width}x{height}: 幅・高さが0にならない");
+                }
+            }
+        }
+    }
+
+    /// 背景を敷く各画面(画面の説明, App)。TTR(SelectSong)とプレイ中は含まない
+    fn apps_on_every_background_screen() -> Vec<(&'static str, App)> {
+        let mut apps = vec![("Splash", App::new()), ("Menu", app_on_menu())];
+        apps.push(("ConfirmQuit", app_on_confirm_quit()));
+
+        let mut app = App::new();
+        app.screen = Screen::SelectDifficulty(0, None);
+        apps.push(("SelectDifficulty", app));
+
+        let mut app = App::new();
+        app.screen = Screen::SelectDifficulty(0, None);
+        press(&mut app, KeyCode::Char('1'));
+        assert!(matches!(app.screen, Screen::Countdown { .. }));
+        apps.push(("Countdown", app));
+
+        let mut app = App::new();
+        app.screen = Screen::Result(sample_result(), Some("保存エラー".to_string()));
+        apps.push(("Result", app));
+
+        let mut app = App::new();
+        app.screen = Screen::History;
+        apps.push(("History", app));
+
+        let mut app = App::new();
+        app.screen = Screen::Jukebox(app.jukebox_list_state());
+        apps.push(("Jukebox", app));
+        apps
+    }
+
+    #[test]
+    fn every_background_screen_is_drawn_inside_screen_rect() {
+        // 外枠・文字は全てscreen_rectの内側に描かれ、四辺の余白には一切描かない
+        for (width, height) in [(80u16, 24u16), (80, 30), (200, 60)] {
+            let area = rect(0, 0, width, height);
+            let screen = screen_rect(area);
+            for (name, mut app) in apps_on_every_background_screen() {
+                let rows = rendered_cells(&mut app, width, height);
+                for position in area.positions() {
+                    if !screen.contains(position) {
+                        assert_eq!(
+                            rows[position.y as usize][position.x as usize],
+                            " ",
+                            "{name} {width}x{height}: 余白({},{})には描かない",
+                            position.x,
+                            position.y
+                        );
+                    }
+                }
+                let drawn = screen
+                    .positions()
+                    .any(|p| rows[p.y as usize][p.x as usize] != " ");
+                assert!(drawn, "{name} {width}x{height}: screen_rectの内側に描く");
+            }
+        }
+    }
+
+    #[test]
+    fn framed_background_screens_put_their_outer_frame_on_screen_rect() {
+        // 外枠のある画面は、枠の左上の角がareaの端ではなくscreen_rectの左上に来る
+        let area = rect(0, 0, 80, 30);
+        let screen = screen_rect(area);
+        for (name, mut app) in apps_on_every_background_screen() {
+            if name == "Countdown" {
+                continue; // カウントダウンは枠を持たない
+            }
+            let rows = rendered_cells(&mut app, 80, 30);
+            let corner = &rows[screen.y as usize][screen.x as usize];
+            assert!(
+                ["╭", "╔", "┌"].contains(&corner.as_str()),
+                "{name}: screen_rectの左上が外枠の角(実際: {corner:?})"
+            );
+            assert_eq!(rows[0][0], " ", "{name}: areaの左上には描かない");
+        }
+    }
+
+    #[test]
+    fn background_fills_the_margins_and_the_ui_stays_visible() {
+        // 背景画像を描ける場合、余白には背景が見え、screen_rectの内側にはUIが描かれる
+        let screen = screen_rect(rect(0, 0, 80, 30));
+        let mut background = halfblocks_background();
+        for (name, mut app) in apps_on_every_background_screen() {
+            let (without, with) = buffers_with_and_without_background(&mut app, &mut background);
+            let default = ratatui::buffer::Cell::default();
+            for (x, y) in [(0, 0), (79, 0), (0, 29), (79, 29)] {
+                assert_ne!(with[(x, y)], default, "{name}: 余白({x},{y})に背景が描かれる");
+            }
+            // 履歴画面の中身は履歴ファイルの内容で決まり、並行して動く他のテストが
+            // 結果を保存すると2回の描画の間に変わりうるので、内側の比較はしない
+            if name == "History" {
+                continue;
+            }
+            for p in screen.positions() {
+                assert_eq!(
+                    with[p], without[p],
+                    "{name}: screen_rectの内側({},{})は背景の有無で変わらない",
+                    p.x, p.y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn image_protocol_background_does_not_hide_the_ui() {
+        // 画像プロトコルは画像の範囲のセルをskip(端末へ出力しない)にする。
+        // screen_rectの内側はskipを外してから描くので、UIの文字が端末へ出力される。
+        // 余白のセルはskipのまま(=端末上では背景画像だけが見える)
+        let mut app = app_on_menu();
+        app.background = BackgroundRenderer::with_picker(Some(test_picker(ProtocolType::Iterm2)));
+        let (width, height) = (80u16, 30u16);
+        let area = rect(0, 0, width, height);
+        let screen = screen_rect(area);
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let buffer = terminal.draw(|frame| app.render(frame)).unwrap().buffer.clone();
+
+        assert!(buffer[(0, 0)].symbol().starts_with('\x1b'), "左上のセルに背景画像のデータ");
+        for position in area.positions() {
+            let cell = &buffer[position];
+            if screen.contains(position) {
+                assert!(!cell.skip, "screen_rectの内側({},{})は出力される", position.x, position.y);
+            } else if position != ratatui::layout::Position::new(0, 0) {
+                assert!(cell.skip, "余白({},{})は背景画像のみ", position.x, position.y);
+            }
+        }
+        // 実際に端末(TestBackend)へ出力された内容にメニューの文字が含まれる
+        let emitted: String = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<String>()
+            .replace(' ', "");
+        assert!(emitted.contains("BRAINTRAIN"), "外枠の見出しが出力される");
+        assert!(emitted.contains(MENU_ITEMS[0]), "メニュー項目が出力される");
+    }
+
+    /// 背景画像の有無を切り替えて同じ画面(80x30)を描き、(背景なし, 背景あり)のバッファを返す。
+    /// backgroundは背景ありの描画に使い、描画後にappから取り戻す
+    fn buffers_with_and_without_background(
+        app: &mut App,
+        background: &mut BackgroundRenderer,
+    ) -> (ratatui::buffer::Buffer, ratatui::buffer::Buffer) {
+        let draw = |app: &mut App| {
+            let backend = ratatui::backend::TestBackend::new(80, 30);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap().buffer.clone()
+        };
+        swap_background(app, BackgroundRenderer::with_picker(None));
+        let without = draw(app);
+        let taken = std::mem::replace(background, BackgroundRenderer::with_picker(None));
+        swap_background(app, taken);
+        let with = draw(app);
+        *background = swap_background(app, BackgroundRenderer::with_picker(None));
+        (without, with)
+    }
+
+    #[test]
+    fn song_select_and_playing_do_not_draw_the_background() {
+        // TTR(曲選択)は既存のTTRスプラッシュ画像を背景にし、プレイ中は対象外
+        let mut background = halfblocks_background();
+        let mut app = App::new();
+        app.screen = Screen::SelectSong(0);
+        let (without, with) = buffers_with_and_without_background(&mut app, &mut background);
+        assert_eq!(without, with, "SelectSong: 背景画像の有無で描画が変わらない");
+
+        let mut app = App::new();
+        app.screen = Screen::SelectDifficulty(0, None);
+        press(&mut app, KeyCode::Char('1'));
+        finish_countdown(&mut app);
+        let (without, with) = buffers_with_and_without_background(&mut app, &mut background);
+        assert_eq!(without, with, "Playing: 背景画像の有無で描画が変わらない");
+    }
+
+    #[test]
+    fn background_screens_render_without_panicking_at_any_size() {
+        let mut background = halfblocks_background();
+        for (width, height) in [(1u16, 1u16), (2, 2), (5, 3), (9, 5), (10, 6), (20, 8), (80, 24)] {
+            for (_, mut app) in apps_on_every_background_screen() {
+                swap_background(&mut app, background);
+                rendered_cells(&mut app, width, height);
+                background = swap_background(&mut app, BackgroundRenderer::with_picker(None));
+            }
+        }
+    }
+
+    #[test]
+    fn clicking_the_menu_margin_selects_nothing() {
+        let (width, height) = (200u16, 60u16);
+        let mut app = app_on_menu();
+        rendered_cells(&mut app, width, height);
+        let screen = screen_rect(rect(0, 0, width, height));
+        for (x, y) in [(0, 0), (screen.x - 1, 10), (10, screen.y - 1), (width - 1, height - 1)] {
+            app.handle_mouse(left_click_at(x, y));
+            assert!(matches!(app.screen, Screen::Menu), "余白({x},{y})のクリックでは選ばない");
+        }
+    }
+
+    #[test]
+    fn menu_clicks_hit_the_cards_drawn_inside_screen_rect() {
+        // 余白の分だけ内側にずれたカードの位置をクリックすると、その項目になる
+        let (width, height) = (200u16, 60u16);
+        let grid = menu_grid(screen_rect(rect(0, 0, width, height)));
+        let card = grid.card_rect(HISTORY_ITEM_INDEX, 0).unwrap();
+        let mut app = app_on_menu();
+        rendered_cells(&mut app, width, height);
+        app.handle_mouse(left_click_at(card.x + 1, card.y + 1));
+        assert!(matches!(app.screen, Screen::History));
+    }
+
+    #[test]
+    fn difficulty_margin_row_selects_nothing() {
+        let mut app = App::new();
+        app.screen = Screen::SelectDifficulty(0, None);
+        app.last_area = rect(0, 0, 80, 24);
+        // 余白の分だけずれる前の(area基準の)初級の行は、screen_rect基準では見出しの行になる
+        let area_based_beginner = Block::default().borders(Borders::ALL).inner(app.last_area).y
+            + DIFFICULTY_ROWS_OFFSET;
+        app.handle_mouse(left_click(0));
+        app.handle_mouse(left_click(area_based_beginner));
+        assert!(matches!(app.screen, Screen::SelectDifficulty(0, None)));
+    }
+
+    #[test]
+    fn menu_keys_and_typing_use_the_grid_inside_screen_rect() {
+        // キー操作の列数・タイプライターの全文字数も、描画と同じscreen_rect基準にそろえる
+        let area = rect(0, 0, 200, 60);
+        assert_ne!(
+            menu_grid(area).columns,
+            menu_grid(screen_rect(area)).columns,
+            "この大きさでは余白の有無で列数が変わる(テストの前提)"
+        );
+        let mut app = App::new();
+        app.last_area = area;
+        press(&mut app, KeyCode::Enter); // Splash -> Menu
+        assert_eq!(
+            app.menu_typewriter.total_chars(),
+            typewriter::char_count(&menu_item_lines(screen_rect(area)))
+        );
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.menu_state.selected(), menu_grid(screen_rect(area)).columns);
     }
 }
