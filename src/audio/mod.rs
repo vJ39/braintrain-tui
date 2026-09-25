@@ -279,11 +279,12 @@ mod tests {
     }
 
     #[test]
-    fn bgm_tracks_in_playing_has_two_tracks() {
+    fn bgm_tracks_in_playing_has_three_tracks() {
         let names = bgm_tracks_in(BgmCategory::Playing);
         assert!(names.iter().any(|n| n == "Method_of_Thought"));
         assert!(names.iter().any(|n| n == "The_Quiet_Calculation"));
-        assert_eq!(names.len(), 2);
+        assert!(names.iter().any(|n| n == "Zenith_Pursuit"));
+        assert_eq!(names.len(), 3);
     }
 
     #[test]
@@ -314,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn random_bgm_track_eventually_picks_both_playing_tracks() {
+    fn random_bgm_track_eventually_picks_every_playing_track() {
         // 複数曲から選ばれることを、十分な試行回数で統計的に確認する
         let mut seen = std::collections::HashSet::new();
         for _ in 0..100 {
@@ -322,6 +323,6 @@ mod tests {
                 seen.insert(name);
             }
         }
-        assert_eq!(seen.len(), 2, "100回試行して両曲が出現するはず: {seen:?}");
+        assert_eq!(seen.len(), 3, "100回試行して全曲が出現するはず: {seen:?}");
     }
 }
