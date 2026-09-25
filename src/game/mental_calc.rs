@@ -9,6 +9,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+use crate::audio::{self, SeKind};
 use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
 
 pub const GAME_ID: &str = "mental_calc";
@@ -99,6 +100,11 @@ impl MentalCalcGame {
         let is_correct = self.selected_index == self.current.correct_index;
         let latency_ms = self.question_started_at.elapsed().as_millis() as f64;
         self.tracker.record(is_correct, latency_ms);
+        audio::play_se(if is_correct {
+            SeKind::Correct
+        } else {
+            SeKind::Incorrect
+        });
         if !self.tracker.is_session_finished() {
             let mut rng = rand::thread_rng();
             self.current = generate_question(&mut rng, self.difficulty);

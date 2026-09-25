@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
+use crate::audio::{self, SeKind};
 use crate::game::mental_calc::MentalCalcGame;
 use crate::game::mirror_match::MirrorMatchGame;
 use crate::game::reaction::ReactionGame;
@@ -71,6 +72,7 @@ impl App {
             }
             Screen::Result(_) | Screen::History => {
                 if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                    audio::play_se(SeKind::Transition);
                     self.screen = Screen::Menu;
                 }
             }
@@ -88,6 +90,7 @@ impl App {
                 self.menu_state.select(Some((selected + 1) % len));
             }
             KeyCode::Enter => {
+                audio::play_se(SeKind::Transition);
                 if selected == 4 {
                     self.screen = Screen::History;
                 } else {
@@ -110,6 +113,7 @@ impl App {
             _ => None,
         };
         if let Some(difficulty) = difficulty {
+            audio::play_se(SeKind::Transition);
             self.screen = Screen::Playing(new_game(item, difficulty));
         }
     }

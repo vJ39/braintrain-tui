@@ -9,6 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+use crate::audio::{self, SeKind};
 use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
 
 pub const GAME_ID: &str = "reaction";
@@ -97,6 +98,11 @@ impl ReactionGame {
     fn advance_question(&mut self, is_correct: bool) {
         let latency_ms = self.question_started_at.elapsed().as_millis() as f64;
         self.tracker.record(is_correct, latency_ms);
+        audio::play_se(if is_correct {
+            SeKind::Correct
+        } else {
+            SeKind::Incorrect
+        });
         if !self.tracker.is_session_finished() {
             self.next_question();
         }

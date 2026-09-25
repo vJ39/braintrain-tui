@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::io::Cursor;
 
 use rodio::{OutputStream, OutputStreamHandle, Sink};
@@ -81,6 +82,20 @@ impl AudioPlayer for RodioPlayer {
     fn play_se(&self, se: SeKind) {
         self.play_asset(se.asset_path());
     }
+}
+
+thread_local! {
+    // rodio::OutputStreamはSend/Syncでないため、シングルスレッドのTUIループ内で
+    // thread_localとして保持する
+    static PLAYER: RefCell<RodioPlayer> = RefCell::new(RodioPlayer::new());
+}
+
+pub fn play_bgm(track: BgmTrack) {
+    PLAYER.with(|p| p.borrow().play_bgm(track));
+}
+
+pub fn play_se(se: SeKind) {
+    PLAYER.with(|p| p.borrow().play_se(se));
 }
 
 #[cfg(test)]
