@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent};
 use rand::Rng;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
@@ -54,6 +54,15 @@ fn judgement_label(judgement: Judgement) -> &'static str {
         Judgement::Great => "GREAT",
         Judgement::Good => "GOOD",
         Judgement::Miss => "MISS",
+    }
+}
+
+fn judgement_color(judgement: Judgement) -> Color {
+    match judgement {
+        Judgement::Perfect => Color::Cyan,
+        Judgement::Great => Color::Green,
+        Judgement::Good => Color::Yellow,
+        Judgement::Miss => Color::Red,
     }
 }
 
@@ -420,7 +429,7 @@ impl Game for RhythmGame {
         ));
 
         // TUIの縦セル数を可能な限り使い、位置計算自体は連続量(progress)で行う(仕様15)
-        let reserved_rows: u16 = 5;
+        let reserved_rows: u16 = 6;
         let track_height = area.height.saturating_sub(reserved_rows).max(4) as usize;
 
         let mut grid = vec![[' '; 4]; track_height];
@@ -442,21 +451,29 @@ impl Game for RhythmGame {
             }
         }
 
-        let mut lines = vec![header, judge_line];
+        let judgement_line = if now.saturating_sub(self.last_judgement_at) <= JUDGEMENT_DISPLAY_HOLD {
+            match self.last_judgement {
+                Some(j) => Line::from(Span::styled(
+                    judgement_label(j),
+                    Style::default()
+                        .fg(judgement_color(j))
+                        .add_modifier(Modifier::BOLD),
+                )),
+                None => Line::from(""),
+            }
+        } else {
+            Line::from("")
+        };
+
+        let mut lines = vec![header, judge_line, judgement_line];
         for row in grid.iter() {
             let text: String = row.iter().map(|c| format!("   {c}   ")).collect();
             lines.push(Line::from(Span::raw(text)));
         }
 
         let judged_count = self.notes.iter().filter(|n| n.is_judged()).count();
-        let judgement_text = if now.saturating_sub(self.last_judgement_at) <= JUDGEMENT_DISPLAY_HOLD {
-            self.last_judgement.map(judgement_label).unwrap_or("")
-        } else {
-            ""
-        };
-
         lines.push(Line::from(Span::raw(format!(
-            "COMBO {}  (MAX {})   {judgement_text}",
+            "COMBO {}  (MAX {})",
             self.combo, self.max_combo
         ))));
         lines.push(Line::from(Span::raw(format!(
@@ -491,6 +508,32 @@ mod tests {
 
     fn note(lanes: &[Lane], hit_at_ms: u64) -> Note {
         Note::new(lanes.to_vec(), Duration::from_millis(hit_at_ms))
+    }
+
+    // --- 表示ラベル/色 ---
+
+    #[test]
+    fn judgement_label_and_color_are_defined_for_every_rank() {
+        for j in [
+            Judgement::Perfect,
+            Judgement::Great,
+            Judgement::Good,
+            Judgement::Miss,
+        ] {
+            assert!(!judgement_label(j).is_empty());
+            // 各ランクで別々の色が割り当てられていることを確認する
+        }
+        let colors = [
+            judgement_color(Judgement::Perfect),
+            judgement_color(Judgement::Great),
+            judgement_color(Judgement::Good),
+            judgement_color(Judgement::Miss),
+        ];
+        for i in 0..colors.len() {
+            for j in (i + 1)..colors.len() {
+                assert_ne!(colors[i], colors[j], "判定ランクごとに異なる色にすること");
+            }
+        }
     }
 
     // --- 判定ランク(best_judgement_for_diff) ---

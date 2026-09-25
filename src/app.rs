@@ -226,3 +226,23 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
         ])
         .split(layout[1])[1]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MENU_ITEMSにゲームを追加してnew_gameのmatchを更新し忘れると、
+    /// この範囲でunreachable!に到達してpanicし検知できる
+    #[test]
+    fn new_game_handles_every_non_history_menu_item() {
+        for item in 0..HISTORY_ITEM_INDEX {
+            let _game = new_game(item, Difficulty::Beginner);
+        }
+    }
+
+    #[test]
+    fn history_item_index_is_the_last_menu_item() {
+        assert_eq!(HISTORY_ITEM_INDEX, MENU_ITEMS.len() - 1);
+        assert_eq!(MENU_ITEMS[HISTORY_ITEM_INDEX], "履歴");
+    }
+}
