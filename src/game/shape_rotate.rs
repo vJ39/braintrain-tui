@@ -306,6 +306,68 @@ mod tests {
         assert!(game.feedback.current().is_none());
     }
 
+    /// 左右のキャンバスを画像(sixel)経路にしたゲーム
+    fn game_with_image_canvases() -> ShapeRotateGame {
+        let mut game = ShapeRotateGame::new(Difficulty::Beginner);
+        game.original_canvas = ShapeCanvas::with_sixel_for_test();
+        game.transformed_canvas = ShapeCanvas::with_sixel_for_test();
+        game
+    }
+
+    const TERM_W: u16 = 80;
+    const TERM_H: u16 = 24;
+
+    #[test]
+    fn plain_terminal_resends_only_the_right_shape_image_every_frame() {
+        // 報告された症状の再現: 端末へのセル出力をそのまま記録すると、問題が変わっていなくても
+        // 右(比較図形)の画像データだけが毎フレーム出力し直されている
+        use crate::image_backend::RecordingBackend;
+        let game = game_with_image_canvases();
+        let mut terminal = ratatui::Terminal::new(RecordingBackend::new(TERM_W, TERM_H)).unwrap();
+        terminal.draw(|f| game.render(f, f.area())).unwrap();
+        let first = terminal.backend().last_payload_positions();
+        assert_eq!(first.len(), 2, "初回は左右2枚の画像を出力する");
+        terminal.draw(|f| game.render(f, f.area())).unwrap();
+        let second = terminal.backend().last_payload_positions();
+        assert_eq!(second.len(), 1);
+        assert!(second[0].0 >= TERM_W / 2, "再送されるのは右半分の画像: {second:?}");
+    }
+
+    #[test]
+    fn shape_images_are_not_resent_while_question_is_unchanged() {
+        use crate::image_backend::{ImageDedupBackend, RecordingBackend};
+        let game = game_with_image_canvases();
+        let mut terminal = ratatui::Terminal::new(ImageDedupBackend::new(RecordingBackend::new(
+            TERM_W, TERM_H,
+        )))
+        .unwrap();
+        terminal.draw(|f| game.render(f, f.area())).unwrap();
+        assert_eq!(terminal.backend().inner().last_payload_positions().len(), 2);
+        for _ in 0..5 {
+            terminal.draw(|f| game.render(f, f.area())).unwrap();
+            assert!(
+                terminal.backend().inner().last_payload_positions().is_empty(),
+                "問題が変わらない間は画像を送り直さない"
+            );
+        }
+    }
+
+    #[test]
+    fn right_shape_image_is_sent_again_when_comparison_shape_changes() {
+        use crate::image_backend::{ImageDedupBackend, RecordingBackend};
+        let mut game = game_with_image_canvases();
+        let mut terminal = ratatui::Terminal::new(ImageDedupBackend::new(RecordingBackend::new(
+            TERM_W, TERM_H,
+        )))
+        .unwrap();
+        terminal.draw(|f| game.render(f, f.area())).unwrap();
+        game.current.transformed = game.current.transformed.rotated(45f64.to_radians());
+        terminal.draw(|f| game.render(f, f.area())).unwrap();
+        let sent = terminal.backend().inner().last_payload_positions();
+        assert_eq!(sent.len(), 1, "変わった右の画像だけを送る: {sent:?}");
+        assert!(sent[0].0 >= TERM_W / 2);
+    }
+
     #[test]
     fn session_finishes_after_configured_question_count() {
         let mut game = ShapeRotateGame::new(Difficulty::Beginner);
