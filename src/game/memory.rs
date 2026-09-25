@@ -21,8 +21,11 @@ const PANEL_COLORS: [(usize, Color); 4] = [
     (4, Color::Yellow),
 ];
 
-/// 提示フェーズで1パネルを光らせる間隔
-const SHOW_INTERVAL: Duration = Duration::from_millis(600);
+/// 提示フェーズで1パネルを光らせている時間
+const SHOW_ON_DURATION: Duration = Duration::from_millis(400);
+/// 提示フェーズで次のパネルへ移る前に消灯しておく時間
+/// (同じパネルが連続するとき、一度消えないと1回の点灯か連続点灯か区別がつかないため)
+const SHOW_OFF_DURATION: Duration = Duration::from_millis(200);
 
 fn panel_color(panel: usize) -> Color {
     PANEL_COLORS
@@ -47,11 +50,19 @@ fn generate_sequence(rng: &mut impl Rng, difficulty: Difficulty) -> Vec<usize> {
     (0..len).map(|_| rng.gen_range(1..=4)).collect()
 }
 
+/// 提示フェーズ内で、いま点灯中か消灯中か
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShowSubPhase {
+    On,
+    Off,
+}
+
 /// 提示フェーズ・入力フェーズの内部状態
 enum Phase {
     /// シーケンスを順番に見せている最中。`shown` は見せ終えたパネル数
     Showing {
         shown: usize,
+        sub_phase: ShowSubPhase,
         elapsed_in_step: Duration,
     },
     /// プレイヤーが数字キーで再現している最中。`entered` は入力済みの数
@@ -73,12 +84,14 @@ impl MemoryGame {
         let mut rng = rand::thread_rng();
         let sequence = generate_sequence(&mut rng, difficulty);
         let active_panel = sequence.first().copied();
+        audio::play_se(SeKind::Transition);
         Self {
             difficulty,
             tracker: ScoreTracker::new(),
             sequence,
             phase: Phase::Showing {
                 shown: 0,
+                sub_phase: ShowSubPhase::On,
                 elapsed_in_step: Duration::ZERO,
             },
             active_panel,
@@ -90,8 +103,10 @@ impl MemoryGame {
         let mut rng = rand::thread_rng();
         self.sequence = generate_sequence(&mut rng, self.difficulty);
         self.active_panel = self.sequence.first().copied();
+        audio::play_se(SeKind::Transition);
         self.phase = Phase::Showing {
             shown: 0,
+            sub_phase: ShowSubPhase::On,
             elapsed_in_step: Duration::ZERO,
         };
     }
@@ -121,6 +136,7 @@ impl Game for MemoryGame {
         if let KeyCode::Char(c @ '1'..='4') = key.code {
             let pressed = c.to_digit(10).unwrap() as usize;
             self.active_panel = Some(pressed);
+            audio::play_se(SeKind::Transition);
             let expected = self.sequence[*entered];
             if pressed != expected {
                 self.finish_question(false);
@@ -139,19 +155,34 @@ impl Game for MemoryGame {
         }
         if let Phase::Showing {
             shown,
+            sub_phase,
             elapsed_in_step,
         } = &mut self.phase
         {
             *elapsed_in_step += dt;
-            if *elapsed_in_step >= SHOW_INTERVAL {
-                *elapsed_in_step = Duration::ZERO;
-                *shown += 1;
-                if *shown >= self.sequence.len() {
-                    self.active_panel = None;
-                    self.phase = Phase::Input { entered: 0 };
-                    self.input_started_at = Instant::now();
-                } else {
-                    self.active_panel = Some(self.sequence[*shown]);
+            match sub_phase {
+                ShowSubPhase::On => {
+                    if *elapsed_in_step >= SHOW_ON_DURATION {
+                        *elapsed_in_step = Duration::ZERO;
+                        *sub_phase = ShowSubPhase::Off;
+                        // 同じパネルが連続するとき区別がつくよう、必ず一度消灯する
+                        self.active_panel = None;
+                    }
+                }
+                ShowSubPhase::Off => {
+                    if *elapsed_in_step >= SHOW_OFF_DURATION {
+                        *elapsed_in_step = Duration::ZERO;
+                        *shown += 1;
+                        if *shown >= self.sequence.len() {
+                            self.active_panel = None;
+                            self.phase = Phase::Input { entered: 0 };
+                            self.input_started_at = Instant::now();
+                        } else {
+                            self.active_panel = Some(self.sequence[*shown]);
+                            audio::play_se(SeKind::Transition);
+                            *sub_phase = ShowSubPhase::On;
+                        }
+                    }
                 }
             }
         }
@@ -233,6 +264,12 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::SeedableRng;
 
+    /// 提示フェーズの1ステップ(点灯→消灯)を進める
+    fn advance_one_step(game: &mut MemoryGame) {
+        game.update(SHOW_ON_DURATION);
+        game.update(SHOW_OFF_DURATION);
+    }
+
     #[test]
     fn generated_sequence_has_expected_length_per_difficulty() {
         let mut rng = StdRng::seed_from_u64(1);
@@ -260,7 +297,7 @@ mod tests {
         let mut game = MemoryGame::new(Difficulty::Beginner);
         let len = game.sequence.len();
         for _ in 0..len {
-            game.update(SHOW_INTERVAL);
+            advance_one_step(&mut game);
         }
         assert!(matches!(game.phase, Phase::Input { entered: 0 }));
     }
@@ -268,8 +305,49 @@ mod tests {
     #[test]
     fn showing_phase_does_not_advance_before_interval_elapses() {
         let mut game = MemoryGame::new(Difficulty::Beginner);
-        game.update(SHOW_INTERVAL / 2);
+        game.update(SHOW_ON_DURATION / 2);
         assert!(matches!(game.phase, Phase::Showing { shown: 0, .. }));
+    }
+
+    #[test]
+    fn consecutive_same_panel_blinks_off_between_repeats() {
+        // 同じパネルが連続するシーケンスでも、1回の点灯なのか連続点灯なのか
+        // 区別できるよう、次の点灯前に必ず一度消灯を経由することを確認する
+        let mut game = MemoryGame::new(Difficulty::Beginner);
+        game.sequence = vec![1, 1, 3];
+        game.active_panel = Some(1);
+        game.phase = Phase::Showing {
+            shown: 0,
+            sub_phase: ShowSubPhase::On,
+            elapsed_in_step: Duration::ZERO,
+        };
+
+        // 点灯継続中は消灯しない
+        game.update(SHOW_ON_DURATION - Duration::from_millis(1));
+        assert_eq!(game.active_panel, Some(1));
+
+        // 点灯時間が経過すると、次のパネルが同じ1番でも一度消灯する
+        game.update(Duration::from_millis(1));
+        assert_eq!(game.active_panel, None);
+        assert!(matches!(
+            game.phase,
+            Phase::Showing {
+                sub_phase: ShowSubPhase::Off,
+                ..
+            }
+        ));
+
+        // 消灯時間が経過すると、同じ1番が再点灯する
+        game.update(SHOW_OFF_DURATION);
+        assert_eq!(game.active_panel, Some(1));
+        assert!(matches!(
+            game.phase,
+            Phase::Showing {
+                shown: 1,
+                sub_phase: ShowSubPhase::On,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -277,7 +355,7 @@ mod tests {
         let mut game = MemoryGame::new(Difficulty::Beginner);
         let len = game.sequence.len();
         for _ in 0..len {
-            game.update(SHOW_INTERVAL);
+            advance_one_step(&mut game);
         }
         let sequence = game.sequence.clone();
         for &panel in &sequence {
@@ -294,7 +372,7 @@ mod tests {
         let mut game = MemoryGame::new(Difficulty::Beginner);
         let len = game.sequence.len();
         for _ in 0..len {
-            game.update(SHOW_INTERVAL);
+            advance_one_step(&mut game);
         }
         // 最初の1手だけ間違った番号を入力すると、残りの手を待たずに即打ち切られる
         let wrong_first = if game.sequence[0] == 1 { 2 } else { 1 };
@@ -319,7 +397,7 @@ mod tests {
         for _ in 0..crate::game::QUESTIONS_PER_SESSION {
             let len = game.sequence.len();
             for _ in 0..len {
-                game.update(SHOW_INTERVAL);
+                advance_one_step(&mut game);
             }
             let sequence = game.sequence.clone();
             for &panel in &sequence {
