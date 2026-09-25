@@ -20,9 +20,7 @@ use ratatui_image::StatefulImage;
 use rust_embed::RustEmbed;
 
 use super::layout::{circle_contains, label_area};
-use super::ripple::{
-    ring_image, Ripple, RIPPLE_COLOR, RIPPLE_MAX_RADIUS_CELLS, RIPPLE_THICKNESS_CELLS,
-};
+use super::ripple::{ring_image, Ripple, RIPPLE_COLOR, RIPPLE_THICKNESS_CELLS};
 use super::wrong_mark::{
     cross_image, WrongMark, WRONG_MARK_COLOR, WRONG_MARK_HALF_SIZE_CELLS,
     WRONG_MARK_THICKNESS_CELLS,
@@ -380,6 +378,7 @@ fn ring_thickness(cell_height: f64) -> f64 {
 }
 
 /// 波紋が広がり切るまでにリングが届く範囲(セル)。パッチはこの範囲を切り出す。
+/// 広がり切った時の半径は波紋ごと(押した円の大きさごと)に違うので、その波紋の値を使う。
 /// ボードの中に収め、ボードの左端の2列は含めない。盤面の画像はボード左上のセルを起点に描かれ、
 /// kittyでは各行の左端のセルが起点になる。そこにパッチを重ねると盤面の画像が描かれなくなる。
 /// また、ratatuiの差分処理は画像データの入ったセルの直後の1セルを出力しないため、
@@ -388,7 +387,7 @@ fn ring_thickness(cell_height: f64) -> f64 {
 fn ripple_patch_rect(board: Rect, font_size: (u16, u16), ripple: &Ripple) -> Rect {
     let cell_height = f64::from(font_size.1.max(1));
     // 中心からリングの外側の端までの距離(ピクセル)。丸め誤差の分として1ピクセル足す
-    let reach = RIPPLE_MAX_RADIUS_CELLS * cell_height + ring_thickness(cell_height) / 2.0 + 1.0;
+    let reach = ripple.max_radius_cells() * cell_height + ring_thickness(cell_height) / 2.0 + 1.0;
     patch_rect_around(board, font_size, ripple.center(), reach)
 }
 
@@ -637,6 +636,7 @@ fn render_mark_text(frame: &mut Frame, board: Rect, mark: &WrongMark) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::layout::CircleSize;
     use super::super::ripple::RIPPLE_DURATION;
     use super::*;
     use image::Rgba;
@@ -814,7 +814,9 @@ mod tests {
 
     /// 持続時間の半分まで進めた、セル(10, 5)中心の波紋
     fn half_way_ripple() -> Ripple {
-        Ripple::new(10, 5).advanced(RIPPLE_DURATION / 2).unwrap()
+        Ripple::new(10, 5, CircleSize::Small)
+            .advanced(RIPPLE_DURATION / 2)
+            .unwrap()
     }
 
     /// 波紋の中心から右へ半径ぶん進んだピクセル(リングの上)
@@ -903,7 +905,7 @@ mod tests {
             color: [200, 100, 50],
         };
         let mut terminal = Terminal::new(TestBackend::new(30, 12)).unwrap();
-        let mut ripple = Some(Ripple::new(6, 3));
+        let mut ripple = Some(Ripple::new(6, 3, CircleSize::Small));
         // 波紋が広がって消えるまでの各フレームと、消えた後を描く
         for _ in 0..8 {
             terminal
@@ -915,7 +917,7 @@ mod tests {
         }
         assert!(ripple.is_none());
         // 端のセルを中心にした波紋・小さすぎる画面でもパニックしない
-        let edge = Ripple::new(29, 11);
+        let edge = Ripple::new(29, 11, CircleSize::Small);
         terminal
             .draw(|frame| renderer.render_board(frame, frame.area(), &[circle], Some(&edge), None))
             .unwrap();
@@ -941,7 +943,7 @@ mod tests {
 
     /// 持続時間の終わる直前(半径が最大)の、セル(10, 5)中心の波紋
     fn widest_ripple() -> Ripple {
-        Ripple::new(10, 5)
+        Ripple::new(10, 5, CircleSize::Small)
             .advanced(RIPPLE_DURATION - std::time::Duration::from_millis(1))
             .unwrap()
     }
@@ -977,12 +979,72 @@ mod tests {
         }
     }
 
+    /// 持続時間の終わる直前(半径が最大)の、セルcenterを中心とするsizeの円の波紋
+    fn widest_ripple_of(center: (u16, u16), size: CircleSize) -> Ripple {
+        Ripple::new(center.0, center.1, size)
+            .advanced(RIPPLE_DURATION - std::time::Duration::from_millis(1))
+            .unwrap()
+    }
+
+    #[test]
+    fn huge_circle_ripple_patch_is_larger_and_still_covers_whole_ring() {
+        // 特大の円の波紋は小さい円の波紋より大きく広がり、パッチもそのぶん広く切り出す
+        let board = Rect::new(0, 0, 60, 30);
+        let center = (30, 15);
+        let small = ripple_patch_rect(
+            board,
+            RIPPLE_FONT,
+            &widest_ripple_of(center, CircleSize::Small),
+        );
+        let huge_ripple = widest_ripple_of(center, CircleSize::Huge);
+        let huge = ripple_patch_rect(board, RIPPLE_FONT, &huge_ripple);
+        assert!(
+            huge.width > small.width && huge.height > small.height,
+            "特大{huge:?} > 小{small:?}"
+        );
+        let full = build_board_image(board, RIPPLE_FONT, &[], Some(&huge_ripple)).unwrap();
+        let (cw, ch) = (u32::from(RIPPLE_FONT.0), u32::from(RIPPLE_FONT.1));
+        let ring: Vec<(u32, u32)> = full
+            .enumerate_pixels()
+            .filter(|(_, _, p)| p.0[3] > 0)
+            .map(|(x, y, _)| (x, y))
+            .collect();
+        assert!(!ring.is_empty());
+        for (x, y) in ring {
+            assert!(
+                (u32::from(huge.x) * cw..u32::from(huge.right()) * cw).contains(&x)
+                    && (u32::from(huge.y) * ch..u32::from(huge.bottom()) * ch).contains(&y),
+                "リングの({x},{y})がパッチ{huge:?}の外にある"
+            );
+        }
+    }
+
+    #[test]
+    fn huge_circle_ripple_ring_is_drawn_farther_than_small_one() {
+        // 同じ時点で比べると、特大の円の波紋のリングは中心からより遠くに描かれる
+        let board = Rect::new(0, 0, 60, 30);
+        let farthest = |size: CircleSize| {
+            let ripple = Ripple::new(30, 15, size)
+                .advanced(RIPPLE_DURATION / 2)
+                .unwrap();
+            let image = build_board_image(board, RIPPLE_FONT, &[], Some(&ripple)).unwrap();
+            // セル(30, 15)の中心 = ピクセル(305, 310)
+            image
+                .enumerate_pixels()
+                .filter(|(_, _, p)| p.0[3] > 0)
+                .map(|(x, y, _)| (f64::from(x) + 0.5 - 305.0).hypot(f64::from(y) + 0.5 - 310.0))
+                .fold(0.0, f64::max)
+        };
+        let (huge, small) = (farthest(CircleSize::Huge), farthest(CircleSize::Small));
+        assert!(huge > small * 2.0, "特大{huge} > 小{small}の2倍");
+    }
+
     #[test]
     fn patch_rect_avoids_two_left_columns_of_board() {
         // 盤面画像の起点(左端の列)にパッチを重ねると盤面画像が描かれなくなり、
         // そのすぐ右の列は差分処理が起点の画像データの表示幅ぶん出力を飛ばすため、左端の2列は含めない
         let board = Rect::new(2, 3, 20, 10);
-        let corner = Ripple::new(2, 3);
+        let corner = Ripple::new(2, 3, CircleSize::Small);
         let rect = ripple_patch_rect(board, RIPPLE_FONT, &corner);
         assert!(!rect.is_empty());
         assert_eq!(rect.x, board.x + 2);
@@ -990,7 +1052,10 @@ mod tests {
         assert_eq!(rect.intersection(board), rect);
         // 2列以下のボードではパッチを作らない
         let narrow = Rect::new(0, 0, 2, 10);
-        assert!(ripple_patch_rect(narrow, RIPPLE_FONT, &Ripple::new(0, 5)).is_empty());
+        assert!(
+            ripple_patch_rect(narrow, RIPPLE_FONT, &Ripple::new(0, 5, CircleSize::Small))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1069,7 +1134,7 @@ mod tests {
     fn ripple_animation_reencodes_only_patch_once_per_frame() {
         let renderer = image_renderer();
         let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
-        let mut ripple = Some(Ripple::new(20, 8));
+        let mut ripple = Some(Ripple::new(20, 8, CircleSize::Small));
         let mut frames = std::collections::BTreeSet::new();
         let mut ticks = 0;
         while let Some(r) = ripple {
@@ -1099,7 +1164,9 @@ mod tests {
 
     #[test]
     fn ripple_patch_only_changes_cells_inside_patch() {
-        let ripple = Ripple::new(20, 8).advanced(RIPPLE_DURATION / 2).unwrap();
+        let ripple = Ripple::new(20, 8, CircleSize::Small)
+            .advanced(RIPPLE_DURATION / 2)
+            .unwrap();
         let rect = ripple_patch_rect(Rect::new(0, 0, 60, 24), (4, 8), &ripple);
         let with = draw_image_board(
             &image_renderer(),
@@ -1134,7 +1201,7 @@ mod tests {
     fn board_change_rebuilds_board_and_patch() {
         let renderer = image_renderer();
         let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
-        let ripple = Ripple::new(20, 8);
+        let ripple = Ripple::new(20, 8, CircleSize::Small);
         draw_image_board(&renderer, &mut terminal, &PATCH_CIRCLES, Some(&ripple));
         // 円が1つ消えると、同じコマの波紋でも下地が変わるので両方作り直す
         draw_image_board(&renderer, &mut terminal, &PATCH_CIRCLES[..1], Some(&ripple));
@@ -1196,7 +1263,7 @@ mod tests {
         // その内側に重ねたパッチの起点セルがskipのままだと、画像データを入れても端末へ出力されない
         let renderer = protocol_renderer(ProtocolType::Sixel);
         let mut terminal = Terminal::new(TestBackend::new(PIPE_W, PIPE_H)).unwrap();
-        let ripple = Ripple::new(20, 8);
+        let ripple = Ripple::new(20, 8, CircleSize::Small);
         let patch = ripple_patch_rect(PIPE_BOARD, PIPE_FONT, &ripple);
         let completed = terminal
             .draw(|frame| {
@@ -1224,7 +1291,7 @@ mod tests {
         ] {
             let renderer = protocol_renderer(protocol);
             let mut terminal = pipeline_terminal();
-            let mut ripple = Some(Ripple::new(20, 8));
+            let mut ripple = Some(Ripple::new(20, 8, CircleSize::Small));
             let mut last_frame = None;
             while let Some(r) = ripple {
                 let patch = ripple_patch_rect(PIPE_BOARD, PIPE_FONT, &r);
@@ -1267,7 +1334,7 @@ mod tests {
                 "{protocol:?}: 波紋が無ければ盤面だけ"
             );
             assert!(draw_sent(&renderer, &mut terminal, None).is_empty());
-            let ripple = Ripple::new(20, 8);
+            let ripple = Ripple::new(20, 8, CircleSize::Small);
             let patch = ripple_patch_rect(PIPE_BOARD, PIPE_FONT, &ripple);
             let sent = draw_sent(&renderer, &mut terminal, Some(&ripple));
             assert_eq!(
@@ -1283,7 +1350,7 @@ mod tests {
         // 波紋が消えたら、端末に残った最後のリングを消すため、リングの無いパッチを1回送る
         let renderer = protocol_renderer(ProtocolType::Sixel);
         let mut terminal = pipeline_terminal();
-        let ripple = Ripple::new(20, 8);
+        let ripple = Ripple::new(20, 8, CircleSize::Small);
         let patch = ripple_patch_rect(PIPE_BOARD, PIPE_FONT, &ripple);
         draw_sent(&renderer, &mut terminal, Some(&ripple));
         assert_eq!(
@@ -1306,7 +1373,7 @@ mod tests {
                 let renderer = protocol_renderer(protocol);
                 let mut terminal = pipeline_terminal();
                 draw_sent(&renderer, &mut terminal, None);
-                let ripple = Ripple::new(center.0, center.1);
+                let ripple = Ripple::new(center.0, center.1, CircleSize::Small);
                 let patch = ripple_patch_rect(PIPE_BOARD, PIPE_FONT, &ripple);
                 assert!(!patch.is_empty());
                 let sent = draw_sent(&renderer, &mut terminal, Some(&ripple));

@@ -1,6 +1,7 @@
 //! カウントマニア: ランダムに並んだ1〜Nの数字付き円を、1から順にクリックしていくマウス専用ゲーム。
 //!
-//! 1セッション=3ラウンド。ラウンドごとに「全部押せたか(クリア)/ライフが尽きたか(失敗)」を
+//! 1セッション=3ラウンド。難易度は選ばせず、ROUND1=初級・ROUND2=中級・ROUND3=上級と上がっていく。
+//! ラウンドごとに「全部押せたか(クリア)/ライフが尽きたか(失敗)」を
 //! ScoreTrackerに1件として記録する。キー入力は受け付けない。
 
 mod circle_image;
@@ -34,6 +35,16 @@ pub const GAME_ID: &str = "count_mania";
 
 /// 1セッションのラウンド数
 pub const ROUNDS_PER_SESSION: u32 = 3;
+
+/// 各ラウンドの難易度。難易度は選ばせず、ROUND1=初級・ROUND2=中級・ROUND3=上級と上がっていく
+pub const ROUND_DIFFICULTIES: [Difficulty; ROUNDS_PER_SESSION as usize] = [
+    Difficulty::Beginner,
+    Difficulty::Intermediate,
+    Difficulty::Advanced,
+];
+
+/// 結果の記録に使う難易度。ラウンドごとに難易度が変わるため、最後のラウンドの上級を代表値にする
+pub const SESSION_DIFFICULTY: Difficulty = Difficulty::Advanced;
 
 /// ラウンド終了から次のラウンド開始までの間隔。この間はクリックを受け付けない
 /// (前のラウンドの最後のクリックが次の盤面に当たらないようにするため)
@@ -212,11 +223,11 @@ struct LayoutCache {
 }
 
 pub struct CountManiaGame {
-    difficulty: Difficulty,
-    params: DifficultyParams,
     tracker: ScoreTracker,
     round: Round,
-    /// ラウンドの通し番号(配置キャッシュの作り直し判定に使う)
+    /// ラウンドの通し番号(0始まり)。いまのラウンドの難易度と、配置キャッシュの作り直し判定に使う。
+    /// 次のラウンドが始まった時だけ進むので、ラウンドの記録直後(待ち時間中・GAME OVER後)も
+    /// 記録したラウンドを指したままになる
     round_serial: u32,
     /// ラウンド間の待ち時間の残り。Noneならプレイ中
     interval: Option<Duration>,
@@ -238,12 +249,9 @@ fn board_area(area: Rect) -> Rect {
 }
 
 impl CountManiaGame {
-    pub fn new(difficulty: Difficulty) -> Self {
-        let params = params(difficulty);
-        let round = new_round(&mut rand::thread_rng(), &params);
+    pub fn new() -> Self {
+        let round = new_round(&mut rand::thread_rng(), &params(ROUND_DIFFICULTIES[0]));
         Self {
-            difficulty,
-            params,
             tracker: ScoreTracker::new(),
             round,
             round_serial: 0,
@@ -255,6 +263,17 @@ impl CountManiaGame {
             renderer: CircleRenderer::new(),
             game_over: false,
         }
+    }
+
+    /// いまのラウンドの難易度(ROUND_DIFFICULTIESの並びに従う)
+    fn round_difficulty(&self) -> Difficulty {
+        let last = ROUND_DIFFICULTIES.len() - 1;
+        ROUND_DIFFICULTIES[(self.round_serial as usize).min(last)]
+    }
+
+    /// いまのラウンドの難易度のパラメータ
+    fn round_params(&self) -> DifficultyParams {
+        params(self.round_difficulty())
     }
 
     /// boardに対する円の配置(キャッシュ済みならそれを返す)
@@ -271,8 +290,12 @@ impl CountManiaGame {
             .iter()
             .map(|c| (c.number, c.size))
             .collect();
-        let placements =
-            layout_circles(&mut rand::thread_rng(), board, &circles, self.params.dense);
+        let placements = layout_circles(
+            &mut rand::thread_rng(),
+            board,
+            &circles,
+            self.round_params().dense,
+        );
         *cache = Some(LayoutCache {
             board,
             round_serial: self.round_serial,
@@ -283,7 +306,7 @@ impl CountManiaGame {
 
     /// 番号numberの円がまだ残っているか
     fn is_visible(&self, number: u8) -> bool {
-        number >= self.round.next && number <= self.params.max_number
+        number >= self.round.next && number <= self.round_params().max_number
     }
 
     /// いま何ラウンド目か(1始まり。全ラウンド終了後は最終ラウンドのまま)
@@ -295,15 +318,22 @@ impl CountManiaGame {
     /// 正解の円をクリックした。(column, row)はクリックしたセルで、そこから波紋を広げる
     fn click_correct(&mut self, column: u16, row: u16) {
         audio::play_se(SeKind::Correct);
+        // 押した円(次に押すべき数字の円)の大きさに応じて、波紋の広がる大きさを変える
+        let size = self
+            .round
+            .circles
+            .iter()
+            .find(|c| c.number == self.round.next)
+            .map_or(CircleSize::Medium, |c| c.size);
         // 前の波紋が残っていても、新しい波紋に置き換える
-        self.ripple = Some(Ripple::new(column, row));
+        self.ripple = Some(Ripple::new(column, row, size));
         // 押し間違いの印は、正解に進んだら役目を終えるので消す(画像表示では波紋と同じパッチに
         // 重ねて描くため、離れた位置のバツ印が残ると波紋のパッチが大きくなり作り直しが重くなる)
         self.wrong_mark = None;
         self.round.next += 1;
         // 次の数字に進んだので、焦らせる背景は最初からやり直す
         self.round.time_since_target = Duration::ZERO;
-        if self.round.next > self.params.max_number {
+        if self.round.next > self.round_params().max_number {
             let latency_ms = self.round.elapsed.as_secs_f64() * 1000.0;
             self.tracker.record(true, latency_ms);
             self.feedback.record(
@@ -323,7 +353,8 @@ impl CountManiaGame {
         if self.round.lives == 0 {
             // GAME OVERで焦らせる背景を止める
             self.round.time_since_target = Duration::ZERO;
-            self.tracker.record(false, self.params.fail_latency_ms);
+            self.tracker
+                .record(false, self.round_params().fail_latency_ms);
             self.feedback.record(false, "ライフが尽きた");
             // GAME OVERは残りラウンドを待たずセッションを即終了する(次のラウンドへの
             // 待ち時間には入らない。フィードバック表示が消えたらis_finished()がtrueになる)
@@ -338,7 +369,8 @@ impl CountManiaGame {
         audio::play_se(SeKind::Incorrect);
         // GAME OVERで焦らせる背景・円の点滅を止める
         self.round.time_since_target = Duration::ZERO;
-        self.tracker.record(false, self.params.fail_latency_ms);
+        self.tracker
+            .record(false, self.round_params().fail_latency_ms);
         self.feedback.record(false, "時間切れ");
         self.game_over = true;
     }
@@ -350,14 +382,15 @@ impl CountManiaGame {
         }
     }
 
+    /// 次のラウンドを始める。ラウンドの番号を先に進め、そのラウンドの難易度で盤面を作る
     fn start_next_round(&mut self) {
-        self.round = new_round(&mut rand::thread_rng(), &self.params);
         self.round_serial += 1;
+        self.round = new_round(&mut rand::thread_rng(), &self.round_params());
         self.interval = None;
     }
 
     fn render_hud(&self, frame: &mut Frame, area: Rect) {
-        let (difficulty_text, difficulty_color) = theme::difficulty_label(self.difficulty);
+        let (difficulty_text, difficulty_color) = theme::difficulty_label(self.round_difficulty());
         let block = theme::panel(" ◆ カウントマニア ")
             .border_style(Style::default().fg(theme::flash_border_color(self.feedback.current())))
             .title(
@@ -413,7 +446,7 @@ impl CountManiaGame {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!(" / {}", self.params.max_number),
+                    format!(" / {}", self.round_params().max_number),
                     Style::default().fg(theme::MUTED),
                 ),
             ]),
@@ -421,7 +454,7 @@ impl CountManiaGame {
         };
         frame.render_widget(Paragraph::new(center).alignment(Alignment::Center), cols[1]);
 
-        let lost = self.params.lives.saturating_sub(self.round.lives);
+        let lost = self.round_params().lives.saturating_sub(self.round.lives);
         let lives = Line::from(vec![
             Span::styled("マウス専用  ", Style::default().fg(theme::MUTED)),
             Span::styled(
@@ -460,6 +493,12 @@ impl CountManiaGame {
         ];
         let area = theme::vertical_center(board, lines.len() as u16);
         frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
+    }
+}
+
+impl Default for CountManiaGame {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -575,7 +614,7 @@ impl Game for CountManiaGame {
     }
 
     fn result(&self) -> GameResult {
-        self.tracker.to_result(GAME_ID, self.difficulty)
+        self.tracker.to_result(GAME_ID, SESSION_DIFFICULTY)
     }
 }
 
@@ -662,8 +701,31 @@ mod tests {
     }
 
     fn clear_round(game: &mut CountManiaGame) {
-        for number in 1..=game.params.max_number {
+        for number in 1..=game.round_params().max_number {
             click_circle(game, number);
+        }
+    }
+
+    /// 0始まりでindex番目のラウンドまで、前のラウンドを全部クリアして進める
+    fn advance_to_round(game: &mut CountManiaGame, index: u32) {
+        for _ in 0..index {
+            clear_round(game);
+            game.update(ROUND_INTERVAL);
+        }
+        assert_eq!(
+            game.round_serial,
+            index,
+            "ROUND{}が始まっていること",
+            index + 1
+        );
+        assert!(game.interval.is_none());
+    }
+
+    /// いまのラウンドのライフを全部失うまで押し間違える
+    fn lose_all_lives(game: &mut CountManiaGame) {
+        for _ in 0..game.round.lives {
+            let wrong = wrong_number(game);
+            click_circle(game, wrong);
         }
     }
 
@@ -782,10 +844,11 @@ mod tests {
 
     #[test]
     fn new_game_starts_with_full_lives_and_next_number_one() {
-        let game = CountManiaGame::new(Difficulty::Intermediate);
+        // ROUND1は初級
+        let game = CountManiaGame::new();
         assert_eq!(game.round.next, 1);
-        assert_eq!(game.round.lives, 2);
-        assert_eq!(game.round.circles.len(), 14);
+        assert_eq!(game.round.lives, 3);
+        assert_eq!(game.round.circles.len(), 10);
         assert_eq!(game.tracker.total(), 0);
         assert!(!game.is_finished());
     }
@@ -794,7 +857,7 @@ mod tests {
 
     #[test]
     fn clicking_next_number_removes_it_and_advances() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         click_circle(&mut game, 1);
         assert_eq!(game.round.next, 2);
         assert!(!game.is_visible(1), "押した円は消える");
@@ -805,7 +868,7 @@ mod tests {
 
     #[test]
     fn clearing_all_numbers_records_success_with_elapsed_time() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         game.update(Duration::from_millis(1500));
         clear_round(&mut game);
         let result = game.result();
@@ -818,7 +881,7 @@ mod tests {
 
     #[test]
     fn clicking_wrong_number_loses_a_life_and_keeps_next() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         let wrong = wrong_number(&game);
         click_circle(&mut game, wrong);
         assert_eq!(game.round.lives, 2);
@@ -829,18 +892,16 @@ mod tests {
 
     #[test]
     fn losing_all_lives_ends_round_as_failure_with_limit_latency() {
-        let mut game = CountManiaGame::new(Difficulty::Intermediate);
+        let mut game = CountManiaGame::new();
         click_circle(&mut game, 1);
-        for _ in 0..2 {
-            let wrong = wrong_number(&game);
-            click_circle(&mut game, wrong);
-        }
+        lose_all_lives(&mut game);
         let result = game.result();
         assert_eq!(result.total, 1, "ライフ0で即ラウンド終了");
         assert_eq!(result.correct, 0);
         assert_eq!(
             result.avg_latency_ms,
-            params(Difficulty::Intermediate).fail_latency_ms
+            params(Difficulty::Beginner).fail_latency_ms,
+            "ROUND1(初級)の想定上限で記録する"
         );
     }
 
@@ -848,12 +909,9 @@ mod tests {
     fn game_over_ends_the_session_without_waiting_for_remaining_rounds() {
         // GAME OVER(ライフ0)は、3ラウンド構成の途中でも次のラウンドへ進まず、
         // フィードバック("ライフが尽きた")が消えたらセッション全体が終了する
-        let mut game = CountManiaGame::new(Difficulty::Intermediate);
+        let mut game = CountManiaGame::new();
         click_circle(&mut game, 1);
-        for _ in 0..2 {
-            let wrong = wrong_number(&game);
-            click_circle(&mut game, wrong);
-        }
+        lose_all_lives(&mut game);
         assert_eq!(
             game.tracker.total(),
             1,
@@ -876,12 +934,9 @@ mod tests {
 
     #[test]
     fn clicks_after_game_over_are_ignored() {
-        let mut game = CountManiaGame::new(Difficulty::Intermediate);
+        let mut game = CountManiaGame::new();
         click_circle(&mut game, 1);
-        for _ in 0..2 {
-            let wrong = wrong_number(&game);
-            click_circle(&mut game, wrong);
-        }
+        lose_all_lives(&mut game);
         let next_before = game.round.next;
         click_circle(&mut game, next_before);
         assert_eq!(game.tracker.total(), 1, "GAME OVER後のクリックは無視される");
@@ -891,7 +946,7 @@ mod tests {
 
     #[test]
     fn clicks_are_ignored_during_interval_then_next_round_starts() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         clear_round(&mut game);
         assert!(game.interval.is_some(), "ラウンド終了後は待ち時間に入る");
         let before = game.round.next;
@@ -902,13 +957,17 @@ mod tests {
         game.update(ROUND_INTERVAL);
         assert!(game.interval.is_none());
         assert_eq!(game.round.next, 1, "新しいラウンドは1から");
-        assert_eq!(game.round.lives, 3, "ライフも元に戻る");
+        assert_eq!(
+            game.round.lives,
+            params(Difficulty::Intermediate).lives,
+            "ライフもROUND2(中級)の数で満タンに戻る"
+        );
         assert!(game.round.elapsed.is_zero(), "経過時間も0から");
     }
 
     #[test]
     fn session_finishes_after_three_rounds() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         for round in 0..ROUNDS_PER_SESSION {
             assert!(
                 !game.is_finished(),
@@ -922,14 +981,18 @@ mod tests {
         assert!(game.is_finished());
         let result = game.result();
         assert_eq!(result.game_id, GAME_ID);
-        assert_eq!(result.difficulty, Difficulty::Beginner);
+        assert_eq!(
+            result.difficulty, SESSION_DIFFICULTY,
+            "記録の難易度は代表値の上級"
+        );
+        assert_eq!(SESSION_DIFFICULTY, Difficulty::Advanced);
         assert_eq!(result.total, ROUNDS_PER_SESSION);
         assert_eq!(result.correct, ROUNDS_PER_SESSION);
     }
 
     #[test]
     fn clicks_after_session_finished_are_ignored() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         for _ in 0..ROUNDS_PER_SESSION {
             clear_round(&mut game);
             game.update(ROUND_INTERVAL);
@@ -944,7 +1007,7 @@ mod tests {
 
     #[test]
     fn handle_key_never_changes_state() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         let keys = [
             KeyCode::Enter,
             KeyCode::Esc,
@@ -971,7 +1034,7 @@ mod tests {
 
     #[test]
     fn clicking_empty_space_does_nothing() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         let (column, row) = empty_cell(&game);
         game.handle_mouse(left_click(column, row), AREA);
         assert_eq!(game.round.next, 1);
@@ -980,7 +1043,7 @@ mod tests {
 
     #[test]
     fn clicking_outside_board_or_non_left_button_does_nothing() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         // HUD(ボード外)のクリック
         game.handle_mouse(left_click(1, 1), AREA);
         // 1の円を右クリック
@@ -1001,7 +1064,7 @@ mod tests {
     #[test]
     fn clicking_overlap_hits_smaller_circle_then_circle_below_after_removal() {
         // 小さい円1が大きい円2の上に重なっている
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         set_overlap_layout(&game, 2, 1);
         let (x, y) = OVERLAP;
         click_board(&mut game, x, y);
@@ -1014,7 +1077,7 @@ mod tests {
     #[test]
     fn clicking_overlap_never_hits_larger_circle_below() {
         // 次に押すべき円1が大きい方で、その上に小さい円2が重なっている。重なった所は円2扱い
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         set_overlap_layout(&game, 1, 2);
         let (x, y) = OVERLAP;
         click_board(&mut game, x, y);
@@ -1024,7 +1087,7 @@ mod tests {
 
     #[test]
     fn render_draws_smaller_circle_on_top_of_larger() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         game.round.circles[0].color = [200, 50, 50];
         game.round.circles[1].color = [50, 50, 200];
         set_overlap_layout(&game, 2, 1);
@@ -1044,7 +1107,7 @@ mod tests {
 
     #[test]
     fn clicking_removed_circle_does_nothing() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         // 円1の下に他の円が無い配置にする(下に円があればそちらに当たるのが正しい動作のため)
         set_layout(&game, &[(1, 2, 2, 10, 5), (2, 40, 2, 10, 5)]);
         click_circle(&mut game, 1);
@@ -1058,7 +1121,7 @@ mod tests {
 
     #[test]
     fn layout_is_kept_between_clicks_and_regenerated_for_new_round() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         let board = board_area(AREA);
         let first = game.placements(board);
         click_circle(&mut game, 1);
@@ -1067,14 +1130,14 @@ mod tests {
             first,
             "ラウンド中は配置が変わらない"
         );
-        for number in 2..=game.params.max_number {
+        for number in 2..=game.round_params().max_number {
             click_circle(&mut game, number);
         }
         game.update(ROUND_INTERVAL);
         // 新しいラウンドでは色・サイズも振り直されるので、配置も作り直される
         assert_eq!(
             game.placements(board).len(),
-            game.params.max_number as usize
+            game.round_params().max_number as usize
         );
         assert_eq!(
             game.layout.borrow().as_ref().unwrap().round_serial,
@@ -1086,7 +1149,7 @@ mod tests {
 
     #[test]
     fn hud_shows_mouse_only_next_number_and_lives() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         let text = rendered_text(&game, AREA.width, AREA.height);
         assert!(text.contains("マウス専用"), "マウス専用と明記すること");
         assert!(text.contains("つぎ"));
@@ -1101,7 +1164,9 @@ mod tests {
 
     #[test]
     fn board_shows_every_remaining_number_in_fallback_mode() {
-        let mut game = CountManiaGame::new(Difficulty::Advanced);
+        // ROUND3(上級)の20個の円
+        let mut game = CountManiaGame::new();
+        advance_to_round(&mut game, 2);
         click_circle(&mut game, 1);
         let text = rendered_text(&game, AREA.width, AREA.height);
         assert!(!text.contains('①'), "押した円は描かれない");
@@ -1113,7 +1178,8 @@ mod tests {
 
     #[test]
     fn render_does_not_panic_in_tiny_or_interval_state() {
-        let mut game = CountManiaGame::new(Difficulty::Advanced);
+        let mut game = CountManiaGame::new();
+        advance_to_round(&mut game, 1);
         rendered_text(&game, 20, 6);
         rendered_text(&game, 1, 1);
         clear_round(&mut game);
@@ -1126,7 +1192,7 @@ mod tests {
 
     #[test]
     fn interval_message_tells_clear_and_hides_circles() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         clear_round(&mut game);
         let text = rendered_text(&game, AREA.width, AREA.height);
         assert!(text.contains("CLEAR!"));
@@ -1136,7 +1202,7 @@ mod tests {
 
     #[test]
     fn elapsed_time_does_not_advance_during_interval() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         clear_round(&mut game);
         game.update(ROUND_INTERVAL / 2);
         assert!(game.interval.is_some());
@@ -1158,7 +1224,7 @@ mod tests {
 
     #[test]
     fn correct_click_starts_ripple_at_clicked_cell() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         let (x, y) = set_separate_layout(&game);
         assert!(game.ripple.is_none(), "始めは波紋なし");
         click_board(&mut game, x, y);
@@ -1175,7 +1241,7 @@ mod tests {
 
     #[test]
     fn wrong_or_empty_click_does_not_start_ripple() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         set_separate_layout(&game);
         // 円2(次に押すべきでない円)をクリック
         click_board(&mut game, 44, 4);
@@ -1188,7 +1254,7 @@ mod tests {
 
     #[test]
     fn update_advances_ripple_and_removes_it_after_duration() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         let (x, y) = set_separate_layout(&game);
         click_board(&mut game, x, y);
         game.update(ripple::RIPPLE_DURATION / 2);
@@ -1200,7 +1266,7 @@ mod tests {
 
     #[test]
     fn new_correct_click_replaces_previous_ripple() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         let (x, y) = set_separate_layout(&game);
         click_board(&mut game, x, y);
         game.update(ripple::RIPPLE_DURATION / 2);
@@ -1218,7 +1284,7 @@ mod tests {
 
     #[test]
     fn ripple_expires_during_round_interval_without_affecting_score() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         clear_round(&mut game);
         assert!(game.ripple.is_some(), "最後の正解クリックでも波紋は始まる");
         assert!(game.interval.is_some());
@@ -1230,7 +1296,7 @@ mod tests {
 
     #[test]
     fn fallback_render_ignores_ripple() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         let (x, y) = set_separate_layout(&game);
         click_board(&mut game, x, y);
         assert!(game.ripple.is_some());
@@ -1242,7 +1308,8 @@ mod tests {
     #[test]
     fn image_mode_render_with_ripple_does_not_panic() {
         use ratatui_image::picker::{Picker, ProtocolType};
-        let mut game = CountManiaGame::new(Difficulty::Advanced);
+        let mut game = CountManiaGame::new();
+        advance_to_round(&mut game, 2);
         let mut picker = Picker::from_fontsize((4, 8));
         picker.set_protocol_type(ProtocolType::Halfblocks);
         game.renderer = CircleRenderer::with_picker(picker);
@@ -1263,7 +1330,8 @@ mod tests {
     fn ripple_animation_does_not_reencode_whole_board_every_tick() {
         // 実際のゲームループと同じく、tickごとにupdateして描く
         use ratatui_image::picker::{Picker, ProtocolType};
-        let mut game = CountManiaGame::new(Difficulty::Advanced);
+        let mut game = CountManiaGame::new();
+        advance_to_round(&mut game, 2);
         let mut picker = Picker::from_fontsize((4, 8));
         picker.set_protocol_type(ProtocolType::Halfblocks);
         game.renderer = CircleRenderer::with_picker(picker);
@@ -1330,13 +1398,13 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(1);
         let round = new_round(&mut rng, &params(Difficulty::Beginner));
         assert!(round.time_since_target.is_zero());
-        let game = CountManiaGame::new(Difficulty::Beginner);
+        let game = CountManiaGame::new();
         assert!(game.round.time_since_target.is_zero());
     }
 
     #[test]
     fn update_advances_time_since_target_only_while_playing() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         game.update(Duration::from_millis(1500));
         game.update(Duration::from_millis(500));
         assert_eq!(game.round.time_since_target, Duration::from_secs(2));
@@ -1358,7 +1426,7 @@ mod tests {
 
     #[test]
     fn time_since_target_does_not_advance_after_session_finished() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         for _ in 0..ROUNDS_PER_SESSION {
             clear_round(&mut game);
             game.update(ROUND_INTERVAL);
@@ -1370,7 +1438,7 @@ mod tests {
 
     #[test]
     fn correct_click_resets_time_since_target() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         game.update(Duration::from_secs(8));
         click_circle(&mut game, 1);
         assert_eq!(game.round.next, 2);
@@ -1384,7 +1452,7 @@ mod tests {
 
     #[test]
     fn wrong_click_keeps_time_since_target_while_lives_remain() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         game.update(Duration::from_secs(8));
         let wrong = wrong_number(&game);
         click_circle(&mut game, wrong);
@@ -1394,12 +1462,9 @@ mod tests {
 
     #[test]
     fn game_over_resets_time_since_target() {
-        let mut game = CountManiaGame::new(Difficulty::Intermediate);
+        let mut game = CountManiaGame::new();
         game.update(Duration::from_secs(8));
-        for _ in 0..2 {
-            let wrong = wrong_number(&game);
-            click_circle(&mut game, wrong);
-        }
+        lose_all_lives(&mut game);
         assert_eq!(game.round.lives, 0);
         assert!(game.round.time_since_target.is_zero());
     }
@@ -1447,7 +1512,7 @@ mod tests {
 
     #[test]
     fn board_background_stays_normal_within_threshold() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         let normal = board_background(&game);
         assert_eq!(normal, Color::Reset);
         game.update(Duration::from_millis(4_900));
@@ -1456,7 +1521,7 @@ mod tests {
 
     #[test]
     fn board_background_flashes_red_after_threshold_and_resets_on_correct_click() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         game.update(PRESSURE_THRESHOLD + PRESSURE_PERIOD / 2);
         let (r, g, b) = rgb(board_background(&game));
         assert!(r > g && r > b, "盤面の背景が赤系になる: {r},{g},{b}");
@@ -1482,12 +1547,9 @@ mod tests {
 
     #[test]
     fn board_background_resets_on_game_over() {
-        let mut game = CountManiaGame::new(Difficulty::Intermediate);
+        let mut game = CountManiaGame::new();
         game.update(PRESSURE_THRESHOLD * 2);
-        for _ in 0..2 {
-            let wrong = wrong_number(&game);
-            click_circle(&mut game, wrong);
-        }
+        lose_all_lives(&mut game);
         assert!(game.game_over, "ライフ切れでGAME OVERになる");
         let buffer = rendered_buffer(&game);
         let (_, body) = theme::split_hud(AREA);
@@ -1517,7 +1579,7 @@ mod tests {
 
     #[test]
     fn wrong_click_shows_mark_at_clicked_cell() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         set_separate_layout(&game);
         assert!(game.wrong_mark.is_none(), "始めはバツ印なし");
         // 円2(次に押すべきでない円)をクリック
@@ -1534,7 +1596,7 @@ mod tests {
 
     #[test]
     fn wrong_mark_disappears_after_duration() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         set_separate_layout(&game);
         click_board(&mut game, 44, 4);
         game.update(wrong_mark::WRONG_MARK_DURATION - Duration::from_millis(1));
@@ -1545,7 +1607,7 @@ mod tests {
 
     #[test]
     fn empty_or_correct_click_does_not_show_mark() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         let (x, y) = set_separate_layout(&game);
         click_board(&mut game, 25, 4);
         assert!(
@@ -1559,7 +1621,7 @@ mod tests {
 
     #[test]
     fn new_wrong_click_moves_mark_and_restarts_it() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         set_layout(
             &game,
             &[(1, 2, 2, 10, 5), (2, 40, 2, 10, 5), (3, 60, 10, 10, 5)],
@@ -1580,7 +1642,7 @@ mod tests {
 
     #[test]
     fn correct_click_after_wrong_click_keeps_ripple_and_feedback_unaffected() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         let (x, y) = set_separate_layout(&game);
         click_board(&mut game, 44, 4);
         assert!(game.wrong_mark.is_some());
@@ -1600,12 +1662,9 @@ mod tests {
 
     #[test]
     fn game_over_click_shows_mark_with_life_feedback() {
-        let mut game = CountManiaGame::new(Difficulty::Intermediate);
+        let mut game = CountManiaGame::new();
         click_circle(&mut game, 1);
-        for _ in 0..2 {
-            let wrong = wrong_number(&game);
-            click_circle(&mut game, wrong);
-        }
+        lose_all_lives(&mut game);
         assert!(game.game_over);
         assert!(
             game.wrong_mark.is_some(),
@@ -1619,7 +1678,7 @@ mod tests {
 
     #[test]
     fn fallback_render_draws_red_cross_at_wrong_click() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         set_separate_layout(&game);
         let board = board_area(AREA);
         let cell = (board.x + 42, board.y + 3);
@@ -1642,7 +1701,7 @@ mod tests {
 
     #[test]
     fn time_out_is_game_over_with_time_out_message() {
-        let mut game = CountManiaGame::new(Difficulty::Intermediate);
+        let mut game = CountManiaGame::new();
         click_circle(&mut game, 1);
         game.update(TIMEOUT_LIMIT - Duration::from_millis(1));
         assert!(!game.game_over, "上限の直前はまだGAME OVERではない");
@@ -1663,14 +1722,18 @@ mod tests {
         assert_eq!((result.total, result.correct), (1, 0), "失敗として1回記録");
         assert_eq!(
             result.avg_latency_ms,
-            params(Difficulty::Intermediate).fail_latency_ms
+            params(Difficulty::Beginner).fail_latency_ms
         );
-        assert_eq!(game.round.lives, 2, "ライフは減らさない");
+        assert_eq!(
+            game.round.lives,
+            params(Difficulty::Beginner).lives,
+            "ライフは減らさない"
+        );
     }
 
     #[test]
     fn time_out_accumulates_over_many_ticks() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         let mut elapsed = Duration::ZERO;
         while !game.game_over {
             game.update(crate::TICK_RATE);
@@ -1685,7 +1748,7 @@ mod tests {
 
     #[test]
     fn time_out_ends_session_after_feedback_like_life_game_over() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         game.update(TIMEOUT_LIMIT);
         assert!(game.game_over);
         assert!(!game.is_finished(), "フィードバック表示中はまだ終了しない");
@@ -1700,7 +1763,7 @@ mod tests {
 
     #[test]
     fn time_out_is_recorded_only_once() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         game.update(TIMEOUT_LIMIT);
         game.update(TIMEOUT_LIMIT);
         game.update(TIMEOUT_LIMIT);
@@ -1709,7 +1772,7 @@ mod tests {
 
     #[test]
     fn clicks_after_time_out_are_ignored() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         game.update(TIMEOUT_LIMIT);
         click_circle(&mut game, 1);
         assert_eq!(game.round.next, 1, "GAME OVER後のクリックは無視される");
@@ -1718,7 +1781,7 @@ mod tests {
 
     #[test]
     fn time_out_resets_pressure_background() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         game.update(TIMEOUT_LIMIT);
         assert!(game.round.time_since_target.is_zero());
         let buffer = rendered_buffer(&game);
@@ -1728,7 +1791,7 @@ mod tests {
 
     #[test]
     fn correct_click_resets_time_out_countdown() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         game.update(TIMEOUT_LIMIT - Duration::from_secs(1));
         click_circle(&mut game, 1);
         game.update(TIMEOUT_LIMIT - Duration::from_secs(1));
@@ -1739,7 +1802,7 @@ mod tests {
 
     #[test]
     fn wrong_click_does_not_reset_time_out_countdown() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         game.update(TIMEOUT_LIMIT - Duration::from_secs(1));
         let wrong = wrong_number(&game);
         click_circle(&mut game, wrong);
@@ -1750,7 +1813,7 @@ mod tests {
 
     #[test]
     fn time_out_does_not_happen_during_round_interval() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         clear_round(&mut game);
         assert!(game.interval.is_some());
         game.update(TIMEOUT_LIMIT);
@@ -1809,7 +1872,7 @@ mod tests {
 
     #[test]
     fn target_circle_blinks_before_time_out_and_other_circles_do_not() {
-        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut game = CountManiaGame::new();
         set_separate_layout(&game);
         let [r, g, b] = game.round.circles[0].color;
         let own = Color::Rgb(r, g, b);
@@ -1838,5 +1901,160 @@ mod tests {
         assert_eq!(digit_color(&game, 1), highlight);
         click_circle(&mut game, 1);
         assert_eq!(digit_color(&game, 2), other, "正解で点滅は解除される");
+    }
+
+    // --- 固定3ラウンド(初級→中級→上級) ---
+
+    #[test]
+    fn round_difficulties_rise_from_beginner_to_advanced() {
+        assert_eq!(
+            ROUND_DIFFICULTIES,
+            [
+                Difficulty::Beginner,
+                Difficulty::Intermediate,
+                Difficulty::Advanced
+            ]
+        );
+        assert_eq!(ROUND_DIFFICULTIES.len(), ROUNDS_PER_SESSION as usize);
+    }
+
+    #[test]
+    fn each_round_uses_params_of_its_difficulty() {
+        let mut game = CountManiaGame::new();
+        let board = board_area(AREA);
+        for (index, difficulty) in ROUND_DIFFICULTIES.into_iter().enumerate() {
+            let expected = params(difficulty);
+            assert_eq!(game.round_difficulty(), difficulty, "ROUND{}", index + 1);
+            assert_eq!(game.round_params(), expected, "ROUND{}", index + 1);
+            assert_eq!(game.round.circles.len(), expected.max_number as usize);
+            assert_eq!(game.round.lives, expected.lives);
+            let used: HashSet<CircleSize> = game.round.circles.iter().map(|c| c.size).collect();
+            let allowed: HashSet<CircleSize> = expected.size_levels.iter().copied().collect();
+            assert_eq!(used, allowed, "ROUND{}のサイズ段階", index + 1);
+            assert_eq!(game.placements(board).len(), expected.max_number as usize);
+            clear_round(&mut game);
+            if index + 1 < ROUND_DIFFICULTIES.len() {
+                game.update(ROUND_INTERVAL);
+            }
+        }
+        assert!(game.is_finished());
+        let result = game.result();
+        assert_eq!((result.total, result.correct), (3, 3));
+    }
+
+    #[test]
+    fn difficulty_switches_only_when_next_round_starts() {
+        let mut game = CountManiaGame::new();
+        clear_round(&mut game);
+        assert!(game.interval.is_some());
+        assert_eq!(
+            game.round_difficulty(),
+            Difficulty::Beginner,
+            "待ち時間中はクリアしたラウンドの難易度のまま"
+        );
+        game.update(ROUND_INTERVAL / 2);
+        assert_eq!(game.round_difficulty(), Difficulty::Beginner);
+        game.update(ROUND_INTERVAL / 2);
+        assert!(game.interval.is_none());
+        assert_eq!(game.round_difficulty(), Difficulty::Intermediate);
+        assert_eq!(game.round.circles.len(), 14);
+    }
+
+    #[test]
+    fn game_over_in_round2_records_intermediate_fail_latency() {
+        let mut game = CountManiaGame::new();
+        // ROUND1は経過時間0でクリア(記録0ms)
+        advance_to_round(&mut game, 1);
+        lose_all_lives(&mut game);
+        assert!(game.game_over);
+        assert_eq!(
+            game.round_difficulty(),
+            Difficulty::Intermediate,
+            "GAME OVER後も失敗したラウンドの難易度のまま"
+        );
+        let result = game.result();
+        assert_eq!((result.total, result.correct), (2, 1));
+        let expected = params(Difficulty::Intermediate).fail_latency_ms / 2.0;
+        assert!((result.avg_latency_ms - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn round3_uses_advanced_dense_layout_and_two_lives() {
+        let mut game = CountManiaGame::new();
+        advance_to_round(&mut game, 2);
+        assert_eq!(game.round_difficulty(), Difficulty::Advanced);
+        assert!(game.round_params().dense);
+        assert_eq!(game.round.lives, 2);
+        let text = rendered_text(&game, AREA.width, AREA.height);
+        assert!(text.contains("♥♥"));
+        assert!(!text.contains("♥♥♥"), "上級のライフは2");
+    }
+
+    #[test]
+    fn hud_shows_difficulty_label_of_current_round() {
+        let mut game = CountManiaGame::new();
+        let labels: Vec<String> = ROUND_DIFFICULTIES
+            .iter()
+            .map(|&d| theme::difficulty_label(d).0.replace(' ', ""))
+            .collect();
+        for (index, label) in labels.iter().enumerate() {
+            if index > 0 {
+                clear_round(&mut game);
+                // 待ち時間中は、クリアしたラウンドの番号・難易度のまま
+                let text = rendered_text(&game, AREA.width, AREA.height);
+                assert!(text.contains(&format!("ROUND{index}/3")));
+                assert!(text.contains(labels[index - 1].as_str()));
+                game.update(ROUND_INTERVAL);
+            }
+            let text = rendered_text(&game, AREA.width, AREA.height);
+            assert!(
+                text.contains(&format!("ROUND{}/3", index + 1)),
+                "ROUND{}の表示",
+                index + 1
+            );
+            assert!(text.contains(label.as_str()), "ROUND{}: {label}", index + 1);
+            for (other_index, other) in labels.iter().enumerate() {
+                if other_index != index {
+                    assert!(
+                        !text.contains(other.as_str()),
+                        "ROUND{}に{other}を出さない",
+                        index + 1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn result_difficulty_is_session_difficulty_from_the_start() {
+        let game = CountManiaGame::new();
+        assert_eq!(game.result().difficulty, SESSION_DIFFICULTY);
+    }
+
+    // --- 円のサイズに応じた波紋 ---
+
+    #[test]
+    fn ripple_size_follows_clicked_circle_size() {
+        let mut game = CountManiaGame::new();
+        let (x, y) = set_separate_layout(&game);
+        game.round.circles[0].size = CircleSize::Huge;
+        game.round.circles[1].size = CircleSize::Small;
+        click_board(&mut game, x, y);
+        let huge = game.ripple.expect("正解で波紋が出る");
+        assert_eq!(
+            huge.max_radius_cells(),
+            ripple::max_radius_cells_for(CircleSize::Huge)
+        );
+        click_board(&mut game, 44, 4);
+        assert_eq!(game.round.next, 3);
+        let small = game.ripple.expect("正解で波紋が出る");
+        assert_eq!(
+            small.max_radius_cells(),
+            ripple::max_radius_cells_for(CircleSize::Small)
+        );
+        assert!(
+            huge.max_radius_cells() > small.max_radius_cells() * 2.0,
+            "特大の円の波紋は小さい円よりはっきり大きく広がる"
+        );
     }
 }
