@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -35,6 +36,13 @@ fn main() -> io::Result<()> {
 
     while !app.should_quit() {
         terminal.draw(|frame| app.render(frame))?;
+        // メニューに戻った直後は、画像プロトコルの残留が端末のスクロールバッファに
+        // 溜まっていることがあるのでクリアする。Purgeで画面内容も消えるため、
+        // ratatui側のバッファもterminal.clear()でリセットし、次のdraw()で全体を描き直す
+        if app.take_pending_scrollback_clear() {
+            execute!(terminal.backend_mut(), Clear(ClearType::Purge))?;
+            terminal.clear()?;
+        }
 
         let timeout = TICK_RATE.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {

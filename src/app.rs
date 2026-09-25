@@ -86,6 +86,9 @@ pub struct App {
     /// 現在再生中のBGMトラック名(ジュークボックス画面のハイライト表示に使う)
     current_bgm: Option<String>,
     splash_renderer: crate::ui::splash::SplashRenderer,
+    /// メニューへ戻った直後にtrueになる。main.rsがtake_pending_scrollback_clear()で
+    /// 検知して端末のスクロールバッファをクリアする(画像プロトコルの残留対策)
+    pending_scrollback_clear: bool,
 }
 
 impl App {
@@ -103,7 +106,21 @@ impl App {
             last_area: Rect::default(),
             current_bgm,
             splash_renderer: crate::ui::splash::SplashRenderer::new(),
+            pending_scrollback_clear: false,
         }
+    }
+
+    /// メニュー画面へ遷移する。既存の`self.screen = Screen::Menu`は全てこれに統一し、
+    /// メニューに戻るたびに端末側でのスクロールバッファのクリアを要求する
+    fn enter_menu(&mut self) {
+        self.screen = Screen::Menu;
+        self.pending_scrollback_clear = true;
+    }
+
+    /// メニューへ戻った直後に一度だけtrueを返す(呼ぶとフラグは消費されfalseに戻る)。
+    /// main.rsが端末のスクロールバッファをクリアするタイミングの判定に使う
+    pub fn take_pending_scrollback_clear(&mut self) -> bool {
+        std::mem::take(&mut self.pending_scrollback_clear)
     }
 
     pub fn should_quit(&self) -> bool {
@@ -161,7 +178,7 @@ impl App {
     fn handle_confirm_quit_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => self.should_quit = true,
-            KeyCode::Char('n') | KeyCode::Esc => self.screen = Screen::Menu,
+            KeyCode::Char('n') | KeyCode::Esc => self.enter_menu(),
             _ => {}
         }
     }
@@ -176,7 +193,7 @@ impl App {
             .is_some_and(|name| menu_tracks.contains(name));
         if playing_menu_bgm {
             audio::play_se(SeKind::Transition);
-            self.screen = Screen::Menu;
+            self.enter_menu();
         } else {
             self.return_to_menu();
         }
@@ -227,7 +244,7 @@ impl App {
     /// タイトル画面(Splash)からメニューへ進む(Enter/クリック共通)
     fn leave_splash(&mut self) {
         audio::play_se(SeKind::Confirm);
-        self.screen = Screen::Menu;
+        self.enter_menu();
     }
 
     /// ゲーム終了後、リザルト画面へ進む(キー/クリック共通)。リザルト用BGMに切り替える。
@@ -313,7 +330,7 @@ impl App {
             audio::play_bgm_track(&name);
             self.current_bgm = Some(name);
         }
-        self.screen = Screen::Menu;
+        self.enter_menu();
     }
 
     /// 現在再生中の曲を選択済みにしたジュークボックス画面用ListStateを作る
@@ -375,7 +392,7 @@ impl App {
                 self.current_bgm = None;
             }
             KeyCode::Esc => {
-                self.screen = Screen::Menu;
+                self.enter_menu();
             }
             _ => {}
         }
@@ -395,7 +412,7 @@ impl App {
                     }
                 }
             }
-            KeyCode::Esc => self.screen = Screen::Menu,
+            KeyCode::Esc => self.enter_menu(),
             _ => {}
         }
     }
@@ -1444,6 +1461,37 @@ mod tests {
         let mut app = App::new();
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         assert!(matches!(app.screen, Screen::Menu));
+    }
+
+    #[test]
+    fn entering_menu_requests_a_scrollback_clear_exactly_once() {
+        let mut app = App::new();
+        assert!(
+            !app.take_pending_scrollback_clear(),
+            "起動直後(Splash)ではまだ要求しない"
+        );
+        app.handle_key(KeyEvent::from(KeyCode::Enter)); // Splash -> Menu
+        assert!(matches!(app.screen, Screen::Menu));
+        assert!(
+            app.take_pending_scrollback_clear(),
+            "メニューに入ったらクリアを要求する"
+        );
+        assert!(
+            !app.take_pending_scrollback_clear(),
+            "取り出したら消費されて次はfalse"
+        );
+    }
+
+    #[test]
+    fn returning_to_menu_from_every_non_menu_screen_requests_a_scrollback_clear() {
+        for (name, mut app) in apps_on_every_non_menu_screen() {
+            press(&mut app, KeyCode::Char('q'));
+            assert!(matches!(app.screen, Screen::Menu), "{name}: メニューへ戻る");
+            assert!(
+                app.take_pending_scrollback_clear(),
+                "{name}: メニューへ戻ったらクリアを要求する"
+            );
+        }
     }
 
     #[test]
