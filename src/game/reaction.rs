@@ -185,7 +185,7 @@ impl Game for ReactionGame {
         theme::render_hud(
             frame,
             hud_area,
-            "反応速度(Stroop)",
+            "イロピッタン",
             self.difficulty,
             self.tracker.total(),
             &self.feedback,

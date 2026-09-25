@@ -26,7 +26,7 @@ use crate::stats::store;
 const MENU_ITEMS: [&str; 12] = [
     "図形回転判定",
     "鏡像判定",
-    "反応速度(Stroop)",
+    "イロピッタン",
     "暗算スピード",
     "パターン補完",
     "記憶(位置と色)",
