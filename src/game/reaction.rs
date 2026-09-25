@@ -69,7 +69,6 @@ pub struct ReactionGame {
     difficulty: Difficulty,
     tracker: ScoreTracker,
     current: Question,
-    selected_match: bool,
     question_started_at: Instant,
     elapsed_in_question: Duration,
 }
@@ -81,7 +80,6 @@ impl ReactionGame {
             difficulty,
             tracker: ScoreTracker::new(),
             current: generate_question(&mut rng, difficulty),
-            selected_match: true,
             question_started_at: Instant::now(),
             elapsed_in_question: Duration::ZERO,
         }
@@ -90,7 +88,6 @@ impl ReactionGame {
     fn next_question(&mut self) {
         let mut rng = rand::thread_rng();
         self.current = generate_question(&mut rng, self.difficulty);
-        self.selected_match = true;
         self.question_started_at = Instant::now();
         self.elapsed_in_question = Duration::ZERO;
     }
@@ -115,9 +112,12 @@ impl Game for ReactionGame {
             return;
         }
         match key.code {
-            KeyCode::Left | KeyCode::Right => self.selected_match = !self.selected_match,
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                let is_correct = self.selected_match == self.current.is_match;
+            KeyCode::Left => {
+                let is_correct = self.current.is_match;
+                self.advance_question(is_correct);
+            }
+            KeyCode::Right => {
+                let is_correct = !self.current.is_match;
                 self.advance_question(is_correct);
             }
             _ => {}
@@ -150,27 +150,14 @@ impl Game for ReactionGame {
             .block(Block::default().borders(Borders::ALL).title("この文字色と文字の意味は一致？"));
         frame.render_widget(label_paragraph, rows[0]);
 
-        let match_style = if self.selected_match {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-        };
-        let mismatch_style = if !self.selected_match {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-        };
         let progress = format!(
             "{} / {}問",
             self.tracker.total(),
             crate::game::QUESTIONS_PER_SESSION
         );
-        let line = Line::from(vec![
-            Span::styled(" 一致 ", match_style),
-            Span::raw("  "),
-            Span::styled(" 不一致 ", mismatch_style),
-            Span::raw(format!("   ←→で選択 Enterで決定   {progress}")),
-        ]);
+        let line = Line::from(vec![Span::raw(format!(
+            "← 一致    不一致 →   {progress}"
+        ))]);
         let paragraph = Paragraph::new(line).block(Block::default().borders(Borders::ALL));
         frame.render_widget(paragraph, rows[1]);
     }

@@ -4,7 +4,6 @@ use crossterm::event::{KeyCode, KeyEvent};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
@@ -80,7 +79,6 @@ pub struct MentalCalcGame {
     difficulty: Difficulty,
     tracker: ScoreTracker,
     current: Question,
-    selected_index: usize,
     question_started_at: Instant,
 }
 
@@ -91,13 +89,12 @@ impl MentalCalcGame {
             difficulty,
             tracker: ScoreTracker::new(),
             current: generate_question(&mut rng, difficulty),
-            selected_index: 0,
             question_started_at: Instant::now(),
         }
     }
 
-    fn advance_question(&mut self) {
-        let is_correct = self.selected_index == self.current.correct_index;
+    fn advance_question(&mut self, answered_index: usize) {
+        let is_correct = answered_index == self.current.correct_index;
         let latency_ms = self.question_started_at.elapsed().as_millis() as f64;
         self.tracker.record(is_correct, latency_ms);
         audio::play_se(if is_correct {
@@ -108,7 +105,6 @@ impl MentalCalcGame {
         if !self.tracker.is_session_finished() {
             let mut rng = rand::thread_rng();
             self.current = generate_question(&mut rng, self.difficulty);
-            self.selected_index = 0;
             self.question_started_at = Instant::now();
         }
     }
@@ -119,15 +115,9 @@ impl Game for MentalCalcGame {
         if self.tracker.is_session_finished() {
             return;
         }
-        match key.code {
-            KeyCode::Up => {
-                self.selected_index = (self.selected_index + CHOICE_COUNT - 1) % CHOICE_COUNT;
-            }
-            KeyCode::Down => {
-                self.selected_index = (self.selected_index + 1) % CHOICE_COUNT;
-            }
-            KeyCode::Enter | KeyCode::Char(' ') => self.advance_question(),
-            _ => {}
+        if let KeyCode::Char(c @ '1'..='4') = key.code {
+            let index = c.to_digit(10).unwrap() as usize - 1;
+            self.advance_question(index);
         }
     }
 
@@ -153,14 +143,7 @@ impl Game for MentalCalcGame {
             .choices
             .iter()
             .enumerate()
-            .map(|(i, value)| {
-                let style = if i == self.selected_index {
-                    Style::default().add_modifier(Modifier::REVERSED)
-                } else {
-                    Style::default()
-                };
-                Line::styled(format!(" {value} "), style)
-            })
+            .map(|(i, value)| Line::from(format!(" {}: {value} ", i + 1)))
             .collect();
         let choices_paragraph = Paragraph::new(choice_lines)
             .alignment(Alignment::Center)
@@ -172,7 +155,7 @@ impl Game for MentalCalcGame {
             self.tracker.total(),
             crate::game::QUESTIONS_PER_SESSION
         );
-        let footer = Paragraph::new(format!("↑↓で選択 Enterで決定   {progress}"))
+        let footer = Paragraph::new(format!("数字キー1〜4で回答   {progress}"))
             .alignment(Alignment::Center)
             .block(Block::default().borders(Borders::ALL));
         frame.render_widget(footer, rows[2]);
@@ -237,8 +220,8 @@ mod tests {
     #[test]
     fn advance_question_records_correct_answer() {
         let mut game = MentalCalcGame::new(Difficulty::Beginner);
-        game.selected_index = game.current.correct_index;
-        game.advance_question();
+        let answer = game.current.correct_index;
+        game.advance_question(answer);
         assert_eq!(game.tracker.total(), 1);
     }
 }

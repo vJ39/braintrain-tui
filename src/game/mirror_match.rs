@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent};
 use rand::Rng;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Color;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -62,7 +62,6 @@ pub struct MirrorMatchGame {
     difficulty: Difficulty,
     tracker: ScoreTracker,
     current: Question,
-    selected_mirror: bool,
     question_started_at: Instant,
 }
 
@@ -73,13 +72,12 @@ impl MirrorMatchGame {
             difficulty,
             tracker: ScoreTracker::new(),
             current: generate_question(&mut rng, difficulty),
-            selected_mirror: true,
             question_started_at: Instant::now(),
         }
     }
 
-    fn advance_question(&mut self) {
-        let is_correct = self.selected_mirror == self.current.is_mirror;
+    fn advance_question(&mut self, answered_mirror: bool) {
+        let is_correct = answered_mirror == self.current.is_mirror;
         let latency_ms = self.question_started_at.elapsed().as_millis() as f64;
         self.tracker.record(is_correct, latency_ms);
         audio::play_se(if is_correct {
@@ -90,7 +88,6 @@ impl MirrorMatchGame {
         if !self.tracker.is_session_finished() {
             let mut rng = rand::thread_rng();
             self.current = generate_question(&mut rng, self.difficulty);
-            self.selected_mirror = true;
             self.question_started_at = Instant::now();
         }
     }
@@ -102,8 +99,8 @@ impl Game for MirrorMatchGame {
             return;
         }
         match key.code {
-            KeyCode::Left | KeyCode::Right => self.selected_mirror = !self.selected_mirror,
-            KeyCode::Enter | KeyCode::Char(' ') => self.advance_question(),
+            KeyCode::Left => self.advance_question(true),
+            KeyCode::Right => self.advance_question(false),
             _ => {}
         }
     }
@@ -123,27 +120,14 @@ impl Game for MirrorMatchGame {
         draw_shape(frame, cols[0], "元の図形", &self.current.original);
         draw_shape(frame, cols[1], "比較図形", &self.current.transformed);
 
-        let mirror_style = if self.selected_mirror {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-        };
-        let normal_style = if !self.selected_mirror {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-        };
         let progress = format!(
             "{} / {}問",
             self.tracker.total(),
             crate::game::QUESTIONS_PER_SESSION
         );
-        let line = Line::from(vec![
-            Span::styled(" 鏡像 ", mirror_style),
-            Span::raw("  "),
-            Span::styled(" 通常 ", normal_style),
-            Span::raw(format!("   ←→で選択 Enterで決定   {progress}")),
-        ]);
+        let line = Line::from(vec![Span::raw(format!(
+            "← 鏡像    通常 →   {progress}"
+        ))]);
         let paragraph = Paragraph::new(line).block(Block::default().borders(Borders::ALL));
         frame.render_widget(paragraph, rows[1]);
     }
@@ -230,8 +214,8 @@ mod tests {
     fn session_finishes_after_configured_question_count() {
         let mut game = MirrorMatchGame::new(Difficulty::Beginner);
         for _ in 0..crate::game::QUESTIONS_PER_SESSION {
-            game.selected_mirror = game.current.is_mirror;
-            game.advance_question();
+            let answer = game.current.is_mirror;
+            game.advance_question(answer);
         }
         assert!(game.is_finished());
     }

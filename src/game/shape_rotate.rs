@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent};
 use rand::Rng;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Color;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -62,7 +62,6 @@ pub struct ShapeRotateGame {
     difficulty: Difficulty,
     tracker: ScoreTracker,
     current: Question,
-    selected_same: bool,
     question_started_at: Instant,
 }
 
@@ -73,13 +72,12 @@ impl ShapeRotateGame {
             difficulty,
             tracker: ScoreTracker::new(),
             current: generate_question(&mut rng, difficulty),
-            selected_same: true,
             question_started_at: Instant::now(),
         }
     }
 
-    fn advance_question(&mut self) {
-        let is_correct = self.selected_same == self.current.is_same;
+    fn advance_question(&mut self, answered_same: bool) {
+        let is_correct = answered_same == self.current.is_same;
         let latency_ms = self.question_started_at.elapsed().as_millis() as f64;
         self.tracker.record(is_correct, latency_ms);
         audio::play_se(if is_correct {
@@ -90,7 +88,6 @@ impl ShapeRotateGame {
         if !self.tracker.is_session_finished() {
             let mut rng = rand::thread_rng();
             self.current = generate_question(&mut rng, self.difficulty);
-            self.selected_same = true;
             self.question_started_at = Instant::now();
         }
     }
@@ -102,8 +99,8 @@ impl Game for ShapeRotateGame {
             return;
         }
         match key.code {
-            KeyCode::Left | KeyCode::Right => self.selected_same = !self.selected_same,
-            KeyCode::Enter | KeyCode::Char(' ') => self.advance_question(),
+            KeyCode::Left => self.advance_question(true),
+            KeyCode::Right => self.advance_question(false),
             _ => {}
         }
     }
@@ -123,27 +120,14 @@ impl Game for ShapeRotateGame {
         draw_shape(frame, cols[0], "元の図形", &self.current.original);
         draw_shape(frame, cols[1], "比較図形", &self.current.transformed);
 
-        let same_style = if self.selected_same {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-        };
-        let diff_style = if !self.selected_same {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-        };
         let progress = format!(
             "{} / {}問",
             self.tracker.total(),
             crate::game::QUESTIONS_PER_SESSION
         );
-        let line = Line::from(vec![
-            Span::styled(" 同じ ", same_style),
-            Span::raw("  "),
-            Span::styled(" 違う ", diff_style),
-            Span::raw(format!("   ←→で選択 Enterで決定   {progress}")),
-        ]);
+        let line = Line::from(vec![Span::raw(format!(
+            "← 同じ    違う →   {progress}"
+        ))]);
         let paragraph = Paragraph::new(line).block(Block::default().borders(Borders::ALL));
         frame.render_widget(paragraph, rows[1]);
     }
@@ -230,8 +214,8 @@ mod tests {
     #[test]
     fn advance_question_records_correct_answer() {
         let mut game = ShapeRotateGame::new(Difficulty::Beginner);
-        game.selected_same = game.current.is_same;
-        game.advance_question();
+        let answer = game.current.is_same;
+        game.advance_question(answer);
         assert_eq!(game.tracker.total(), 1);
     }
 
@@ -239,8 +223,8 @@ mod tests {
     fn session_finishes_after_configured_question_count() {
         let mut game = ShapeRotateGame::new(Difficulty::Beginner);
         for _ in 0..crate::game::QUESTIONS_PER_SESSION {
-            game.selected_same = game.current.is_same;
-            game.advance_question();
+            let answer = game.current.is_same;
+            game.advance_question(answer);
         }
         assert!(game.is_finished());
     }
