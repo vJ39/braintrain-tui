@@ -41,6 +41,16 @@ pub trait Game {
     fn result(&self) -> GameResult;
 }
 
+/// クリック座標(column, row)がareaの矩形内にあるかを判定する。
+/// column_index/row_indexはそれぞれ1軸しか見ないため、呼び出し側はまずこれで
+/// 2次元的にエリア内かどうかを確認してから使うこと
+pub fn contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x + area.width
+        && row >= area.y
+        && row < area.y + area.height
+}
+
 /// エリアを横方向にN列に等分し、クリック座標(column)がどの列(0-indexed)に
 /// 属するかを返す。選択肢を横並びに表示するゲーム(2択等)のクリック判定に使う
 pub fn column_index(area: Rect, column: u16, column_count: u16) -> Option<usize> {
@@ -169,6 +179,22 @@ mod tests {
 
     fn rect(x: u16, y: u16, width: u16, height: u16) -> Rect {
         Rect::new(x, y, width, height)
+    }
+
+    #[test]
+    fn contains_true_inside_area() {
+        let area = rect(5, 10, 20, 8);
+        assert!(contains(area, 5, 10), "左上端は含む");
+        assert!(contains(area, 24, 17), "右下端(width-1,height-1)は含む");
+    }
+
+    #[test]
+    fn contains_false_outside_area() {
+        let area = rect(5, 10, 20, 8);
+        assert!(!contains(area, 4, 10), "左端より左");
+        assert!(!contains(area, 25, 10), "右端(x+width)ちょうどは含まない");
+        assert!(!contains(area, 5, 9), "上端より上");
+        assert!(!contains(area, 5, 18), "下端(y+height)ちょうどは含まない");
     }
 
     #[test]

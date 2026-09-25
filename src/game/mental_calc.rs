@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -9,11 +9,24 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::audio::{self, SeKind};
-use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
+use crate::game::{contains, row_index, Difficulty, Game, GameResult, ScoreTracker};
 
 pub const GAME_ID: &str = "mental_calc";
 
 const CHOICE_COUNT: usize = 4;
+
+/// 描画エリアを「問題文」「選択肢」「フッター」に分割する
+fn split_areas(area: Rect) -> (Rect, Rect, Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(CHOICE_COUNT as u16 + 2),
+            Constraint::Length(3),
+        ])
+        .split(area);
+    (rows[0], rows[1], rows[2])
+}
 
 struct Question {
     expression: String,
@@ -121,22 +134,32 @@ impl Game for MentalCalcGame {
         }
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+        if self.tracker.is_session_finished() {
+            return;
+        }
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return;
+        }
+        let (_, choices_area, _) = split_areas(area);
+        let inner = Block::default().borders(Borders::ALL).inner(choices_area);
+        if !contains(inner, mouse.column, mouse.row) {
+            return;
+        }
+        if let Some(index) = row_index(inner, mouse.row, CHOICE_COUNT as u16) {
+            self.advance_question(index);
+        }
+    }
+
     fn update(&mut self, _dt: Duration) {}
 
     fn render(&self, frame: &mut Frame, area: Rect) {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(CHOICE_COUNT as u16 + 2),
-                Constraint::Length(3),
-            ])
-            .split(area);
+        let (expr_area, choices_area, footer_area) = split_areas(area);
 
         let expr_paragraph = Paragraph::new(Line::from(self.current.expression.clone()))
             .alignment(Alignment::Center)
             .block(Block::default().borders(Borders::ALL).title("この式の答えは？"));
-        frame.render_widget(expr_paragraph, rows[0]);
+        frame.render_widget(expr_paragraph, expr_area);
 
         let choice_lines: Vec<Line> = self
             .current
@@ -148,7 +171,7 @@ impl Game for MentalCalcGame {
         let choices_paragraph = Paragraph::new(choice_lines)
             .alignment(Alignment::Center)
             .block(Block::default().borders(Borders::ALL));
-        frame.render_widget(choices_paragraph, rows[1]);
+        frame.render_widget(choices_paragraph, choices_area);
 
         let progress = format!(
             "{} / {}問",
@@ -158,7 +181,7 @@ impl Game for MentalCalcGame {
         let footer = Paragraph::new(format!("数字キー1〜4で回答   {progress}"))
             .alignment(Alignment::Center)
             .block(Block::default().borders(Borders::ALL));
-        frame.render_widget(footer, rows[2]);
+        frame.render_widget(footer, footer_area);
     }
 
     fn is_finished(&self) -> bool {
@@ -223,5 +246,37 @@ mod tests {
         let answer = game.current.correct_index;
         game.advance_question(answer);
         assert_eq!(game.tracker.total(), 1);
+    }
+
+    fn left_click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn clicking_a_choice_row_selects_that_index() {
+        let mut game = MentalCalcGame::new(Difficulty::Beginner);
+        let area = Rect::new(0, 0, 40, 15);
+        let (_, choices_area, _) = split_areas(area);
+        let inner = Block::default().borders(Borders::ALL).inner(choices_area);
+        let correct = game.current.correct_index;
+        let row = inner.y + correct as u16;
+        game.handle_mouse(left_click(inner.x, row), area);
+        let result = game.tracker.to_result(GAME_ID, game.difficulty);
+        assert_eq!(result.total, 1);
+        assert_eq!(result.correct, 1);
+    }
+
+    #[test]
+    fn clicking_outside_choices_area_does_nothing() {
+        let mut game = MentalCalcGame::new(Difficulty::Beginner);
+        let area = Rect::new(0, 0, 40, 15);
+        let (expr_area, _, _) = split_areas(area);
+        game.handle_mouse(left_click(expr_area.x, expr_area.y), area);
+        assert_eq!(game.tracker.total(), 0);
     }
 }

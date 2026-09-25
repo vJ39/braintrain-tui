@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use rand::Rng;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -9,9 +9,40 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::audio::{self, SeKind};
-use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
+use crate::game::{contains, Difficulty, Game, GameResult, ScoreTracker};
 
 pub const GAME_ID: &str = "memory";
+
+/// 描画エリアを「2x2パネル」「フッター」に分割する
+fn split_areas(area: Rect) -> (Rect, Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(7), Constraint::Length(3)])
+        .split(area);
+    (rows[0], rows[1])
+}
+
+/// パネル番号(1〜4)ごとの描画エリアを求める(renderとhandle_mouseで共有)
+fn panel_areas(grid_area: Rect) -> [(usize, Rect); 4] {
+    let grid_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(grid_area);
+    let left_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(grid_cols[0]);
+    let right_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(grid_cols[1]);
+    [
+        (1usize, left_rows[0]),
+        (2, right_rows[0]),
+        (3, left_rows[1]),
+        (4, right_rows[1]),
+    ]
+}
 
 /// パネル番号(1〜4)ごとの色。1=左上, 2=右上, 3=左下, 4=右下
 const PANEL_COLORS: [(usize, Color); 4] = [
@@ -131,6 +162,24 @@ impl MemoryGame {
             };
         }
     }
+
+    /// 入力フェーズ中にパネル(1〜4)が押された時の共通処理(キー/クリック共通)
+    fn press_panel(&mut self, pressed: usize) {
+        let Phase::Input { entered } = &mut self.phase else {
+            return;
+        };
+        self.active_panel = Some(pressed);
+        audio::play_se(SeKind::Transition);
+        let expected = self.sequence[*entered];
+        if pressed != expected {
+            self.finish_question(false);
+            return;
+        }
+        *entered += 1;
+        if *entered >= self.sequence.len() {
+            self.finish_question(true);
+        }
+    }
 }
 
 impl Game for MemoryGame {
@@ -138,21 +187,27 @@ impl Game for MemoryGame {
         if self.tracker.is_session_finished() {
             return;
         }
-        let Phase::Input { entered } = &mut self.phase else {
-            return;
-        };
         if let KeyCode::Char(c @ '1'..='4') = key.code {
             let pressed = c.to_digit(10).unwrap() as usize;
-            self.active_panel = Some(pressed);
-            audio::play_se(SeKind::Transition);
-            let expected = self.sequence[*entered];
-            if pressed != expected {
-                self.finish_question(false);
+            self.press_panel(pressed);
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+        if self.tracker.is_session_finished() {
+            return;
+        }
+        if !matches!(self.phase, Phase::Input { .. }) {
+            return;
+        }
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return;
+        }
+        let (grid_area, _) = split_areas(area);
+        for (panel, panel_area) in panel_areas(grid_area) {
+            if contains(panel_area, mouse.column, mouse.row) {
+                self.press_panel(panel);
                 return;
-            }
-            *entered += 1;
-            if *entered >= self.sequence.len() {
-                self.finish_question(true);
             }
         }
     }
@@ -205,31 +260,9 @@ impl Game for MemoryGame {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect) {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(7), Constraint::Length(3)])
-            .split(area);
+        let (grid_area, footer_area) = split_areas(area);
 
-        let grid_cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(rows[0]);
-        let left_rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(grid_cols[0]);
-        let right_rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(grid_cols[1]);
-        let panel_areas = [
-            (1usize, left_rows[0]),
-            (2, right_rows[0]),
-            (3, left_rows[1]),
-            (4, right_rows[1]),
-        ];
-
-        for (panel, panel_area) in panel_areas {
+        for (panel, panel_area) in panel_areas(grid_area) {
             let is_active = self.active_panel == Some(panel);
             let color = panel_color(panel);
             let style = if is_active {
@@ -269,7 +302,7 @@ impl Game for MemoryGame {
         let footer = Paragraph::new(Line::from(format!("{status}   {progress}")))
             .alignment(Alignment::Center)
             .block(Block::default().borders(Borders::ALL));
-        frame.render_widget(footer, rows[1]);
+        frame.render_widget(footer, footer_area);
     }
 
     fn is_finished(&self) -> bool {
@@ -482,5 +515,44 @@ mod tests {
         }
         assert!(game.is_finished());
         assert_eq!(game.tracker.total(), crate::game::QUESTIONS_PER_SESSION);
+    }
+
+    fn left_click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn clicking_correct_panel_sequence_via_mouse_records_correct_answer() {
+        let mut game = MemoryGame::new(Difficulty::Beginner);
+        let len = game.sequence.len();
+        for _ in 0..len {
+            advance_one_step(&mut game);
+        }
+        let area = Rect::new(0, 0, 40, 12);
+        let (grid_area, _) = split_areas(area);
+        let areas = panel_areas(grid_area);
+        let sequence = game.sequence.clone();
+        for &panel in &sequence {
+            let (_, panel_area) = areas.iter().find(|(p, _)| *p == panel).unwrap();
+            game.handle_mouse(left_click(panel_area.x, panel_area.y), area);
+        }
+        let result = game.tracker.to_result(GAME_ID, game.difficulty);
+        assert_eq!(result.total, 1);
+        assert_eq!(result.correct, 1);
+    }
+
+    #[test]
+    fn clicking_panel_during_showing_phase_is_ignored() {
+        let mut game = MemoryGame::new(Difficulty::Beginner);
+        let area = Rect::new(0, 0, 40, 12);
+        let (grid_area, _) = split_areas(area);
+        let (_, panel_area) = panel_areas(grid_area)[0];
+        game.handle_mouse(left_click(panel_area.x, panel_area.y), area);
+        assert_eq!(game.tracker.total(), 0);
     }
 }

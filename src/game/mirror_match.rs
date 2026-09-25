@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use rand::Rng;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Color;
@@ -11,7 +11,16 @@ use ratatui::Frame;
 
 use crate::audio::{self, SeKind};
 use crate::canvas::shapes::{base_shapes, Shape};
-use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
+use crate::game::{column_index, contains, Difficulty, Game, GameResult, ScoreTracker};
+
+/// このゲームの描画エリアを「図形表示」と「選択肢フッター」に分割する
+fn split_areas(area: Rect) -> (Rect, Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .split(area);
+    (rows[0], rows[1])
+}
 
 pub const GAME_ID: &str = "mirror_match";
 
@@ -105,17 +114,30 @@ impl Game for MirrorMatchGame {
         }
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+        if self.tracker.is_session_finished() {
+            return;
+        }
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return;
+        }
+        let (_, footer_area) = split_areas(area);
+        if !contains(footer_area, mouse.column, mouse.row) {
+            return;
+        }
+        if let Some(col) = column_index(footer_area, mouse.column, 2) {
+            self.advance_question(col == 0);
+        }
+    }
+
     fn update(&mut self, _dt: Duration) {}
 
     fn render(&self, frame: &mut Frame, area: Rect) {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(3)])
-            .split(area);
+        let (shapes_area, footer_area) = split_areas(area);
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(rows[0]);
+            .split(shapes_area);
 
         draw_shape(frame, cols[0], "元の図形", &self.current.original);
         draw_shape(frame, cols[1], "比較図形", &self.current.transformed);
@@ -129,7 +151,7 @@ impl Game for MirrorMatchGame {
             "← 鏡像    通常 →   {progress}"
         ))]);
         let paragraph = Paragraph::new(line).block(Block::default().borders(Borders::ALL));
-        frame.render_widget(paragraph, rows[1]);
+        frame.render_widget(paragraph, footer_area);
     }
 
     fn is_finished(&self) -> bool {
@@ -218,5 +240,48 @@ mod tests {
             game.advance_question(answer);
         }
         assert!(game.is_finished());
+    }
+
+    fn left_click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn clicking_left_half_of_footer_answers_mirror() {
+        let mut game = MirrorMatchGame::new(Difficulty::Beginner);
+        let area = Rect::new(0, 0, 40, 10);
+        let (_, footer_area) = split_areas(area);
+        game.current.is_mirror = true;
+        game.handle_mouse(left_click(footer_area.x, footer_area.y), area);
+        let result = game.tracker.to_result(GAME_ID, game.difficulty);
+        assert_eq!(result.total, 1);
+        assert_eq!(result.correct, 1);
+    }
+
+    #[test]
+    fn clicking_right_half_of_footer_answers_normal() {
+        let mut game = MirrorMatchGame::new(Difficulty::Beginner);
+        let area = Rect::new(0, 0, 40, 10);
+        let (_, footer_area) = split_areas(area);
+        game.current.is_mirror = false;
+        let right_column = footer_area.x + footer_area.width - 1;
+        game.handle_mouse(left_click(right_column, footer_area.y), area);
+        let result = game.tracker.to_result(GAME_ID, game.difficulty);
+        assert_eq!(result.total, 1);
+        assert_eq!(result.correct, 1);
+    }
+
+    #[test]
+    fn clicking_outside_footer_area_does_nothing() {
+        let mut game = MirrorMatchGame::new(Difficulty::Beginner);
+        let area = Rect::new(0, 0, 40, 10);
+        let (shapes_area, _) = split_areas(area);
+        game.handle_mouse(left_click(shapes_area.x, shapes_area.y), area);
+        assert_eq!(game.tracker.total(), 0);
     }
 }

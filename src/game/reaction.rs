@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -10,7 +10,16 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::audio::{self, SeKind};
-use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
+use crate::game::{column_index, contains, Difficulty, Game, GameResult, ScoreTracker};
+
+/// このゲームの描画エリアを「ラベル表示」と「選択肢フッター」に分割する
+fn split_areas(area: Rect) -> (Rect, Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .split(area);
+    (rows[0], rows[1])
+}
 
 pub const GAME_ID: &str = "reaction";
 
@@ -124,6 +133,27 @@ impl Game for ReactionGame {
         }
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+        if self.tracker.is_session_finished() {
+            return;
+        }
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return;
+        }
+        let (_, footer_area) = split_areas(area);
+        if !contains(footer_area, mouse.column, mouse.row) {
+            return;
+        }
+        if let Some(col) = column_index(footer_area, mouse.column, 2) {
+            let is_correct = if col == 0 {
+                self.current.is_match
+            } else {
+                !self.current.is_match
+            };
+            self.advance_question(is_correct);
+        }
+    }
+
     fn update(&mut self, dt: Duration) {
         if self.tracker.is_session_finished() {
             return;
@@ -137,13 +167,7 @@ impl Game for ReactionGame {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect) {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(3)])
-            .split(area);
-
-        // 表示エリアいっぱいを使い、縦方向中央に文字を配置して大きく見せる
-        let label_area = rows[0];
+        let (label_area, footer_area) = split_areas(area);
         let vertical_padding = label_area.height.saturating_sub(3) / 2;
         let mut lines: Vec<Line> = (0..vertical_padding).map(|_| Line::from("")).collect();
         let label_style = Style::default()
@@ -173,7 +197,7 @@ impl Game for ReactionGame {
             "← 一致    不一致 →   {progress}"
         ))]);
         let paragraph = Paragraph::new(line).block(Block::default().borders(Borders::ALL));
-        frame.render_widget(paragraph, rows[1]);
+        frame.render_widget(paragraph, footer_area);
     }
 
     fn is_finished(&self) -> bool {
@@ -239,5 +263,48 @@ mod tests {
     #[test]
     fn beginner_difficulty_has_no_time_limit() {
         assert_eq!(time_limit(Difficulty::Beginner), None);
+    }
+
+    fn left_click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn clicking_left_half_answers_match() {
+        let mut game = ReactionGame::new(Difficulty::Beginner);
+        let area = Rect::new(0, 0, 40, 10);
+        let (_, footer_area) = split_areas(area);
+        game.current.is_match = true;
+        game.handle_mouse(left_click(footer_area.x, footer_area.y), area);
+        let result = game.tracker.to_result(GAME_ID, game.difficulty);
+        assert_eq!(result.total, 1);
+        assert_eq!(result.correct, 1);
+    }
+
+    #[test]
+    fn clicking_right_half_answers_mismatch() {
+        let mut game = ReactionGame::new(Difficulty::Beginner);
+        let area = Rect::new(0, 0, 40, 10);
+        let (_, footer_area) = split_areas(area);
+        game.current.is_match = false;
+        let right_column = footer_area.x + footer_area.width - 1;
+        game.handle_mouse(left_click(right_column, footer_area.y), area);
+        let result = game.tracker.to_result(GAME_ID, game.difficulty);
+        assert_eq!(result.total, 1);
+        assert_eq!(result.correct, 1);
+    }
+
+    #[test]
+    fn clicking_outside_footer_area_does_nothing() {
+        let mut game = ReactionGame::new(Difficulty::Beginner);
+        let area = Rect::new(0, 0, 40, 10);
+        let (label_area, _) = split_areas(area);
+        game.handle_mouse(left_click(label_area.x, label_area.y), area);
+        assert_eq!(game.tracker.total(), 0);
     }
 }

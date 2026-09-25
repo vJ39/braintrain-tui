@@ -10,7 +10,8 @@ use rust_embed::RustEmbed;
 struct Assets;
 
 /// assets/audio/bgm/ 配下は用途別にサブフォルダで分ける
-/// (menu/ = 起動画面・Playing以外、playing/ = ゲームプレイ中)
+/// (menu/ = 起動画面・Playing以外、playing/ = ゲームプレイ中、
+///  rhythm/ = リズムゲームの楽曲。譜面と同期させるため曲ごとに選んで再生する)
 #[derive(RustEmbed)]
 #[folder = "assets/audio/bgm/"]
 struct BgmAssets;
@@ -26,6 +27,10 @@ pub enum SeKind {
 pub enum BgmCategory {
     Menu,
     Playing,
+    /// リズムゲームの楽曲。再生は譜面と対応する曲をトラック名で直接指定するため
+    /// ランダム選曲には使わず、曲データとassetsの対応確認(テスト)で参照する
+    #[cfg_attr(not(test), allow(dead_code))]
+    Rhythm,
 }
 
 impl BgmCategory {
@@ -33,6 +38,7 @@ impl BgmCategory {
         match self {
             BgmCategory::Menu => "menu/",
             BgmCategory::Playing => "playing/",
+            BgmCategory::Rhythm => "rhythm/",
         }
     }
 }
@@ -245,6 +251,27 @@ mod tests {
         assert!(names.iter().any(|n| n == "Method_of_Thought"));
         assert!(names.iter().any(|n| n == "The_Quiet_Calculation"));
         assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn bgm_tracks_in_rhythm_has_both_rhythm_songs_only() {
+        let names = bgm_tracks_in(BgmCategory::Rhythm);
+        assert_eq!(
+            names,
+            vec![
+                "Redline_Response_Time".to_string(),
+                "Top_of_the_Leaderboard".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn rhythm_songs_are_not_mixed_into_playing_or_menu() {
+        for category in [BgmCategory::Menu, BgmCategory::Playing] {
+            let names = bgm_tracks_in(category);
+            assert!(!names.iter().any(|n| n == "Top_of_the_Leaderboard"));
+            assert!(!names.iter().any(|n| n == "Redline_Response_Time"));
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -11,12 +11,25 @@ use ratatui::Frame;
 
 use crate::audio::{self, SeKind};
 use crate::canvas::shapes::{base_shapes, Shape};
-use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
+use crate::game::{column_index, contains, Difficulty, Game, GameResult, ScoreTracker};
 
 pub const GAME_ID: &str = "pattern_fill";
 
 const CHOICE_COUNT: usize = 4;
 const GRID_SIZE: usize = 9;
+
+/// 描画エリアを「グリッド」「選択肢」「フッター」に分割する
+fn split_areas(area: Rect) -> (Rect, Rect, Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(11),
+            Constraint::Length(7),
+            Constraint::Length(3),
+        ])
+        .split(area);
+    (rows[0], rows[1], rows[2])
+}
 
 /// グリッド1マス分の内容(どの図形を何度回転させて置くか)
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -259,24 +272,33 @@ impl Game for PatternFillGame {
         }
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+        if self.tracker.is_session_finished() {
+            return;
+        }
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return;
+        }
+        let (_, choices_area, _) = split_areas(area);
+        if !contains(choices_area, mouse.column, mouse.row) {
+            return;
+        }
+        if let Some(index) = column_index(choices_area, mouse.column, CHOICE_COUNT as u16) {
+            self.advance_question(index);
+        }
+    }
+
     fn update(&mut self, _dt: Duration) {}
 
     fn render(&self, frame: &mut Frame, area: Rect) {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(11),
-                Constraint::Length(7),
-                Constraint::Length(3),
-            ])
-            .split(area);
+        let (grid_area, choices_area, footer_area) = split_areas(area);
 
-        draw_grid(frame, rows[0], &self.current);
+        draw_grid(frame, grid_area, &self.current);
 
         let choice_cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(25); 4])
-            .split(rows[1]);
+            .split(choices_area);
         let shapes = base_shapes();
         for (i, col_area) in choice_cols.iter().enumerate() {
             let cell = self.current.choices[i];
@@ -292,7 +314,7 @@ impl Game for PatternFillGame {
         let footer = Paragraph::new(format!("？に当てはまる図形を数字キー1〜4で回答   {progress}"))
             .alignment(Alignment::Center)
             .block(Block::default().borders(Borders::ALL));
-        frame.render_widget(footer, rows[2]);
+        frame.render_widget(footer, footer_area);
     }
 
     fn is_finished(&self) -> bool {
@@ -542,5 +564,40 @@ mod tests {
             game.advance_question(answer);
         }
         assert!(game.is_finished());
+    }
+
+    fn left_click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn clicking_a_choice_column_selects_that_index() {
+        let mut game = PatternFillGame::new(Difficulty::Beginner);
+        let area = Rect::new(0, 0, 40, 21);
+        let (_, choices_area, _) = split_areas(area);
+        let correct = game.current.correct_index;
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(25); 4])
+            .split(choices_area);
+        let target = cols[correct];
+        game.handle_mouse(left_click(target.x, target.y), area);
+        let result = game.tracker.to_result(GAME_ID, game.difficulty);
+        assert_eq!(result.total, 1);
+        assert_eq!(result.correct, 1);
+    }
+
+    #[test]
+    fn clicking_outside_choices_area_does_nothing() {
+        let mut game = PatternFillGame::new(Difficulty::Beginner);
+        let area = Rect::new(0, 0, 40, 21);
+        let (grid_area, _, _) = split_areas(area);
+        game.handle_mouse(left_click(grid_area.x, grid_area.y), area);
+        assert_eq!(game.tracker.total(), 0);
     }
 }
