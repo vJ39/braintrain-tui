@@ -231,7 +231,8 @@ impl ReactionGame {
 
 impl Game for ReactionGame {
     fn handle_key(&mut self, key: KeyEvent) {
-        if self.tracker.is_session_finished() {
+        // 正誤フィードバック(◯✗)表示中の入力は、次の問題への回答として扱わない
+        if self.tracker.is_session_finished() || self.feedback.current().is_some() {
             return;
         }
         match key.code {
@@ -248,7 +249,8 @@ impl Game for ReactionGame {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
-        if self.tracker.is_session_finished() {
+        // 正誤フィードバック(◯✗)表示中の入力は、次の問題への回答として扱わない
+        if self.tracker.is_session_finished() || self.feedback.current().is_some() {
             return;
         }
         if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
@@ -673,6 +675,59 @@ mod tests {
         assert!(game.feedback.current().is_none());
         // 正解数の表示は消えない
         assert_eq!(game.feedback.correct(), 1);
+    }
+
+    #[test]
+    fn key_input_during_feedback_is_ignored() {
+        let mut game = ReactionGame::new(Difficulty::Beginner);
+        let is_match = game.current.is_match;
+        game.handle_key(KeyEvent::from(if is_match {
+            KeyCode::Left
+        } else {
+            KeyCode::Right
+        }));
+        assert!(game.feedback.current().is_some(), "回答直後は正誤表示中");
+        // 正誤表示が消える前の追加入力は次の問題への回答として扱わない
+        game.handle_key(KeyEvent::from(KeyCode::Left));
+        game.handle_key(KeyEvent::from(KeyCode::Right));
+        assert_eq!(game.tracker.total(), 1, "表示中の入力は無視される");
+    }
+
+    #[test]
+    fn mouse_input_during_feedback_is_ignored() {
+        let mut game = ReactionGame::new(Difficulty::Beginner);
+        let area = Rect::new(0, 0, 40, 10);
+        let (_, footer_area) = split_areas(area);
+        let is_match = game.current.is_match;
+        let column = if is_match {
+            footer_area.x
+        } else {
+            footer_area.x + footer_area.width - 1
+        };
+        game.handle_mouse(left_click(column, footer_area.y), area);
+        assert!(game.feedback.current().is_some(), "回答直後は正誤表示中");
+        game.handle_mouse(left_click(column, footer_area.y), area);
+        assert_eq!(game.tracker.total(), 1, "表示中のクリックは無視される");
+    }
+
+    #[test]
+    fn input_is_accepted_again_after_feedback_hold_time() {
+        let mut game = ReactionGame::new(Difficulty::Beginner);
+        let is_match = game.current.is_match;
+        game.handle_key(KeyEvent::from(if is_match {
+            KeyCode::Left
+        } else {
+            KeyCode::Right
+        }));
+        game.update(crate::game::feedback::FEEDBACK_HOLD);
+        assert!(game.feedback.current().is_none());
+        let next_is_match = game.current.is_match;
+        game.handle_key(KeyEvent::from(if next_is_match {
+            KeyCode::Left
+        } else {
+            KeyCode::Right
+        }));
+        assert_eq!(game.tracker.total(), 2, "表示が消えたら次の回答を受け付ける");
     }
 
     const ALL_DIFFICULTIES: [Difficulty; 3] = [
@@ -1242,6 +1297,7 @@ mod tests {
         let mut game = ReactionGame::new(Difficulty::Beginner);
         for i in 0..SESSION_LENGTH - 1 {
             game.handle_key(KeyEvent::from(KeyCode::Left));
+            game.update(crate::game::feedback::FEEDBACK_HOLD);
             assert!(!game.is_finished(), "{}問目では終わらない", i + 1);
         }
         game.handle_key(KeyEvent::from(KeyCode::Left));
@@ -1264,6 +1320,7 @@ mod tests {
         let mut game = ReactionGame::new(Difficulty::Beginner);
         for _ in 0..12 {
             game.handle_key(KeyEvent::from(KeyCode::Left));
+            game.update(crate::game::feedback::FEEDBACK_HOLD);
         }
         let (buffer, _) = render_game(&game, 60, 20);
         let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
