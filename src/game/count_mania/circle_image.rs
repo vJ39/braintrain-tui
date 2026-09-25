@@ -3,11 +3,12 @@
 //! 画像(assets/image/count_mania/1.png〜20.png、白い円に黒い数字)の白い部分だけを
 //! 指定色に塗り替えて表示する。sixel/kitty/iTerm2の画像プロトコルに対応した端末では画像を、
 //! 非対応の端末では丸囲み数字(①②…)を色付きテキストで表示する。
+//! 円どうしは重なり合い、渡された並び順に描く(後の円ほど手前)。
 //! 図形描画用のShapeCanvasとは独立した、このゲーム専用の部品。
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 
+use image::imageops::{self, FilterType};
 use image::{DynamicImage, RgbaImage};
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -18,7 +19,7 @@ use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
 use rust_embed::RustEmbed;
 
-use super::layout::circle_contains;
+use super::layout::{circle_contains, label_area};
 
 #[derive(RustEmbed)]
 #[folder = "assets/image/count_mania/"]
@@ -75,31 +76,35 @@ pub fn circled_digit(number: u8) -> Option<char> {
     char::from_u32(0x2460 + u32::from(number) - 1)
 }
 
-/// 直前に作った画像と同じ内容なら再エンコードを省くためのキー
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct CacheKey {
-    color: [u8; 3],
-    width: u16,
-    height: u16,
+/// ボードに描く円1つ(位置・番号・色)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoardCircle {
+    pub rect: Rect,
+    pub number: u8,
+    pub color: [u8; 3],
 }
 
-struct Cached {
-    key: CacheKey,
+/// 直前に作ったボード画像。描画エリアと円の並びが同じなら再エンコードを省く
+struct BoardCache {
+    board: Rect,
+    circles: Vec<BoardCircle>,
     protocol: StatefulProtocol,
 }
 
-/// 数字付き円の描画器。画像プロトコルが使える端末では円ごとにエンコード済み画像を
-/// キャッシュし、色やサイズが変わった時だけ作り直す
+/// 数字付き円の描画器。画像プロトコルが使える端末では、ボード上の全ての円を1枚の画像に
+/// 重ね合わせてから表示する(円ごとに別の画像にすると、重なった所で手前の画像が矩形ごと
+/// 奥の画像を消したり、押して消えた円の画像が画面に残ったりするため)。
+/// 描画エリアか円の並び(押して消えた円・色・位置)が変わった時だけ作り直す
 pub struct CircleRenderer {
     picker: Option<Picker>,
-    cache: RefCell<HashMap<u8, Cached>>,
+    cache: RefCell<Option<BoardCache>>,
 }
 
 impl CircleRenderer {
     pub fn new() -> Self {
         Self {
             picker: detect_picker(),
-            cache: RefCell::new(HashMap::new()),
+            cache: RefCell::new(None),
         }
     }
 
@@ -109,44 +114,101 @@ impl CircleRenderer {
         self.picker.is_some()
     }
 
-    /// 番号numberの円をrectにcolorで描く
-    pub fn render(&self, frame: &mut Frame, rect: Rect, number: u8, color: [u8; 3]) {
+    /// board内にcirclesを並び順に描く。後の円ほど手前に重なる
+    pub fn render_board(&self, frame: &mut Frame, board: Rect, circles: &[BoardCircle]) {
         // 描画先がフレームからはみ出さないよう切り詰める
-        let rect = rect.intersection(frame.area());
-        if rect.is_empty() {
+        let board = board.intersection(frame.area());
+        if board.is_empty() {
             return;
         }
-        if !self.render_image(frame, rect, number, color) {
-            render_text(frame, rect, number, color);
+        if self.render_board_image(frame, board, circles) {
+            return;
+        }
+        for circle in circles {
+            let rect = circle.rect.intersection(frame.area());
+            if !rect.is_empty() {
+                render_text(frame, rect, circle.number, circle.color);
+            }
         }
     }
 
     /// 画像プロトコルで描く。画像プロトコルが使えない/画像が読めない場合はfalse
-    fn render_image(&self, frame: &mut Frame, rect: Rect, number: u8, color: [u8; 3]) -> bool {
+    fn render_board_image(&self, frame: &mut Frame, board: Rect, circles: &[BoardCircle]) -> bool {
         let Some(picker) = &self.picker else {
             return false;
         };
-        let key = CacheKey {
-            color,
-            width: rect.width,
-            height: rect.height,
-        };
+        if circles.is_empty() {
+            return true;
+        }
         let mut cache = self.cache.borrow_mut();
-        let needs_regen = !matches!(cache.get(&number), Some(cached) if cached.key == key);
+        let needs_regen = !matches!(
+            cache.as_ref(),
+            Some(cached) if cached.board == board && cached.circles == circles
+        );
         if needs_regen {
-            let Some(image) = load_circle_image(number) else {
+            let Some(images) = circles
+                .iter()
+                .map(|c| load_circle_image(c.number).map(|image| recolor(&image, c.color)))
+                .collect::<Option<Vec<_>>>()
+            else {
                 return false;
             };
-            let recolored = DynamicImage::ImageRgba8(recolor(&image, color));
-            let protocol = picker.new_resize_protocol(recolored);
-            cache.insert(number, Cached { key, protocol });
+            let layers: Vec<(Rect, &RgbaImage)> = circles
+                .iter()
+                .zip(&images)
+                .map(|(c, image)| (c.rect, image))
+                .collect();
+            let composed = compose_board(board, picker.font_size(), &layers);
+            let protocol = picker.new_resize_protocol(DynamicImage::ImageRgba8(composed));
+            *cache = Some(BoardCache {
+                board,
+                circles: circles.to_vec(),
+                protocol,
+            });
         }
-        let Some(cached) = cache.get_mut(&number) else {
+        let Some(cached) = cache.as_mut() else {
             return false;
         };
-        frame.render_stateful_widget(StatefulImage::default(), rect, &mut cached.protocol);
+        frame.render_stateful_widget(StatefulImage::default(), board, &mut cached.protocol);
         true
     }
+}
+
+/// board(セル単位)と同じ大きさのピクセル画像に、layers(セル単位の位置, 画像)を並び順に
+/// 重ね合わせる。後の画像ほど手前で、透明な部分からは奥の画像が見える。円の無い所は透明。
+/// 各画像は縦横比を保ったまま位置の枠に収まる最大の大きさにして、枠の中央に置く。
+/// font_sizeは1セルのピクセル数(幅, 高さ)
+pub fn compose_board(
+    board: Rect,
+    font_size: (u16, u16),
+    layers: &[(Rect, &RgbaImage)],
+) -> RgbaImage {
+    let cell_width = u32::from(font_size.0.max(1));
+    let cell_height = u32::from(font_size.1.max(1));
+    let mut canvas = RgbaImage::new(
+        u32::from(board.width) * cell_width,
+        u32::from(board.height) * cell_height,
+    );
+    for &(rect, image) in layers {
+        if rect.is_empty() || image.width() == 0 || image.height() == 0 {
+            continue;
+        }
+        let frame_width = u32::from(rect.width) * cell_width;
+        let frame_height = u32::from(rect.height) * cell_height;
+        let scale = f64::min(
+            f64::from(frame_width) / f64::from(image.width()),
+            f64::from(frame_height) / f64::from(image.height()),
+        );
+        let width = ((f64::from(image.width()) * scale).round() as u32).clamp(1, frame_width);
+        let height = ((f64::from(image.height()) * scale).round() as u32).clamp(1, frame_height);
+        let scaled = imageops::resize(image, width, height, FilterType::Triangle);
+        let x = (i64::from(rect.x) - i64::from(board.x)) * i64::from(cell_width)
+            + i64::from((frame_width - width) / 2);
+        let y = (i64::from(rect.y) - i64::from(board.y)) * i64::from(cell_height)
+            + i64::from((frame_height - height) / 2);
+        imageops::overlay(&mut canvas, &scaled, x, y);
+    }
+    canvas
 }
 
 /// 端末の画像プロトコルを調べる。sixel/kitty/iTerm2のどれかが使える時だけSome。
@@ -179,15 +241,10 @@ fn render_text(frame: &mut Frame, rect: Rect, number: u8, color: [u8; 3]) {
     let Some(digit) = circled_digit(number) else {
         return;
     };
-    // 丸囲み数字は端末によって2セル幅で表示されるため、両隣を空白にして網掛けと重ならないようにする
-    let label_width = rect.width.min(3);
-    let label = Rect::new(
-        rect.x + (rect.width - label_width) / 2,
-        rect.y + rect.height / 2,
-        label_width,
-        1,
-    );
-    let text = if label_width >= 3 {
+    // 丸囲み数字は端末によって2セル幅で表示されるため、両隣を空白にして網掛けと重ならないようにする。
+    // 置く位置は配置側(layout)が手前の円に覆わせないよう守っている範囲と同じにする
+    let label = label_area(rect);
+    let text = if label.width >= 3 {
         format!(" {digit} ")
     } else {
         digit.to_string()
@@ -269,6 +326,107 @@ mod tests {
         assert_eq!(circled_digit(21), None);
     }
 
+    /// テキスト表示でボードを描き、バッファを返す
+    fn render_fallback(
+        width: u16,
+        height: u16,
+        circles: &[BoardCircle],
+    ) -> ratatui::buffer::Buffer {
+        let renderer = CircleRenderer::new();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| renderer.render_board(frame, frame.area(), circles))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn solid(width: u32, height: u32, rgba: [u8; 4]) -> RgbaImage {
+        RgbaImage::from_pixel(width, height, Rgba(rgba))
+    }
+
+    #[test]
+    fn fallback_draws_later_circles_on_top() {
+        // 大きい円1の左側に小さい円2が重なっている。重なった所は後に描いた円の色になる
+        let large = BoardCircle {
+            rect: Rect::new(0, 0, 14, 7),
+            number: 1,
+            color: [10, 10, 10],
+        };
+        let small = BoardCircle {
+            rect: Rect::new(0, 2, 6, 3),
+            number: 2,
+            color: [200, 200, 200],
+        };
+        let buffer = render_fallback(20, 8, &[large, small]);
+        assert_eq!(
+            buffer[(2, 3)].fg,
+            Color::Rgb(200, 200, 200),
+            "小さい円が手前"
+        );
+        assert_eq!(
+            buffer[(10, 3)].fg,
+            Color::Rgb(10, 10, 10),
+            "重ならない所は大きい円"
+        );
+        let buffer = render_fallback(20, 8, &[small, large]);
+        assert_eq!(
+            buffer[(2, 3)].fg,
+            Color::Rgb(10, 10, 10),
+            "描く順番どおりに重なる"
+        );
+    }
+
+    #[test]
+    fn compose_board_stacks_layers_in_order() {
+        // ボード20x10セル、1セル10x20ピクセル => 200x200ピクセル
+        let board = Rect::new(3, 5, 20, 10);
+        let red = solid(4, 4, [255, 0, 0, 255]);
+        let blue = solid(4, 4, [0, 0, 255, 255]);
+        // 大きい円: 12x6セル=120x120ピクセル(ボード左上から)。小さい円: 4x2セル=40x40ピクセル
+        let large = Rect::new(3, 5, 12, 6);
+        let small = Rect::new(7, 7, 4, 2);
+        let image = compose_board(board, (10, 20), &[(large, &red), (small, &blue)]);
+        assert_eq!(image.dimensions(), (200, 200));
+        assert_eq!(image.get_pixel(10, 10).0, [255, 0, 0, 255], "大きい円");
+        assert_eq!(image.get_pixel(50, 50).0, [0, 0, 255, 255], "後の円が手前");
+        assert_eq!(image.get_pixel(150, 150).0[3], 0, "円の無い所は透明");
+
+        let image = compose_board(board, (10, 20), &[(small, &blue), (large, &red)]);
+        assert_eq!(
+            image.get_pixel(50, 50).0,
+            [255, 0, 0, 255],
+            "並び順どおりに重なる"
+        );
+    }
+
+    #[test]
+    fn compose_board_keeps_aspect_ratio_and_centers_image() {
+        // 4x1セル=40x20ピクセルの枠に正方形の画像を置くと、20x20で横方向の中央に来る
+        let board = Rect::new(0, 0, 4, 1);
+        let green = solid(8, 8, [0, 255, 0, 255]);
+        let image = compose_board(board, (10, 20), &[(board, &green)]);
+        assert_eq!(image.dimensions(), (40, 20));
+        assert_eq!(image.get_pixel(5, 10).0[3], 0, "左の余白は透明");
+        assert_eq!(image.get_pixel(20, 10).0, [0, 255, 0, 255]);
+        assert_eq!(image.get_pixel(35, 10).0[3], 0, "右の余白は透明");
+    }
+
+    #[test]
+    fn compose_board_shows_lower_layer_through_transparent_pixels() {
+        // 上の画像の透明な部分(円の外側の角)からは下の円が見える
+        let board = Rect::new(0, 0, 2, 1);
+        let below = solid(2, 2, [255, 0, 0, 255]);
+        let mut above = solid(2, 2, [0, 0, 255, 255]);
+        above.put_pixel(0, 0, Rgba([0, 0, 0, 0]));
+        let image = compose_board(board, (10, 20), &[(board, &below), (board, &above)]);
+        assert_eq!(
+            image.get_pixel(1, 1).0,
+            [255, 0, 0, 255],
+            "透明な角から下が見える"
+        );
+        assert_eq!(image.get_pixel(18, 18).0, [0, 0, 255, 255]);
+    }
+
     #[test]
     fn fallback_renders_colored_circled_digit_in_rect() {
         // テスト環境(非TTY)では画像プロトコルを検出できず、テキスト表示になる
@@ -277,8 +435,13 @@ mod tests {
         let backend = TestBackend::new(30, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         let rect = Rect::new(4, 2, 8, 4);
+        let circle = BoardCircle {
+            rect,
+            number: 12,
+            color: [1, 2, 3],
+        };
         terminal
-            .draw(|frame| renderer.render(frame, rect, 12, [1, 2, 3]))
+            .draw(|frame| renderer.render_board(frame, frame.area(), &[circle]))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let cell = (rect.x..rect.right())

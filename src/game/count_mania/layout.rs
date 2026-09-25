@@ -2,7 +2,11 @@
 //!
 //! 円の大きさは「端末上で占めるセル数」で表す。端末のセルは縦長(横:縦 ≒ 1:2)なので、
 //! 幅を高さの2倍にすると見た目がほぼ正円になる。配置はプレイエリアをセルのグリッドとして扱い、
-//! 円ごとの矩形が重ならないようにランダムに置く。
+//! 円どうしが重なり合うようにランダムに置く。大きい円ほど奥、小さい円ほど手前に描く。
+//! どの円も数字が読めてクリックできるよう、手前の円が奥の円の数字の範囲(protected_area)を
+//! 覆う位置には置かない。
+
+use std::cmp::Reverse;
 
 use rand::seq::SliceRandom;
 use rand::Rng;
@@ -28,31 +32,25 @@ pub struct Placement {
 /// 幅は高さの2倍にする
 const SIZE_TIERS: [[u16; 3]; 5] = [[7, 5, 3], [6, 4, 3], [5, 4, 2], [4, 3, 2], [3, 2, 1]];
 
-/// 1つの組で配置をやり直す回数(ランダムな置き方の運で失敗することがあるため)
+/// 1つの組・配置領域で配置をやり直す回数(ランダムな置き方の運で失敗することがあるため)
 const ATTEMPTS_PER_TIER: usize = 3;
 
-/// 配置の詰め具合。gapは円どうしの最小間隔(セル)、max_fillは円の占有面積(間隔込み)が
-/// 配置領域に占めてよい割合の上限
-struct Packing {
-    gap_x: u16,
-    gap_y: u16,
-    max_fill: f64,
-}
+/// 円1つを置く時に、全ての位置を調べる前にランダムな位置を試す回数
+const RANDOM_POSITION_TRIES: usize = 64;
 
-const LOOSE: Packing = Packing {
-    gap_x: 2,
-    gap_y: 1,
-    max_fill: 0.45,
-};
+/// 円の面積の合計が配置領域の面積に占めてよい割合の上限。重なりを許すので1を超えてもよい。
+/// 超える場合は円を1段小さい組に落とす(重なりすぎて数字の範囲を避けて置けなくなるのを防ぐ)
+const LOOSE_MAX_COVERAGE: f64 = 0.8;
+const DENSE_MAX_COVERAGE: f64 = 1.4;
 
-const DENSE: Packing = Packing {
-    gap_x: 0,
-    gap_y: 0,
-    max_fill: 0.75,
-};
+/// 密集配置のとき、円を寄せるプレイエリア中央の領域の割合(幅・高さそれぞれ)。
+/// 狭い領域に置くほど円どうしの重なりが強くなる
+const DENSE_REGION_RATIO: f64 = 0.6;
 
-/// 密集配置のとき、プレイエリアの中央に寄せる領域の割合(幅・高さそれぞれ)
-const DENSE_REGION_RATIO: f64 = 0.7;
+/// 数字の範囲(手前の円に覆わせない範囲)の、円の幅・高さに対する割合。
+/// 円の画像の2桁の数字は幅約42%・高さ約30%を占めるので、少し余裕を持たせている
+const DIGIT_WIDTH_RATIO: f64 = 0.46;
+const DIGIT_HEIGHT_RATIO: f64 = 0.4;
 
 /// 指定の組(tier)でのサイズ段階ごとのセル数(幅, 高さ)
 pub fn size_dims(tier: usize, size: CircleSize) -> (u16, u16) {
@@ -65,9 +63,11 @@ pub fn size_dims(tier: usize, size: CircleSize) -> (u16, u16) {
     (height * 2, height)
 }
 
-/// 円(番号, サイズ段階)をarea内に重ならないようランダムに配置する。
-/// denseがtrueなら円どうしの間隔を詰め、プレイエリア中央に寄せて密集させる。
-/// エリアが小さすぎる場合は円を小さい組に落として収める
+/// 円(番号, サイズ段階)をarea内にランダムに配置する。円どうしの重なりは許すが、
+/// 手前の円が奥の円の数字の範囲を覆うことはない。
+/// 戻り値は描画順(奥→手前。面積の大きい円が先)に並ぶ。
+/// denseがtrueならプレイエリア中央の狭い領域に寄せ、重なりを強くする。
+/// 円の面積の合計が領域に対して大きすぎる場合は、円を小さい組に落として収める
 pub fn layout_circles(
     rng: &mut impl Rng,
     area: Rect,
@@ -77,22 +77,27 @@ pub fn layout_circles(
     if circles.is_empty() || area.is_empty() {
         return Vec::new();
     }
-    let packing = if dense { &DENSE } else { &LOOSE };
-    // 密集配置はまず中央の領域に詰め、収まらなければエリア全体に広げる
+    let max_coverage = if dense {
+        DENSE_MAX_COVERAGE
+    } else {
+        LOOSE_MAX_COVERAGE
+    };
+    // 密集配置はまず中央の領域に置き、収まらなければ同じ大きさのままエリア全体に広げる
+    // (円を小さくするより、広げて置く方を優先する)
     let mut regions = Vec::with_capacity(2);
     if dense {
         regions.push(central_region(area, DENSE_REGION_RATIO));
     }
     regions.push(area);
 
-    for region in &regions {
-        for tier in 0..SIZE_TIERS.len() {
-            let sized = sized_circles(tier, circles);
-            if !fits_by_area(region, &sized, packing) {
+    for tier in 0..SIZE_TIERS.len() {
+        let sized = sized_circles(tier, circles);
+        for region in &regions {
+            if !fits_by_area(region, &sized, max_coverage) {
                 continue;
             }
             for _ in 0..ATTEMPTS_PER_TIER {
-                let placements = place_circles(rng, *region, &sized, packing, false);
+                let placements = place_circles(rng, *region, &sized, false);
                 if placements.len() == sized.len() {
                     return placements;
                 }
@@ -104,7 +109,7 @@ pub fn layout_circles(
     // 置けなかった円はクリックできないが、端末を広げれば描画エリアが変わって配置し直される
     let sized = sized_circles(SIZE_TIERS.len() - 1, circles);
     (0..ATTEMPTS_PER_TIER)
-        .map(|_| place_circles(rng, area, &sized, packing, true))
+        .map(|_| place_circles(rng, area, &sized, true))
         .max_by_key(|placements| placements.len())
         .unwrap_or_default()
 }
@@ -132,8 +137,8 @@ fn sized_circles(tier: usize, circles: &[(u8, CircleSize)]) -> Vec<(u8, u16, u16
         .collect()
 }
 
-/// 円の占有面積(間隔込み)が配置領域の上限割合に収まり、どの円も領域に入る大きさか
-fn fits_by_area(region: &Rect, sized: &[(u8, u16, u16)], packing: &Packing) -> bool {
+/// どの円も領域に入る大きさで、円の面積の合計が領域の面積のmax_coverage倍以下か
+fn fits_by_area(region: &Rect, sized: &[(u8, u16, u16)], max_coverage: f64) -> bool {
     let every_circle_fits = sized
         .iter()
         .all(|&(_, w, h)| w <= region.width && h <= region.height);
@@ -142,65 +147,126 @@ fn fits_by_area(region: &Rect, sized: &[(u8, u16, u16)], packing: &Packing) -> b
     }
     let occupied: u64 = sized
         .iter()
-        .map(|&(_, w, h)| u64::from(w + packing.gap_x) * u64::from(h + packing.gap_y))
+        .map(|&(_, w, h)| u64::from(w) * u64::from(h))
         .sum();
-    // 領域の右端・下端には間隔が要らないので、その分だけ領域を広げて比べる
-    let capacity =
-        u64::from(region.width + packing.gap_x) * u64::from(region.height + packing.gap_y);
-    occupied as f64 <= capacity as f64 * packing.max_fill
+    occupied as f64 <= f64::from(region.area()) * max_coverage
 }
 
-/// 大きい円から順に、region内のグリッドを走査して他の円(間隔込み)と重ならない位置を集め、
-/// その中からランダムに選んで置く。置けない円があった場合、skip_unplaceableがfalseならそこで
-/// 打ち切り、trueならその円を飛ばして残りを置き続ける。戻り値は置けた円(番号順)
+/// 大きい円から順に(=奥から手前へ)置く。新しく置く円は、それまでに置いた円の数字の範囲を
+/// 覆わない位置の中からランダムに選ぶ。置けない円があった場合、skip_unplaceableがfalseなら
+/// そこで打ち切り、trueならその円を飛ばして残りを置き続ける。戻り値は置けた円(描画順)
 fn place_circles(
     rng: &mut impl Rng,
     region: Rect,
     sized: &[(u8, u16, u16)],
-    packing: &Packing,
     skip_unplaceable: bool,
 ) -> Vec<Placement> {
     let mut order: Vec<&(u8, u16, u16)> = sized.iter().collect();
-    // 同じ大きさの円どうしの順番はランダムにする(番号順に偏った配置にしないため)
+    // 同じ大きさの円どうしの順番(=重なった時の前後)はランダムにする
     order.shuffle(rng);
-    order.sort_by_key(|&&(_, w, h)| std::cmp::Reverse(u32::from(w) * u32::from(h)));
+    order.sort_by_key(|&&(_, w, h)| Reverse(u32::from(w) * u32::from(h)));
 
     let mut placed: Vec<Placement> = Vec::with_capacity(sized.len());
     for &&(number, width, height) in &order {
-        if width > region.width || height > region.height {
-            if skip_unplaceable {
-                continue;
-            }
-            break;
+        match choose_position(rng, region, width, height, &placed) {
+            Some(rect) => placed.push(Placement { number, rect }),
+            None if skip_unplaceable => continue,
+            None => break,
         }
-        let candidates: Vec<(u16, u16)> = (region.y..=region.bottom() - height)
-            .flat_map(|y| (region.x..=region.right() - width).map(move |x| (x, y)))
-            .filter(|&(x, y)| {
-                let rect = Rect::new(x, y, width, height);
-                placed.iter().all(|p| !too_close(rect, p.rect, packing))
-            })
-            .collect();
-        let Some(&(x, y)) = candidates.choose(rng) else {
-            if skip_unplaceable {
-                continue;
-            }
-            break;
-        };
-        placed.push(Placement {
-            number,
-            rect: Rect::new(x, y, width, height),
-        });
     }
-    placed.sort_by_key(|p| p.number);
     placed
 }
 
-/// 2つの矩形が重なる、または間隔(gap)未満まで近づいているか
-fn too_close(a: Rect, b: Rect, packing: &Packing) -> bool {
-    a.x < b.right() + packing.gap_x
-        && b.x < a.right() + packing.gap_x
-        && a.y < b.bottom() + packing.gap_y
-        && b.y < a.bottom() + packing.gap_y
+/// 幅width・高さheightの円を、region内で置いた円(placed)の数字の範囲を覆わない位置に
+/// ランダムに置く。まずランダムな位置を何度か試し(条件を満たす位置の中から一様に選ぶのと同じ)、
+/// 見つからなければ全ての位置を調べて選ぶ。置ける位置が無ければNone
+fn choose_position(
+    rng: &mut impl Rng,
+    region: Rect,
+    width: u16,
+    height: u16,
+    placed: &[Placement],
+) -> Option<Rect> {
+    if width > region.width || height > region.height {
+        return None;
+    }
+    let valid = |rect: Rect| placed.iter().all(|below| !hides_number(rect, below.rect));
+    let (max_x, max_y) = (region.right() - width, region.bottom() - height);
+    for _ in 0..RANDOM_POSITION_TRIES {
+        let rect = Rect::new(
+            rng.gen_range(region.x..=max_x),
+            rng.gen_range(region.y..=max_y),
+            width,
+            height,
+        );
+        if valid(rect) {
+            return Some(rect);
+        }
+    }
+    let candidates: Vec<Rect> = (region.y..=max_y)
+        .flat_map(|y| (region.x..=max_x).map(move |x| Rect::new(x, y, width, height)))
+        .filter(|&rect| valid(rect))
+        .collect();
+    candidates.choose(rng).copied()
+}
+
+/// 手前に置く円aboveが、奥の円belowの数字の範囲のセルを1つでも覆うか
+fn hides_number(above: Rect, below: Rect) -> bool {
+    let protected = protected_area(below);
+    if !above.intersects(protected) {
+        return false;
+    }
+    (protected.y..protected.bottom())
+        .flat_map(|y| (protected.x..protected.right()).map(move |x| (x, y)))
+        .any(|(x, y)| circle_contains(above, x, y))
+}
+
+/// 丸囲み数字(テキスト表示)を置くセル。円の中央の行の、中央最大3セル
+pub fn label_area(rect: Rect) -> Rect {
+    let width = rect.width.min(3);
+    Rect::new(
+        rect.x + (rect.width - width) / 2,
+        rect.y + rect.height / 2,
+        width,
+        rect.height.min(1),
+    )
+}
+
+/// 円の数字の範囲。手前の円にここを覆わせないことで、どの円も数字が読め、
+/// 中心をクリックすればその円に当たる。丸囲み数字のセル(label_area)と、
+/// 画像表示での数字の範囲(円の中央、幅・高さの一定割合)を合わせた範囲
+pub fn protected_area(rect: Rect) -> Rect {
+    let label = label_area(rect);
+    let (x, width) = central_span(rect.x, rect.width, DIGIT_WIDTH_RATIO);
+    let (y, height) = central_span(rect.y, rect.height, DIGIT_HEIGHT_RATIO);
+    let digits = Rect::new(x, y, width, height);
+    if digits.is_empty() {
+        label
+    } else {
+        label.union(digits)
+    }
+}
+
+/// start から len セル並んだ区間のうち、中央の長さ len*ratio の範囲にセルの中心が入るものの
+/// (先頭のセル, 個数)。該当するセルが無ければ個数0
+fn central_span(start: u16, len: u16, ratio: f64) -> (u16, u16) {
+    let mid = f64::from(len) / 2.0;
+    let half = f64::from(len) * ratio / 2.0;
+    // セルiの中心は i+0.5。mid-half <= i+0.5 <= mid+half を満たすiの範囲
+    let first = (mid - half - 0.5).ceil().max(0.0);
+    let last = (mid + half - 0.5).floor().min(f64::from(len) - 1.0);
+    if last < first {
+        return (start, 0);
+    }
+    (start + first as u16, (last - first) as u16 + 1)
+}
+
+/// 描画順(奥→手前)に並べ替えた配置。面積の大きい円が奥で、同じ大きさどうしは元の並び順
+/// (後ろほど手前)を保つ。hit_testの優先順位とそろえている
+pub fn back_to_front(placements: &[Placement]) -> Vec<Placement> {
+    let mut ordered = placements.to_vec();
+    ordered.sort_by_key(|p| Reverse(p.rect.area()));
+    ordered
 }
 
 /// (column, row)のセルが、rectに内接する楕円(=円の見た目)の内側にあるか。
@@ -216,7 +282,9 @@ pub fn circle_contains(rect: Rect, column: u16, row: u16) -> bool {
     dx * dx + dy * dy <= 1.0
 }
 
-/// クリック座標にある円の番号を返す。is_visibleがfalseの円(消えた円)は対象外
+/// クリック座標にある円の番号を返す。is_visibleがfalseの円(消えた円)は対象外。
+/// 複数の円が重なっている場合は、見た目で手前にある円を返す。
+/// つまり最も面積の小さい円で、同じ大きさどうしなら並びの後ろ(後に描かれる方)を優先する
 pub fn hit_test(
     placements: &[Placement],
     is_visible: impl Fn(u8) -> bool,
@@ -225,8 +293,10 @@ pub fn hit_test(
 ) -> Option<u8> {
     placements
         .iter()
-        .find(|p| is_visible(p.number) && circle_contains(p.rect, column, row))
-        .map(|p| p.number)
+        .enumerate()
+        .filter(|(_, p)| is_visible(p.number) && circle_contains(p.rect, column, row))
+        .min_by_key(|&(index, p)| (p.rect.area(), Reverse(index)))
+        .map(|(_, p)| p.number)
 }
 
 #[cfg(test)]
@@ -242,21 +312,96 @@ mod tests {
     }
 
     const ALL: [CircleSize; 3] = [CircleSize::Large, CircleSize::Medium, CircleSize::Small];
+    const LARGE_MEDIUM: [CircleSize; 2] = [CircleSize::Large, CircleSize::Medium];
 
-    fn assert_no_overlap(placements: &[Placement]) {
-        for (i, a) in placements.iter().enumerate() {
-            for b in &placements[i + 1..] {
-                assert!(
-                    !a.rect.intersects(b.rect),
-                    "円{}({:?})と円{}({:?})が重なっている",
-                    a.number,
-                    a.rect,
-                    b.number,
-                    b.rect
+    /// 難易度ごとの(円の数, サイズ段階, 密集配置)の組み合わせ
+    const CONFIGS: [(u8, &[CircleSize], bool); 3] = [
+        (10, &LARGE_MEDIUM, false),
+        (14, &ALL, false),
+        (20, &ALL, true),
+    ];
+
+    /// 円の中心セル(テストや当たり判定の確認でクリックする位置)
+    fn center(rect: Rect) -> (u16, u16) {
+        (rect.x + rect.width / 2, rect.y + rect.height / 2)
+    }
+
+    fn cells(rect: Rect) -> impl Iterator<Item = (u16, u16)> {
+        (rect.y..rect.bottom()).flat_map(move |y| (rect.x..rect.right()).map(move |x| (x, y)))
+    }
+
+    /// どの円の数字も読めて、中心をクリックすればその円に当たること。
+    /// 押し終えた円が消えていく途中(1..k-1が消えた状態)でも同じことを確かめる
+    fn assert_numbers_readable(placements: &[Placement]) {
+        // 描画順で後ろ(手前)の円が、前(奥)の円の数字の範囲を覆っていないこと
+        let ordered = back_to_front(placements);
+        for (i, below) in ordered.iter().enumerate() {
+            for above in &ordered[i + 1..] {
+                for (x, y) in cells(protected_area(below.rect)) {
+                    assert!(
+                        !circle_contains(above.rect, x, y),
+                        "円{}({:?})の数字の範囲({x},{y})が手前の円{}({:?})に隠れている",
+                        below.number,
+                        below.rect,
+                        above.number,
+                        above.rect
+                    );
+                }
+            }
+        }
+        let max = placements.iter().map(|p| p.number).max().unwrap_or(0);
+        for removed_below in 1..=max {
+            let visible = |n: u8| n >= removed_below;
+            for p in placements.iter().filter(|p| visible(p.number)) {
+                let (x, y) = center(p.rect);
+                assert_eq!(
+                    hit_test(placements, visible, x, y),
+                    Some(p.number),
+                    "{removed_below}未満が消えた状態で円{}の中心をクリックするとその円に当たる",
+                    p.number
                 );
             }
         }
     }
+
+    fn assert_inside(area: Rect, placements: &[Placement]) {
+        for p in placements {
+            assert_eq!(
+                area.intersection(p.rect),
+                p.rect,
+                "円{}がエリア内に収まること",
+                p.number
+            );
+        }
+    }
+
+    /// 2つの円の矩形が重なっている面積の合計
+    fn total_overlap(placements: &[Placement]) -> u64 {
+        let mut total = 0u64;
+        for (i, a) in placements.iter().enumerate() {
+            for b in &placements[i + 1..] {
+                total += u64::from(a.rect.intersection(b.rect).area());
+            }
+        }
+        total
+    }
+
+    fn any_overlap(placements: &[Placement]) -> bool {
+        placements.iter().enumerate().any(|(i, a)| {
+            placements[i + 1..]
+                .iter()
+                .any(|b| a.rect.intersects(b.rect))
+        })
+    }
+
+    fn placement(number: u8, x: u16, y: u16, width: u16, height: u16) -> Placement {
+        Placement {
+            number,
+            rect: Rect::new(x, y, width, height),
+        }
+    }
+
+    // --- サイズ段階 ---
 
     #[test]
     fn size_dims_keep_large_medium_small_order_in_every_tier() {
@@ -271,30 +416,61 @@ mod tests {
         }
     }
 
+    // --- 配置 ---
+
     #[test]
-    fn layout_places_every_circle_inside_area_without_overlap() {
-        let area = Rect::new(3, 5, 78, 19);
-        for (seed, (n, dense)) in [(10u8, false), (14, false), (20, true)].iter().enumerate() {
-            for trial in 0..20u64 {
-                let mut rng = StdRng::seed_from_u64(seed as u64 * 100 + trial);
-                let input = circles(*n, &ALL);
-                let placements = layout_circles(&mut rng, area, &input, *dense);
-                assert_eq!(placements.len(), *n as usize, "全ての円が配置されること");
-                let mut numbers: Vec<u8> = placements.iter().map(|p| p.number).collect();
-                numbers.sort();
-                assert_eq!(numbers, (1..=*n).collect::<Vec<_>>(), "各番号が1つずつ");
-                for p in &placements {
-                    assert!(
-                        area.contains(p.rect.as_position())
-                            && p.rect.right() <= area.right()
-                            && p.rect.bottom() <= area.bottom(),
-                        "円{}がエリア内に収まること: {:?}",
-                        p.number,
-                        p.rect
-                    );
+    fn layout_places_every_circle_inside_area_with_numbers_readable() {
+        let areas = [
+            Rect::new(3, 5, 78, 19),
+            Rect::new(0, 0, 160, 50),
+            Rect::new(0, 0, 40, 10),
+        ];
+        for area in areas {
+            for (n, levels, dense) in CONFIGS {
+                for trial in 0..20u64 {
+                    let mut rng = StdRng::seed_from_u64(u64::from(n) * 1000 + trial);
+                    let placements = layout_circles(&mut rng, area, &circles(n, levels), dense);
+                    assert_eq!(placements.len(), n as usize, "全ての円が配置されること");
+                    let mut numbers: Vec<u8> = placements.iter().map(|p| p.number).collect();
+                    numbers.sort();
+                    assert_eq!(numbers, (1..=n).collect::<Vec<_>>(), "各番号が1つずつ");
+                    assert_inside(area, &placements);
+                    assert_numbers_readable(&placements);
                 }
-                assert_no_overlap(&placements);
             }
+        }
+    }
+
+    #[test]
+    fn layout_lets_circles_overlap() {
+        // 元のゲームと同じく円どうしが重なり合う配置になる
+        let area = Rect::new(3, 5, 78, 19);
+        for (n, levels, dense) in CONFIGS {
+            let overlapping = (0..20u64)
+                .filter(|&seed| {
+                    let mut rng = StdRng::seed_from_u64(seed);
+                    any_overlap(&layout_circles(&mut rng, area, &circles(n, levels), dense))
+                })
+                .count();
+            assert!(
+                overlapping >= 10,
+                "n={n}: 20回中{overlapping}回しか重ならない"
+            );
+        }
+    }
+
+    #[test]
+    fn layout_returns_circles_back_to_front() {
+        // 戻り値は描画順(大きい円が先=奥、小さい円が後=手前)
+        let area = Rect::new(0, 0, 120, 40);
+        for seed in 0..10 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let placements = layout_circles(&mut rng, area, &circles(20, &ALL), true);
+            let areas: Vec<u32> = placements.iter().map(|p| p.rect.area()).collect();
+            assert!(
+                areas.windows(2).all(|w| w[0] >= w[1]),
+                "面積が大きい順: {areas:?}"
+            );
         }
     }
 
@@ -324,12 +500,13 @@ mod tests {
 
     #[test]
     fn layout_shrinks_circles_to_fit_small_area() {
-        // 小さな端末でも全ての円が重ならずに収まる
+        // 小さな端末でも全ての円が収まり、数字も読める
         let area = Rect::new(0, 0, 40, 10);
         let mut rng = StdRng::seed_from_u64(3);
         let placements = layout_circles(&mut rng, area, &circles(20, &ALL), true);
         assert_eq!(placements.len(), 20);
-        assert_no_overlap(&placements);
+        assert_inside(area, &placements);
+        assert_numbers_readable(&placements);
     }
 
     #[test]
@@ -358,55 +535,109 @@ mod tests {
     }
 
     #[test]
+    fn dense_layout_overlaps_more_than_loose_layout() {
+        let area = Rect::new(0, 0, 160, 50);
+        let input = circles(20, &ALL);
+        let overlap = |dense: bool| {
+            (0..10)
+                .map(|seed| {
+                    let mut rng = StdRng::seed_from_u64(seed);
+                    total_overlap(&layout_circles(&mut rng, area, &input, dense))
+                })
+                .sum::<u64>()
+        };
+        let (dense, loose) = (overlap(true), overlap(false));
+        assert!(dense > loose, "密集{dense} > 通常{loose}");
+    }
+
+    #[test]
     fn dense_layout_stays_in_central_region_when_it_fits() {
-        // 広いエリアなら、密集配置の円は全て中央70%の領域に収まる
+        // 広いエリアなら、密集配置の円は全て中央の領域に収まる
         let area = Rect::new(0, 0, 160, 50);
         let region = central_region(area, DENSE_REGION_RATIO);
-        assert_eq!(region, Rect::new(24, 7, 112, 35));
+        assert_eq!(region, Rect::new(32, 10, 96, 30));
         for seed in 0..5 {
             let mut rng = StdRng::seed_from_u64(seed);
             let placements = layout_circles(&mut rng, area, &circles(20, &ALL), true);
             assert_eq!(placements.len(), 20);
-            for p in &placements {
-                assert_eq!(
-                    region.intersection(p.rect),
-                    p.rect,
-                    "円{}が中央領域内",
-                    p.number
-                );
-            }
+            assert_inside(region, &placements);
         }
     }
 
     #[test]
-    fn layout_in_too_small_area_places_what_fits_without_overlap() {
-        // 全部は収まらないほど小さいエリアでもpanicせず、置けた分は重ならない
+    fn layout_in_too_small_area_places_what_fits_with_numbers_readable() {
+        // 全部は収まらないほど小さいエリアでもpanicせず、置けた分の数字は読める
         let area = Rect::new(0, 0, 6, 2);
         let mut rng = StdRng::seed_from_u64(1);
         let placements = layout_circles(&mut rng, area, &circles(20, &ALL), true);
         assert!(!placements.is_empty() && placements.len() < 20);
-        assert_no_overlap(&placements);
+        assert_inside(area, &placements);
+        assert_numbers_readable(&placements);
         assert!(
             layout_circles(&mut rng, Rect::new(0, 0, 0, 0), &circles(3, &ALL), false).is_empty()
         );
     }
 
+    // --- 数字の範囲 ---
+
     #[test]
-    fn loose_layout_keeps_gap_between_circles() {
-        let area = Rect::new(0, 0, 120, 40);
-        let mut rng = StdRng::seed_from_u64(11);
-        let placements = layout_circles(&mut rng, area, &circles(10, &ALL), false);
-        for (i, a) in placements.iter().enumerate() {
-            for b in &placements[i + 1..] {
-                assert!(
-                    !too_close(a.rect, b.rect, &LOOSE),
-                    "円{}と円{}の間隔",
-                    a.number,
-                    b.number
+    fn protected_area_covers_label_and_center_and_stays_inside_circle() {
+        for tier in 0..SIZE_TIERS.len() {
+            for size in ALL {
+                let (w, h) = size_dims(tier, size);
+                let rect = Rect::new(5, 3, w, h);
+                let label = label_area(rect);
+                let protected = protected_area(rect);
+                assert!(!label.is_empty() && label.height == 1);
+                assert_eq!(
+                    protected.intersection(label),
+                    label,
+                    "{rect:?}: 数字のセルを含む"
                 );
+                let (cx, cy) = center(rect);
+                assert!(
+                    crate::game::contains(protected, cx, cy),
+                    "{rect:?}: 中心を含む"
+                );
+                for (x, y) in cells(protected) {
+                    assert!(circle_contains(rect, x, y), "{rect:?}: ({x},{y})は円の内側");
+                }
             }
         }
     }
+
+    #[test]
+    fn protected_area_of_large_circle_covers_two_digit_number() {
+        // 画像の2桁の数字(幅約42%・高さ約30%)が隠れないよう、ラベルより広い範囲を守る
+        let rect = Rect::new(0, 0, 14, 7);
+        let protected = protected_area(rect);
+        assert!(protected.width >= 6, "{protected:?}");
+        assert!(protected.height >= 3, "{protected:?}");
+    }
+
+    #[test]
+    fn label_area_is_centered_up_to_three_cells() {
+        assert_eq!(label_area(Rect::new(10, 5, 12, 6)), Rect::new(14, 8, 3, 1));
+        assert_eq!(label_area(Rect::new(0, 0, 2, 1)), Rect::new(0, 0, 2, 1));
+        assert_eq!(label_area(Rect::new(0, 0, 4, 2)), Rect::new(0, 1, 3, 1));
+    }
+
+    // --- 描画順 ---
+
+    #[test]
+    fn back_to_front_puts_larger_first_and_keeps_order_among_same_size() {
+        let input = [
+            placement(1, 0, 0, 2, 1),
+            placement(2, 0, 0, 14, 7),
+            placement(3, 0, 0, 10, 5),
+            placement(4, 5, 0, 14, 7),
+            placement(5, 9, 0, 2, 1),
+        ];
+        let numbers: Vec<u8> = back_to_front(&input).iter().map(|p| p.number).collect();
+        assert_eq!(numbers, [2, 4, 3, 1, 5]);
+    }
+
+    // --- 当たり判定 ---
 
     #[test]
     fn circle_contains_center_but_not_corners() {
@@ -429,16 +660,7 @@ mod tests {
 
     #[test]
     fn hit_test_returns_number_of_clicked_visible_circle() {
-        let placements = [
-            Placement {
-                number: 1,
-                rect: Rect::new(0, 0, 10, 5),
-            },
-            Placement {
-                number: 2,
-                rect: Rect::new(20, 0, 10, 5),
-            },
-        ];
+        let placements = [placement(1, 0, 0, 10, 5), placement(2, 20, 0, 10, 5)];
         assert_eq!(hit_test(&placements, |_| true, 5, 2), Some(1));
         assert_eq!(hit_test(&placements, |_| true, 25, 2), Some(2));
         assert_eq!(
@@ -456,5 +678,34 @@ mod tests {
             None,
             "消えた円はクリックできない"
         );
+    }
+
+    #[test]
+    fn hit_test_prefers_smallest_overlapping_circle_regardless_of_order() {
+        // 大きい円1の上に小さい円2が重なっている。重なった所は手前の小さい円に当たる
+        let large = placement(1, 0, 0, 14, 7);
+        let small = placement(2, 4, 2, 6, 3);
+        for placements in [[large, small], [small, large]] {
+            assert_eq!(hit_test(&placements, |_| true, 7, 3), Some(2));
+            assert_eq!(
+                hit_test(&placements, |_| true, 2, 3),
+                Some(1),
+                "小さい円の外は大きい円"
+            );
+        }
+    }
+
+    #[test]
+    fn hit_test_among_same_size_prefers_later_drawn_circle() {
+        let a = placement(1, 0, 0, 10, 5);
+        let b = placement(2, 4, 0, 10, 5);
+        assert_eq!(hit_test(&[a, b], |_| true, 6, 2), Some(2));
+        assert_eq!(hit_test(&[b, a], |_| true, 6, 2), Some(1));
+    }
+
+    #[test]
+    fn hit_test_falls_through_to_circle_below_when_top_is_removed() {
+        let placements = [placement(1, 0, 0, 14, 7), placement(2, 4, 2, 6, 3)];
+        assert_eq!(hit_test(&placements, |n| n != 2, 7, 3), Some(1));
     }
 }
