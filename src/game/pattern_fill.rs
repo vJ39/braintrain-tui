@@ -3,14 +3,16 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use rand::seq::SliceRandom;
 use rand::Rng;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::Color;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
-use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::audio::{self, SeKind};
 use crate::canvas::shapes::{base_shapes, Shape};
+use crate::game::feedback::{AnswerFeedback, Flash};
+use crate::game::theme;
 use crate::game::{column_index, contains, Difficulty, Game, GameResult, ScoreTracker};
 
 pub const GAME_ID: &str = "pattern_fill";
@@ -231,6 +233,8 @@ pub struct PatternFillGame {
     tracker: ScoreTracker,
     current: Question,
     question_started_at: Instant,
+    /// 直前の回答の正誤表示(描画専用)
+    feedback: AnswerFeedback,
 }
 
 impl PatternFillGame {
@@ -241,6 +245,7 @@ impl PatternFillGame {
             tracker: ScoreTracker::new(),
             current: generate_question(&mut rng, difficulty),
             question_started_at: Instant::now(),
+            feedback: AnswerFeedback::new(),
         }
     }
 
@@ -248,6 +253,10 @@ impl PatternFillGame {
         let is_correct = answered_index == self.current.correct_index;
         let latency_ms = self.question_started_at.elapsed().as_millis() as f64;
         self.tracker.record(is_correct, latency_ms);
+        self.feedback.record(
+            is_correct,
+            format!("こたえ: {}番", self.current.correct_index + 1),
+        );
         audio::play_se(if is_correct {
             SeKind::Correct
         } else {
@@ -288,33 +297,41 @@ impl Game for PatternFillGame {
         }
     }
 
-    fn update(&mut self, _dt: Duration) {}
+    fn update(&mut self, dt: Duration) {
+        self.feedback.tick(dt);
+    }
 
     fn render(&self, frame: &mut Frame, area: Rect) {
         let (grid_area, choices_area, footer_area) = split_areas(area);
+        // HUDはクリック判定の無いグリッドエリアの上端から切り出す(選択肢の位置は変えない)
+        let (hud_area, grid_area) = theme::split_hud(grid_area);
+        theme::render_hud(
+            frame,
+            hud_area,
+            "パターン補完",
+            self.difficulty,
+            self.tracker.total(),
+            &self.feedback,
+        );
 
-        draw_grid(frame, grid_area, &self.current);
+        draw_grid(frame, grid_area, &self.current, self.feedback.current());
 
-        let choice_cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(25); 4])
-            .split(choices_area);
+        // 選択肢はクリック判定(column_index)と同じ4等分の帯に描く
         let shapes = base_shapes();
-        for (i, col_area) in choice_cols.iter().enumerate() {
+        for (i, col_area) in theme::column_bands(choices_area, CHOICE_COUNT as u16)
+            .into_iter()
+            .enumerate()
+        {
             let cell = self.current.choices[i];
             let shape = shapes[cell.shape_index].rotated(cell.angle_deg.to_radians());
-            draw_choice(frame, *col_area, i + 1, &shape);
+            draw_choice(frame, col_area, i + 1, &shape);
         }
 
-        let progress = format!(
-            "{} / {}問",
-            self.tracker.total(),
-            crate::game::QUESTIONS_PER_SESSION
+        theme::render_hint_footer(
+            frame,
+            footer_area,
+            &[("1〜4", "？に当てはまる図形を回答"), ("q", "終了")],
         );
-        let footer = Paragraph::new(format!("？に当てはまる図形を数字キー1〜4で回答   {progress}"))
-            .alignment(Alignment::Center)
-            .block(Block::default().borders(Borders::ALL));
-        frame.render_widget(footer, footer_area);
     }
 
     fn is_finished(&self) -> bool {
@@ -326,17 +343,13 @@ impl Game for PatternFillGame {
     }
 }
 
-fn draw_grid(frame: &mut Frame, area: Rect, question: &Question) {
+fn draw_grid(frame: &mut Frame, area: Rect, question: &Question, flash: Option<&Flash>) {
     let shapes = base_shapes();
     let blank_index = question.blank_index;
     let cells = question.cells;
 
     let canvas = Canvas::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("この規則に当てはまる図形は？"),
-        )
+        .block(theme::focus_panel(" この規則に当てはまる図形は？ ", flash))
         .x_bounds([-3.2, 3.2])
         .y_bounds([-3.2, 3.2])
         .paint(move |ctx| {
@@ -363,10 +376,19 @@ fn draw_grid(frame: &mut Frame, area: Rect, question: &Question) {
                             y1,
                             x2,
                             y2,
-                            color: Color::DarkGray,
+                            color: theme::HIGHLIGHT,
                         });
                     }
-                    ctx.print(cx - 0.2, cy, "?");
+                    ctx.print(
+                        cx - 0.2,
+                        cy,
+                        Span::styled(
+                            "?",
+                            Style::default()
+                                .fg(theme::HIGHLIGHT)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    );
                 } else {
                     let shape = shapes[cell.shape_index].rotated(cell.angle_deg.to_radians());
                     for (p1, p2) in shape.to_lines() {
@@ -375,7 +397,7 @@ fn draw_grid(frame: &mut Frame, area: Rect, question: &Question) {
                             y1: p1.1 * 0.8 + cy,
                             x2: p2.0 * 0.8 + cx,
                             y2: p2.1 * 0.8 + cy,
-                            color: Color::Green,
+                            color: theme::ACCENT_STRONG,
                         });
                     }
                 }
@@ -386,12 +408,17 @@ fn draw_grid(frame: &mut Frame, area: Rect, question: &Question) {
 
 fn draw_choice(frame: &mut Frame, area: Rect, number: usize, shape: &Shape) {
     let lines = shape.to_lines();
+    // 枠の上辺に番号をキー風に出す(押すキーが一目で分かるように)
+    let title = Line::from(Span::styled(
+        format!(" {number} "),
+        Style::default()
+            .fg(Color::Black)
+            .bg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD),
+    ))
+    .centered();
     let canvas = Canvas::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(number.to_string()),
-        )
+        .block(theme::sub_panel().title(title))
         .x_bounds([-1.0, 1.0])
         .y_bounds([-1.0, 1.0])
         .paint(move |ctx| {
@@ -401,7 +428,7 @@ fn draw_choice(frame: &mut Frame, area: Rect, number: usize, shape: &Shape) {
                     y1: p1.1,
                     x2: p2.0,
                     y2: p2.1,
-                    color: Color::Cyan,
+                    color: theme::ACCENT,
                 });
             }
         });
@@ -599,5 +626,36 @@ mod tests {
         let (grid_area, _, _) = split_areas(area);
         game.handle_mouse(left_click(grid_area.x, grid_area.y), area);
         assert_eq!(game.tracker.total(), 0);
+    }
+
+    #[test]
+    fn answering_shows_feedback_with_the_correct_choice_number() {
+        let mut game = PatternFillGame::new(Difficulty::Beginner);
+        let correct = game.current.correct_index;
+        game.advance_question(correct);
+        let flash = game.feedback.current().expect("回答直後は正誤を表示する");
+        assert_eq!(flash.verdict, crate::game::feedback::Verdict::Correct);
+        assert_eq!(flash.detail, format!("こたえ: {}番", correct + 1));
+        game.update(crate::game::feedback::FEEDBACK_HOLD);
+        assert!(game.feedback.current().is_none());
+    }
+
+    #[test]
+    fn clicking_anywhere_inside_a_drawn_choice_panel_selects_it() {
+        // 選択肢パネルの描画位置(column_bands)とクリック判定(column_index)が一致すること
+        let area = Rect::new(0, 0, 43, 24);
+        let (_, choices_area, _) = split_areas(area);
+        for (i, band) in crate::game::theme::column_bands(choices_area, CHOICE_COUNT as u16)
+            .into_iter()
+            .enumerate()
+        {
+            for column in [band.x, band.x + band.width - 1] {
+                let mut game = PatternFillGame::new(Difficulty::Beginner);
+                game.current.correct_index = i;
+                game.handle_mouse(left_click(column, band.y), area);
+                let result = game.tracker.to_result(GAME_ID, game.difficulty);
+                assert_eq!(result.correct, 1, "選択肢{}の列{column}", i + 1);
+            }
+        }
     }
 }

@@ -1,12 +1,13 @@
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
+use crate::game::theme;
 use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
 
 /// 曲ごとの実測ビート時刻データ(src/game/rhythm/beats.rs)
@@ -34,6 +35,24 @@ impl Lane {
     /// 表示位置と入力キーの対応はこの順序に一致させる。
     fn all() -> [Lane; 4] {
         [Lane::Left, Lane::Down, Lane::Up, Lane::Right]
+    }
+
+    /// 判定ライン上に出す矢印
+    fn arrow(self) -> &'static str {
+        match self {
+            Lane::Left => "←",
+            Lane::Up => "↑",
+            Lane::Down => "↓",
+            Lane::Right => "→",
+        }
+    }
+
+    /// レーンの色。左右と上下で色を分け、どのレーンのノーツかを見分けやすくする
+    fn color(self) -> Color {
+        match self {
+            Lane::Left | Lane::Right => Color::LightMagenta,
+            Lane::Up | Lane::Down => Color::LightCyan,
+        }
     }
 }
 
@@ -530,6 +549,93 @@ impl RhythmGame {
         self.last_judgement_at = now;
     }
 
+    /// 時刻nowの時点で画面に出すべき直近の判定(表示時間を過ぎていればNone)
+    fn visible_judgement(&self, now: Duration) -> Option<Judgement> {
+        if now.saturating_sub(self.last_judgement_at) <= JUDGEMENT_DISPLAY_HOLD {
+            self.last_judgement
+        } else {
+            None
+        }
+    }
+
+    /// 上段: 左=コンボ、中央=直近の判定、右=譜面の進み具合。枠の上辺に曲名と難易度
+    fn render_header(&self, frame: &mut Frame, area: Rect, judgement: Option<Judgement>) {
+        let (difficulty_text, difficulty_color) = theme::difficulty_label(self.difficulty);
+        let block = theme::panel(format!(" ♪ {} ", self.song().display_name)).title(
+            Line::from(Span::styled(
+                format!(" {difficulty_text} "),
+                Style::default()
+                    .fg(difficulty_color)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .right_aligned(),
+        );
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(22),
+                Constraint::Fill(1),
+                Constraint::Length(24),
+            ])
+            .split(inner);
+
+        // コンボが続いているほど目立つ色にする
+        let combo_color = if self.combo >= 10 {
+            theme::HIGHLIGHT
+        } else if self.combo > 0 {
+            theme::ACCENT_STRONG
+        } else {
+            theme::MUTED
+        };
+        let combo = Line::from(vec![
+            Span::styled(" COMBO ", Style::default().fg(theme::MUTED)),
+            Span::styled(
+                self.combo.to_string(),
+                Style::default()
+                    .fg(combo_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  MAX {}", self.max_combo),
+                Style::default().fg(theme::MUTED),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(combo), cols[0]);
+
+        if let Some(j) = judgement {
+            let label = Line::from(Span::styled(
+                format!("★ {} ★", judgement_label(j)),
+                Style::default()
+                    .fg(judgement_color(j))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            frame.render_widget(
+                Paragraph::new(label).alignment(Alignment::Center),
+                cols[1],
+            );
+        }
+
+        let judged_count = self.notes.iter().filter(|n| n.is_judged()).count() as u32;
+        let total = self.notes.len() as u32;
+        let progress = Line::from(vec![
+            Span::styled(
+                theme::progress_bar(judged_count, total, 10),
+                Style::default().fg(theme::ACCENT),
+            ),
+            Span::styled(
+                format!(" {judged_count}/{total} "),
+                Style::default().fg(theme::TEXT),
+            ),
+        ]);
+        frame.render_widget(
+            Paragraph::new(progress).alignment(Alignment::Right),
+            cols[2],
+        );
+    }
+
     /// ノーツ1つが確定した際に、コンボ・スコアへ反映する
     fn apply_note_result(&mut self, judgement: Judgement, latency_ms: f64) {
         let is_correct = judgement != Judgement::Miss;
@@ -596,19 +702,58 @@ impl Game for RhythmGame {
     fn render(&self, frame: &mut Frame, area: Rect) {
         let now = self.started_at.elapsed();
         let lanes = Lane::all();
+        let judgement = self.visible_judgement(now);
 
-        let header = Line::from(Span::styled(
-            "   ←      ↓      ↑      →   ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+        // 「曲情報・コンボ」「譜面トラック」「操作説明」の3段
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(theme::HUD_HEIGHT),
+                Constraint::Min(6),
+                Constraint::Length(3),
+            ])
+            .split(area);
+        let (header_area, track_area, footer_area) = (rows[0], rows[1], rows[2]);
+
+        self.render_header(frame, header_area, judgement);
+
+        // 判定が出ている間はトラックの枠をその判定の色に光らせる
+        let track_border = judgement.map_or(theme::ACCENT, judgement_color);
+        let track_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Thick)
+            .border_style(Style::default().fg(track_border));
+        let track_inner = track_block.inner(track_area);
+        frame.render_widget(track_block, track_area);
+
+        // 1レーン分の表示幅(文字数)。全行でこの幅を守ることでレーンが縦にそろう
+        const LANE_CELL: &str = "       ";
+        let lane_cell = |symbol: &str| format!("   {symbol}   ");
+
+        let receptors = Line::from(
+            lanes
+                .iter()
+                .map(|lane| {
+                    Span::styled(
+                        lane_cell(lane.arrow()),
+                        Style::default()
+                            .fg(lane.color())
+                            .add_modifier(Modifier::BOLD),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
         let judge_line = Line::from(Span::styled(
-            "=============================",
-            Style::default().add_modifier(Modifier::BOLD),
+            "━".repeat(LANE_CELL.len() * lanes.len()),
+            Style::default()
+                .fg(theme::ACCENT_STRONG)
+                .add_modifier(Modifier::BOLD),
         ));
 
         // TUIの縦セル数を可能な限り使い、位置計算自体は連続量(progress)で行う(仕様15)
-        let reserved_rows: u16 = 6;
-        let track_height = area.height.saturating_sub(reserved_rows).max(4) as usize;
+        // トラック内部から「矢印」「判定ライン」の2行を除いた分がノーツの流れる高さ
+        let reserved_rows: u16 = 2;
+        let track_height = track_inner.height.saturating_sub(reserved_rows).max(4) as usize;
 
         let mut grid = vec![[' '; 4]; track_height];
         for note in &self.notes {
@@ -629,44 +774,37 @@ impl Game for RhythmGame {
             }
         }
 
-        let judgement_line = if now.saturating_sub(self.last_judgement_at) <= JUDGEMENT_DISPLAY_HOLD
-        {
-            match self.last_judgement {
-                Some(j) => Line::from(Span::styled(
-                    judgement_label(j),
-                    Style::default()
-                        .fg(judgement_color(j))
-                        .add_modifier(Modifier::BOLD),
-                )),
-                None => Line::from(""),
-            }
-        } else {
-            Line::from("")
-        };
-
-        let mut lines = vec![header, judge_line, judgement_line];
-        for row in grid.iter() {
-            let text: String = row.iter().map(|c| format!("   {c}   ")).collect();
-            lines.push(Line::from(Span::raw(text)));
+        let mut lines = vec![receptors, judge_line];
+        for (row_idx, row) in grid.iter().enumerate() {
+            let spans: Vec<Span> = row
+                .iter()
+                .zip(lanes.iter())
+                .map(|(&c, lane)| {
+                    if c == ' ' {
+                        // ノーツの無いマスはレーンの目印として薄い点を置く
+                        Span::styled(lane_cell("·"), Style::default().fg(theme::MUTED))
+                    } else {
+                        let mut style = Style::default().fg(lane.color());
+                        // 判定ライン直前のノーツは太字にして踏むタイミングを目立たせる
+                        if row_idx <= 1 {
+                            style = style.add_modifier(Modifier::BOLD);
+                        }
+                        Span::styled(lane_cell(&c.to_string()), style)
+                    }
+                })
+                .collect();
+            lines.push(Line::from(spans));
         }
+        frame.render_widget(
+            Paragraph::new(lines).alignment(Alignment::Center),
+            track_inner,
+        );
 
-        let judged_count = self.notes.iter().filter(|n| n.is_judged()).count();
-        lines.push(Line::from(Span::raw(format!(
-            "COMBO {}  (MAX {})",
-            self.combo, self.max_combo
-        ))));
-        lines.push(Line::from(Span::raw(format!(
-            "判定ラインに矢印キーを合わせよう   {judged_count} / {}ノーツ",
-            self.notes.len()
-        ))));
-
-        let paragraph = Paragraph::new(lines)
-            .alignment(ratatui::layout::Alignment::Center)
-            .block(Block::default().borders(Borders::ALL).title(format!(
-                "リズム/タイミング合わせ(DDR風) - {}",
-                self.song().display_name
-            )));
-        frame.render_widget(paragraph, area);
+        theme::render_hint_footer(
+            frame,
+            footer_area,
+            &[("← ↑ ↓ →", "判定ラインで踏む"), ("q", "終了")],
+        );
     }
 
     fn is_finished(&self) -> bool {
@@ -710,6 +848,41 @@ mod tests {
                 assert_ne!(colors[i], colors[j], "判定ランクごとに異なる色にすること");
             }
         }
+    }
+
+    // --- 直近判定の表示時間(visible_judgement) ---
+
+    #[test]
+    fn visible_judgement_is_none_before_any_judgement() {
+        let game = RhythmGame::new(Difficulty::Beginner, 0);
+        assert_eq!(game.visible_judgement(Duration::ZERO), None);
+    }
+
+    #[test]
+    fn visible_judgement_holds_for_display_time_then_disappears() {
+        let mut game = RhythmGame::new(Difficulty::Beginner, 0);
+        let at = Duration::from_secs(5);
+        game.set_last_judgement(Judgement::Great, at);
+        assert_eq!(game.visible_judgement(at), Some(Judgement::Great));
+        assert_eq!(
+            game.visible_judgement(at + JUDGEMENT_DISPLAY_HOLD),
+            Some(Judgement::Great),
+            "表示時間ちょうどまでは表示する"
+        );
+        assert_eq!(
+            game.visible_judgement(at + JUDGEMENT_DISPLAY_HOLD + Duration::from_millis(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn lane_colors_distinguish_horizontal_and_vertical_lanes() {
+        assert_eq!(Lane::Left.color(), Lane::Right.color());
+        assert_eq!(Lane::Up.color(), Lane::Down.color());
+        assert_ne!(Lane::Left.color(), Lane::Up.color());
+        // 矢印は4レーンで全部異なる
+        let arrows: Vec<&str> = Lane::all().iter().map(|l| l.arrow()).collect();
+        assert_eq!(arrows, vec!["←", "↓", "↑", "→"]);
     }
 
     // --- 判定ランク(best_judgement_for_diff) ---
