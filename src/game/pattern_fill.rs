@@ -3,13 +3,14 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use rand::seq::SliceRandom;
 use rand::Rng;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::audio::{self, SeKind};
+use crate::canvas::renderer::ShapeCanvas;
 use crate::canvas::shapes::{base_shapes, Shape};
 use crate::game::feedback::{AnswerFeedback, Flash};
 use crate::game::theme;
@@ -235,6 +236,9 @@ pub struct PatternFillGame {
     question_started_at: Instant,
     /// 直前の回答の正誤表示(描画専用)
     feedback: AnswerFeedback,
+    /// グリッドの各マス用(空欄マスの回はそのマスに対応するものは使わない)
+    grid_canvases: [ShapeCanvas; GRID_SIZE],
+    choice_canvases: [ShapeCanvas; CHOICE_COUNT],
 }
 
 impl PatternFillGame {
@@ -246,6 +250,8 @@ impl PatternFillGame {
             current: generate_question(&mut rng, difficulty),
             question_started_at: Instant::now(),
             feedback: AnswerFeedback::new(),
+            grid_canvases: std::array::from_fn(|_| ShapeCanvas::new()),
+            choice_canvases: std::array::from_fn(|_| ShapeCanvas::new()),
         }
     }
 
@@ -314,7 +320,13 @@ impl Game for PatternFillGame {
             &self.feedback,
         );
 
-        draw_grid(frame, grid_area, &self.current, self.feedback.current());
+        draw_grid(
+            frame,
+            grid_area,
+            &self.grid_canvases,
+            &self.current,
+            self.feedback.current(),
+        );
 
         // 選択肢はクリック判定(column_index)と同じ4等分の帯に描く
         let shapes = base_shapes();
@@ -324,7 +336,7 @@ impl Game for PatternFillGame {
         {
             let cell = self.current.choices[i];
             let shape = shapes[cell.shape_index].rotated(cell.angle_deg.to_radians());
-            draw_choice(frame, col_area, i + 1, &shape);
+            draw_choice(frame, col_area, &self.choice_canvases[i], i + 1, &shape);
         }
 
         theme::render_hint_footer(
@@ -343,71 +355,75 @@ impl Game for PatternFillGame {
     }
 }
 
-fn draw_grid(frame: &mut Frame, area: Rect, question: &Question, flash: Option<&Flash>) {
-    let shapes = base_shapes();
-    let blank_index = question.blank_index;
-    let cells = question.cells;
-
-    let canvas = Canvas::default()
-        .block(theme::focus_panel(" この規則に当てはまる図形は？ ", flash))
-        .x_bounds([-3.2, 3.2])
-        .y_bounds([-3.2, 3.2])
-        .paint(move |ctx| {
-            for (i, cell) in cells.iter().enumerate() {
-                let row = i / 3;
-                let col = i % 3;
-                let cx = (col as f64 - 1.0) * 2.2;
-                let cy = (1.0 - row as f64) * 2.2;
-
-                if i == blank_index {
-                    // 空欄マスは枠と「?」のみ表示する
-                    let half = 0.9;
-                    let corners = [
-                        (cx - half, cy - half),
-                        (cx + half, cy - half),
-                        (cx + half, cy + half),
-                        (cx - half, cy + half),
-                    ];
-                    for k in 0..4 {
-                        let (x1, y1) = corners[k];
-                        let (x2, y2) = corners[(k + 1) % 4];
-                        ctx.draw(&CanvasLine {
-                            x1,
-                            y1,
-                            x2,
-                            y2,
-                            color: theme::HIGHLIGHT,
-                        });
-                    }
-                    ctx.print(
-                        cx - 0.2,
-                        cy,
-                        Span::styled(
-                            "?",
-                            Style::default()
-                                .fg(theme::HIGHLIGHT)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    );
-                } else {
-                    let shape = shapes[cell.shape_index].rotated(cell.angle_deg.to_radians());
-                    for (p1, p2) in shape.to_lines() {
-                        ctx.draw(&CanvasLine {
-                            x1: p1.0 * 0.8 + cx,
-                            y1: p1.1 * 0.8 + cy,
-                            x2: p2.0 * 0.8 + cx,
-                            y2: p2.1 * 0.8 + cy,
-                            color: theme::ACCENT_STRONG,
-                        });
-                    }
-                }
-            }
-        });
-    frame.render_widget(canvas, area);
+/// グリッドを3x3個の個別Rectに分割する(row-major、draw_gridと同じ分割をテストでも使う)
+fn grid_cell_areas(inner: Rect) -> [Rect; GRID_SIZE] {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Ratio(1, 3); 3])
+        .split(inner);
+    let mut cells = [Rect::default(); GRID_SIZE];
+    for (row, row_area) in rows.iter().enumerate() {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Ratio(1, 3); 3])
+            .split(*row_area);
+        for (col, col_area) in cols.iter().enumerate() {
+            cells[row * 3 + col] = *col_area;
+        }
+    }
+    cells
 }
 
-fn draw_choice(frame: &mut Frame, area: Rect, number: usize, shape: &Shape) {
-    let lines = shape.to_lines();
+fn draw_grid(
+    frame: &mut Frame,
+    area: Rect,
+    canvases: &[ShapeCanvas; GRID_SIZE],
+    question: &Question,
+    flash: Option<&Flash>,
+) {
+    let shapes = base_shapes();
+    let block = theme::focus_panel(" この規則に当てはまる図形は？ ", flash);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    for (i, cell_area) in grid_cell_areas(inner).into_iter().enumerate() {
+        if i == question.blank_index {
+            draw_blank_cell(frame, cell_area);
+        } else {
+            let cell = question.cells[i];
+            let shape = shapes[cell.shape_index].rotated(cell.angle_deg.to_radians());
+            canvases[i].render(
+                frame,
+                cell_area,
+                Block::default(),
+                &shape,
+                ([-1.0, 1.0], [-1.0, 1.0]),
+                theme::ACCENT_STRONG,
+            );
+        }
+    }
+}
+
+/// 空欄マスは画像化せず、枠と「?」のテキストのみで描く
+/// (画像プロトコルの上にテキストを重ね書きすると端末依存で表示が崩れる恐れがあるため)
+fn draw_blank_cell(frame: &mut Frame, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::HIGHLIGHT));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let text = Paragraph::new(Span::styled(
+        "?",
+        Style::default()
+            .fg(theme::HIGHLIGHT)
+            .add_modifier(Modifier::BOLD),
+    ))
+    .alignment(Alignment::Center);
+    frame.render_widget(text, theme::vertical_center(inner, 1));
+}
+
+fn draw_choice(frame: &mut Frame, area: Rect, canvas: &ShapeCanvas, number: usize, shape: &Shape) {
     // 枠の上辺に番号をキー風に出す(押すキーが一目で分かるように)
     let title = Line::from(Span::styled(
         format!(" {number} "),
@@ -417,22 +433,15 @@ fn draw_choice(frame: &mut Frame, area: Rect, number: usize, shape: &Shape) {
             .add_modifier(Modifier::BOLD),
     ))
     .centered();
-    let canvas = Canvas::default()
-        .block(theme::sub_panel().title(title))
-        .x_bounds([-1.0, 1.0])
-        .y_bounds([-1.0, 1.0])
-        .paint(move |ctx| {
-            for (p1, p2) in &lines {
-                ctx.draw(&CanvasLine {
-                    x1: p1.0,
-                    y1: p1.1,
-                    x2: p2.0,
-                    y2: p2.1,
-                    color: theme::ACCENT,
-                });
-            }
-        });
-    frame.render_widget(canvas, area);
+    let block = theme::sub_panel().title(title);
+    canvas.render(
+        frame,
+        area,
+        block,
+        shape,
+        ([-1.0, 1.0], [-1.0, 1.0]),
+        theme::ACCENT,
+    );
 }
 
 #[cfg(test)]
@@ -440,6 +449,34 @@ mod tests {
     use super::*;
     use rand::rngs::StdRng;
     use rand::SeedableRng;
+
+    #[test]
+    fn grid_cell_areas_covers_the_whole_inner_area_without_overlap() {
+        let inner = Rect::new(0, 0, 30, 21);
+        let cells = grid_cell_areas(inner);
+        // 9マスの面積の合計がinner全体の面積と一致すること(重なりも隙間も無い)
+        let total_area: u32 = cells.iter().map(|c| c.width as u32 * c.height as u32).sum();
+        assert_eq!(total_area, inner.width as u32 * inner.height as u32);
+        // 全マスがinnerの範囲内に収まっていること
+        for cell in cells {
+            assert!(cell.x >= inner.x && cell.y >= inner.y);
+            assert!(cell.x + cell.width <= inner.x + inner.width);
+            assert!(cell.y + cell.height <= inner.y + inner.height);
+        }
+    }
+
+    #[test]
+    fn grid_cell_areas_orders_cells_row_major() {
+        let inner = Rect::new(0, 0, 30, 21);
+        let cells = grid_cell_areas(inner);
+        // 0,1,2が同じ行(y座標が同じ)で、0,3,6が同じ列(x座標が同じ)であること
+        assert_eq!(cells[0].y, cells[1].y);
+        assert_eq!(cells[1].y, cells[2].y);
+        assert_eq!(cells[0].x, cells[3].x);
+        assert_eq!(cells[3].x, cells[6].x);
+        assert!(cells[0].x < cells[1].x);
+        assert!(cells[0].y < cells[3].y);
+    }
 
     #[test]
     fn choices_always_have_exactly_one_correct_and_are_in_range() {
@@ -656,6 +693,22 @@ mod tests {
                 let result = game.tracker.to_result(GAME_ID, game.difficulty);
                 assert_eq!(result.correct, 1, "選択肢{}の列{column}", i + 1);
             }
+        }
+    }
+
+    #[test]
+    fn render_does_not_panic_for_every_difficulty() {
+        for difficulty in [
+            Difficulty::Beginner,
+            Difficulty::Intermediate,
+            Difficulty::Advanced,
+        ] {
+            let game = PatternFillGame::new(difficulty);
+            let backend = ratatui::backend::TestBackend::new(60, 24);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| game.render(frame, frame.area()))
+                .unwrap();
         }
     }
 }

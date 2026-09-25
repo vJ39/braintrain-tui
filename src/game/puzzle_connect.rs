@@ -6,11 +6,11 @@ use rand::Rng;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
 use ratatui::widgets::{Block, Borders};
 use ratatui::Frame;
 
 use crate::audio::{self, SeKind};
+use crate::canvas::renderer::ShapeCanvas;
 use crate::canvas::shapes::{base_shapes, Shape};
 use crate::game::feedback::{AnswerFeedback, Flash};
 use crate::game::theme;
@@ -132,6 +132,7 @@ pub struct PuzzleConnectGame {
     question_started_at: Instant,
     /// 直前の回答の正誤表示(描画専用)
     feedback: AnswerFeedback,
+    demo_canvas: ShapeCanvas,
 }
 
 impl PuzzleConnectGame {
@@ -143,6 +144,7 @@ impl PuzzleConnectGame {
             current: generate_question(&mut rng, difficulty),
             question_started_at: Instant::now(),
             feedback: AnswerFeedback::new(),
+            demo_canvas: ShapeCanvas::new(),
         }
     }
 
@@ -213,6 +215,7 @@ impl Game for PuzzleConnectGame {
         draw_demo(
             frame,
             demo_area,
+            &self.demo_canvas,
             &self.current.demo_piece_a,
             &self.current.demo_piece_b,
             self.feedback.current(),
@@ -250,6 +253,7 @@ const PIECE_B_COLOR: Color = theme::HIGHLIGHT;
 fn draw_demo(
     frame: &mut Frame,
     area: Rect,
+    canvas: &ShapeCanvas,
     piece_a: &Shape,
     piece_b: &Shape,
     flash: Option<&Flash>,
@@ -271,8 +275,6 @@ fn draw_demo(
         .fold(f64::NEG_INFINITY, f64::max)
         + 0.2;
 
-    let lines_a = piece_a.to_lines();
-    let lines_b = piece_b.to_lines();
     // 色の凡例を枠の下辺に出す
     let legend = Line::from(vec![
         Span::styled(" ━ ", Style::default().fg(PIECE_A_COLOR)),
@@ -280,34 +282,15 @@ fn draw_demo(
         Span::styled("━ ", Style::default().fg(PIECE_B_COLOR)),
         Span::styled("2つ目(これを探す) ", Style::default().fg(theme::TEXT)),
     ]);
-    let canvas = Canvas::default()
-        .block(
-            theme::focus_panel(" お手本: この2つを組み合わせた完成形 ", flash)
-                .title_bottom(legend.centered()),
-        )
-        .x_bounds([min_x, max_x])
-        .y_bounds([min_y, max_y])
-        .paint(move |ctx| {
-            for (p1, p2) in &lines_a {
-                ctx.draw(&CanvasLine {
-                    x1: p1.0,
-                    y1: p1.1,
-                    x2: p2.0,
-                    y2: p2.1,
-                    color: PIECE_A_COLOR,
-                });
-            }
-            for (p1, p2) in &lines_b {
-                ctx.draw(&CanvasLine {
-                    x1: p1.0,
-                    y1: p1.1,
-                    x2: p2.0,
-                    y2: p2.1,
-                    color: PIECE_B_COLOR,
-                });
-            }
-        });
-    frame.render_widget(canvas, area);
+    let block = theme::focus_panel(" お手本: この2つを組み合わせた完成形 ", flash)
+        .title_bottom(legend.centered());
+    canvas.render_many(
+        frame,
+        area,
+        block,
+        &[(piece_a, PIECE_A_COLOR), (piece_b, PIECE_B_COLOR)],
+        ([min_x, max_x], [min_y, max_y]),
+    );
 }
 
 #[cfg(test)]

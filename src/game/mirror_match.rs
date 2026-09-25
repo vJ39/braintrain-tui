@@ -4,11 +4,10 @@ use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKin
 use rand::Rng;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Color;
-use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
-use ratatui::widgets::Block;
 use ratatui::Frame;
 
 use crate::audio::{self, SeKind};
+use crate::canvas::renderer::ShapeCanvas;
 use crate::canvas::shapes::{base_shapes, Shape};
 use crate::game::feedback::AnswerFeedback;
 use crate::game::theme;
@@ -75,6 +74,8 @@ pub struct MirrorMatchGame {
     question_started_at: Instant,
     /// 直前の回答の正誤表示(描画専用)
     feedback: AnswerFeedback,
+    original_canvas: ShapeCanvas,
+    transformed_canvas: ShapeCanvas,
 }
 
 impl MirrorMatchGame {
@@ -86,6 +87,8 @@ impl MirrorMatchGame {
             current: generate_question(&mut rng, difficulty),
             question_started_at: Instant::now(),
             feedback: AnswerFeedback::new(),
+            original_canvas: ShapeCanvas::new(),
+            transformed_canvas: ShapeCanvas::new(),
         }
     }
 
@@ -161,18 +164,20 @@ impl Game for MirrorMatchGame {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(shapes_area);
-        draw_shape(
+        self.original_canvas.render(
             frame,
             cols[0],
             theme::panel(" 元の図形 "),
             &self.current.original,
+            ([-1.0, 1.0], [-1.0, 1.0]),
             theme::ACCENT_STRONG,
         );
-        draw_shape(
+        self.transformed_canvas.render(
             frame,
             cols[1],
             theme::focus_panel(" 比較図形: 鏡に映した形？ ", self.feedback.current()),
             &self.current.transformed,
+            ([-1.0, 1.0], [-1.0, 1.0]),
             Color::LightMagenta,
         );
 
@@ -187,26 +192,6 @@ impl Game for MirrorMatchGame {
     fn result(&self) -> GameResult {
         self.tracker.to_result(GAME_ID, self.difficulty)
     }
-}
-
-fn draw_shape(frame: &mut Frame, area: Rect, block: Block, shape: &Shape, color: Color) {
-    let lines = shape.to_lines();
-    let canvas = Canvas::default()
-        .block(block)
-        .x_bounds([-1.0, 1.0])
-        .y_bounds([-1.0, 1.0])
-        .paint(move |ctx| {
-            for (p1, p2) in &lines {
-                ctx.draw(&CanvasLine {
-                    x1: p1.0,
-                    y1: p1.1,
-                    x2: p2.0,
-                    y2: p2.1,
-                    color,
-                });
-            }
-        });
-    frame.render_widget(canvas, area);
 }
 
 #[cfg(test)]
