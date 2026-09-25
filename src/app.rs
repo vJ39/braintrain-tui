@@ -97,7 +97,7 @@ impl App {
         match &mut self.screen {
             Screen::Splash => {
                 if matches!(key.code, KeyCode::Enter) {
-                    self.screen = Screen::Menu;
+                    self.leave_splash();
                 }
             }
             Screen::Menu => self.handle_menu_key(key),
@@ -131,7 +131,7 @@ impl App {
         let area = self.last_area;
         match &mut self.screen {
             Screen::Splash => {
-                self.screen = Screen::Menu;
+                self.leave_splash();
             }
             Screen::Menu => {
                 if let Some(index) = menu_item_at_row(area, mouse.row) {
@@ -161,6 +161,12 @@ impl App {
             }
             Screen::Jukebox(_) => {}
         }
+    }
+
+    /// タイトル画面(Splash)からメニューへ進む(Enter/クリック共通)
+    fn leave_splash(&mut self) {
+        audio::play_se(SeKind::Confirm);
+        self.screen = Screen::Menu;
     }
 
     /// Menu画面での項目決定(キー/クリック共通)。ゲーム/ジュークボックス/履歴へ振り分ける

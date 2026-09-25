@@ -21,6 +21,8 @@ pub enum SeKind {
     Correct,
     Incorrect,
     Transition,
+    /// タイトル画面(Splash)でEnter/クリックした時の決定音
+    Confirm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +90,7 @@ impl SeKind {
             SeKind::Correct => "se_correct.wav",
             SeKind::Incorrect => "se_incorrect.wav",
             SeKind::Transition => "se_transition.wav",
+            SeKind::Confirm => "se_confirm.wav",
         }
     }
 }
@@ -184,11 +187,29 @@ mod tests {
             SeKind::Correct.asset_path(),
             SeKind::Incorrect.asset_path(),
             SeKind::Transition.asset_path(),
+            SeKind::Confirm.asset_path(),
         ];
         for i in 0..paths.len() {
             for j in (i + 1)..paths.len() {
                 assert_ne!(paths[i], paths[j]);
             }
+        }
+    }
+
+    #[test]
+    fn every_se_asset_is_embedded() {
+        for se in [
+            SeKind::Correct,
+            SeKind::Incorrect,
+            SeKind::Transition,
+            SeKind::Confirm,
+        ] {
+            assert!(
+                Assets::get(se.asset_path()).is_some(),
+                "{:?}のasset({})が埋め込まれていること",
+                se,
+                se.asset_path()
+            );
         }
     }
 
