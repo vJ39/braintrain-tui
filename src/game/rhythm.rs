@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
+use crate::audio;
 use crate::game::theme;
 use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
 
@@ -452,6 +453,26 @@ fn generate_chart(song: &RhythmSong) -> Vec<Note> {
     notes
 }
 
+/// 1小節のビート数。全曲4/4拍子を前提にする
+const BEATS_PER_MEASURE: usize = 4;
+
+/// 小節の頭(ビートインデックスが4の倍数)のビート時刻を返す
+fn measure_line_times_ms(beat_times_ms: &[u32]) -> impl Iterator<Item = u32> + '_ {
+    beat_times_ms.iter().step_by(BEATS_PER_MEASURE).copied()
+}
+
+/// 時刻hit_atに判定ラインへ届くもの(ノーツ・小節ライン)を、時刻nowにトラックの何行目に描くか。
+/// 0行目が判定ライン直下、track_height-1行目が画面下端。まだ出現していない/通り過ぎたものはNone
+fn track_row(hit_at: Duration, now: Duration, track_height: usize) -> Option<usize> {
+    let remaining_secs = hit_at.as_secs_f64() - now.as_secs_f64();
+    let progress = 1.0 - remaining_secs / SCROLL_TRAVEL_TIME.as_secs_f64();
+    if !(0.0..=1.05).contains(&progress) {
+        return None;
+    }
+    let row = ((1.0 - progress) * (track_height - 1) as f64).round() as usize;
+    Some(row.min(track_height - 1))
+}
+
 /// タイミング差から判定ランクを求める(仕様7)。良好ウィンドウ(good)を超えたらNone。
 fn best_judgement_for_diff(diff: Duration, windows: JudgeWindows) -> Option<Judgement> {
     if diff <= windows.perfect {
@@ -558,6 +579,9 @@ pub struct RhythmGame {
     max_combo: u32,
     last_judgement: Option<Judgement>,
     last_judgement_at: Duration,
+    /// 最初の1小節(先頭4ビート)のカウント音のうち、次に鳴らすビートのインデックス。
+    /// 4になったら鳴らし終えている
+    next_count_in_beat: usize,
 }
 
 impl RhythmGame {
@@ -579,6 +603,7 @@ impl RhythmGame {
             max_combo: 0,
             last_judgement: None,
             last_judgement_at: Duration::ZERO,
+            next_count_in_beat: 0,
         }
     }
 
@@ -690,6 +715,20 @@ impl RhythmGame {
         );
     }
 
+    /// 最初の1小節の間、次のカウント音のビート時刻を過ぎていればtick音を鳴らして次のビートへ進める。
+    /// ノーツ判定と同じstarted_at基準の時刻nowを使うので、曲頭から流れるBGMのビートと揃う
+    fn play_count_in(&mut self, now: Duration) {
+        let beats = self.song().beat_times_ms;
+        let count_in_beats = &beats[..BEATS_PER_MEASURE.min(beats.len())];
+        let Some(&beat_ms) = count_in_beats.get(self.next_count_in_beat) else {
+            return;
+        };
+        if now >= Duration::from_millis(beat_ms as u64) {
+            audio::play_tick();
+            self.next_count_in_beat += 1;
+        }
+    }
+
     /// ノーツ1つが確定した際に、コンボ・スコアへ反映する
     fn apply_note_result(&mut self, judgement: Judgement, latency_ms: f64) {
         let is_correct = judgement != Judgement::Miss;
@@ -736,6 +775,7 @@ impl Game for RhythmGame {
             return;
         }
         let now = self.started_at.elapsed();
+        self.play_count_in(now);
         let good_window = JUDGE_WINDOWS.good;
         // 良好ウィンドウを過ぎても未判定のノーツはMissとして確定させる(仕様9)
         let newly_missed: Vec<usize> = self
@@ -813,13 +853,9 @@ impl Game for RhythmGame {
             if note.is_judged() {
                 continue;
             }
-            let remaining_secs = note.hit_at.as_secs_f64() - now.as_secs_f64();
-            let progress = 1.0 - remaining_secs / SCROLL_TRAVEL_TIME.as_secs_f64();
-            if !(0.0..=1.05).contains(&progress) {
+            let Some(row) = track_row(note.hit_at, now, track_height) else {
                 continue;
-            }
-            let row = ((1.0 - progress) * (track_height - 1) as f64).round() as usize;
-            let row = row.min(track_height - 1);
+            };
             for lane in &note.lanes {
                 if let Some(lane_idx) = lanes.iter().position(|l| l == lane) {
                     grid[row][lane_idx] = '●';
@@ -827,13 +863,29 @@ impl Game for RhythmGame {
             }
         }
 
+        // 小節の頭のビート時刻もノーツと同じ行位置計算で、小節ラインを敷く行を求める
+        let mut measure_rows = vec![false; track_height];
+        for beat_ms in measure_line_times_ms(self.song().beat_times_ms) {
+            let hit_at = Duration::from_millis(beat_ms as u64);
+            if let Some(row) = track_row(hit_at, now, track_height) {
+                measure_rows[row] = true;
+            }
+        }
+
         let mut lines = vec![receptors, judge_line];
         for (row_idx, row) in grid.iter().enumerate() {
+            let is_measure_row = measure_rows[row_idx];
             let spans: Vec<Span> = row
                 .iter()
                 .zip(lanes.iter())
                 .map(|(&c, lane)| {
-                    if c == ' ' {
+                    if c == ' ' && is_measure_row {
+                        // 小節ラインの行は、ノーツの無いマスを罫線でつないで4レーンを貫く横線にする
+                        Span::styled(
+                            "─".repeat(LANE_CELL.len()),
+                            Style::default().fg(theme::MUTED),
+                        )
+                    } else if c == ' ' {
                         // ノーツの無いマスはレーンの目印として薄い点を置く
                         Span::styled(lane_cell("·"), Style::default().fg(theme::MUTED))
                     } else {
@@ -2238,6 +2290,145 @@ mod tests {
         // 難易度は選ばないので、常に上級として記録する
         assert_eq!(result.difficulty, Difficulty::Advanced);
         assert_eq!(result.difficulty, SESSION_DIFFICULTY);
+    }
+
+    // --- 小節ライン ---
+
+    #[test]
+    fn measure_line_times_ms_returns_every_fourth_beat() {
+        assert_eq!(
+            measure_line_times_ms(TEST_BEATS).collect::<Vec<_>>(),
+            vec![2000, 3600, 5200, 6800]
+        );
+        // ビート数が4の倍数でなくても、存在するビートだけを返す(境界外を含まない)
+        assert_eq!(
+            measure_line_times_ms(SAMPLE_BEATS).collect::<Vec<_>>(),
+            vec![500, 2500]
+        );
+        assert_eq!(
+            measure_line_times_ms(&[100, 200, 300]).collect::<Vec<_>>(),
+            vec![100]
+        );
+        assert_eq!(measure_line_times_ms(&[]).count(), 0);
+    }
+
+    #[test]
+    fn measure_line_times_of_real_songs_are_beats_at_multiples_of_four() {
+        for song in SONGS {
+            let times: Vec<u32> = measure_line_times_ms(song.beat_times_ms).collect();
+            assert_eq!(times.len(), song.beat_times_ms.len().div_ceil(4));
+            for (i, &ms) in times.iter().enumerate() {
+                assert_eq!(ms, song.beat_times_ms[i * 4], "{}", song.track_name);
+            }
+        }
+    }
+
+    #[test]
+    fn track_row_follows_scroll_progress() {
+        let hit_at = Duration::from_millis(2000);
+        let at = |now_ms: u64| track_row(hit_at, Duration::from_millis(now_ms), 11);
+        // 判定時刻ちょうどは判定ライン直下の行(0行目)
+        assert_eq!(at(2000), Some(0));
+        // スクロール所要時間前に画面下端(最終行)に出現する
+        assert_eq!(at(500), Some(10));
+        // 中間時点は中央の行
+        assert_eq!(at(1250), Some(5));
+        // 出現前は表示しない
+        assert_eq!(at(499), None);
+        // 判定時刻を少し過ぎても(progress 1.05まで)0行目に残し、それ以降は表示しない
+        assert_eq!(at(2050), Some(0));
+        assert_eq!(at(2100), None);
+    }
+
+    /// 描画結果のうち、譜面トラック内側(太枠の縦線を含む行)だけを文字列で返す
+    fn rendered_track_lines(game: &RhythmGame) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(80, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| game.render(frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .filter(|line| line.contains('┃'))
+            .collect()
+    }
+
+    #[test]
+    fn render_draws_measure_line_across_all_lanes_on_empty_row() {
+        let mut game = RhythmGame::new(0);
+        game.notes.clear();
+        // 開始直後は最初の小節の頭(1ビート目)が判定ライン付近に見えている
+        game.set_elapsed_for_test(Duration::ZERO);
+        let lines = rendered_track_lines(&game);
+        let full_line = "─".repeat(7 * 4);
+        assert!(
+            lines.iter().any(|l| l.contains(&full_line)),
+            "4レーン全体を貫く小節ラインが描かれること: {lines:#?}"
+        );
+        // 小節ライン以外のノーツ無しの行は従来通り薄い点
+        assert!(
+            lines.iter().any(|l| l.contains('·') && !l.contains('─')),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn render_prefers_note_over_measure_line_on_same_row() {
+        let mut game = RhythmGame::new(0);
+        let measure_ms = measure_line_times_ms(game.song().beat_times_ms)
+            .nth(1)
+            .unwrap() as u64;
+        // 2小節目の頭と同じ時刻に↓レーンのノーツを置き、スクロールの中間まで進める
+        game.notes = vec![note(&[Lane::Down], measure_ms)];
+        game.set_elapsed_for_test(Duration::from_millis(measure_ms) - SCROLL_TRAVEL_TIME / 2);
+        let lines = rendered_track_lines(&game);
+        let note_line = lines
+            .iter()
+            .find(|l| l.contains('●'))
+            .expect("ノーツが描かれること");
+        // 並びは ←↓↑→。↓のマスだけノーツで、残り3レーンは小節ライン
+        let expected = format!("{}   ●   {}", "─".repeat(7), "─".repeat(14));
+        assert!(note_line.contains(&expected), "{note_line}");
+        assert_eq!(note_line.matches('●').count(), 1);
+        assert!(!note_line.contains('·'), "{note_line}");
+    }
+
+    // --- 最初の1小節のカウント音 ---
+
+    #[test]
+    fn count_in_starts_with_no_beat_played() {
+        let game = RhythmGame::new(0);
+        assert_eq!(game.next_count_in_beat, 0);
+    }
+
+    #[test]
+    fn count_in_advances_on_each_of_first_four_beats_only() {
+        let mut game = RhythmGame::new(1);
+        let beats = game.song().beat_times_ms;
+        let ms = |i: usize| Duration::from_millis(beats[i] as u64);
+        // 1ビート目の直前はまだ鳴らさない
+        game.set_elapsed_for_test(ms(0) - Duration::from_millis(1));
+        game.update(Duration::ZERO);
+        assert_eq!(game.next_count_in_beat, 0);
+        for i in 0..4 {
+            game.set_elapsed_for_test(ms(i));
+            game.update(Duration::ZERO);
+            assert_eq!(game.next_count_in_beat, i + 1, "{}ビート目", i + 1);
+            // 次のビート時刻の直前では進まない
+            game.set_elapsed_for_test(ms(i + 1) - Duration::from_millis(1));
+            game.update(Duration::ZERO);
+            assert_eq!(game.next_count_in_beat, i + 1, "{}ビート目の後", i + 1);
+        }
+        // 5ビート目以降では鳴らさない
+        for i in 4..8 {
+            game.set_elapsed_for_test(ms(i));
+            game.update(Duration::ZERO);
+            assert_eq!(game.next_count_in_beat, 4, "{}ビート目", i + 1);
+        }
     }
 
     #[test]

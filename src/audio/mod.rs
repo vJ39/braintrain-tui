@@ -1,7 +1,10 @@
 use std::cell::RefCell;
 use std::io::Cursor;
 
+use std::time::Duration;
+
 use rand::Rng;
+use rodio::source::SineWave;
 use rodio::{OutputStream, OutputStreamHandle, Sink, Source};
 use rust_embed::RustEmbed;
 
@@ -103,6 +106,20 @@ impl SeKind {
     }
 }
 
+/// tick音(TTRの最初の1小節で鳴らすカウント音)の周波数
+const TICK_FREQUENCY_HZ: f32 = 880.0;
+/// tick音の長さ
+const TICK_DURATION: Duration = Duration::from_millis(60);
+/// tick音の音量(1.0=元の振幅)。音源ファイルそのままの音量で鳴らすSEより控えめにする
+const TICK_VOLUME: f32 = 0.2;
+
+/// tick音の波形。音源ファイルを使わず、サイン波を短く切り出して生成する
+fn tick_source() -> impl Source<Item = f32> {
+    SineWave::new(TICK_FREQUENCY_HZ)
+        .take_duration(TICK_DURATION)
+        .amplify(TICK_VOLUME)
+}
+
 /// 実際にrodioで音声デバイスへ再生するプレイヤー。
 /// 音声デバイスが無い/取得できない環境では初期化時にNoneとなり、以後は何もしない。
 pub struct RodioPlayer {
@@ -134,6 +151,18 @@ impl RodioPlayer {
             sink.append(source);
             sink.detach();
         }
+    }
+
+    /// 生成したtick音を1回鳴らす。BGMとは別のSinkで鳴らすので、再生中のBGMは止めない
+    fn play_tick(&self) {
+        let Some((_, stream_handle)) = &self.handle else {
+            return;
+        };
+        let Ok(sink) = Sink::try_new(stream_handle) else {
+            return;
+        };
+        sink.append(tick_source());
+        sink.detach();
     }
 
     /// 指定トラックをループ再生する。既に再生中のBGMがあれば止めて切り替える
@@ -177,6 +206,10 @@ pub fn play_se(se: SeKind) {
     PLAYER.with(|p| p.borrow().play_se(se));
 }
 
+pub fn play_tick() {
+    PLAYER.with(|p| p.borrow().play_tick());
+}
+
 pub fn play_bgm_track(track_name: &str) {
     PLAYER.with(|p| p.borrow().play_bgm_track(track_name));
 }
@@ -216,6 +249,41 @@ mod tests {
                 se.asset_path()
             );
         }
+    }
+
+    // --- 生成音(tick音) ---
+
+    #[test]
+    fn tick_source_is_short_mono_beep() {
+        let source = tick_source();
+        assert_eq!(source.channels(), 1);
+        let rate = source.sample_rate() as u128;
+        // 長さはTICK_DURATIONぶんのサンプル数(端数の丸めで±1まで許容)
+        let expected = rate * TICK_DURATION.as_micros() / 1_000_000;
+        let count = source.count() as u128;
+        assert!(
+            count + 1 >= expected && count <= expected + 1,
+            "サンプル数{count}(期待値{expected})"
+        );
+    }
+
+    #[test]
+    fn tick_source_is_quieter_than_full_volume_se() {
+        // SEは音源ファイルそのままの音量(1.0倍)で鳴らすので、tick音はそれより小さくする
+        let peak = tick_source().map(f32::abs).fold(0.0_f32, f32::max);
+        assert!(peak > 0.0, "無音ではないこと");
+        assert!(peak < 1.0, "振幅{peak}が元の振幅(1.0)より小さいこと");
+        assert!(peak <= TICK_VOLUME + 1e-6, "振幅{peak}が音量{TICK_VOLUME}以下");
+    }
+
+    #[test]
+    fn play_tick_without_audio_device_does_not_panic() {
+        // 音声デバイスが無い環境(handleがNone)では何もしない
+        let player = RodioPlayer {
+            handle: None,
+            bgm_sink: RefCell::new(None),
+        };
+        player.play_tick();
     }
 
     #[test]
