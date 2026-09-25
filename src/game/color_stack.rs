@@ -138,14 +138,20 @@ enum PressOutcome {
     Added,
 }
 
-/// colorを押した時の処理。最下段がcolorなら消して詰め、違えば一番上にcolorを1個積む
-fn press_color(board: &mut Board, color: StackColor) -> PressOutcome {
+/// colorを押した時の処理。最下段がcolorなら消して詰め、違えばpaletteからランダムに
+/// 選んだ色を一番上に積む(ミスの度に同じ色が積み上がり続けるのを避けるため)
+fn press_color(
+    rng: &mut impl Rng,
+    board: &mut Board,
+    color: StackColor,
+    palette: &[StackColor],
+) -> PressOutcome {
     if board.first() == Some(&color) {
         // 最下段を取り除くと、残りのブロックは1段ずつ下にずれる(重力)
         board.remove(0);
         PressOutcome::Removed
     } else {
-        board.push(color);
+        board.push(palette[rng.gen_range(0..palette.len())]);
         PressOutcome::Added
     }
 }
@@ -279,7 +285,9 @@ impl ColorStackGame {
         let Some(&color) = self.params.colors().get(index) else {
             return;
         };
-        if press_color(&mut self.round.board, color) == PressOutcome::Added {
+        let mut rng = rand::thread_rng();
+        let palette = self.params.colors();
+        if press_color(&mut rng, &mut self.round.board, color, palette) == PressOutcome::Added {
             // ミス: 押した色が一番上に積まれた(ラウンドは続き、スコアには記録しない)
             audio::play_se(SeKind::Incorrect);
             self.feedback.record(false, "+1段");
@@ -613,6 +621,25 @@ mod tests {
         vec![Red, Blue, Blue, Yellow, Green]
     }
 
+    /// pressed色を押した結果(before→after)が、press_colorの仕様通りかを検証する。
+    /// 追加される色はランダムなので、具体的な色までは断定せずパレット内かどうかだけ見る
+    fn assert_press_outcome(before: &Board, after: &Board, pressed: StackColor) {
+        if before.first() == Some(&pressed) {
+            assert_eq!(after, &before[1..], "一致: 最下段が消えて詰まる");
+        } else {
+            assert_eq!(
+                &after[..before.len()],
+                before.as_slice(),
+                "不一致: 最下段より下は変わらない"
+            );
+            assert_eq!(after.len(), before.len() + 1, "不一致: 1個増える");
+            assert!(
+                StackColor::ALL.contains(after.last().unwrap()),
+                "追加される色はパレット内であること"
+            );
+        }
+    }
+
     /// 最下段の色をキーで押し続けて、ラウンドをクリアする
     fn solve_round(game: &mut ColorStackGame) {
         while let Some(&color) = game.round.board.first() {
@@ -724,14 +751,21 @@ mod tests {
 
     #[test]
     fn pressing_the_bottom_color_removes_it_and_drops_the_rest() {
+        let mut rng = StdRng::seed_from_u64(1);
         let mut board = sample_board();
-        assert_eq!(press_color(&mut board, Red), PressOutcome::Removed);
+        assert_eq!(
+            press_color(&mut rng, &mut board, Red, &StackColor::ALL),
+            PressOutcome::Removed
+        );
         assert_eq!(
             board,
             vec![Blue, Blue, Yellow, Green],
             "最下段の赤が消え、上のブロックが1段下に詰まる"
         );
-        assert_eq!(press_color(&mut board, Blue), PressOutcome::Removed);
+        assert_eq!(
+            press_color(&mut rng, &mut board, Blue, &StackColor::ALL),
+            PressOutcome::Removed
+        );
         assert_eq!(
             board,
             vec![Blue, Yellow, Green],
@@ -740,35 +774,70 @@ mod tests {
     }
 
     #[test]
-    fn pressing_a_different_color_adds_that_color_on_top() {
+    fn pressing_a_different_color_adds_a_random_palette_color_on_top() {
+        let mut rng = StdRng::seed_from_u64(2);
         for color in [Blue, Yellow, Green] {
             let mut board = sample_board();
-            assert_eq!(press_color(&mut board, color), PressOutcome::Added);
-            let mut expected = sample_board();
-            expected.push(color);
             assert_eq!(
-                board, expected,
-                "{color:?}: 最下段は変わらず、一番上に押した色が1個増える"
+                press_color(&mut rng, &mut board, color, &StackColor::ALL),
+                PressOutcome::Added
+            );
+            assert_eq!(
+                &board[..sample_board().len()],
+                sample_board().as_slice(),
+                "{color:?}: 最下段から下は変わらない"
+            );
+            assert_eq!(board.len(), sample_board().len() + 1);
+            assert!(
+                StackColor::ALL.contains(board.last().unwrap()),
+                "追加される色はパレット内であること"
             );
         }
     }
 
     #[test]
+    fn added_color_is_not_always_the_pressed_color() {
+        // 十分な試行回数で、追加される色が押した色以外にもなることを統計的に確認する
+        let mut rng = StdRng::seed_from_u64(3);
+        let mut seen_other_than_pressed = false;
+        for _ in 0..100 {
+            let mut board = sample_board();
+            press_color(&mut rng, &mut board, Blue, &StackColor::ALL);
+            if *board.last().unwrap() != Blue {
+                seen_other_than_pressed = true;
+                break;
+            }
+        }
+        assert!(
+            seen_other_than_pressed,
+            "100回試行して押した色以外が一度も追加されないのは統計的に考えにくい"
+        );
+    }
+
+    #[test]
     fn repeated_misses_keep_growing_the_column() {
+        let mut rng = StdRng::seed_from_u64(4);
         let mut board = sample_board();
         for i in 1..=500 {
-            assert_eq!(press_color(&mut board, Green), PressOutcome::Added);
+            assert_eq!(
+                press_color(&mut rng, &mut board, Green, &StackColor::ALL),
+                PressOutcome::Added
+            );
             assert_eq!(board.len(), sample_board().len() + i);
         }
         assert_eq!(board[0], Red, "最下段は変わらない");
-        assert!(board[5..].iter().all(|&c| c == Green));
+        assert!(
+            board[5..].iter().all(|c| StackColor::ALL.contains(c)),
+            "追加された色はすべてパレット内であること"
+        );
     }
 
     #[test]
     fn cleared_follows_the_board() {
+        let mut rng = StdRng::seed_from_u64(5);
         let mut board = vec![Red];
         assert!(!is_cleared(&board));
-        press_color(&mut board, Red);
+        press_color(&mut rng, &mut board, Red, &StackColor::ALL);
         assert!(is_cleared(&board));
     }
 
@@ -791,10 +860,9 @@ mod tests {
         for (key, color) in ['1', '2', '3', '4'].into_iter().zip(StackColor::ALL) {
             let mut game = ColorStackGame::new(Difficulty::Intermediate);
             game.round.board = sample_board();
-            let mut expected = sample_board();
-            press_color(&mut expected, color);
+            let before = game.round.board.clone();
             press_key(&mut game, key);
-            assert_eq!(game.round.board, expected, "キー{key}は{color:?}");
+            assert_press_outcome(&before, &game.round.board, color);
         }
     }
 
@@ -802,10 +870,9 @@ mod tests {
     fn a_miss_adds_a_block_and_shows_incorrect_feedback_but_records_nothing() {
         let mut game = ColorStackGame::new(Difficulty::Intermediate);
         game.round.board = sample_board();
+        let before = game.round.board.clone();
         press_key(&mut game, key_for(Yellow));
-        let mut expected = sample_board();
-        expected.push(Yellow);
-        assert_eq!(game.round.board, expected);
+        assert_press_outcome(&before, &game.round.board, Yellow);
         assert_eq!(
             game.feedback.current().map(|f| f.verdict),
             Some(crate::game::feedback::Verdict::Incorrect),
@@ -852,11 +919,12 @@ mod tests {
     fn clearing_after_misses_still_records_success() {
         let mut game = ColorStackGame::new(Difficulty::Beginner);
         game.round.board = vec![Red];
+        // 明らかに不一致の色を押してミスさせる(パレット内のいずれかの色が積まれる)
         press_key(&mut game, key_for(Blue));
-        assert_eq!(game.round.board, vec![Red, Blue]);
-        press_key(&mut game, key_for(Red));
-        assert_eq!(game.result().total, 0, "追加された青がまだ残っている");
-        press_key(&mut game, key_for(Blue));
+        assert_eq!(game.round.board.len(), 2, "ミスで1個増える");
+        assert_eq!(game.result().total, 0, "ミス直後はまだクリアしていない");
+        // 増えた分も含めて最下段から順に解消すればクリアになる
+        solve_round(&mut game);
         let result = game.result();
         assert_eq!(result.total, 1);
         assert_eq!(result.correct, 1);
@@ -997,15 +1065,11 @@ mod tests {
             for &color in &StackColor::ALL[..count] {
                 let mut game = ColorStackGame::new(difficulty);
                 game.round.board = sample_board();
+                let before = game.round.board.clone();
                 let buffer = render_buffer(&game, AREA.width, AREA.height);
                 let (x, y) = button_label_position(&buffer, color);
                 game.handle_mouse(left_click(x, y), AREA);
-                let mut expected = sample_board();
-                press_color(&mut expected, color);
-                assert_eq!(
-                    game.round.board, expected,
-                    "{difficulty:?}: {color:?}ボタン"
-                );
+                assert_press_outcome(&before, &game.round.board, color);
             }
         }
     }
@@ -1029,10 +1093,9 @@ mod tests {
             for x in [band.x, band.right() - 1] {
                 let mut game = ColorStackGame::new(Difficulty::Intermediate);
                 game.round.board = sample_board();
+                let before = game.round.board.clone();
                 game.handle_mouse(left_click(x, band.y), AREA);
-                let mut expected = sample_board();
-                press_color(&mut expected, color);
-                assert_eq!(game.round.board, expected, "x={x}: {color:?}");
+                assert_press_outcome(&before, &game.round.board, color);
             }
         }
     }
@@ -1218,11 +1281,14 @@ mod tests {
         let cell = grid.cell_rect(4).unwrap();
         assert!(!block_bg_colors().contains(&format!("{:?}", buffer[(cell.x, cell.y)].bg)));
 
-        // ミスで赤が一番上(level 4)に追加される
+        // ミスでパレット内のいずれかの色が一番上(level 4)に追加される
         press_key(&mut game, key_for(Red));
         let buffer = render_buffer(&game, AREA.width, AREA.height);
         let cell = grid.cell_rect(4).unwrap();
-        assert_eq!(buffer[(cell.x, cell.y)].bg, Red.color());
+        assert!(
+            block_bg_colors().contains(&format!("{:?}", buffer[(cell.x, cell.y)].bg)),
+            "追加された色がパレット内であること"
+        );
         let cell = grid.cell_rect(0).unwrap();
         assert_eq!(
             buffer[(cell.x, cell.y)].bg,
@@ -1241,10 +1307,13 @@ mod tests {
         assert_eq!(game.round.board.len(), 10);
         let buffer = render_buffer(&game, AREA.width, AREA.height);
         let grid = grid_geometry(board_area(AREA), 8);
-        let cell = grid.cell_rect(8).unwrap();
-        assert_eq!(buffer[(cell.x, cell.y)].bg, Blue.color());
-        let cell = grid.cell_rect(9).unwrap();
-        assert_eq!(buffer[(cell.x, cell.y)].bg, Yellow.color());
+        for level in [8, 9] {
+            let cell = grid.cell_rect(level).unwrap();
+            assert!(
+                block_bg_colors().contains(&format!("{:?}", buffer[(cell.x, cell.y)].bg)),
+                "level{level}: 追加された色がパレット内であること"
+            );
+        }
     }
 
     #[test]
@@ -1268,7 +1337,10 @@ mod tests {
         let cell = grid.cell_rect(0).unwrap();
         assert_eq!(buffer[(cell.x, cell.y)].bg, Red.color());
         let top = grid.cell_rect(grid.visible_rows - 1).unwrap();
-        assert_eq!(buffer[(top.x, top.y)].bg, Green.color());
+        assert!(
+            block_bg_colors().contains(&format!("{:?}", buffer[(top.x, top.y)].bg)),
+            "見える最上段まで、パレット内の色で塗られていること"
+        );
         // はみ出た段は盤面より上(HUD・盤面の枠)に描かない
         let above_board = Rect::new(0, 0, AREA.width, board.y);
         assert!(
