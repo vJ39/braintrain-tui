@@ -37,6 +37,36 @@ pub const ROUNDS_PER_SESSION: u32 = 3;
 /// (前のラウンドの最後のクリックが次の盤面に当たらないようにするため)
 pub const ROUND_INTERVAL: Duration = Duration::from_millis(1200);
 
+/// 次に押すべき数字がこの時間を超えても押されないと、盤面の背景を赤く明滅させて焦らせる
+pub const PRESSURE_THRESHOLD: Duration = Duration::from_secs(10);
+
+/// 背景の明滅1回(暗い→明るい→暗い)の周期
+pub const PRESSURE_PERIOD: Duration = Duration::from_millis(800);
+
+/// 明滅する背景の赤の強さの範囲(暗い時, 明るい時)。
+/// 明るい時でも、円の色・数字が背景に埋もれない暗さに抑える
+const PRESSURE_RED_RANGE: (f64, f64) = (40.0, 150.0);
+
+/// 背景の緑・青の強さ(赤に対する割合)。純粋な赤より少しだけ温かみを持たせる
+const PRESSURE_GREEN_BLUE_RATIO: f64 = 0.12;
+
+/// 次に押すべき数字になってからの経過時間に対する盤面の背景色。
+/// 閾値以内はNone(通常の背景のまま)。閾値を超えたら、超えた分の時間で赤の明るさを
+/// 周期的に変え、パトランプのように明滅させる。超えた直後は暗い側から始める
+fn pressure_background(time_since_target: Duration) -> Option<Color> {
+    let over = time_since_target.checked_sub(PRESSURE_THRESHOLD)?;
+    if over.is_zero() {
+        return None;
+    }
+    let phase = over.as_secs_f64() / PRESSURE_PERIOD.as_secs_f64() * std::f64::consts::TAU;
+    // 0(暗い)〜1(明るい)を行き来する
+    let level = (1.0 - phase.cos()) / 2.0;
+    let (low, high) = PRESSURE_RED_RANGE;
+    let red = low + (high - low) * level;
+    let other = (red * PRESSURE_GREEN_BLUE_RATIO).round() as u8;
+    Some(Color::Rgb(red.round() as u8, other, other))
+}
+
 /// 難易度ごとのパラメータ
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DifficultyParams {
@@ -95,6 +125,8 @@ struct Round {
     lives: u8,
     /// ラウンド開始からの経過時間
     elapsed: Duration,
+    /// いまの数字が次に押すべき数字になってからの経過時間(プレッシャー背景に使う)
+    time_since_target: Duration,
 }
 
 fn new_round(rng: &mut impl Rng, params: &DifficultyParams) -> Round {
@@ -117,6 +149,7 @@ fn new_round(rng: &mut impl Rng, params: &DifficultyParams) -> Round {
         next: 1,
         lives: params.lives,
         elapsed: Duration::ZERO,
+        time_since_target: Duration::ZERO,
     }
 }
 
@@ -234,6 +267,8 @@ impl CountManiaGame {
         // 前の波紋が残っていても、新しい波紋に置き換える
         self.ripple = Some(Ripple::new(column, row));
         self.round.next += 1;
+        // 次の数字に進んだので、焦らせる背景は最初からやり直す
+        self.round.time_since_target = Duration::ZERO;
         if self.round.next > self.params.max_number {
             let latency_ms = self.round.elapsed.as_secs_f64() * 1000.0;
             self.tracker.record(true, latency_ms);
@@ -249,6 +284,8 @@ impl CountManiaGame {
         audio::play_se(SeKind::Incorrect);
         self.round.lives = self.round.lives.saturating_sub(1);
         if self.round.lives == 0 {
+            // GAME OVERで焦らせる背景を止める
+            self.round.time_since_target = Duration::ZERO;
             self.tracker.record(false, self.params.fail_latency_ms);
             self.feedback.record(false, "ライフが尽きた");
             self.finish_round();
@@ -423,6 +460,7 @@ impl Game for CountManiaGame {
         }
         if !self.is_finished() {
             self.round.elapsed += dt;
+            self.round.time_since_target += dt;
         }
     }
 
@@ -430,7 +468,11 @@ impl Game for CountManiaGame {
         let (hud, body) = theme::split_hud(area);
         self.render_hud(frame, hud);
 
-        let block = theme::focus_panel(" 1から順にクリック ", self.feedback.current());
+        let mut block = theme::focus_panel(" 1から順にクリック ", self.feedback.current());
+        // 次の数字がなかなか押されない時は、パネルの背景を赤く明滅させて焦らせる
+        if let Some(bg) = pressure_background(self.round.time_since_target) {
+            block = block.style(Style::default().bg(bg));
+        }
         let board = block.inner(body);
         frame.render_widget(block, body);
         if board.is_empty() {
@@ -1134,5 +1176,206 @@ mod tests {
             "パッチの作り直しはコマの数まで: {redrawn}"
         );
         assert!(redrawn < ticks, "毎tickは作り直さない: {redrawn}/{ticks}");
+    }
+
+    // --- プレッシャー背景 ---
+
+    /// 画面を描画し、バッファを返す
+    fn rendered_buffer(game: &CountManiaGame) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(AREA.width, AREA.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| game.render(frame, frame.area()))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// 盤面の円の無いセルの背景色
+    fn board_background(game: &CountManiaGame) -> Color {
+        let (column, row) = empty_cell(game);
+        rendered_buffer(game)[(column, row)].bg
+    }
+
+    /// 閾値をsecs秒超えた時点の背景色
+    fn background_after_threshold(secs: f64) -> Color {
+        pressure_background(PRESSURE_THRESHOLD + Duration::from_secs_f64(secs))
+            .expect("閾値を超えたら背景色が付く")
+    }
+
+    fn rgb(color: Color) -> (u8, u8, u8) {
+        match color {
+            Color::Rgb(r, g, b) => (r, g, b),
+            other => panic!("RGBの色であること: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_round_starts_with_zero_time_since_target() {
+        let mut rng = StdRng::seed_from_u64(1);
+        let round = new_round(&mut rng, &params(Difficulty::Beginner));
+        assert!(round.time_since_target.is_zero());
+        let game = CountManiaGame::new(Difficulty::Beginner);
+        assert!(game.round.time_since_target.is_zero());
+    }
+
+    #[test]
+    fn update_advances_time_since_target_only_while_playing() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        game.update(Duration::from_millis(1500));
+        game.update(Duration::from_millis(500));
+        assert_eq!(game.round.time_since_target, Duration::from_secs(2));
+
+        clear_round(&mut game);
+        assert!(game.interval.is_some());
+        game.update(ROUND_INTERVAL / 2);
+        assert!(
+            game.round.time_since_target.is_zero(),
+            "ラウンド間の待ち時間中は進まない"
+        );
+        game.update(ROUND_INTERVAL / 2);
+        assert!(game.interval.is_none());
+        assert!(
+            game.round.time_since_target.is_zero(),
+            "新しいラウンドは0から"
+        );
+    }
+
+    #[test]
+    fn time_since_target_does_not_advance_after_session_finished() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        for _ in 0..ROUNDS_PER_SESSION {
+            clear_round(&mut game);
+            game.update(ROUND_INTERVAL);
+        }
+        assert!(game.is_finished());
+        game.update(PRESSURE_THRESHOLD * 2);
+        assert!(game.round.time_since_target.is_zero());
+    }
+
+    #[test]
+    fn correct_click_resets_time_since_target() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        game.update(Duration::from_secs(12));
+        click_circle(&mut game, 1);
+        assert_eq!(game.round.next, 2);
+        assert!(game.round.time_since_target.is_zero());
+        assert_eq!(
+            game.round.elapsed,
+            Duration::from_secs(12),
+            "ラウンドの経過時間はリセットしない"
+        );
+    }
+
+    #[test]
+    fn wrong_click_keeps_time_since_target_while_lives_remain() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        game.update(Duration::from_secs(12));
+        let wrong = wrong_number(&game);
+        click_circle(&mut game, wrong);
+        assert_eq!(game.round.lives, 2);
+        assert_eq!(game.round.time_since_target, Duration::from_secs(12));
+    }
+
+    #[test]
+    fn game_over_resets_time_since_target() {
+        let mut game = CountManiaGame::new(Difficulty::Intermediate);
+        game.update(Duration::from_secs(12));
+        for _ in 0..2 {
+            let wrong = wrong_number(&game);
+            click_circle(&mut game, wrong);
+        }
+        assert_eq!(game.round.lives, 0);
+        assert!(game.round.time_since_target.is_zero());
+    }
+
+    #[test]
+    fn pressure_background_is_none_up_to_threshold() {
+        assert_eq!(pressure_background(Duration::ZERO), None);
+        assert_eq!(pressure_background(Duration::from_millis(9_999)), None);
+        assert_eq!(pressure_background(PRESSURE_THRESHOLD), None);
+    }
+
+    #[test]
+    fn pressure_background_is_reddish_after_threshold() {
+        for step in 1..=40 {
+            let (r, g, b) = rgb(background_after_threshold(f64::from(step) * 0.05));
+            assert!(r > g && r > b, "赤系であること: {r},{g},{b}");
+            assert!(r >= 30, "背景が分かる程度の赤であること: {r}");
+            assert!(
+                r <= 180,
+                "円・数字が読める程度に暗いこと(明るすぎない): {r}"
+            );
+        }
+    }
+
+    #[test]
+    fn pressure_background_brightness_pulses_periodically() {
+        let dark = rgb(background_after_threshold(0.001)).0;
+        let bright = rgb(background_after_threshold(PRESSURE_PERIOD.as_secs_f64() / 2.0)).0;
+        assert!(
+            bright > dark + 50,
+            "時間経過で明るさが変わる: {dark} -> {bright}"
+        );
+        let later = rgb(background_after_threshold(
+            PRESSURE_PERIOD.as_secs_f64() * 3.0 + 0.001,
+        ))
+        .0;
+        assert!(
+            later.abs_diff(dark) <= 2,
+            "周期ごとに同じ明るさに戻る: {dark} / {later}"
+        );
+    }
+
+    #[test]
+    fn board_background_stays_normal_within_threshold() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let normal = board_background(&game);
+        assert_eq!(normal, Color::Reset);
+        game.update(Duration::from_millis(9_900));
+        assert_eq!(board_background(&game), normal, "10秒以内は変えない");
+    }
+
+    #[test]
+    fn board_background_flashes_red_after_threshold_and_resets_on_correct_click() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        game.update(PRESSURE_THRESHOLD + PRESSURE_PERIOD / 2);
+        let (r, g, b) = rgb(board_background(&game));
+        assert!(r > g && r > b, "盤面の背景が赤系になる: {r},{g},{b}");
+        // 枠の上もパネルの背景として同じ色になる
+        let buffer = rendered_buffer(&game);
+        let (_, body) = theme::split_hud(AREA);
+        assert_eq!(buffer[(body.x, body.y)].bg, Color::Rgb(r, g, b));
+
+        game.update(PRESSURE_PERIOD / 4);
+        assert_ne!(
+            rgb(board_background(&game)),
+            (r, g, b),
+            "時間とともに色が変わる"
+        );
+
+        click_circle(&mut game, 1);
+        assert_eq!(
+            board_background(&game),
+            Color::Reset,
+            "正解クリックで元に戻る"
+        );
+    }
+
+    #[test]
+    fn board_background_resets_on_game_over() {
+        let mut game = CountManiaGame::new(Difficulty::Intermediate);
+        game.update(PRESSURE_THRESHOLD * 2);
+        for _ in 0..2 {
+            let wrong = wrong_number(&game);
+            click_circle(&mut game, wrong);
+        }
+        assert!(game.interval.is_some());
+        let buffer = rendered_buffer(&game);
+        let (_, body) = theme::split_hud(AREA);
+        assert_eq!(
+            buffer[(body.x, body.y)].bg,
+            Color::Reset,
+            "GAME OVERで元に戻る"
+        );
     }
 }
