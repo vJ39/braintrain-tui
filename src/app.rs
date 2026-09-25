@@ -8,20 +8,32 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 use crate::audio::{self, SeKind};
+use crate::game::memory::MemoryGame;
 use crate::game::mental_calc::MentalCalcGame;
 use crate::game::mirror_match::MirrorMatchGame;
+use crate::game::pattern_fill::PatternFillGame;
+use crate::game::puzzle_connect::PuzzleConnectGame;
 use crate::game::reaction::ReactionGame;
+use crate::game::rhythm::RhythmGame;
+use crate::game::sequence::SequenceGame;
 use crate::game::shape_rotate::ShapeRotateGame;
 use crate::game::{Difficulty, Game, GameResult};
 use crate::stats::store;
 
-const MENU_ITEMS: [&str; 5] = [
+const MENU_ITEMS: [&str; 10] = [
     "図形回転判定",
     "鏡像判定",
     "反応速度(Stroop)",
     "暗算スピード",
+    "パターン補完",
+    "記憶(位置と色)",
+    "数列予測",
+    "組み合わせパズル",
+    "リズム(DDR風)",
     "履歴",
 ];
+
+const HISTORY_ITEM_INDEX: usize = MENU_ITEMS.len() - 1;
 
 pub enum Screen {
     Menu,
@@ -91,7 +103,7 @@ impl App {
             }
             KeyCode::Enter => {
                 audio::play_se(SeKind::Transition);
-                if selected == 4 {
+                if selected == HISTORY_ITEM_INDEX {
                     self.screen = Screen::History;
                 } else {
                     self.screen = Screen::SelectDifficulty(selected);
@@ -142,6 +154,11 @@ fn new_game(item: usize, difficulty: Difficulty) -> Box<dyn Game> {
         1 => Box::new(MirrorMatchGame::new(difficulty)),
         2 => Box::new(ReactionGame::new(difficulty)),
         3 => Box::new(MentalCalcGame::new(difficulty)),
+        4 => Box::new(PatternFillGame::new(difficulty)),
+        5 => Box::new(MemoryGame::new(difficulty)),
+        6 => Box::new(SequenceGame::new(difficulty)),
+        7 => Box::new(PuzzleConnectGame::new(difficulty)),
+        8 => Box::new(RhythmGame::new(difficulty)),
         _ => unreachable!("history is handled without creating a game"),
     }
 }

@@ -1,6 +1,11 @@
+pub mod memory;
 pub mod mental_calc;
 pub mod mirror_match;
+pub mod pattern_fill;
+pub mod puzzle_connect;
 pub mod reaction;
+pub mod rhythm;
+pub mod sequence;
 pub mod shape_rotate;
 
 use std::time::Duration;
