@@ -4,6 +4,7 @@ use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+use crate::game::count_mania::GAME_ID as COUNT_MANIA_ID;
 use crate::game::memory::GAME_ID as MEMORY_ID;
 use crate::game::mental_calc::GAME_ID as MENTAL_CALC_ID;
 use crate::game::mirror_match::GAME_ID as MIRROR_MATCH_ID;
@@ -16,7 +17,7 @@ use crate::game::shape_rotate::GAME_ID as SHAPE_ROTATE_ID;
 use crate::game::GameResult;
 use crate::stats::store;
 
-const GAME_IDS: [&str; 9] = [
+const GAME_IDS: [&str; 10] = [
     SHAPE_ROTATE_ID,
     MIRROR_MATCH_ID,
     REACTION_ID,
@@ -25,8 +26,13 @@ const GAME_IDS: [&str; 9] = [
     MEMORY_ID,
     SEQUENCE_ID,
     PUZZLE_CONNECT_ID,
+    COUNT_MANIA_ID,
     RHYTHM_ID,
 ];
+
+/// 履歴グラフを並べるグリッドの列数・行数。GAME_IDSが全部入る大きさにする
+const GRID_COLUMNS: u16 = 4;
+const GRID_ROWS: u16 = (GAME_IDS.len() as u16).div_ceil(GRID_COLUMNS);
 
 pub fn render(frame: &mut Frame, area: Rect) {
     let results = store::load_all().unwrap_or_default();
@@ -39,22 +45,14 @@ pub fn render(frame: &mut Frame, area: Rect) {
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ])
+        .constraints(vec![Constraint::Fill(1); GRID_ROWS as usize])
         .split(area);
 
-    let mut cells = Vec::with_capacity(9);
+    let mut cells = Vec::with_capacity((GRID_ROWS * GRID_COLUMNS) as usize);
     for row in rows.iter() {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(34),
-                Constraint::Percentage(33),
-                Constraint::Percentage(33),
-            ])
+            .constraints(vec![Constraint::Fill(1); GRID_COLUMNS as usize])
             .split(*row);
         cells.extend(cols.iter().copied());
     }
@@ -136,8 +134,17 @@ mod tests {
     }
 
     #[test]
-    fn game_ids_covers_all_nine_games() {
-        assert_eq!(GAME_IDS.len(), 9);
+    fn game_ids_covers_all_ten_games() {
+        assert_eq!(GAME_IDS.len(), 10);
+        assert!(
+            GAME_IDS.contains(&COUNT_MANIA_ID),
+            "カウントマニアも履歴に出す"
+        );
+    }
+
+    #[test]
+    fn grid_has_a_cell_for_every_game() {
+        assert!((GRID_COLUMNS * GRID_ROWS) as usize >= GAME_IDS.len());
     }
 
     #[test]
