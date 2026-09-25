@@ -116,7 +116,7 @@ fn judge_windows(difficulty: Difficulty) -> JudgeWindows {
 // 楽曲と譜面生成
 //
 // 譜面はBPMからの理論値ではなく、曲ごとに実測したビート時刻(beats.rs)の上に配置する。
-// 難易度による違いはBPMではなく「セクション密度(Low/Mid/High)への反応」で表現し、
+// 難易度による違いはBPMではなく「セクション密度(Low/Mid/High/Extreme)への反応」で表現し、
 // 同じ曲・同じビートグリッドの上で難易度ごとに異なるノーツ配置をする。
 // 譜面は乱数を使わず決定的に生成する(同じ曲・同じ難易度なら毎回同じ譜面で、練習して覚えられる)。
 // ---------------------------------------------------------------------------
@@ -127,6 +127,8 @@ pub enum SectionDensity {
     Low,
     Mid,
     High,
+    /// Advanced専用の最高難度区間。Beginner/IntermediateではHighと同じ配置になる
+    Extreme,
 }
 
 /// リズムゲームで遊べる1曲分の定義
@@ -196,6 +198,22 @@ const REDLINE_RESPONSE_TIME_SECTIONS: &[(usize, SectionDensity)] = {
     ]
 };
 
+/// 50-100秒・130-170秒の最高密度区間をExtremeにし、上級譜面を既存2曲より明確に難しくする
+const APEX_MOVEMENT_SECTIONS: &[(usize, SectionDensity)] = {
+    use SectionDensity::{Extreme, Low, Mid};
+    const B: &[u32] = beats::APEX_MOVEMENT_BEATS_MS;
+    &[
+        (beat_index_at_or_after_secs(B, 0), Low),
+        (beat_index_at_or_after_secs(B, 30), Mid),
+        (beat_index_at_or_after_secs(B, 40), Low),
+        (beat_index_at_or_after_secs(B, 50), Extreme),
+        (beat_index_at_or_after_secs(B, 100), Low),
+        (beat_index_at_or_after_secs(B, 120), Mid),
+        (beat_index_at_or_after_secs(B, 130), Extreme),
+        (beat_index_at_or_after_secs(B, 170), Low),
+    ]
+};
+
 /// 曲選択画面に並べる曲一覧(表示順)。曲を増やすときはbeats.rsに実測ビート時刻を足し、ここに追加する
 pub const SONGS: &[RhythmSong] = &[
     RhythmSong {
@@ -209,6 +227,12 @@ pub const SONGS: &[RhythmSong] = &[
         display_name: "Redline Response Time (BPM 180)",
         beat_times_ms: beats::REDLINE_RESPONSE_TIME_BEATS_MS,
         sections: REDLINE_RESPONSE_TIME_SECTIONS,
+    },
+    RhythmSong {
+        track_name: "Apex_Movement",
+        display_name: "Apex Movement (BPM 152)",
+        beat_times_ms: beats::APEX_MOVEMENT_BEATS_MS,
+        sections: APEX_MOVEMENT_SECTIONS,
     },
 ];
 
@@ -236,6 +260,8 @@ enum StepPattern {
     Jump,
     /// このビート位置に同時押し+次のビートとの中間点に単押し
     JumpAndEighth,
+    /// このビート位置に同時押し+次のビートとの中間点にも同時押し(Advanced×Extreme専用)
+    JumpAndEighthJump,
 }
 
 /// セクション密度・難易度・ビートインデックスから、そのビートの配置を決める純粋関数
@@ -245,14 +271,16 @@ enum StepPattern {
 ///   Advancedは「3拍踏んで1拍休む」で間引きを減らす)
 /// - Beginnerは4分音符の単押しだけ。Intermediateは盛り上がり(High)で8分音符が入る
 /// - AdvancedはMidでも8分音符を混ぜ(2拍に1回)、Highは8分音符の連続+4拍ごとの同時押し
+/// - Extremeは Advanced 専用の最高難度。休符なしで全ビート同時押し+8分音符、
+///   4拍目は8分音符の位置も同時押しにする。Beginner/IntermediateではHighと同じ配置
 /// - beat_indexは曲全体での通し番号(4拍・8拍周期の基準に使う)
 fn step_pattern_for(
     density: SectionDensity,
     difficulty: Difficulty,
     beat_index: usize,
 ) -> StepPattern {
-    use SectionDensity::{High, Low, Mid};
-    use StepPattern::{Jump, JumpAndEighth, Single, SingleAndEighth, Skip};
+    use SectionDensity::{Extreme, High, Low, Mid};
+    use StepPattern::{Jump, JumpAndEighth, JumpAndEighthJump, Single, SingleAndEighth, Skip};
     let even_beat = beat_index.is_multiple_of(2);
     match (difficulty, density) {
         (Difficulty::Beginner, Low) | (Difficulty::Intermediate, Low) => {
@@ -262,8 +290,9 @@ fn step_pattern_for(
                 Skip
             }
         }
-        (Difficulty::Beginner, Mid | High) | (Difficulty::Intermediate, Mid) => Single,
-        (Difficulty::Intermediate, High) => SingleAndEighth,
+        // Beginner/IntermediateにはExtremeの概念が無いのでHighと同じ扱い
+        (Difficulty::Beginner, Mid | High | Extreme) | (Difficulty::Intermediate, Mid) => Single,
+        (Difficulty::Intermediate, High | Extreme) => SingleAndEighth,
         (Difficulty::Advanced, Low) => {
             if beat_index % 4 == 3 {
                 Skip
@@ -284,6 +313,14 @@ fn step_pattern_for(
             4 => JumpAndEighth,
             _ => SingleAndEighth,
         },
+        // 休符を作らず毎拍同時押し+8分音符。4拍目は8分音符も同時押しにして畳みかける
+        (Difficulty::Advanced, Extreme) => {
+            if beat_index % 4 == 3 {
+                JumpAndEighthJump
+            } else {
+                JumpAndEighth
+            }
+        }
     }
 }
 
@@ -379,16 +416,23 @@ fn generate_chart(song: &RhythmSong, difficulty: Difficulty) -> Vec<Note> {
             StepPattern::Skip => {}
             StepPattern::Single => notes.push(Note::new(vec![cycler.next_single(i)], hit_at)),
             StepPattern::Jump => notes.push(Note::new(cycler.next_jump(), hit_at)),
-            StepPattern::SingleAndEighth | StepPattern::JumpAndEighth => {
-                let lanes = if pattern == StepPattern::JumpAndEighth {
-                    cycler.next_jump()
-                } else {
+            StepPattern::SingleAndEighth
+            | StepPattern::JumpAndEighth
+            | StepPattern::JumpAndEighthJump => {
+                let lanes = if pattern == StepPattern::SingleAndEighth {
                     vec![cycler.next_single(i)]
+                } else {
+                    cycler.next_jump()
                 };
                 notes.push(Note::new(lanes, hit_at));
                 // 最後のビートには次のビートが無いので8分音符は付けない
                 if let Some(eighth_at) = eighth_at {
-                    notes.push(Note::new(vec![cycler.next_single(i)], eighth_at));
+                    let eighth_lanes = if pattern == StepPattern::JumpAndEighthJump {
+                        cycler.next_jump()
+                    } else {
+                        vec![cycler.next_single(i)]
+                    };
+                    notes.push(Note::new(eighth_lanes, eighth_at));
                 }
             }
         }
@@ -988,7 +1032,8 @@ mod tests {
             counts,
             vec![
                 ("Top_of_the_Leaderboard", 426),
-                ("Redline_Response_Time", 504)
+                ("Redline_Response_Time", 504),
+                ("Apex_Movement", 439)
             ]
         );
         for song in SONGS {
@@ -1029,21 +1074,108 @@ mod tests {
         }
     }
 
+    /// 曲の全ビートのうち、指定した密度の区間に属するビートがあるか
+    fn song_uses_density(song: &RhythmSong, d: SectionDensity) -> bool {
+        (0..song.beat_times_ms.len()).any(|i| density_at(song.sections, i) == d)
+    }
+
+    fn song_by_track(track_name: &str) -> &'static RhythmSong {
+        SONGS.iter().find(|s| s.track_name == track_name).unwrap()
+    }
+
     #[test]
-    fn songs_each_use_all_three_densities() {
-        for song in SONGS {
+    fn songs_are_listed_in_order_with_apex_movement_last() {
+        let names: Vec<&str> = SONGS.iter().map(|s| s.track_name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Top_of_the_Leaderboard",
+                "Redline_Response_Time",
+                "Apex_Movement"
+            ]
+        );
+        assert_eq!(
+            song_by_track("Apex_Movement").display_name,
+            "Apex Movement (BPM 152)"
+        );
+    }
+
+    #[test]
+    fn existing_songs_use_low_mid_high_and_never_extreme() {
+        for track in ["Top_of_the_Leaderboard", "Redline_Response_Time"] {
+            let song = song_by_track(track);
             for d in [
                 SectionDensity::Low,
                 SectionDensity::Mid,
                 SectionDensity::High,
             ] {
-                assert!(
-                    (0..song.beat_times_ms.len()).any(|i| density_at(song.sections, i) == d),
-                    "{}: {d:?}区間を含むこと",
-                    song.track_name
-                );
+                assert!(song_uses_density(song, d), "{track}: {d:?}区間を含むこと");
+            }
+            assert!(
+                !song_uses_density(song, SectionDensity::Extreme),
+                "{track}: 既存曲はExtremeを使わない"
+            );
+        }
+    }
+
+    #[test]
+    fn apex_movement_uses_low_mid_and_extreme() {
+        let song = song_by_track("Apex_Movement");
+        for d in [
+            SectionDensity::Low,
+            SectionDensity::Mid,
+            SectionDensity::Extreme,
+        ] {
+            assert!(
+                song_uses_density(song, d),
+                "Apex_Movement: {d:?}区間を含むこと"
+            );
+        }
+    }
+
+    #[test]
+    fn apex_movement_sections_follow_rms_analysis() {
+        use SectionDensity::{Extreme, Low, Mid};
+        let song = song_by_track("Apex_Movement");
+        // (区間開始秒, 密度)。RMSエネルギー解析の区分そのもの
+        let expected = [
+            (0, Low),
+            (30, Mid),
+            (40, Low),
+            (50, Extreme),
+            (100, Low),
+            (120, Mid),
+            (130, Extreme),
+            (170, Low),
+        ];
+        assert_eq!(song.sections.len(), expected.len());
+        assert_eq!(song.sections[0], (0, Low));
+        for (&(start, density), &(secs, expected_density)) in song.sections.iter().zip(&expected) {
+            assert_eq!(density, expected_density, "{secs}秒の区間");
+            let ms = secs * 1000;
+            // 区間はその秒数「以降」で最初のビートから始まる
+            assert!(song.beat_times_ms[start] >= ms, "{secs}秒の区間");
+            if start > 0 {
+                assert!(song.beat_times_ms[start - 1] < ms, "{secs}秒の区間");
             }
         }
+        // 170秒以降のアウトロは最後のビート(約174.9秒)より前に始まるので、ビートを含む
+        let (outro_start, _) = *song.sections.last().unwrap();
+        assert!(outro_start < song.beat_times_ms.len());
+        assert_eq!(density_at(song.sections, song.beat_times_ms.len() - 1), Low);
+        // 50-100秒・130-170秒の最高密度区間の中はExtreme
+        let at = |ms: u32| {
+            density_at(
+                song.sections,
+                beat_index_at_or_after_ms(song.beat_times_ms, ms),
+            )
+        };
+        assert_eq!(at(50_000), Extreme);
+        assert_eq!(at(99_000), Extreme);
+        assert_eq!(at(100_000), Low);
+        assert_eq!(at(130_000), Extreme);
+        assert_eq!(at(169_500), Extreme);
+        assert_eq!(at(170_000), Low);
     }
 
     // --- セクション密度の決定(density_at) ---
@@ -1097,13 +1229,14 @@ mod tests {
         Difficulty::Intermediate,
         Difficulty::Advanced,
     ];
-    const ALL_DENSITIES: [SectionDensity; 3] = [
+    const ALL_DENSITIES: [SectionDensity; 4] = [
         SectionDensity::Low,
         SectionDensity::Mid,
         SectionDensity::High,
+        SectionDensity::Extreme,
     ];
 
-    /// 1ビートの配置で踏むキーの回数(同時押しは2回、8分音符付きは+1)
+    /// 1ビートの配置で踏むキーの回数(同時押しは2回、8分音符付きは+1、8分音符も同時押しなら+2)
     fn presses(p: StepPattern) -> usize {
         match p {
             StepPattern::Skip => 0,
@@ -1111,7 +1244,19 @@ mod tests {
             StepPattern::SingleAndEighth => 2,
             StepPattern::Jump => 2,
             StepPattern::JumpAndEighth => 3,
+            StepPattern::JumpAndEighthJump => 4,
         }
+    }
+
+    /// 8拍分の同時押しの回数(8分音符位置の同時押しも数える)
+    fn jumps_per_8_beats(density: SectionDensity, difficulty: Difficulty) -> usize {
+        (0..8)
+            .map(|i| match step_pattern_for(density, difficulty, i) {
+                StepPattern::Jump | StepPattern::JumpAndEighth => 1,
+                StepPattern::JumpAndEighthJump => 2,
+                _ => 0,
+            })
+            .sum()
     }
 
     /// 8拍分(フレーズ2小節分)の合計打鍵数
@@ -1176,7 +1321,10 @@ mod tests {
         for density in ALL_DENSITIES {
             for i in 0..16 {
                 let p = step_pattern_for(density, Difficulty::Intermediate, i);
-                assert!(!matches!(p, StepPattern::Jump | StepPattern::JumpAndEighth));
+                assert!(!matches!(
+                    p,
+                    StepPattern::Jump | StepPattern::JumpAndEighth | StepPattern::JumpAndEighthJump
+                ));
             }
         }
     }
@@ -1194,11 +1342,79 @@ mod tests {
                 assert_eq!(p, StepPattern::SingleAndEighth, "beat{i}");
             }
         }
-        // 同時押しはHighだけ
+        // 同時押しはHigh/Extremeだけ
         for density in [SectionDensity::Low, SectionDensity::Mid] {
             for i in 0..16 {
                 let p = step_pattern_for(density, Difficulty::Advanced, i);
-                assert!(!matches!(p, StepPattern::Jump | StepPattern::JumpAndEighth));
+                assert!(!matches!(
+                    p,
+                    StepPattern::Jump | StepPattern::JumpAndEighth | StepPattern::JumpAndEighthJump
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn step_pattern_advanced_extreme_jumps_on_every_beat_with_eighth_and_no_rests() {
+        for i in 0..32 {
+            let p = step_pattern_for(SectionDensity::Extreme, Difficulty::Advanced, i);
+            // 休符なし・全ビートで同時押し・全ビートに8分音符
+            assert!(
+                matches!(
+                    p,
+                    StepPattern::JumpAndEighth | StepPattern::JumpAndEighthJump
+                ),
+                "beat{i} => {p:?}"
+            );
+            // 4拍目は8分音符の位置も同時押しにして畳みかける
+            if i % 4 == 3 {
+                assert_eq!(p, StepPattern::JumpAndEighthJump, "beat{i}");
+            }
+        }
+    }
+
+    #[test]
+    fn step_pattern_advanced_extreme_is_clearly_denser_than_high() {
+        let high = presses_per_8_beats(SectionDensity::High, Difficulty::Advanced);
+        let extreme = presses_per_8_beats(SectionDensity::Extreme, Difficulty::Advanced);
+        // 打鍵数で1.5倍以上(「既存Highよりはっきり難しい」)
+        assert!(extreme * 2 >= high * 3, "High {high} / Extreme {extreme}");
+        let high_jumps = jumps_per_8_beats(SectionDensity::High, Difficulty::Advanced);
+        let extreme_jumps = jumps_per_8_beats(SectionDensity::Extreme, Difficulty::Advanced);
+        assert!(
+            extreme_jumps >= high_jumps * 4,
+            "同時押し High {high_jumps} / Extreme {extreme_jumps}"
+        );
+    }
+
+    #[test]
+    fn step_pattern_extreme_falls_back_to_high_for_beginner_and_intermediate() {
+        // Beginner/IntermediateにはExtremeの概念が無いので、Highと同じ配置にする
+        for difficulty in [Difficulty::Beginner, Difficulty::Intermediate] {
+            for i in 0..32 {
+                assert_eq!(
+                    step_pattern_for(SectionDensity::Extreme, difficulty, i),
+                    step_pattern_for(SectionDensity::High, difficulty, i),
+                    "{difficulty:?} beat{i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn step_pattern_double_jump_only_appears_in_advanced_extreme() {
+        for difficulty in ALL_DIFFICULTIES {
+            for density in ALL_DENSITIES {
+                if (difficulty, density) == (Difficulty::Advanced, SectionDensity::Extreme) {
+                    continue;
+                }
+                for i in 0..32 {
+                    assert_ne!(
+                        step_pattern_for(density, difficulty, i),
+                        StepPattern::JumpAndEighthJump,
+                        "{difficulty:?} {density:?} beat{i}"
+                    );
+                }
             }
         }
     }
@@ -1246,13 +1462,22 @@ mod tests {
         };
         assert!(total(Difficulty::Beginner) < total(Difficulty::Intermediate));
         assert!(total(Difficulty::Intermediate) < total(Difficulty::Advanced));
-        // 同じ難易度ならLow <= Mid <= High
+        // 同じ難易度ならLow < Mid <= High <= Extreme
         for difficulty in ALL_DIFFICULTIES {
             let l = presses_per_8_beats(SectionDensity::Low, difficulty);
             let m = presses_per_8_beats(SectionDensity::Mid, difficulty);
             let h = presses_per_8_beats(SectionDensity::High, difficulty);
-            assert!(l < m && m <= h, "{difficulty:?}: {l} < {m} <= {h}");
+            let e = presses_per_8_beats(SectionDensity::Extreme, difficulty);
+            assert!(
+                l < m && m <= h && h <= e,
+                "{difficulty:?}: {l} < {m} <= {h} <= {e}"
+            );
         }
+        // ExtremeがHighより真に忙しくなるのはAdvancedだけ
+        assert!(
+            presses_per_8_beats(SectionDensity::High, Difficulty::Advanced)
+                < presses_per_8_beats(SectionDensity::Extreme, Difficulty::Advanced)
+        );
     }
 
     // --- 8分音符の時刻 ---
@@ -1317,6 +1542,119 @@ mod tests {
         for j in jumps {
             assert_eq!(j.lanes.len(), 2);
             assert_ne!(j.lanes[0], j.lanes[1]);
+        }
+    }
+
+    /// TEST_SONGと同じビートで、全区間をExtremeにした曲
+    const TEST_SONG_EXTREME: RhythmSong = RhythmSong {
+        track_name: "test",
+        display_name: "test",
+        beat_times_ms: TEST_BEATS,
+        sections: &[(0, SectionDensity::Extreme)],
+    };
+
+    fn chart_signature(notes: &[Note]) -> Vec<(Duration, Vec<Lane>)> {
+        notes.iter().map(|n| (n.hit_at, n.lanes.clone())).collect()
+    }
+
+    #[test]
+    fn generate_chart_extreme_matches_high_for_beginner_and_intermediate() {
+        for difficulty in [Difficulty::Beginner, Difficulty::Intermediate] {
+            let extreme = generate_chart(&TEST_SONG_EXTREME, difficulty);
+            let high = generate_chart(&TEST_SONG, difficulty);
+            assert!(!extreme.is_empty());
+            assert_eq!(
+                chart_signature(&extreme),
+                chart_signature(&high),
+                "{difficulty:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_chart_advanced_extreme_jumps_on_every_beat_and_double_jumps_on_fourth() {
+        let notes = generate_chart(&TEST_SONG_EXTREME, Difficulty::Advanced);
+        // 全ビート+その8分音符(最後のビートは8分音符なし)
+        assert_eq!(notes.len(), TEST_BEATS.len() * 2 - 1);
+        for (i, &beat_ms) in TEST_BEATS.iter().enumerate() {
+            let on_beat = &notes[i * 2];
+            assert_eq!(on_beat.hit_at, Duration::from_millis(beat_ms as u64));
+            assert_eq!(on_beat.lanes.len(), 2, "beat{i}は同時押し");
+            assert_ne!(on_beat.lanes[0], on_beat.lanes[1]);
+            if let Some(next_ms) = TEST_BEATS.get(i + 1) {
+                let eighth = &notes[i * 2 + 1];
+                assert_eq!(eighth.hit_at, eighth_hit_at(beat_ms, *next_ms));
+                let expected_lanes = if i % 4 == 3 { 2 } else { 1 };
+                assert_eq!(eighth.lanes.len(), expected_lanes, "beat{i}の8分音符");
+                // 連続する同時押しは同じレーンの組を続けない(左右→上下と交互)
+                if expected_lanes == 2 {
+                    assert_ne!(eighth.lanes, on_beat.lanes, "beat{i}");
+                    assert_ne!(eighth.lanes, notes[i * 2 + 2].lanes, "beat{i}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generate_chart_advanced_extreme_is_clearly_busier_than_high() {
+        let high = chart_press_count(&generate_chart(&TEST_SONG, Difficulty::Advanced));
+        let extreme = chart_press_count(&generate_chart(&TEST_SONG_EXTREME, Difficulty::Advanced));
+        assert!(extreme * 2 >= high * 3, "High {high} / Extreme {extreme}");
+    }
+
+    /// 譜面中の任意の10秒間に踏むキー数の最大値(ピークの忙しさ)
+    fn peak_presses_in_10s(notes: &[Note]) -> usize {
+        const WINDOW: Duration = Duration::from_secs(10);
+        let mut best = 0;
+        let mut end = 0;
+        let mut sum = 0;
+        for start in 0..notes.len() {
+            while end < notes.len() && notes[end].hit_at < notes[start].hit_at + WINDOW {
+                sum += notes[end].lanes.len();
+                end += 1;
+            }
+            best = best.max(sum);
+            sum -= notes[start].lanes.len();
+        }
+        best
+    }
+
+    #[test]
+    fn apex_movement_advanced_is_clearly_harder_than_existing_songs() {
+        let apex = generate_chart(song_by_track("Apex_Movement"), Difficulty::Advanced);
+        let apex_peak = peak_presses_in_10s(&apex);
+        let apex_total = chart_press_count(&apex);
+        for track in ["Top_of_the_Leaderboard", "Redline_Response_Time"] {
+            let other = generate_chart(song_by_track(track), Difficulty::Advanced);
+            let other_peak = peak_presses_in_10s(&other);
+            let other_total = chart_press_count(&other);
+            println!(
+                "Advanced 10秒ピーク打鍵数 Apex {apex_peak} / {track} {other_peak}, 総打鍵数 Apex {apex_total} / {track} {other_total}"
+            );
+            // ピークの忙しさで1.2倍超、総打鍵数でも上回る
+            assert!(
+                apex_peak * 5 > other_peak * 6,
+                "{track}: Apex {apex_peak} vs {other_peak}"
+            );
+            assert!(
+                apex_total > other_total,
+                "{track}: Apex {apex_total} vs {other_total}"
+            );
+        }
+    }
+
+    #[test]
+    fn apex_movement_charts_generate_for_every_difficulty() {
+        // Beginner/IntermediateでExtreme区間に入ってもクラッシュせず、High相当の譜面になる
+        let song = song_by_track("Apex_Movement");
+        for difficulty in ALL_DIFFICULTIES {
+            let notes = generate_chart(song, difficulty);
+            assert!(notes.len() > 100, "{difficulty:?}: {}", notes.len());
+        }
+        for difficulty in [Difficulty::Beginner, Difficulty::Intermediate] {
+            assert!(generate_chart(song, difficulty)
+                .iter()
+                .all(|n| n.lanes.len() == 1));
         }
     }
 
