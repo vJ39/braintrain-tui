@@ -137,6 +137,8 @@ pub struct RhythmSong {
     pub track_name: &'static str,
     /// 曲選択画面に表示する名前
     pub display_name: &'static str,
+    /// 曲全体の長さ(ミリ秒、音源の実測値)。全ノーツ判定後もこの時間までは曲を流し続ける
+    duration_ms: u32,
     /// 実測ビート時刻(ミリ秒、曲頭からの経過時間、昇順)
     beat_times_ms: &'static [u32],
     /// (この区間が始まるビートインデックス, 密度) を昇順で並べたもの。
@@ -219,18 +221,21 @@ pub const SONGS: &[RhythmSong] = &[
     RhythmSong {
         track_name: "Top_of_the_Leaderboard",
         display_name: "Top of the Leaderboard (BPM 150)",
+        duration_ms: 178_808,
         beat_times_ms: beats::TOP_OF_THE_LEADERBOARD_BEATS_MS,
         sections: TOP_OF_THE_LEADERBOARD_SECTIONS,
     },
     RhythmSong {
         track_name: "Redline_Response_Time",
         display_name: "Redline Response Time (BPM 180)",
+        duration_ms: 179_435,
         beat_times_ms: beats::REDLINE_RESPONSE_TIME_BEATS_MS,
         sections: REDLINE_RESPONSE_TIME_SECTIONS,
     },
     RhythmSong {
         track_name: "Apex_Movement",
         display_name: "Apex Movement (BPM 152)",
+        duration_ms: 182_204,
         beat_times_ms: beats::APEX_MOVEMENT_BEATS_MS,
         sections: APEX_MOVEMENT_SECTIONS,
     },
@@ -859,8 +864,11 @@ impl Game for RhythmGame {
         );
     }
 
+    /// 全ノーツが判定済みで、かつ曲を最後まで再生し終えたら終了。
+    /// 最後のノーツを踏んだ直後に曲を打ち切ってリザルトへ進まないよう、曲の長さも条件にする
     fn is_finished(&self) -> bool {
-        self.notes.iter().all(|n| n.is_judged())
+        let song_end = Duration::from_millis(self.song().duration_ms as u64);
+        self.notes.iter().all(|n| n.is_judged()) && self.started_at.elapsed() >= song_end
     }
 
     fn result(&self) -> GameResult {
@@ -1509,6 +1517,7 @@ mod tests {
     const TEST_SONG: RhythmSong = RhythmSong {
         track_name: "test",
         display_name: "test",
+        duration_ms: 9000,
         beat_times_ms: TEST_BEATS,
         sections: &[(0, SectionDensity::High)],
     };
@@ -1728,6 +1737,7 @@ mod tests {
     const TEST_SONG_EXTREME: RhythmSong = RhythmSong {
         track_name: "test",
         display_name: "test",
+        duration_ms: 9000,
         beat_times_ms: TEST_BEATS,
         sections: &[(0, SectionDensity::Extreme)],
     };
@@ -1841,6 +1851,7 @@ mod tests {
         let song = RhythmSong {
             track_name: "test",
             display_name: "test",
+            duration_ms: 3000,
             beat_times_ms: &[100, 500, 900, 1300, 1700, 2100],
             sections: &[(0, SectionDensity::High)],
         };
@@ -2124,10 +2135,17 @@ mod tests {
         assert_eq!(game.max_combo, 4, "最大コンボは保持される");
     }
 
+    /// 指定した曲の長さ(duration_ms)をDurationで返す
+    fn song_duration(song_index: usize) -> Duration {
+        Duration::from_millis(SONGS[song_index].duration_ms as u64)
+    }
+
     #[test]
     fn is_finished_true_only_after_all_notes_judged() {
         let mut game = RhythmGame::new(Difficulty::Beginner, 0);
         game.notes = vec![note(&[Lane::Up], 500), note(&[Lane::Down], 900)];
+        // 曲は再生し終えている前提で、ノーツ側の条件だけを確かめる
+        game.set_elapsed_for_test(song_duration(0));
         assert!(!game.is_finished());
         game.notes[0].judgement = Some(Judgement::Perfect);
         assert!(!game.is_finished());
@@ -2136,11 +2154,110 @@ mod tests {
     }
 
     #[test]
+    fn is_finished_false_while_song_still_playing_after_all_notes_judged() {
+        let mut game = RhythmGame::new(Difficulty::Beginner, 0);
+        game.notes = vec![note(&[Lane::Up], 500)];
+        game.notes[0].judgement = Some(Judgement::Perfect);
+        // 最後のノーツ直後
+        game.set_elapsed_for_test(Duration::from_millis(600));
+        assert!(!game.is_finished(), "曲の再生中はリザルトに進まない");
+        // 曲の終わりの直前
+        game.set_elapsed_for_test(song_duration(0) - Duration::from_millis(1));
+        assert!(
+            !game.is_finished(),
+            "曲の長さに達するまではリザルトに進まない"
+        );
+    }
+
+    #[test]
+    fn is_finished_true_once_song_duration_reached_after_all_notes_judged() {
+        let mut game = RhythmGame::new(Difficulty::Beginner, 0);
+        game.notes = vec![note(&[Lane::Up], 500)];
+        game.notes[0].judgement = Some(Judgement::Perfect);
+        game.set_elapsed_for_test(song_duration(0));
+        assert!(game.is_finished());
+    }
+
+    #[test]
+    fn is_finished_false_with_unjudged_note_even_after_song_duration() {
+        let mut game = RhythmGame::new(Difficulty::Beginner, 0);
+        game.notes = vec![note(&[Lane::Up], 500), note(&[Lane::Down], 900)];
+        game.notes[0].judgement = Some(Judgement::Perfect);
+        game.set_elapsed_for_test(song_duration(0) + Duration::from_secs(5));
+        assert!(
+            !game.is_finished(),
+            "曲の長さを過ぎても未判定のノーツが残っていれば終わらない"
+        );
+    }
+
+    #[test]
+    fn is_finished_uses_duration_of_selected_song() {
+        // 一番長い曲(Apex_Movement)を選び、それより短い曲の長さだけ経過させる
+        let longest = SONGS
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, s)| s.duration_ms)
+            .map(|(i, _)| i)
+            .unwrap();
+        let shortest = SONGS
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, s)| s.duration_ms)
+            .map(|(i, _)| i)
+            .unwrap();
+        assert_ne!(longest, shortest);
+        let mut game = RhythmGame::new(Difficulty::Beginner, longest);
+        game.notes = vec![note(&[Lane::Up], 500)];
+        game.notes[0].judgement = Some(Judgement::Perfect);
+        game.set_elapsed_for_test(song_duration(shortest));
+        assert!(!game.is_finished(), "プレイ中の曲の長さで判定する");
+        game.set_elapsed_for_test(song_duration(longest));
+        assert!(game.is_finished());
+    }
+
+    #[test]
+    fn songs_have_measured_duration_longer_than_last_beat() {
+        let expected = [
+            ("Top_of_the_Leaderboard", 178_808),
+            ("Redline_Response_Time", 179_435),
+            ("Apex_Movement", 182_204),
+        ];
+        assert_eq!(SONGS.len(), expected.len());
+        for (track_name, duration_ms) in expected {
+            let song = song_by_track(track_name);
+            assert_eq!(
+                song.duration_ms, duration_ms,
+                "{track_name}: 実測の曲の長さ"
+            );
+            assert!(
+                song.duration_ms > *song.beat_times_ms.last().unwrap(),
+                "{track_name}: 曲の長さは最後のビートより後"
+            );
+        }
+    }
+
+    #[test]
+    fn keys_and_updates_after_all_notes_judged_do_not_change_score_while_song_plays() {
+        let mut game = RhythmGame::new(Difficulty::Beginner, 0);
+        game.notes = vec![note(&[Lane::Up], 500)];
+        game.set_elapsed_for_test(Duration::from_millis(500));
+        game.handle_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(game.tracker.total(), 1);
+        // 全ノーツ判定済みだが曲はまだ再生中。入力・時間経過ともスコアを変えない
+        game.set_elapsed_for_test(Duration::from_secs(60));
+        game.handle_key(KeyEvent::from(KeyCode::Up));
+        game.update(Duration::from_millis(16));
+        assert_eq!(game.tracker.total(), 1);
+        assert!(!game.is_finished());
+    }
+
+    #[test]
     fn handle_key_does_nothing_once_finished() {
         let mut game = RhythmGame::new(Difficulty::Beginner, 0);
         game.notes = vec![note(&[Lane::Up], 500)];
         game.notes[0].judgement = Some(Judgement::Perfect);
-        game.set_elapsed_for_test(Duration::from_millis(500));
+        game.set_elapsed_for_test(song_duration(0));
+        assert!(game.is_finished());
         game.handle_key(KeyEvent::from(KeyCode::Up));
         // 既に終了しているので何も記録されない
         assert_eq!(game.tracker.total(), 0);
