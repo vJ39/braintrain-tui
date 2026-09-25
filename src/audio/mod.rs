@@ -294,11 +294,12 @@ mod tests {
     }
 
     #[test]
-    fn bgm_tracks_in_rhythm_has_both_rhythm_songs_only() {
+    fn bgm_tracks_in_rhythm_has_all_rhythm_songs_only() {
         let names = bgm_tracks_in(BgmCategory::Rhythm);
         assert_eq!(
             names,
             vec![
+                "Apex_Movement".to_string(),
                 "Redline_Response_Time".to_string(),
                 "Top_of_the_Leaderboard".to_string()
             ]
@@ -311,6 +312,7 @@ mod tests {
             let names = bgm_tracks_in(category);
             assert!(!names.iter().any(|n| n == "Top_of_the_Leaderboard"));
             assert!(!names.iter().any(|n| n == "Redline_Response_Time"));
+            assert!(!names.iter().any(|n| n == "Apex_Movement"));
         }
     }
 
