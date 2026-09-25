@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use crate::audio::{self, SeKind};
+use crate::audio::{self, BgmCategory, SeKind};
 use crate::game::memory::MemoryGame;
 use crate::game::mental_calc::MentalCalcGame;
 use crate::game::mirror_match::MirrorMatchGame;
@@ -21,7 +21,7 @@ use crate::game::shape_rotate::ShapeRotateGame;
 use crate::game::{Difficulty, Game, GameResult};
 use crate::stats::store;
 
-const MENU_ITEMS: [&str; 10] = [
+const MENU_ITEMS: [&str; 11] = [
     "図形回転判定",
     "鏡像判定",
     "反応速度(Stroop)",
@@ -31,9 +31,11 @@ const MENU_ITEMS: [&str; 10] = [
     "数列予測",
     "組み合わせパズル",
     "リズム(DDR風)",
+    "ジュークボックス",
     "履歴",
 ];
 
+const JUKEBOX_ITEM_INDEX: usize = MENU_ITEMS.len() - 2;
 const HISTORY_ITEM_INDEX: usize = MENU_ITEMS.len() - 1;
 
 pub enum Screen {
@@ -42,6 +44,7 @@ pub enum Screen {
     Playing(Box<dyn Game>),
     Result(GameResult),
     History,
+    Jukebox(ListState),
 }
 
 pub struct App {
@@ -51,17 +54,24 @@ pub struct App {
     /// 直近のrender()で描画したフルスクリーンのエリア。マウス座標からのヒット
     /// テストに使う(render()より前にhandle_mouseが呼ばれることは無い前提)
     last_area: Rect,
+    /// 現在再生中のBGMトラック名(ジュークボックス画面のハイライト表示に使う)
+    current_bgm: Option<String>,
 }
 
 impl App {
     pub fn new() -> Self {
         let mut menu_state = ListState::default();
         menu_state.select(Some(0));
+        let current_bgm = audio::random_bgm_track(BgmCategory::Menu);
+        if let Some(name) = &current_bgm {
+            audio::play_bgm_track(name);
+        }
         Self {
             screen: Screen::Menu,
             menu_state,
             should_quit: false,
             last_area: Rect::default(),
+            current_bgm,
         }
     }
 
@@ -89,10 +99,10 @@ impl App {
             }
             Screen::Result(_) | Screen::History => {
                 if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
-                    audio::play_se(SeKind::Transition);
-                    self.screen = Screen::Menu;
+                    self.return_to_menu();
                 }
             }
+            Screen::Jukebox(_) => self.handle_jukebox_key(key),
         }
     }
 
@@ -105,19 +115,13 @@ impl App {
             Screen::Menu => {
                 if let Some(index) = menu_item_at_row(area, mouse.row) {
                     self.menu_state.select(Some(index));
-                    audio::play_se(SeKind::Transition);
-                    if index == HISTORY_ITEM_INDEX {
-                        self.screen = Screen::History;
-                    } else {
-                        self.screen = Screen::SelectDifficulty(index);
-                    }
+                    self.select_menu_item(index);
                 }
             }
             Screen::SelectDifficulty(item) => {
                 let item = *item;
                 if let Some(difficulty) = difficulty_at_row(area, mouse.row) {
-                    audio::play_se(SeKind::Transition);
-                    self.screen = Screen::Playing(new_game(item, difficulty));
+                    self.start_playing(item, difficulty);
                 }
             }
             Screen::Playing(game) => {
@@ -127,10 +131,55 @@ impl App {
                 }
             }
             Screen::Result(_) | Screen::History => {
-                audio::play_se(SeKind::Transition);
-                self.screen = Screen::Menu;
+                self.return_to_menu();
             }
+            Screen::Jukebox(_) => {}
         }
+    }
+
+    /// Menu画面での項目決定(キー/クリック共通)。ゲーム/ジュークボックス/履歴へ振り分ける
+    fn select_menu_item(&mut self, selected: usize) {
+        audio::play_se(SeKind::Transition);
+        if selected == HISTORY_ITEM_INDEX {
+            self.screen = Screen::History;
+        } else if selected == JUKEBOX_ITEM_INDEX {
+            self.screen = Screen::Jukebox(self.jukebox_list_state());
+        } else {
+            self.screen = Screen::SelectDifficulty(selected);
+        }
+    }
+
+    /// 難易度決定後、指定ゲームを開始しPlaying用BGMに切り替える(キー/クリック共通)
+    fn start_playing(&mut self, item: usize, difficulty: Difficulty) {
+        audio::play_se(SeKind::Transition);
+        if let Some(name) = audio::random_bgm_track(BgmCategory::Playing) {
+            audio::play_bgm_track(&name);
+            self.current_bgm = Some(name);
+        }
+        self.screen = Screen::Playing(new_game(item, difficulty));
+    }
+
+    /// Menu画面に戻り、Menu用BGMに切り替える(キー/クリック共通)
+    fn return_to_menu(&mut self) {
+        audio::play_se(SeKind::Transition);
+        if let Some(name) = audio::random_bgm_track(BgmCategory::Menu) {
+            audio::play_bgm_track(&name);
+            self.current_bgm = Some(name);
+        }
+        self.screen = Screen::Menu;
+    }
+
+    /// 現在再生中の曲を選択済みにしたジュークボックス画面用ListStateを作る
+    fn jukebox_list_state(&self) -> ListState {
+        let tracks = audio::bgm_track_names();
+        let mut state = ListState::default();
+        let index = self
+            .current_bgm
+            .as_ref()
+            .and_then(|name| tracks.iter().position(|t| t == name))
+            .unwrap_or(0);
+        state.select(Some(index));
+        state
     }
 
     fn handle_menu_key(&mut self, key: KeyEvent) {
@@ -143,13 +192,43 @@ impl App {
             KeyCode::Down => {
                 self.menu_state.select(Some((selected + 1) % len));
             }
-            KeyCode::Enter => {
-                audio::play_se(SeKind::Transition);
-                if selected == HISTORY_ITEM_INDEX {
-                    self.screen = Screen::History;
-                } else {
-                    self.screen = Screen::SelectDifficulty(selected);
+            KeyCode::Enter => self.select_menu_item(selected),
+            _ => {}
+        }
+    }
+
+    fn handle_jukebox_key(&mut self, key: KeyEvent) {
+        let tracks = audio::bgm_track_names();
+        let len = tracks.len().max(1);
+        let selected = if let Screen::Jukebox(state) = &self.screen {
+            state.selected().unwrap_or(0)
+        } else {
+            return;
+        };
+
+        match key.code {
+            KeyCode::Up => {
+                if let Screen::Jukebox(state) = &mut self.screen {
+                    state.select(Some((selected + len - 1) % len));
                 }
+            }
+            KeyCode::Down => {
+                if let Screen::Jukebox(state) = &mut self.screen {
+                    state.select(Some((selected + 1) % len));
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(name) = tracks.get(selected).cloned() {
+                    audio::play_bgm_track(&name);
+                    self.current_bgm = Some(name);
+                }
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                audio::stop_bgm();
+                self.current_bgm = None;
+            }
+            KeyCode::Esc => {
+                self.screen = Screen::Menu;
             }
             _ => {}
         }
@@ -167,8 +246,7 @@ impl App {
             _ => None,
         };
         if let Some(difficulty) = difficulty {
-            audio::play_se(SeKind::Transition);
-            self.screen = Screen::Playing(new_game(item, difficulty));
+            self.start_playing(item, difficulty);
         }
     }
 
@@ -181,12 +259,14 @@ impl App {
     pub fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
         self.last_area = area;
-        match &self.screen {
+        let current_bgm = self.current_bgm.clone();
+        match &mut self.screen {
             Screen::Menu => render_menu(frame, area, &mut self.menu_state),
             Screen::SelectDifficulty(item) => render_difficulty_select(frame, area, MENU_ITEMS[*item]),
             Screen::Playing(game) => game.render(frame, area),
             Screen::Result(result) => render_result(frame, area, result),
             Screen::History => render_history(frame, area),
+            Screen::Jukebox(state) => render_jukebox(frame, area, state, current_bgm.as_deref()),
         }
     }
 }
@@ -273,6 +353,32 @@ fn render_result(frame: &mut Frame, area: Rect, result: &GameResult) {
     frame.render_widget(paragraph, area);
 }
 
+fn render_jukebox(frame: &mut Frame, area: Rect, state: &mut ListState, playing: Option<&str>) {
+    let tracks = audio::bgm_track_names();
+    let items: Vec<ListItem> = if tracks.is_empty() {
+        vec![ListItem::new("(曲がありません)")]
+    } else {
+        tracks
+            .iter()
+            .map(|name| {
+                if Some(name.as_str()) == playing {
+                    ListItem::new(format!("♪ {name} (再生中)"))
+                } else {
+                    ListItem::new(name.clone())
+                }
+            })
+            .collect()
+    };
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("ジュークボックス (Enter:再生 S:停止 Esc:戻る)"),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    frame.render_stateful_widget(list, area, state);
+}
+
 fn render_history(frame: &mut Frame, area: Rect) {
     crate::stats::history_view::render(frame, area);
 }
@@ -303,15 +409,17 @@ mod tests {
     /// MENU_ITEMSにゲームを追加してnew_gameのmatchを更新し忘れると、
     /// この範囲でunreachable!に到達してpanicし検知できる
     #[test]
-    fn new_game_handles_every_non_history_menu_item() {
-        for item in 0..HISTORY_ITEM_INDEX {
+    fn new_game_handles_every_game_menu_item() {
+        for item in 0..JUKEBOX_ITEM_INDEX {
             let _game = new_game(item, Difficulty::Beginner);
         }
     }
 
     #[test]
-    fn history_item_index_is_the_last_menu_item() {
+    fn jukebox_and_history_are_the_last_two_menu_items() {
+        assert_eq!(JUKEBOX_ITEM_INDEX, MENU_ITEMS.len() - 2);
         assert_eq!(HISTORY_ITEM_INDEX, MENU_ITEMS.len() - 1);
+        assert_eq!(MENU_ITEMS[JUKEBOX_ITEM_INDEX], "ジュークボックス");
         assert_eq!(MENU_ITEMS[HISTORY_ITEM_INDEX], "履歴");
     }
 
@@ -321,8 +429,9 @@ mod tests {
 
     #[test]
     fn menu_item_at_row_maps_each_row_to_its_index() {
-        // area(0,0,20,12)、Block枠込みなので内部は(1,1,18,10)
-        let area = rect(0, 0, 20, 12);
+        // 上下の枠線(2行)+項目数ぶんの高さを持つエリア
+        let height = MENU_ITEMS.len() as u16 + 2;
+        let area = rect(0, 0, 20, height);
         for (offset, expected) in (0..MENU_ITEMS.len()).enumerate() {
             let row = 1 + offset as u16;
             assert_eq!(menu_item_at_row(area, row), Some(expected));
@@ -331,9 +440,14 @@ mod tests {
 
     #[test]
     fn menu_item_at_row_on_border_is_none() {
-        let area = rect(0, 0, 20, 12);
+        let height = MENU_ITEMS.len() as u16 + 2;
+        let area = rect(0, 0, 20, height);
         assert_eq!(menu_item_at_row(area, 0), None, "上端の枠線上はNone");
-        assert_eq!(menu_item_at_row(area, 11), None, "下端の枠線上はNone");
+        assert_eq!(
+            menu_item_at_row(area, height - 1),
+            None,
+            "下端の枠線上はNone"
+        );
     }
 
     #[test]
@@ -364,5 +478,72 @@ mod tests {
             difficulty_at_row(area, inner_top + DIFFICULTY_ROWS_OFFSET + 3),
             None
         );
+    }
+
+    #[test]
+    fn selecting_jukebox_menu_item_enters_jukebox_screen() {
+        let mut app = App::new();
+        app.select_menu_item(JUKEBOX_ITEM_INDEX);
+        assert!(matches!(app.screen, Screen::Jukebox(_)));
+    }
+
+    #[test]
+    fn selecting_history_menu_item_enters_history_screen() {
+        let mut app = App::new();
+        app.select_menu_item(HISTORY_ITEM_INDEX);
+        assert!(matches!(app.screen, Screen::History));
+    }
+
+    #[test]
+    fn selecting_game_menu_item_enters_difficulty_screen() {
+        let mut app = App::new();
+        app.select_menu_item(0);
+        assert!(matches!(app.screen, Screen::SelectDifficulty(0)));
+    }
+
+    #[test]
+    fn jukebox_up_down_wraps_around_track_list() {
+        let mut app = App::new();
+        app.screen = Screen::Jukebox(app.jukebox_list_state());
+        let tracks = audio::bgm_track_names();
+        let len = tracks.len();
+
+        // 先頭で上キーを押すと末尾に巡回する
+        if let Screen::Jukebox(state) = &mut app.screen {
+            state.select(Some(0));
+        }
+        app.handle_jukebox_key(KeyEvent::from(KeyCode::Up));
+        let Screen::Jukebox(state) = &app.screen else {
+            panic!("Jukebox画面のはず");
+        };
+        assert_eq!(state.selected(), Some(len - 1));
+    }
+
+    #[test]
+    fn jukebox_enter_sets_current_bgm_to_selected_track() {
+        let mut app = App::new();
+        app.screen = Screen::Jukebox(app.jukebox_list_state());
+        let tracks = audio::bgm_track_names();
+        if let Screen::Jukebox(state) = &mut app.screen {
+            state.select(Some(0));
+        }
+        app.handle_jukebox_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.current_bgm.as_deref(), Some(tracks[0].as_str()));
+    }
+
+    #[test]
+    fn jukebox_stop_key_clears_current_bgm() {
+        let mut app = App::new();
+        app.screen = Screen::Jukebox(app.jukebox_list_state());
+        app.handle_jukebox_key(KeyEvent::from(KeyCode::Char('s')));
+        assert_eq!(app.current_bgm, None);
+    }
+
+    #[test]
+    fn jukebox_esc_returns_to_menu() {
+        let mut app = App::new();
+        app.screen = Screen::Jukebox(app.jukebox_list_state());
+        app.handle_jukebox_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(app.screen, Screen::Menu));
     }
 }
