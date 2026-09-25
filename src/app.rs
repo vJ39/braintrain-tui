@@ -49,7 +49,7 @@ const MENU_ITEMS: [&str; 14] = [
 const COUNT_MANIA_ITEM_INDEX: usize = 8;
 /// カラーストック
 const COLOR_STACK_ITEM_INDEX: usize = 9;
-/// リズムゲームだけは難易度選択の前に曲選択を挟む
+/// リズムゲーム(TTR)は難易度選択の代わりに曲選択を挟む(難易度は常に上級)
 const RHYTHM_ITEM_INDEX: usize = 10;
 /// 反射神経
 const QUICK_DRAW_ITEM_INDEX: usize = 11;
@@ -82,10 +82,8 @@ pub enum Screen {
     /// 起動直後のタイトル画面。Enterを押すとMenuへ進む
     Splash,
     Menu,
-    /// メニューでTTR(リズムゲーム)を選んだ直後のスプラッシュ画面。
-    /// Enter/クリックで曲選択(SelectSong)へ進む
-    RhythmSplash,
-    /// リズムゲームの曲選択(選択中の曲 = SONGSのインデックス)
+    /// リズムゲームの曲選択(選択中の曲 = SONGSのインデックス)。
+    /// TTRスプラッシュ画像を背景に、その上へ曲リストのパネルを重ねて描く
     SelectSong(usize),
     /// (メニュー項目, リズムゲームの場合は選んだ曲)
     SelectDifficulty(usize, Option<usize>),
@@ -117,7 +115,7 @@ pub struct App {
     /// 現在再生中のBGMトラック名(ジュークボックス画面のハイライト表示に使う)
     current_bgm: Option<String>,
     splash_renderer: SplashRenderer,
-    /// TTRスプラッシュ画面(Screen::RhythmSplash)用
+    /// 曲選択画面(Screen::SelectSong)の背景に描くTTRスプラッシュ画像用
     ttr_splash_renderer: SplashRenderer,
     /// メニューへ戻った直後にtrueになる。main.rsがtake_pending_scrollback_clear()で
     /// 検知して端末のスクロールバッファをクリアする(画像プロトコルの残留対策)
@@ -204,11 +202,6 @@ impl App {
                     self.leave_splash();
                 }
             }
-            Screen::RhythmSplash => {
-                if matches!(key.code, KeyCode::Enter) {
-                    self.leave_rhythm_splash();
-                }
-            }
             Screen::Menu => self.handle_menu_key(key),
             Screen::SelectSong(selected) => {
                 let selected = *selected;
@@ -272,9 +265,6 @@ impl App {
             Screen::Splash => {
                 self.leave_splash();
             }
-            Screen::RhythmSplash => {
-                self.leave_rhythm_splash();
-            }
             Screen::Menu => {
                 if let Some(index) = menu_item_at_row(area, mouse.row) {
                     self.menu_state.select(Some(index));
@@ -286,10 +276,10 @@ impl App {
                     self.select_song(song);
                 }
             }
-            Screen::SelectDifficulty(item, song) => {
-                let (item, song) = (*item, *song);
+            Screen::SelectDifficulty(item, _) => {
+                let item = *item;
                 if let Some(difficulty) = difficulty_at_row(area, mouse.row) {
-                    self.start_playing(item, difficulty, song);
+                    self.start_playing(item, difficulty);
                 }
             }
             Screen::Countdown { .. } => {}
@@ -312,12 +302,6 @@ impl App {
     fn leave_splash(&mut self) {
         audio::play_se(SeKind::Confirm);
         self.enter_menu();
-    }
-
-    /// TTRスプラッシュ画面から曲選択へ進む(Enter/クリック共通)
-    fn leave_rhythm_splash(&mut self) {
-        audio::play_se(SeKind::Confirm);
-        self.screen = Screen::SelectSong(0);
     }
 
     /// ゲーム終了後、リザルト画面へ進む(キー/クリック共通)。リザルト用BGMに切り替える。
@@ -345,7 +329,6 @@ impl App {
             self.start_playing(
                 COLOR_STACK_ITEM_INDEX,
                 crate::game::color_stack::SESSION_DIFFICULTY,
-                None,
             );
             return;
         }
@@ -355,32 +338,27 @@ impl App {
         } else if selected == JUKEBOX_ITEM_INDEX {
             self.screen = Screen::Jukebox(self.jukebox_list_state());
         } else if selected == RHYTHM_ITEM_INDEX {
-            // 曲選択の前にTTR専用のスプラッシュ画面を挟む。BGMもTTR専用のものに切り替え、
+            // TTRスプラッシュ画像を背景にした曲選択画面へ進む。BGMもTTR専用のものに切り替え、
             // 実際に曲を選んでプレイが始まるまで(start_rhythmで曲のBGMに切り替わるまで)流し続ける
             if let Some(name) = audio::random_bgm_track(BgmCategory::RhythmSplash) {
                 audio::play_bgm_track(&name);
                 self.current_bgm = Some(name);
             }
-            self.screen = Screen::RhythmSplash;
+            self.screen = Screen::SelectSong(0);
         } else {
             self.screen = Screen::SelectDifficulty(selected, None);
         }
     }
 
-    /// 曲選択画面での曲決定(キー/クリック共通)。その曲の難易度選択へ進む
+    /// 曲選択画面での曲決定(キー/クリック共通)。難易度選択を挟まず、その曲のプレイを始める
     fn select_song(&mut self, song: usize) {
         audio::play_se(SeKind::Transition);
-        self.screen = Screen::SelectDifficulty(RHYTHM_ITEM_INDEX, Some(song));
+        self.start_rhythm(song);
     }
 
-    /// 難易度決定後、指定ゲームを開始する(キー/クリック共通)。リズムゲームはすぐに
-    /// プレイを始め、それ以外はPlaying用BGMに切り替えてカウントダウンを挟む
-    fn start_playing(&mut self, item: usize, difficulty: Difficulty, song: Option<usize>) {
-        if item == RHYTHM_ITEM_INDEX {
-            audio::play_se(SeKind::Transition);
-            self.start_rhythm(song.unwrap_or(0), difficulty);
-            return;
-        }
+    /// 難易度決定後、指定ゲームを開始する(キー/クリック共通)。
+    /// Playing用BGMに切り替えてカウントダウンを挟む(TTRはこの経路を通らない)
+    fn start_playing(&mut self, item: usize, difficulty: Difficulty) {
         if let Some(name) = audio::random_bgm_track(BgmCategory::Playing) {
             audio::play_bgm_track(&name);
             self.current_bgm = Some(name);
@@ -397,10 +375,10 @@ impl App {
         };
     }
 
-    /// リズムゲームを開始する。譜面生成を先に済ませ、選んだ曲のBGM再生を始めた直後に
-    /// ゲーム内時計を合わせることで、曲と譜面(実測ビート時刻)の時間基準を揃える
-    fn start_rhythm(&mut self, song: usize, difficulty: Difficulty) {
-        let mut game = RhythmGame::new(difficulty, song);
+    /// リズムゲームを開始する(常に上級の譜面・判定)。譜面生成を先に済ませ、選んだ曲のBGM再生を
+    /// 始めた直後にゲーム内時計を合わせることで、曲と譜面(実測ビート時刻)の時間基準を揃える
+    fn start_rhythm(&mut self, song: usize) {
+        let mut game = RhythmGame::new(song);
         let track_name = game.song().track_name;
         audio::play_bgm_track(track_name);
         game.restart_clock();
@@ -518,7 +496,7 @@ impl App {
             _ => None,
         };
         if let Some(difficulty) = difficulty {
-            self.start_playing(item, difficulty, song);
+            self.start_playing(item, difficulty);
         }
     }
 
@@ -558,11 +536,14 @@ impl App {
         let current_bgm = self.current_bgm.clone();
         match &mut self.screen {
             Screen::Splash => self.splash_renderer.render(frame, area),
-            Screen::RhythmSplash => self.ttr_splash_renderer.render(frame, area),
             Screen::Menu => {
                 render_menu(frame, area, &mut self.menu_state, &mut self.menu_typewriter)
             }
-            Screen::SelectSong(selected) => render_song_select(frame, area, *selected),
+            Screen::SelectSong(selected) => {
+                // TTRスプラッシュ画像を全画面に描いてから、その上に曲リストのパネルを重ねる
+                self.ttr_splash_renderer.render(frame, area);
+                render_song_select(frame, area, *selected)
+            }
             Screen::SelectDifficulty(item, song) => {
                 let title = match song.and_then(|s| SONGS.get(s)) {
                     Some(song) => format!("{} / {}", MENU_ITEMS[*item], song.display_name),
@@ -644,8 +625,22 @@ fn new_game(item: usize, difficulty: Difficulty) -> Box<dyn Game> {
 /// render_song_selectとsong_at_rowで一致させること
 const SONG_ROWS_OFFSET: u16 = 2;
 
-fn render_song_select(frame: &mut Frame, area: Rect, selected: usize) {
-    // 行の並びはsong_at_rowと一致させる(1行目=見出し、2行目=空行、3行目以降=曲)
+/// 曲選択パネルの操作説明(枠の下辺に出す)
+const SONG_SELECT_HINTS: [(&str, &str); 3] = [
+    ("↑↓", "選択"),
+    ("Enter / 数字", "決定"),
+    ("Esc", "戻る"),
+];
+
+/// 曲選択パネルの外枠(見出し・操作説明つき)
+fn song_panel_block() -> Block<'static> {
+    theme::panel(" ◆ BRAIN TRAIN ◆ ")
+        .title_bottom(theme::hints_line(&SONG_SELECT_HINTS).centered())
+}
+
+/// 曲選択パネルの中身(1行目=見出し、2行目=空行、3行目以降=曲)。
+/// 行の並びはsong_at_rowと一致させる
+fn song_select_lines(selected: usize) -> Vec<Line<'static>> {
     let mut text = vec![
         Line::from(vec![
             Span::styled("♪ ", Style::default().fg(theme::ACCENT)),
@@ -666,23 +661,42 @@ fn render_song_select(frame: &mut Frame, area: Rect, selected: usize) {
         };
         text.push(line);
     }
-    let block = theme::panel(" ◆ BRAIN TRAIN ◆ ").title_bottom(
-        theme::hints_line(&[
-            ("↑↓", "選択"),
-            ("Enter / 数字", "決定"),
-            ("Esc", "戻る"),
-        ])
-        .centered(),
-    );
-    let paragraph = Paragraph::new(text)
-        .alignment(Alignment::Center)
-        .block(block);
-    frame.render_widget(paragraph, area);
+    text
 }
 
-/// SelectSong画面でのクリック行(area基準、Block枠含む)から曲インデックスを求める
+/// 曲選択パネルを置く位置。背景のTTR画像が見えるよう全画面にはせず、中身(曲リスト・
+/// 操作説明)が収まる大きさで画面中央に置く。画面が小さければ画面に収まるよう縮める
+fn song_panel_rect(area: Rect) -> Rect {
+    // 選択中の行は「 ▶ 」で幅が広がるので、各曲を選択した時の幅で測る
+    let content_width = (0..SONGS.len())
+        .flat_map(song_select_lines)
+        .map(|line| line.width() as u16)
+        .max()
+        .unwrap_or(0);
+    let hints_width = theme::hints_line(&SONG_SELECT_HINTS).width() as u16;
+    // 左右の枠(各1セル)と、枠の内側の左右の余白(各1セル)
+    let width = (content_width.max(hints_width) + 4).min(area.width);
+    // 上下の枠(各1セル)
+    let height = (SONG_ROWS_OFFSET + SONGS.len() as u16 + 2).min(area.height);
+    centered_rect(area, width, height)
+}
+
+fn render_song_select(frame: &mut Frame, area: Rect, selected: usize) {
+    let panel = song_panel_rect(area);
+    // 背景に描いた画像・文字をパネルの範囲だけ消してから、その上にパネルを描く
+    frame.render_widget(ratatui::widgets::Clear, panel);
+    let paragraph = Paragraph::new(song_select_lines(selected))
+        .alignment(Alignment::Center)
+        .block(song_panel_block());
+    frame.render_widget(paragraph, panel);
+}
+
+/// SelectSong画面でのクリック行(画面全体のarea基準)から曲インデックスを求める。
+/// 曲選択パネル(song_panel_rect)の枠の内側の曲の行だけが対象
 fn song_at_row(area: Rect, mouse_row: u16) -> Option<usize> {
-    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let inner = Block::default()
+        .borders(Borders::ALL)
+        .inner(song_panel_rect(area));
     let relative = mouse_row
         .checked_sub(inner.y)?
         .checked_sub(SONG_ROWS_OFFSET)? as usize;
@@ -1309,7 +1323,7 @@ mod tests {
         assert!(matches!(app.screen, Screen::SelectDifficulty(0, None)));
     }
 
-    // --- リズムゲーム: Menu → 曲選択 → 難易度選択 → プレイ ---
+    // --- リズムゲーム: Menu → (TTR画像を背景にした)曲選択 → プレイ ---
 
     #[test]
     fn rhythm_item_index_points_at_rhythm_menu_item() {
@@ -1375,12 +1389,12 @@ mod tests {
     }
 
     #[test]
-    fn selecting_rhythm_menu_item_enters_ttr_splash_first() {
+    fn selecting_rhythm_menu_item_goes_straight_to_song_select() {
         let mut app = App::new();
         app.select_menu_item(RHYTHM_ITEM_INDEX);
         assert!(
-            matches!(app.screen, Screen::RhythmSplash),
-            "曲選択に直接進まず、TTRスプラッシュ画面を挟む"
+            matches!(app.screen, Screen::SelectSong(0)),
+            "スプラッシュ画面を挟まず、TTR画像を背景にした曲選択画面へ直接進む"
         );
     }
 
@@ -1400,7 +1414,11 @@ mod tests {
         let mut app = App::new();
         app.select_menu_item(RHYTHM_ITEM_INDEX);
         let started_bgm = app.current_bgm.clone();
-        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.screen, Screen::SelectSong(0)));
+        // 曲を選び直している間もTTR専用BGMのまま
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        app.handle_key(KeyEvent::from(KeyCode::Up));
+        rendered_text(&mut app);
         assert!(matches!(app.screen, Screen::SelectSong(0)));
         assert_eq!(
             app.current_bgm, started_bgm,
@@ -1409,16 +1427,17 @@ mod tests {
     }
 
     #[test]
-    fn ttr_splash_bgm_keeps_playing_through_difficulty_select() {
+    fn ttr_splash_bgm_keeps_playing_until_the_song_starts() {
+        // 難易度選択を挟まなくなっても、曲を決定するまではTTR専用BGMが途切れない
         let mut app = App::new();
         app.select_menu_item(RHYTHM_ITEM_INDEX);
         let started_bgm = app.current_bgm.clone();
-        app.select_song(1);
-        assert!(matches!(
-            app.screen,
-            Screen::SelectDifficulty(RHYTHM_ITEM_INDEX, Some(1))
-        ));
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        assert!(matches!(app.screen, Screen::SelectSong(1)));
         assert_eq!(app.current_bgm, started_bgm);
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.screen, Screen::Playing(_)));
+        assert_eq!(app.current_bgm.as_deref(), Some(SONGS[1].track_name));
     }
 
     #[test]
@@ -1426,12 +1445,12 @@ mod tests {
         let mut app = App::new();
         app.select_menu_item(RHYTHM_ITEM_INDEX);
         app.select_song(1);
-        app.start_playing(RHYTHM_ITEM_INDEX, Difficulty::Beginner, Some(1));
+        assert!(matches!(app.screen, Screen::Playing(_)));
         assert_eq!(app.current_bgm.as_deref(), Some(SONGS[1].track_name));
     }
 
     #[test]
-    fn clicking_rhythm_menu_item_enters_ttr_splash_first() {
+    fn clicking_rhythm_menu_item_goes_straight_to_song_select() {
         let mut app = App::new();
         app.screen = Screen::Menu;
         let area = rect(0, 0, 80, 30);
@@ -1440,23 +1459,6 @@ mod tests {
             .find(|&row| menu_item_at_row(area, row) == Some(RHYTHM_ITEM_INDEX))
             .expect("TTR項目の行があるはず");
         app.handle_mouse(left_click(row));
-        assert!(matches!(app.screen, Screen::RhythmSplash));
-    }
-
-    #[test]
-    fn ttr_splash_enter_key_goes_to_song_select() {
-        let mut app = App::new();
-        app.screen = Screen::RhythmSplash;
-        app.handle_key(KeyEvent::from(KeyCode::Enter));
-        assert!(matches!(app.screen, Screen::SelectSong(0)));
-    }
-
-    #[test]
-    fn ttr_splash_click_goes_to_song_select() {
-        let mut app = App::new();
-        app.screen = Screen::RhythmSplash;
-        app.last_area = rect(0, 0, 40, 12);
-        app.handle_mouse(left_click(5));
         assert!(matches!(app.screen, Screen::SelectSong(0)));
     }
 
@@ -1473,16 +1475,16 @@ mod tests {
     }
 
     #[test]
-    fn ttr_splash_other_key_stays_on_ttr_splash() {
+    fn song_select_other_key_stays_on_song_select() {
         let mut app = App::new();
-        app.screen = Screen::RhythmSplash;
-        app.handle_key(KeyEvent::from(KeyCode::Down));
-        app.handle_key(KeyEvent::from(KeyCode::Char('1')));
-        assert!(matches!(app.screen, Screen::RhythmSplash));
+        app.screen = Screen::SelectSong(0);
+        app.handle_key(KeyEvent::from(KeyCode::Left));
+        app.handle_key(KeyEvent::from(KeyCode::Char('x')));
+        assert!(matches!(app.screen, Screen::SelectSong(0)));
     }
 
     #[test]
-    fn ttr_splash_q_returns_to_menu() {
+    fn ttr_song_select_q_returns_to_menu() {
         let mut app = App::new();
         app.select_menu_item(RHYTHM_ITEM_INDEX);
         press(&mut app, KeyCode::Char('q'));
@@ -1491,10 +1493,41 @@ mod tests {
     }
 
     #[test]
-    fn ttr_splash_renders_without_panicking() {
+    fn song_select_draws_the_ttr_background_behind_the_song_panel() {
+        // 実行環境によりImage/Fallbackどちらになるかは変わる。Fallbackであれば、
+        // 曲リストの外側に背景(TTRスプラッシュのフォールバック文言)が見えていること
         let mut app = App::new();
-        app.screen = Screen::RhythmSplash;
-        rendered_text(&mut app);
+        app.screen = Screen::SelectSong(0);
+        let text = rendered_text(&mut app).replace(' ', "");
+        for song in SONGS {
+            assert!(text.contains(&song.display_name.replace(' ', "")));
+        }
+        if let crate::ui::splash::SplashRenderer::Fallback(ttr) = &app.ttr_splash_renderer {
+            assert!(
+                text.contains(&ttr.subtitle.replace(' ', "")),
+                "曲選択パネルの背景にTTRスプラッシュが描かれること"
+            );
+            assert!(
+                !text.contains(&crate::ui::splash::TITLE_FALLBACK.subtitle.replace(' ', "")),
+                "タイトル画面の背景は使わない"
+            );
+        }
+    }
+
+    #[test]
+    fn song_panel_is_centered_and_smaller_than_the_screen() {
+        // 背景の画像が見えるよう、曲選択パネルは全画面ではなく中央に小さく重ねる
+        let area = rect(0, 0, 80, 24);
+        let panel = song_panel_rect(area);
+        assert!(panel.width < area.width && panel.height < area.height);
+        assert!(panel.x > 0 && panel.y > 0);
+        assert!(panel.right() < area.right() && panel.bottom() < area.bottom());
+        // 曲リスト(見出し2行+曲数)と枠が全部収まる高さがある
+        assert!(panel.height >= SONG_ROWS_OFFSET + SONGS.len() as u16 + 2);
+        // 画面が小さすぎる時は画面からはみ出さない
+        let tiny = rect(0, 0, 20, 5);
+        let panel = song_panel_rect(tiny);
+        assert!(panel.width <= tiny.width && panel.height <= tiny.height);
     }
 
     #[test]
@@ -1512,26 +1545,43 @@ mod tests {
         }
     }
 
-    #[test]
-    fn song_select_enter_goes_to_difficulty_with_selected_song() {
-        let mut app = App::new();
-        app.screen = Screen::SelectSong(1);
-        app.handle_key(KeyEvent::from(KeyCode::Enter));
-        assert!(matches!(
-            app.screen,
-            Screen::SelectDifficulty(RHYTHM_ITEM_INDEX, Some(1))
-        ));
+    /// TTRのプレイ画面になっていて、指定した曲が上級で始まっていることを確かめる
+    fn assert_rhythm_playing_song(app: &App, song: usize) {
+        let Screen::Playing(game) = &app.screen else {
+            panic!("難易度選択を挟まずPlaying画面になるはず");
+        };
+        let result = game.result();
+        assert_eq!(result.game_id, crate::game::rhythm::GAME_ID);
+        assert_eq!(result.difficulty, Difficulty::Advanced, "常に上級");
+        assert_eq!(app.current_bgm.as_deref(), Some(SONGS[song].track_name));
     }
 
     #[test]
-    fn song_select_number_key_picks_song_directly() {
+    fn song_select_enter_starts_playing_selected_song() {
+        let mut app = App::new();
+        app.screen = Screen::SelectSong(1);
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_rhythm_playing_song(&app, 1);
+    }
+
+    #[test]
+    fn song_select_number_key_starts_playing_song_directly() {
         let mut app = App::new();
         app.screen = Screen::SelectSong(0);
         app.handle_key(KeyEvent::from(KeyCode::Char('2')));
-        assert!(matches!(
-            app.screen,
-            Screen::SelectDifficulty(RHYTHM_ITEM_INDEX, Some(1))
-        ));
+        assert_rhythm_playing_song(&app, 1);
+    }
+
+    #[test]
+    fn song_select_can_start_the_last_song_overclocked_tempo() {
+        let mut app = App::new();
+        app.select_menu_item(RHYTHM_ITEM_INDEX);
+        let last = SONGS.len() - 1;
+        app.handle_key(KeyEvent::from(KeyCode::Up));
+        assert!(matches!(app.screen, Screen::SelectSong(i) if i == last));
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_rhythm_playing_song(&app, last);
+        assert_eq!(SONGS[last].track_name, "Overclocked_Tempo");
     }
 
     #[test]
@@ -1548,14 +1598,6 @@ mod tests {
         app.screen = Screen::SelectSong(1);
         app.handle_key(KeyEvent::from(KeyCode::Esc));
         assert!(matches!(app.screen, Screen::Menu));
-    }
-
-    #[test]
-    fn rhythm_difficulty_esc_returns_to_song_select() {
-        let mut app = App::new();
-        app.screen = Screen::SelectDifficulty(RHYTHM_ITEM_INDEX, Some(1));
-        app.handle_key(KeyEvent::from(KeyCode::Esc));
-        assert!(matches!(app.screen, Screen::SelectSong(1)));
     }
 
     #[test]
@@ -1583,11 +1625,9 @@ mod tests {
     #[test]
     fn full_rhythm_flow_starts_selected_song_with_its_bgm() {
         let mut app = App::new();
-        app.select_menu_item(RHYTHM_ITEM_INDEX);
-        app.handle_key(KeyEvent::from(KeyCode::Enter)); // TTRスプラッシュ -> 曲選択
+        app.select_menu_item(RHYTHM_ITEM_INDEX); // TTR -> (TTR画像を背景にした)曲選択
         app.handle_key(KeyEvent::from(KeyCode::Down));
-        app.handle_key(KeyEvent::from(KeyCode::Enter));
-        app.handle_key(KeyEvent::from(KeyCode::Char('3')));
+        app.handle_key(KeyEvent::from(KeyCode::Enter)); // 難易度選択を挟まずプレイ開始
         let Screen::Playing(game) = &app.screen else {
             panic!("Playing画面のはず");
         };
@@ -1654,16 +1694,12 @@ mod tests {
     }
 
     #[test]
-    fn rhythm_difficulty_screen_shows_selected_song_name() {
-        let mut app = App::new();
-        app.screen = Screen::SelectDifficulty(RHYTHM_ITEM_INDEX, Some(1));
-        assert!(rendered_text(&mut app).contains(SONGS[1].display_name));
-    }
-
-    #[test]
     fn song_at_row_maps_each_song_row() {
-        let area = rect(0, 0, 40, 12);
-        let inner_top = Block::default().borders(Borders::ALL).inner(area).y;
+        let area = rect(0, 0, 80, 24);
+        let inner_top = Block::default()
+            .borders(Borders::ALL)
+            .inner(song_panel_rect(area))
+            .y;
         for i in 0..SONGS.len() {
             assert_eq!(
                 song_at_row(area, inner_top + SONG_ROWS_OFFSET + i as u16),
@@ -1678,24 +1714,27 @@ mod tests {
     }
 
     #[test]
-    fn clicking_song_row_goes_to_difficulty_with_that_song() {
+    fn clicking_song_row_starts_playing_that_song() {
         let mut app = App::new();
         app.screen = Screen::SelectSong(0);
-        app.last_area = rect(0, 0, 40, 12);
+        app.last_area = rect(0, 0, 80, 24);
         let inner_top = Block::default()
             .borders(Borders::ALL)
-            .inner(app.last_area)
+            .inner(song_panel_rect(app.last_area))
             .y;
-        app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 5,
-            row: inner_top + SONG_ROWS_OFFSET + 1,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        });
-        assert!(matches!(
-            app.screen,
-            Screen::SelectDifficulty(RHYTHM_ITEM_INDEX, Some(1))
-        ));
+        app.handle_mouse(left_click(inner_top + SONG_ROWS_OFFSET + 1));
+        assert_rhythm_playing_song(&app, 1);
+    }
+
+    #[test]
+    fn clicking_outside_song_rows_stays_on_song_select() {
+        // 背景(TTR画像)部分のクリックでは曲を決定しない
+        let mut app = App::new();
+        app.screen = Screen::SelectSong(0);
+        app.last_area = rect(0, 0, 80, 24);
+        app.handle_mouse(left_click(0));
+        app.handle_mouse(left_click(23));
+        assert!(matches!(app.screen, Screen::SelectSong(0)));
     }
 
     #[test]
@@ -1977,8 +2016,8 @@ mod tests {
     #[test]
     fn starting_rhythm_goes_straight_to_playing_without_countdown() {
         let mut app = App::new();
-        app.screen = Screen::SelectDifficulty(RHYTHM_ITEM_INDEX, Some(0));
-        app.handle_key(KeyEvent::from(KeyCode::Char('1')));
+        app.screen = Screen::SelectSong(0);
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
         let Screen::Playing(game) = &app.screen else {
             panic!("DDRはカウントダウンを挟まずPlaying画面になるはず");
         };
@@ -2123,10 +2162,6 @@ mod tests {
         apps.push(("SelectDifficulty", app));
 
         let mut app = App::new();
-        app.screen = Screen::SelectDifficulty(RHYTHM_ITEM_INDEX, Some(1));
-        apps.push(("SelectDifficulty(リズム)", app));
-
-        let mut app = App::new();
         app.screen = Screen::SelectDifficulty(0, None);
         press(&mut app, KeyCode::Char('1'));
         assert!(matches!(app.screen, Screen::Countdown { .. }));
@@ -2139,8 +2174,8 @@ mod tests {
         apps.push(("Playing", app));
 
         let mut app = App::new();
-        app.screen = Screen::SelectDifficulty(RHYTHM_ITEM_INDEX, Some(0));
-        press(&mut app, KeyCode::Char('1'));
+        app.screen = Screen::SelectSong(0);
+        press(&mut app, KeyCode::Enter);
         assert!(matches!(app.screen, Screen::Playing(_)));
         apps.push(("Playing(リズム)", app));
 
@@ -2154,8 +2189,8 @@ mod tests {
 
         let mut app = App::new();
         app.select_menu_item(RHYTHM_ITEM_INDEX);
-        assert!(matches!(app.screen, Screen::RhythmSplash));
-        apps.push(("RhythmSplash", app));
+        assert!(matches!(app.screen, Screen::SelectSong(0)));
+        apps.push(("SelectSong(TTR選択直後)", app));
 
         let mut app = App::new();
         app.screen = Screen::Jukebox(app.jukebox_list_state());
