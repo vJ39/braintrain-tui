@@ -1,6 +1,7 @@
 //! カウントマニア: ランダムに並んだ1〜Nの数字付き円を、1から順にクリックしていくマウス専用ゲーム。
 //!
-//! 1セッション=3ラウンド。難易度は選ばせず、ROUND1=初級・ROUND2=中級・ROUND3=上級と上がっていく。
+//! 1セッション=5ラウンド。難易度は選ばせず、ROUND1=初級・ROUND2=中級・ROUND3〜5=上級と上がっていく。
+//! ROUND4は正解クリックのたびに近くの円が離れる方向へ散らばり、ROUND5は全ての円が動き続ける。
 //! ラウンドごとに「全部押せたか(クリア)/ライフが尽きたか(失敗)」を
 //! ScoreTrackerに1件として記録する。キー入力は受け付けない。
 
@@ -27,20 +28,75 @@ use crate::game::theme;
 use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
 
 use circle_image::{BoardCircle, CircleRenderer};
-use layout::{back_to_front, hit_test, layout_circles, CircleSize, Placement};
+use layout::{
+    back_to_front, clamp_position, hit_test, layout_circles, numbers_stay_readable,
+    reflect_position, scatter_offset, CircleSize, Placement, CELL_ASPECT,
+};
 use ripple::Ripple;
 use wrong_mark::WrongMark;
 
 pub const GAME_ID: &str = "count_mania";
 
 /// 1セッションのラウンド数
-pub const ROUNDS_PER_SESSION: u32 = 3;
+pub const ROUNDS_PER_SESSION: u32 = 5;
 
-/// 各ラウンドの難易度。難易度は選ばせず、ROUND1=初級・ROUND2=中級・ROUND3=上級と上がっていく
+/// 各ラウンドの難易度。難易度は選ばせず、ROUND1=初級・ROUND2=中級・ROUND3=上級と上がっていく。
+/// ROUND4・ROUND5も上級のパラメータのまま、円が動く(ROUND_MOTIONS)
 pub const ROUND_DIFFICULTIES: [Difficulty; ROUNDS_PER_SESSION as usize] = [
     Difficulty::Beginner,
     Difficulty::Intermediate,
     Difficulty::Advanced,
+    Difficulty::Advanced,
+    Difficulty::Advanced,
+];
+
+/// ラウンド中の円の動き方
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionKind {
+    /// 動かない(配置したまま)
+    Still,
+    /// 正解クリックのたびに、クリック位置の近くの円がクリック位置から離れる方向へ動く
+    Scatter,
+    /// 全ての円が円ごとの速度で動き続け、盤面の端で跳ね返る
+    Drift,
+}
+
+/// 各ラウンドの円の動き方。ROUND4で拡散、ROUND5で常に動く
+pub const ROUND_MOTIONS: [MotionKind; ROUNDS_PER_SESSION as usize] = [
+    MotionKind::Still,
+    MotionKind::Still,
+    MotionKind::Still,
+    MotionKind::Scatter,
+    MotionKind::Drift,
+];
+
+/// ROUND5で円の位置を進める間隔。画像表示では位置が変わるたびに盤面全体の画像を作り直し
+/// (sixelで約230ms)、tick(33ms)ごとに動かすと作り直しが追いつかず処理落ち・ちらつきになる。
+/// そのため連続的には動かさず、この間隔ごとにまとめて進める(合間は止まっていて画像を使い回せる)
+pub const MOTION_STEP_INTERVAL: Duration = Duration::from_millis(300);
+
+/// ROUND5の円の速さの範囲(見た目の距離で横のセル数/秒)。円ごとにこの範囲でばらつかせる
+pub const DRIFT_SPEED_RANGE: (f64, f64) = (3.0, 9.0);
+
+/// ROUND4で、クリック位置からこの見た目の距離(横のセル数)以内に中心がある円を散らす
+const SCATTER_RADIUS: f64 = 24.0;
+
+/// ROUND4で散らす円を動かす見た目の距離(横のセル数。縦はこの半分の行数)
+const SCATTER_DISTANCE: f64 = 12.0;
+
+/// ROUND4で散らす円の動かし方の候補(離れる向きから回す角度[度], 距離の倍率)。先頭から試し、
+/// 動かした先で残っている円の数字が隠れない最初の候補を使う(配置の時と同じく、重なりは許すが
+/// 数字は隠さない。盤面の端に寄せられた同じ大きさの円がぴったり重なると、奥の円を押せなくなるため)。
+/// どれも隠れるなら動かさない(元の位置はどの数字も隠していない)
+const SCATTER_CANDIDATES: [(f64, f64); 8] = [
+    (0.0, 1.0),
+    (25.0, 1.0),
+    (-25.0, 1.0),
+    (0.0, 0.75),
+    (25.0, 0.75),
+    (-25.0, 0.75),
+    (0.0, 0.5),
+    (0.0, 0.25),
 ];
 
 /// 結果の記録に使う難易度。ラウンドごとに難易度が変わるため、最後のラウンドの上級を代表値にする
@@ -163,6 +219,213 @@ struct Round {
     elapsed: Duration,
     /// いまの数字が次に押すべき数字になってからの経過時間(プレッシャー背景に使う)
     time_since_target: Duration,
+    /// 円が動くラウンド(ROUND4・ROUND5)の状態。動かないラウンドはNone
+    motion: Option<Motion>,
+}
+
+/// 動くラウンドの円1つの現在位置。大きさは配置した時のまま変えない
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MovingCircle {
+    number: u8,
+    /// 左上のセル座標(盤面の絶対座標)。浮動小数点で持ち、描く時に丸める
+    x: f64,
+    y: f64,
+    width: u16,
+    height: u16,
+}
+
+impl MovingCircle {
+    /// 描く位置(左上を丸めたセル)
+    fn rect(&self) -> Rect {
+        Rect::new(
+            self.x.round() as u16,
+            self.y.round() as u16,
+            self.width,
+            self.height,
+        )
+    }
+
+    fn center(&self) -> (f64, f64) {
+        (
+            self.x + f64::from(self.width) / 2.0,
+            self.y + f64::from(self.height) / 2.0,
+        )
+    }
+}
+
+/// 円が動くラウンド(ROUND4・ROUND5)専用の状態。円の現在位置は、最初の配置
+/// (LayoutCache::base)から取り込み、以後はここで更新する
+struct Motion {
+    kind: MotionKind,
+    /// 現在位置を取り込んだ盤面。Noneならまだ配置から取り込んでいない
+    board: Option<Rect>,
+    /// 円ごとの現在位置。取り込んだ配置と同じ並び(描画順・当たり判定の優先順位を保つため)
+    circles: Vec<MovingCircle>,
+    /// 番号ごとの速度(横のセル/秒, 縦の行/秒)。添字は番号-1。ROUND5のみで、ほかは空
+    velocities: Vec<(f64, f64)>,
+    /// 位置を更新した回数(位置の世代)。配置のキャッシュはこれが変わった時だけ置き直す
+    generation: u32,
+    /// 前回位置を進めてからの経過時間(ROUND5)
+    since_step: Duration,
+}
+
+impl Motion {
+    /// kindの動き方の状態を作る。動かないラウンドはNone。ROUND5は円ごとに速度を割り当てる
+    fn new(rng: &mut impl Rng, kind: MotionKind, count: usize) -> Option<Self> {
+        let velocities = match kind {
+            MotionKind::Still => return None,
+            MotionKind::Scatter => Vec::new(),
+            MotionKind::Drift => (0..count).map(|_| random_velocity(rng)).collect(),
+        };
+        Some(Self {
+            kind,
+            board: None,
+            circles: Vec::new(),
+            velocities,
+            generation: 0,
+            since_step: Duration::ZERO,
+        })
+    }
+
+    /// boardの配置baseから位置を取り込んだ状態か(盤面・円の並び・大きさが同じか)
+    fn follows(&self, board: Rect, base: &[Placement]) -> bool {
+        self.board == Some(board)
+            && self.circles.len() == base.len()
+            && self.circles.iter().zip(base).all(|(circle, placement)| {
+                circle.number == placement.number
+                    && circle.width == placement.rect.width
+                    && circle.height == placement.rect.height
+            })
+    }
+
+    /// boardの配置baseの位置を、現在位置として取り込み直す
+    fn adopt(&mut self, board: Rect, base: &[Placement]) {
+        self.board = Some(board);
+        self.circles = base
+            .iter()
+            .map(|placement| MovingCircle {
+                number: placement.number,
+                x: f64::from(placement.rect.x),
+                y: f64::from(placement.rect.y),
+                width: placement.rect.width,
+                height: placement.rect.height,
+            })
+            .collect();
+        self.generation += 1;
+    }
+
+    /// 配置baseを今の位置に置き直したもの。まだ取り込んでいない盤面・配置ならbaseのまま
+    fn placements(&self, board: Rect, base: &[Placement]) -> Vec<Placement> {
+        if !self.follows(board, base) {
+            return base.to_vec();
+        }
+        self.circles
+            .iter()
+            .map(|circle| Placement {
+                number: circle.number,
+                rect: circle.rect(),
+            })
+            .collect()
+    }
+
+    /// ROUND4: クリック位置clickの近くにある、残っている円(is_remainingがtrueのもの)を、
+    /// クリック位置から離れる方向へ動かし、盤面の中に収める。動かした先で残っている円の
+    /// 数字が隠れる時は、SCATTER_CANDIDATESの順に向き・距離を変えて試す
+    fn scatter(
+        &mut self,
+        rng: &mut impl Rng,
+        click: (f64, f64),
+        is_remaining: impl Fn(u8) -> bool,
+    ) {
+        let Some(board) = self.board else {
+            return;
+        };
+        // 円の中心がちょうどクリック位置にあって向きが決まらない時に使う向き
+        let angle = rng.gen_range(0.0..std::f64::consts::TAU);
+        let fallback = (angle.cos(), angle.sin());
+        // 数字が隠れるかの判定に使う、今の位置の配置(動かすたびに更新する)
+        let mut current: Vec<Placement> = self
+            .circles
+            .iter()
+            .map(|circle| Placement {
+                number: circle.number,
+                rect: circle.rect(),
+            })
+            .collect();
+        for (index, circle) in self.circles.iter_mut().enumerate() {
+            if !is_remaining(circle.number) {
+                continue;
+            }
+            let Some((dx, dy)) = scatter_offset(
+                click,
+                circle.center(),
+                SCATTER_RADIUS,
+                SCATTER_DISTANCE,
+                fallback,
+            ) else {
+                continue;
+            };
+            let destination = SCATTER_CANDIDATES.iter().find_map(|&(degrees, scale)| {
+                let (ox, oy) = rotate_offset((dx, dy), degrees, scale);
+                let (x, y) = clamp_position(
+                    board,
+                    circle.width,
+                    circle.height,
+                    circle.x + ox,
+                    circle.y + oy,
+                );
+                let moved = MovingCircle { x, y, ..*circle };
+                numbers_stay_readable(&current, index, moved.rect(), &is_remaining).then_some(moved)
+            });
+            if let Some(moved) = destination {
+                *circle = moved;
+                current[index].rect = moved.rect();
+            }
+        }
+        self.generation += 1;
+    }
+
+    /// ROUND5: 動かす円(is_movingがtrueのもの)の位置を、secs秒分の速度だけ進める。
+    /// 盤面の端に着いたら跳ね返す
+    fn drift(&mut self, secs: f64, is_moving: impl Fn(u8) -> bool) {
+        let Some(board) = self.board else {
+            return;
+        };
+        for circle in self.circles.iter_mut().filter(|c| is_moving(c.number)) {
+            let Some(velocity) = self
+                .velocities
+                .get_mut(usize::from(circle.number).wrapping_sub(1))
+            else {
+                continue;
+            };
+            let moved = (circle.x + velocity.0 * secs, circle.y + velocity.1 * secs);
+            let (position, reflected) =
+                reflect_position(board, circle.width, circle.height, moved, *velocity);
+            (circle.x, circle.y) = position;
+            *velocity = reflected;
+        }
+        self.generation += 1;
+    }
+}
+
+/// 移動量(横のセル数, 縦の行数)を、見た目の向きでdegrees度回してscale倍したもの
+fn rotate_offset((dx, dy): (f64, f64), degrees: f64, scale: f64) -> (f64, f64) {
+    let (sin, cos) = degrees.to_radians().sin_cos();
+    // 見た目の距離(縦は行数×CELL_ASPECT)にしてから回し、行数に戻す
+    let (vx, vy) = (dx, dy * CELL_ASPECT);
+    (
+        (vx * cos - vy * sin) * scale,
+        (vx * sin + vy * cos) * scale / CELL_ASPECT,
+    )
+}
+
+/// ROUND5の円1つの速度(横のセル/秒, 縦の行/秒)。向きはランダム、速さはDRIFT_SPEED_RANGEの範囲で
+/// ランダム(見た目の速さ。縦はセルが縦長なので行数に直すと半分になる)
+fn random_velocity(rng: &mut impl Rng) -> (f64, f64) {
+    let (low, high) = DRIFT_SPEED_RANGE;
+    let speed = rng.gen_range(low..=high);
+    let angle = rng.gen_range(0.0..std::f64::consts::TAU);
+    (speed * angle.cos(), speed * angle.sin() / CELL_ASPECT)
 }
 
 fn new_round(rng: &mut impl Rng, params: &DifficultyParams) -> Round {
@@ -186,6 +449,7 @@ fn new_round(rng: &mut impl Rng, params: &DifficultyParams) -> Round {
         lives: params.lives,
         elapsed: Duration::ZERO,
         time_since_target: Duration::ZERO,
+        motion: None,
     }
 }
 
@@ -215,10 +479,17 @@ fn hsv_to_rgb(hue: f64, saturation: f64, value: f64) -> [u8; 3] {
     [to_u8(r), to_u8(g), to_u8(b)]
 }
 
-/// 配置のキャッシュ。描画エリアかラウンドが変わった時だけ作り直す
+/// 配置のキャッシュ。描画エリアかラウンドが変わった時だけ最初の配置(base)を作り直す。
+/// 動くラウンド(ROUND4・ROUND5)で位置の世代(generation)が変わった時は、baseは作り直さず
+/// 今の位置に置き直す(動かないラウンドは世代が0のまま変わらないので、そのまま使い回す)
 struct LayoutCache {
     board: Rect,
     round_serial: u32,
+    /// placementsを作った時の位置の世代
+    generation: u32,
+    /// layout_circlesで決めた最初の配置
+    base: Vec<Placement>,
+    /// 今の位置の配置(動かないラウンドはbaseと同じ)
     placements: Vec<Placement>,
 }
 
@@ -250,7 +521,9 @@ fn board_area(area: Rect) -> Rect {
 
 impl CountManiaGame {
     pub fn new() -> Self {
-        let round = new_round(&mut rand::thread_rng(), &params(ROUND_DIFFICULTIES[0]));
+        let mut rng = rand::thread_rng();
+        let mut round = new_round(&mut rng, &params(ROUND_DIFFICULTIES[0]));
+        round.motion = Motion::new(&mut rng, ROUND_MOTIONS[0], round.circles.len());
         Self {
             tracker: ScoreTracker::new(),
             round,
@@ -276,11 +549,32 @@ impl CountManiaGame {
         params(self.round_difficulty())
     }
 
-    /// boardに対する円の配置(キャッシュ済みならそれを返す)
+    /// いまのラウンドの円の動き方(ROUND_MOTIONSの並びに従う)
+    fn round_motion(&self) -> MotionKind {
+        let last = ROUND_MOTIONS.len() - 1;
+        ROUND_MOTIONS[(self.round_serial as usize).min(last)]
+    }
+
+    /// 円の位置の世代。動かないラウンドは常に0
+    fn position_generation(&self) -> u32 {
+        self.round
+            .motion
+            .as_ref()
+            .map_or(0, |motion| motion.generation)
+    }
+
+    /// boardに対する円の配置(キャッシュ済みならそれを返す)。
+    /// 動くラウンドでは、円の今の位置を反映した配置を返す
     fn placements(&self, board: Rect) -> Vec<Placement> {
+        let generation = self.position_generation();
         let mut cache = self.layout.borrow_mut();
-        if let Some(cached) = cache.as_ref() {
+        if let Some(cached) = cache.as_mut() {
             if cached.board == board && cached.round_serial == self.round_serial {
+                if cached.generation != generation {
+                    // 位置が更新された(ROUND4・ROUND5のみ)。最初の配置は作り直さず、今の位置に置き直す
+                    cached.placements = self.moved_placements(board, &cached.base);
+                    cached.generation = generation;
+                }
                 return cached.placements.clone();
             }
         }
@@ -290,18 +584,95 @@ impl CountManiaGame {
             .iter()
             .map(|c| (c.number, c.size))
             .collect();
-        let placements = layout_circles(
+        let base = layout_circles(
             &mut rand::thread_rng(),
             board,
             &circles,
             self.round_params().dense,
         );
+        let placements = self.moved_placements(board, &base);
         *cache = Some(LayoutCache {
             board,
             round_serial: self.round_serial,
+            generation,
+            base,
             placements: placements.clone(),
         });
         placements
+    }
+
+    /// 最初の配置baseを、円の今の位置に置き直したもの(動かないラウンドはbaseのまま)
+    fn moved_placements(&self, board: Rect, base: &[Placement]) -> Vec<Placement> {
+        match &self.round.motion {
+            Some(motion) => motion.placements(board, base),
+            None => base.to_vec(),
+        }
+    }
+
+    /// 動くラウンドで、円の今の位置を配置のキャッシュに合わせる。まだ取り込んでいない
+    /// (ラウンド最初の配置、盤面の大きさが変わって配置し直した)時は、その配置から取り込む。
+    /// このラウンドの配置がまだ無い(描画もクリックもしていない)・動かないラウンドならfalse
+    fn sync_motion(&mut self) -> bool {
+        let round_serial = self.round_serial;
+        let cache = self.layout.borrow();
+        let Some(cached) = cache.as_ref().filter(|c| c.round_serial == round_serial) else {
+            return false;
+        };
+        let Some(motion) = self.round.motion.as_mut() else {
+            return false;
+        };
+        if !motion.follows(cached.board, &cached.base) {
+            motion.adopt(cached.board, &cached.base);
+        }
+        true
+    }
+
+    /// ROUND4: 正解クリックの位置(column, row)の近くにある、まだ残っている円を散らす。
+    /// 押した円(いまの次に押すべき数字)自身は動かさない
+    fn scatter_from(&mut self, column: u16, row: u16) {
+        if self.round_motion() != MotionKind::Scatter || !self.sync_motion() {
+            return;
+        }
+        let clicked = self.round.next;
+        let max = self.round_params().max_number;
+        let Some(motion) = self.round.motion.as_mut() else {
+            return;
+        };
+        // クリックしたセルの中心から測る
+        let click = (f64::from(column) + 0.5, f64::from(row) + 0.5);
+        motion.scatter(&mut rand::thread_rng(), click, |n| n > clicked && n <= max);
+    }
+
+    /// ROUND5: MOTION_STEP_INTERVALが経つたびに、まだ残っている円の位置を進める
+    /// (連続的には動かさない。MOTION_STEP_INTERVALの説明を参照)
+    fn advance_motion(&mut self, dt: Duration) {
+        let Some(motion) = self
+            .round
+            .motion
+            .as_mut()
+            .filter(|motion| motion.kind == MotionKind::Drift)
+        else {
+            return;
+        };
+        motion.since_step += dt;
+        let mut steps = 0;
+        while motion.since_step >= MOTION_STEP_INTERVAL {
+            motion.since_step -= MOTION_STEP_INTERVAL;
+            steps += 1;
+        }
+        if steps == 0 || !self.sync_motion() {
+            return;
+        }
+        let next = self.round.next;
+        let max = self.round_params().max_number;
+        let Some(motion) = self.round.motion.as_mut() else {
+            return;
+        };
+        for _ in 0..steps {
+            motion.drift(MOTION_STEP_INTERVAL.as_secs_f64(), |n| {
+                n >= next && n <= max
+            });
+        }
     }
 
     /// 番号numberの円がまだ残っているか
@@ -330,6 +701,8 @@ impl CountManiaGame {
         // 押し間違いの印は、正解に進んだら役目を終えるので消す(画像表示では波紋と同じパッチに
         // 重ねて描くため、離れた位置のバツ印が残ると波紋のパッチが大きくなり作り直しが重くなる)
         self.wrong_mark = None;
+        // ROUND4はクリックした位置の近くの円を散らす(押した円はこの後で消える)
+        self.scatter_from(column, row);
         self.round.next += 1;
         // 次の数字に進んだので、焦らせる背景は最初からやり直す
         self.round.time_since_target = Duration::ZERO;
@@ -385,7 +758,10 @@ impl CountManiaGame {
     /// 次のラウンドを始める。ラウンドの番号を先に進め、そのラウンドの難易度で盤面を作る
     fn start_next_round(&mut self) {
         self.round_serial += 1;
-        self.round = new_round(&mut rand::thread_rng(), &self.round_params());
+        let mut rng = rand::thread_rng();
+        self.round = new_round(&mut rng, &self.round_params());
+        // ROUND4・ROUND5だけ円を動かす状態を持つ(ROUND5はここで円ごとの速度を決める)
+        self.round.motion = Motion::new(&mut rng, self.round_motion(), self.round.circles.len());
         self.interval = None;
     }
 
@@ -553,6 +929,10 @@ impl Game for CountManiaGame {
             if !self.game_over && self.round.time_since_target >= TIMEOUT_LIMIT {
                 self.time_out();
             }
+            // ROUND5の円を動かす。GAME OVERになったら止める
+            if !self.game_over {
+                self.advance_motion(dt);
+            }
         }
     }
 
@@ -650,8 +1030,30 @@ mod tests {
 
     /// 番号numberの円をクリックする(実際の当たり判定を通す)
     fn click_circle(game: &mut CountManiaGame, number: u8) {
-        let (column, row) = center_of(game, number);
+        let (column, row) = clickable_cell(game, number);
         game.handle_mouse(left_click(column, row), AREA);
+    }
+
+    /// 番号numberの円に当たるセル。まず中心を試し、当たらなければ円の矩形の中を探す。
+    /// 動くラウンド(ROUND4・ROUND5)では、動いた手前の円が中心に重なることがあるため。
+    /// どこも当たらない(消えた円など)なら中心を返す
+    fn clickable_cell(game: &CountManiaGame, number: u8) -> (u16, u16) {
+        let center = center_of(game, number);
+        let placements = game.placements(board_area(AREA));
+        let rect = placements
+            .iter()
+            .find(|p| p.number == number)
+            .expect("配置されていること")
+            .rect;
+        let hits = |&(x, y): &(u16, u16)| {
+            hit_test(&placements, |n| game.is_visible(n), x, y) == Some(number)
+        };
+        std::iter::once(center)
+            .chain(
+                (rect.y..rect.bottom()).flat_map(|y| (rect.x..rect.right()).map(move |x| (x, y))),
+            )
+            .find(hits)
+            .unwrap_or(center)
     }
 
     /// どの円にも当たらないセルを探す
@@ -674,10 +1076,12 @@ mod tests {
                 number,
                 rect: Rect::new(board.x + x, board.y + y, width, height),
             })
-            .collect();
+            .collect::<Vec<_>>();
         *game.layout.borrow_mut() = Some(LayoutCache {
             board,
             round_serial: game.round_serial,
+            generation: game.position_generation(),
+            base: placements.clone(),
             placements,
         });
     }
@@ -702,8 +1106,23 @@ mod tests {
 
     fn clear_round(game: &mut CountManiaGame) {
         for number in 1..=game.round_params().max_number {
+            // ROUND5は動いている途中で円が一時的に隠れることがあるので、プレイヤーと同じく
+            // 見えるようになるまで待ってから押す
+            for _ in 0..100 {
+                if game.round_motion() != MotionKind::Drift || is_clickable(game, number) {
+                    break;
+                }
+                step_motion(game);
+            }
             click_circle(game, number);
         }
+    }
+
+    /// 番号numberの円に当たるセルがあるか
+    fn is_clickable(game: &CountManiaGame, number: u8) -> bool {
+        let (x, y) = clickable_cell(game, number);
+        let placements = game.placements(board_area(AREA));
+        hit_test(&placements, |n| game.is_visible(n), x, y) == Some(number)
     }
 
     /// 0始まりでindex番目のラウンドまで、前のラウンドを全部クリアして進める
@@ -907,7 +1326,7 @@ mod tests {
 
     #[test]
     fn game_over_ends_the_session_without_waiting_for_remaining_rounds() {
-        // GAME OVER(ライフ0)は、3ラウンド構成の途中でも次のラウンドへ進まず、
+        // GAME OVER(ライフ0)は、5ラウンド構成の途中でも次のラウンドへ進まず、
         // フィードバック("ライフが尽きた")が消えたらセッション全体が終了する
         let mut game = CountManiaGame::new();
         click_circle(&mut game, 1);
@@ -915,7 +1334,7 @@ mod tests {
         assert_eq!(
             game.tracker.total(),
             1,
-            "3ラウンドのうち1回しか記録されない"
+            "5ラウンドのうち1回しか記録されない"
         );
         assert!(!game.is_finished(), "フィードバック表示中はまだ終了しない");
         assert!(
@@ -966,7 +1385,7 @@ mod tests {
     }
 
     #[test]
-    fn session_finishes_after_three_rounds() {
+    fn session_finishes_after_five_rounds() {
         let mut game = CountManiaGame::new();
         for round in 0..ROUNDS_PER_SESSION {
             assert!(
@@ -1196,7 +1615,7 @@ mod tests {
         clear_round(&mut game);
         let text = rendered_text(&game, AREA.width, AREA.height);
         assert!(text.contains("CLEAR!"));
-        assert!(text.contains("NEXTROUND2/3"));
+        assert!(text.contains("NEXTROUND2/5"));
         assert!(!text.contains('②'), "待ち時間中は円を描かない");
     }
 
@@ -1903,15 +2322,18 @@ mod tests {
         assert_eq!(digit_color(&game, 2), other, "正解で点滅は解除される");
     }
 
-    // --- 固定3ラウンド(初級→中級→上級) ---
+    // --- 固定5ラウンド(初級→中級→上級→上級→上級) ---
 
     #[test]
     fn round_difficulties_rise_from_beginner_to_advanced() {
+        assert_eq!(ROUNDS_PER_SESSION, 5);
         assert_eq!(
             ROUND_DIFFICULTIES,
             [
                 Difficulty::Beginner,
                 Difficulty::Intermediate,
+                Difficulty::Advanced,
+                Difficulty::Advanced,
                 Difficulty::Advanced
             ]
         );
@@ -1939,7 +2361,10 @@ mod tests {
         }
         assert!(game.is_finished());
         let result = game.result();
-        assert_eq!((result.total, result.correct), (3, 3));
+        assert_eq!(
+            (result.total, result.correct),
+            (ROUNDS_PER_SESSION, ROUNDS_PER_SESSION)
+        );
     }
 
     #[test]
@@ -2002,19 +2427,20 @@ mod tests {
                 clear_round(&mut game);
                 // 待ち時間中は、クリアしたラウンドの番号・難易度のまま
                 let text = rendered_text(&game, AREA.width, AREA.height);
-                assert!(text.contains(&format!("ROUND{index}/3")));
+                assert!(text.contains(&format!("ROUND{index}/{ROUNDS_PER_SESSION}")));
                 assert!(text.contains(labels[index - 1].as_str()));
                 game.update(ROUND_INTERVAL);
             }
             let text = rendered_text(&game, AREA.width, AREA.height);
             assert!(
-                text.contains(&format!("ROUND{}/3", index + 1)),
+                text.contains(&format!("ROUND{}/{ROUNDS_PER_SESSION}", index + 1)),
                 "ROUND{}の表示",
                 index + 1
             );
             assert!(text.contains(label.as_str()), "ROUND{}: {label}", index + 1);
-            for (other_index, other) in labels.iter().enumerate() {
-                if other_index != index {
+            // ROUND3〜5はどれも上級なので、ラベルの文字が違うものだけ出ないことを確かめる
+            for other in &labels {
+                if other != label {
                     assert!(
                         !text.contains(other.as_str()),
                         "ROUND{}に{other}を出さない",
@@ -2056,5 +2482,568 @@ mod tests {
             huge.max_radius_cells() > small.max_radius_cells() * 2.0,
             "特大の円の波紋は小さい円よりはっきり大きく広がる"
         );
+    }
+
+    // --- ROUND4・ROUND5: 動く円 ---
+
+    /// 前のラウンドを遊ばずに、0始まりでindex番目のラウンドを直接始める
+    /// (動くラウンドを、前のラウンドの配置の乱数に左右されずに確かめるため)
+    fn start_round(game: &mut CountManiaGame, index: u32) {
+        assert!(index >= 1, "ROUND1はnew()で始まる");
+        game.round_serial = index - 1;
+        game.start_next_round();
+        assert_eq!(game.round_serial, index);
+    }
+
+    /// 動きの1回分(MOTION_STEP_INTERVAL)だけ時間を進める。何度進めても時間切れの
+    /// GAME OVERにならないよう、押すべき数字になってからの時間は0に戻しておく
+    fn step_motion(game: &mut CountManiaGame) {
+        game.round.time_since_target = Duration::ZERO;
+        game.update(MOTION_STEP_INTERVAL);
+    }
+
+    /// 番号numberの円の、盤面左上からの相対位置の矩形
+    fn rect_of(game: &CountManiaGame, number: u8) -> Rect {
+        let board = board_area(AREA);
+        let rect = game
+            .placements(board)
+            .iter()
+            .find(|p| p.number == number)
+            .unwrap_or_else(|| panic!("円{number}が配置されていること"))
+            .rect;
+        Rect::new(rect.x - board.x, rect.y - board.y, rect.width, rect.height)
+    }
+
+    /// 動くラウンドで、番号numberの円のいまの位置(左上、浮動小数点の絶対座標)
+    fn moving_position(game: &CountManiaGame, number: u8) -> (f64, f64) {
+        let circle = game
+            .round
+            .motion
+            .as_ref()
+            .expect("動くラウンドであること")
+            .circles
+            .iter()
+            .find(|c| c.number == number)
+            .unwrap_or_else(|| panic!("円{number}の位置を持っていること"));
+        (circle.x, circle.y)
+    }
+
+    /// 番号numberの円の速度(セル/秒)を書き換える(動き方を決めて確かめるため)
+    fn set_velocity(game: &mut CountManiaGame, number: u8, velocity: (f64, f64)) {
+        let motion = game.round.motion.as_mut().expect("動くラウンドであること");
+        motion.velocities[usize::from(number) - 1] = velocity;
+    }
+
+    fn assert_all_inside_board(game: &CountManiaGame, board: Rect) {
+        for p in game.placements(board) {
+            assert_eq!(
+                board.intersection(p.rect),
+                p.rect,
+                "円{}が盤面の中にあること",
+                p.number
+            );
+        }
+    }
+
+    #[test]
+    fn round4_and_round5_use_advanced_params() {
+        let mut game = CountManiaGame::new();
+        for index in [3, 4] {
+            start_round(&mut game, index);
+            let advanced = params(Difficulty::Advanced);
+            assert_eq!(game.round_difficulty(), Difficulty::Advanced);
+            assert_eq!(game.round_params(), advanced, "ROUND{}", index + 1);
+            assert_eq!(game.round.circles.len(), advanced.max_number as usize);
+            assert_eq!(game.round.lives, advanced.lives);
+        }
+    }
+
+    #[test]
+    fn only_round4_scatters_and_only_round5_drifts() {
+        assert_eq!(
+            ROUND_MOTIONS,
+            [
+                MotionKind::Still,
+                MotionKind::Still,
+                MotionKind::Still,
+                MotionKind::Scatter,
+                MotionKind::Drift
+            ]
+        );
+        let mut game = CountManiaGame::new();
+        assert!(game.round.motion.is_none(), "ROUND1は円が動かない");
+        for index in 1..ROUNDS_PER_SESSION {
+            start_round(&mut game, index);
+            let kind = game.round.motion.as_ref().map(|m| m.kind);
+            let expected = match index {
+                3 => Some(MotionKind::Scatter),
+                4 => Some(MotionKind::Drift),
+                _ => None,
+            };
+            assert_eq!(kind, expected, "ROUND{}", index + 1);
+        }
+    }
+
+    #[test]
+    fn motion_step_interval_is_discrete_not_every_tick() {
+        // 画像表示では位置が変わるたびに盤面全体を作り直す(sixelで約230ms)ので、毎tickは動かさない
+        assert!(MOTION_STEP_INTERVAL >= crate::TICK_RATE * 6);
+        assert!(MOTION_STEP_INTERVAL <= Duration::from_millis(500));
+    }
+
+    #[test]
+    fn rounds_1_to_3_keep_positions_over_time_and_clicks() {
+        let board = board_area(AREA);
+        let mut game = CountManiaGame::new();
+        for index in 0..3 {
+            if index > 0 {
+                start_round(&mut game, index);
+            }
+            let first = game.placements(board);
+            for _ in 0..30 {
+                game.update(crate::TICK_RATE);
+            }
+            click_circle(&mut game, 1);
+            game.update(MOTION_STEP_INTERVAL * 3);
+            assert_eq!(game.round.next, 2);
+            assert_eq!(
+                game.placements(board),
+                first,
+                "ROUND{}は円が動かない",
+                index + 1
+            );
+            assert_eq!(game.position_generation(), 0, "位置の世代も進まない");
+            assert_eq!(game.layout.borrow().as_ref().unwrap().generation, 0);
+        }
+    }
+
+    /// ROUND4の拡散を確かめる配置(盤面左上からの相対位置)。円1の中心をクリックすると、
+    /// 近くの円2(真右)・円3(左下)は離れる向きへ動き、遠くの円4は動かない。戻り値は円1の中心
+    fn set_scatter_layout(game: &CountManiaGame) -> (u16, u16) {
+        set_layout(
+            game,
+            &[
+                (1, 40, 10, 10, 5),
+                (2, 54, 10, 10, 5),
+                (3, 30, 14, 10, 5),
+                (4, 2, 25, 10, 5),
+            ],
+        );
+        (45, 12)
+    }
+
+    #[test]
+    fn round4_correct_click_pushes_nearby_circles_away_and_keeps_far_ones() {
+        let mut game = CountManiaGame::new();
+        start_round(&mut game, 3);
+        let (x, y) = set_scatter_layout(&game);
+        click_board(&mut game, x, y);
+        assert_eq!(game.round.next, 2, "円1は正解");
+
+        let right = rect_of(&game, 2);
+        assert!(right.x >= 54 + 8, "真右の円2は右へ離れる: {right:?}");
+        assert_eq!(right.y, 10, "真横の円は縦には動かない");
+        let lower_left = rect_of(&game, 3);
+        assert!(
+            lower_left.x < 30 && lower_left.y > 14,
+            "左下の円3は左下へ離れる: {lower_left:?}"
+        );
+        assert_eq!(
+            rect_of(&game, 4),
+            Rect::new(2, 25, 10, 5),
+            "遠くの円4は動かない"
+        );
+        assert_eq!(
+            rect_of(&game, 1),
+            Rect::new(40, 10, 10, 5),
+            "押した円自身は動かさない"
+        );
+        assert_eq!((right.width, right.height), (10, 5), "大きさは変わらない");
+    }
+
+    #[test]
+    fn round4_scatter_keeps_circles_inside_board() {
+        let mut game = CountManiaGame::new();
+        start_round(&mut game, 3);
+        // 盤面は98x31なので、幅10・高さ5の円の左上が取れる範囲は x=0〜88, y=0〜26
+        set_layout(
+            &game,
+            &[(1, 70, 12, 10, 5), (2, 84, 12, 10, 5), (3, 72, 3, 10, 5)],
+        );
+        click_board(&mut game, 75, 14);
+        assert_eq!(game.round.next, 2);
+        assert_eq!(rect_of(&game, 2).x, 88, "右端で止まる");
+        assert_eq!(rect_of(&game, 3).y, 0, "上端で止まる");
+        assert_all_inside_board(&game, board_area(AREA));
+    }
+
+    #[test]
+    fn round4_wrong_or_empty_click_does_not_move_circles() {
+        let mut game = CountManiaGame::new();
+        start_round(&mut game, 3);
+        set_scatter_layout(&game);
+        let board = board_area(AREA);
+        let before = game.placements(board);
+        // 円2(次に押すべきでない円)をクリック
+        click_board(&mut game, 59, 12);
+        assert_eq!(game.round.lives, 1, "不正解");
+        assert!(game.wrong_mark.is_some(), "動くラウンドでもバツ印を出す");
+        // 円の無い所をクリック
+        click_board(&mut game, 20, 2);
+        assert_eq!(game.placements(board), before, "正解以外では円は動かない");
+    }
+
+    #[test]
+    fn round4_circles_stay_still_between_clicks() {
+        let mut game = CountManiaGame::new();
+        start_round(&mut game, 3);
+        let (x, y) = set_scatter_layout(&game);
+        click_board(&mut game, x, y);
+        let board = board_area(AREA);
+        let after = game.placements(board);
+        for _ in 0..30 {
+            game.update(crate::TICK_RATE);
+        }
+        assert_eq!(game.placements(board), after, "放っておいても動き続けない");
+    }
+
+    #[test]
+    fn round4_next_click_is_judged_at_moved_position() {
+        let mut game = CountManiaGame::new();
+        start_round(&mut game, 3);
+        let (x, y) = set_scatter_layout(&game);
+        click_board(&mut game, x, y);
+        // 円2が元あった場所のクリックは空振り(円1も消えている)
+        click_board(&mut game, 59, 12);
+        assert_eq!(game.round.next, 2);
+        assert_eq!(game.round.lives, 2, "空白扱いでライフは減らない");
+        // 動いた先の円2をクリックすれば正解
+        let moved = rect_of(&game, 2);
+        click_board(
+            &mut game,
+            moved.x + moved.width / 2,
+            moved.y + moved.height / 2,
+        );
+        assert_eq!(game.round.next, 3);
+        let board = board_area(AREA);
+        let ripple = game.ripple.expect("動いた円でも正解の波紋が出る");
+        assert_eq!(
+            ripple.center(),
+            (
+                board.x + moved.x + moved.width / 2,
+                board.y + moved.y + moved.height / 2
+            )
+        );
+    }
+
+    #[test]
+    fn round5_moves_visible_circles_only_at_each_step_interval() {
+        let mut game = CountManiaGame::new();
+        start_round(&mut game, 4);
+        let board = board_area(AREA);
+        let first = game.placements(board);
+        game.update(MOTION_STEP_INTERVAL - Duration::from_millis(1));
+        assert_eq!(game.placements(board), first, "間隔が来るまでは動かない");
+        let generation = game.position_generation();
+        game.update(Duration::from_millis(1));
+        assert!(
+            game.position_generation() > generation,
+            "間隔が来たら位置を更新する"
+        );
+        for p in &first {
+            assert_ne!(
+                moving_position(&game, p.number),
+                (f64::from(p.rect.x), f64::from(p.rect.y)),
+                "円{}が動いていること",
+                p.number
+            );
+        }
+    }
+
+    #[test]
+    fn round5_circles_have_different_speeds() {
+        let mut game = CountManiaGame::new();
+        start_round(&mut game, 4);
+        let motion = game.round.motion.as_ref().unwrap();
+        let speeds: Vec<f64> = motion
+            .velocities
+            .iter()
+            .map(|&(vx, vy)| vx.hypot(vy * layout::CELL_ASPECT))
+            .collect();
+        assert_eq!(
+            speeds.len(),
+            game.round.circles.len(),
+            "全ての円に速度がある"
+        );
+        let (low, high) = DRIFT_SPEED_RANGE;
+        for speed in &speeds {
+            assert!(
+                (low..=high).contains(speed),
+                "速度{speed}が範囲内であること"
+            );
+        }
+        let min = speeds.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = speeds.iter().copied().fold(0.0, f64::max);
+        assert!(max - min > 1.0, "円ごとに速度がばらつく: {min}〜{max}");
+    }
+
+    #[test]
+    fn round5_placements_follow_positions_without_relayout() {
+        let mut game = CountManiaGame::new();
+        start_round(&mut game, 4);
+        set_layout(&game, &[(1, 10, 5, 10, 5), (2, 60, 10, 10, 5)]);
+        // 1回(0.3秒)で円1は横に1.5セル、円2は縦に3行進む
+        set_velocity(&mut game, 1, (5.0, 0.0));
+        set_velocity(&mut game, 2, (0.0, 10.0));
+        step_motion(&mut game);
+        assert_eq!(
+            rect_of(&game, 1),
+            Rect::new(12, 5, 10, 5),
+            "描く位置は丸めたセル"
+        );
+        assert_eq!(rect_of(&game, 2), Rect::new(60, 13, 10, 5));
+        step_motion(&mut game);
+        assert_eq!(rect_of(&game, 1), Rect::new(13, 5, 10, 5));
+        assert_eq!(rect_of(&game, 2), Rect::new(60, 16, 10, 5));
+        let cache = game.layout.borrow();
+        let cache = cache.as_ref().unwrap();
+        assert_eq!(cache.generation, game.position_generation());
+        let board = board_area(AREA);
+        assert_eq!(
+            cache.base[0].rect,
+            Rect::new(board.x + 10, board.y + 5, 10, 5),
+            "初期配置は作り直さない"
+        );
+    }
+
+    #[test]
+    fn round5_circle_reflects_at_board_edge() {
+        let mut game = CountManiaGame::new();
+        start_round(&mut game, 4);
+        // 幅10の円の左上が取れる範囲は x=0〜88。1回に6セルずつ右へ進む
+        set_layout(&game, &[(1, 2, 2, 10, 5), (2, 80, 10, 10, 5)]);
+        set_velocity(&mut game, 2, (20.0, 0.0));
+        step_motion(&mut game);
+        assert_eq!(rect_of(&game, 2).x, 86);
+        step_motion(&mut game);
+        assert_eq!(rect_of(&game, 2).x, 84, "右端で跳ね返る");
+        let motion = game.round.motion.as_ref().unwrap();
+        assert!(motion.velocities[1].0 < 0.0, "横向きの速度が反転する");
+        assert_eq!(motion.velocities[1].1, 0.0, "縦向きはそのまま");
+    }
+
+    #[test]
+    fn round5_circles_stay_inside_board_for_a_long_time() {
+        let mut game = CountManiaGame::new();
+        start_round(&mut game, 4);
+        let board = board_area(AREA);
+        game.placements(board);
+        for _ in 0..200 {
+            step_motion(&mut game);
+            assert_all_inside_board(&game, board);
+        }
+        assert!(!game.game_over);
+    }
+
+    #[test]
+    fn round5_removed_circles_stop_moving() {
+        let mut game = CountManiaGame::new();
+        start_round(&mut game, 4);
+        set_layout(&game, &[(1, 10, 5, 10, 5), (2, 60, 10, 10, 5)]);
+        set_velocity(&mut game, 1, (5.0, 0.0));
+        set_velocity(&mut game, 2, (5.0, 0.0));
+        step_motion(&mut game);
+        // 動いた後の位置の円1をクリックする
+        click_circle(&mut game, 1);
+        assert_eq!(game.round.next, 2, "動いた円も今の位置でクリックできる");
+        let removed = moving_position(&game, 1);
+        let other = moving_position(&game, 2);
+        for _ in 0..5 {
+            step_motion(&mut game);
+        }
+        assert_eq!(
+            moving_position(&game, 1),
+            removed,
+            "押して消えた円は動かない"
+        );
+        assert_ne!(moving_position(&game, 2), other, "残っている円は動き続ける");
+    }
+
+    #[test]
+    fn round5_stops_moving_after_game_over() {
+        let mut game = CountManiaGame::new();
+        start_round(&mut game, 4);
+        let board = board_area(AREA);
+        game.placements(board);
+        step_motion(&mut game);
+        lose_all_lives(&mut game);
+        assert!(game.game_over);
+        let before = game.placements(board);
+        game.update(MOTION_STEP_INTERVAL * 3);
+        assert_eq!(game.placements(board), before, "GAME OVER後は円を止める");
+    }
+
+    #[test]
+    fn round5_resized_board_restarts_positions_from_new_layout() {
+        let mut game = CountManiaGame::new();
+        start_round(&mut game, 4);
+        game.placements(board_area(AREA));
+        step_motion(&mut game);
+        step_motion(&mut game);
+        let bigger = board_area(Rect::new(0, 0, 160, 50));
+        game.placements(bigger);
+        assert_all_inside_board(&game, bigger);
+        step_motion(&mut game);
+        assert_eq!(
+            game.round.motion.as_ref().unwrap().board,
+            Some(bigger),
+            "新しい盤面の配置から動かし直す"
+        );
+        assert_all_inside_board(&game, bigger);
+    }
+
+    #[test]
+    fn round5_image_mode_reencodes_board_at_most_once_per_step() {
+        // 実際のゲームループと同じく、tickごとにupdateして描く
+        use ratatui_image::picker::{Picker, ProtocolType};
+        let mut game = CountManiaGame::new();
+        start_round(&mut game, 4);
+        let mut picker = Picker::from_fontsize((4, 8));
+        picker.set_protocol_type(ProtocolType::Halfblocks);
+        game.renderer = CircleRenderer::with_picker(picker);
+        rendered_text(&game, AREA.width, AREA.height);
+        let boards = game.renderer.board_encode_count();
+        let mut elapsed = Duration::ZERO;
+        let mut ticks = 0u32;
+        while elapsed < MOTION_STEP_INTERVAL * 4 {
+            // 時間切れ前の点滅(これも盤面を作り直す)が混ざらないようにする
+            game.round.time_since_target = Duration::ZERO;
+            game.update(crate::TICK_RATE);
+            rendered_text(&game, AREA.width, AREA.height);
+            elapsed += crate::TICK_RATE;
+            ticks += 1;
+        }
+        let steps = (elapsed.as_millis() / MOTION_STEP_INTERVAL.as_millis()) as usize;
+        let reencoded = game.renderer.board_encode_count() - boards;
+        assert!(reencoded >= 1, "円が動いたら盤面を描き直す");
+        assert!(
+            reencoded <= steps,
+            "盤面の作り直しは位置の更新1回につき1回まで: {reencoded}/{steps}"
+        );
+        assert!((reencoded as u32) < ticks, "毎tickは作り直さない");
+    }
+
+    #[test]
+    fn full_session_of_five_rounds_can_be_cleared_with_moving_rounds() {
+        let mut game = CountManiaGame::new();
+        for round in 0..ROUNDS_PER_SESSION {
+            // ROUND5は円が動いている途中でも、今の位置をクリックすれば進める
+            if round == 4 {
+                let board = board_area(AREA);
+                let first = game.placements(board);
+                step_motion(&mut game);
+                step_motion(&mut game);
+                assert_ne!(game.placements(board), first, "ROUND5の円は動いている");
+            }
+            clear_round(&mut game);
+            if round + 1 < ROUNDS_PER_SESSION {
+                game.update(ROUND_INTERVAL);
+            }
+        }
+        assert!(game.is_finished());
+        let result = game.result();
+        assert_eq!(
+            (result.total, result.correct),
+            (ROUNDS_PER_SESSION, ROUNDS_PER_SESSION)
+        );
+    }
+
+    #[test]
+    fn round4_scatter_never_hides_any_remaining_number() {
+        // 散らした円が盤面の端に寄せられて同じ大きさの円とぴったり重なる等で、
+        // 残っている円の数字が隠れる(=押せなくなる)ことが無いこと。
+        // どの時点でも、残っている全ての円の中心をクリックすればその円に当たる
+        let board = board_area(AREA);
+        for trial in 0..40 {
+            let mut game = CountManiaGame::new();
+            start_round(&mut game, 3);
+            for number in 1..=game.round_params().max_number {
+                let placements = game.placements(board);
+                for p in placements.iter().filter(|p| game.is_visible(p.number)) {
+                    let (x, y) = (p.rect.x + p.rect.width / 2, p.rect.y + p.rect.height / 2);
+                    assert_eq!(
+                        hit_test(&placements, |n| game.is_visible(n), x, y),
+                        Some(p.number),
+                        "trial={trial} 円{number}を押す前: 円{}の中心が他の円に隠れている",
+                        p.number
+                    );
+                }
+                let (x, y) = center_of(&game, number);
+                game.handle_mouse(left_click(x, y), AREA);
+                assert_eq!(game.round.next, number + 1, "trial={trial}");
+            }
+            assert_eq!(game.tracker.total(), 1);
+            assert_eq!(game.round.lives, params(Difficulty::Advanced).lives);
+        }
+    }
+
+    #[test]
+    fn round4_scatter_still_moves_circles_on_average() {
+        // 数字を隠さない位置に限っても、クリックした付近の円ははっきり散らばる
+        let board = board_area(AREA);
+        let (mut moved, mut total) = (0.0, 0usize);
+        for _ in 0..20 {
+            let mut game = CountManiaGame::new();
+            start_round(&mut game, 3);
+            for number in 1..game.round_params().max_number {
+                let before = game.placements(board);
+                let (x, y) = center_of(&game, number);
+                game.handle_mouse(left_click(x, y), AREA);
+                let after = game.placements(board);
+                let click = (f64::from(x) + 0.5, f64::from(y) + 0.5);
+                for (b, a) in before.iter().zip(&after) {
+                    let center = (
+                        f64::from(b.rect.x) + f64::from(b.rect.width) / 2.0,
+                        f64::from(b.rect.y) + f64::from(b.rect.height) / 2.0,
+                    );
+                    let nearby =
+                        scatter_offset(click, center, SCATTER_RADIUS, 1.0, (1.0, 0.0)).is_some();
+                    if b.number > number && nearby {
+                        let dx = f64::from(a.rect.x) - f64::from(b.rect.x);
+                        let dy = (f64::from(a.rect.y) - f64::from(b.rect.y)) * CELL_ASPECT;
+                        moved += dx.hypot(dy);
+                        total += 1;
+                    }
+                }
+            }
+        }
+        let average = moved / total as f64;
+        assert!(
+            average >= SCATTER_DISTANCE * 0.5,
+            "近くの円の平均の移動距離{average:.1}"
+        );
+    }
+
+    #[test]
+    fn round4_scatter_avoids_hiding_number_of_crowded_neighbor() {
+        let mut game = CountManiaGame::new();
+        start_round(&mut game, 3);
+        // 円2をそのまま右へ押すと、同じ大きさで手前(並びの後ろ)の円3にぴったり重なって隠れる
+        set_layout(
+            &game,
+            &[(1, 40, 10, 10, 5), (2, 54, 10, 10, 5), (3, 66, 10, 10, 5)],
+        );
+        click_board(&mut game, 45, 12);
+        assert_eq!(game.round.next, 2);
+        let board = board_area(AREA);
+        let placements = game.placements(board);
+        for number in [2, 3] {
+            let (x, y) = center_of(&game, number);
+            assert_eq!(
+                hit_test(&placements, |n| game.is_visible(n), x, y),
+                Some(number),
+                "円{number}の数字が隠れていないこと: {placements:?}"
+            );
+        }
     }
 }
