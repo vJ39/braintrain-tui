@@ -62,6 +62,22 @@ Overclocked_Tempoは曲一覧の最後(既存3曲の後)に追加する。
 - 関連する既存テスト(`ttr_splash_bgm_keeps_playing_through_difficulty_select`等、`SelectDifficulty(RHYTHM_ITEM_INDEX, ...)`を前提にしているテスト)を、「曲を選んだら直接プレイが始まる」新しいフローに合わせて更新する
 - 画面フローは「TOP → メニューでTTR選択(ここでBGM開始) → TTRスプラッシュ → 曲選択 → (難易度選択を挟まず)直接プレイ開始」になる
 
+## 3. TTRスプラッシュ画面と曲選択画面の統合
+
+現状、TTR選択後は `Screen::RhythmSplash`(画像1枚・Enter/クリック待ちのスプラッシュ画面)→`Screen::SelectSong(usize)`(曲リストの選択画面)の2画面を経由している。これを1画面に統合し、TTRスプラッシュ画像を背景にしたまま曲を選べるようにする。
+
+- `Screen::RhythmSplash` バリアントと、それに関連する `leave_rhythm_splash`・`Screen::RhythmSplash`分岐のキー/マウス処理を削除する
+- `select_menu_item` のTTR分岐(`RHYTHM_ITEM_INDEX`)は、`Screen::RhythmSplash` ではなく `Screen::SelectSong(0)` へ直接遷移するようにする(TTR専用BGM(`BgmCategory::RhythmSplash`)の再生開始はそのまま維持する)
+- `render_song_select` の描画で、`app.ttr_splash_renderer`(既存の `SplashRenderer`。画像プロトコル対応/フォールバックの両方を持つ)を背景として全画面に描画してから、その上に既存の曲選択パネル(`theme::panel`のブロックと曲リスト)を重ねて描画する
+- 曲選択画面のキー操作(↑↓・Enter・数字)・マウスクリックは既存のまま(`Screen::SelectSong`のロジックは変えない)
+- 画面フローは最終的に「TOP → メニューでTTR選択(BGM開始) → (スプラッシュ画像を背景にした)曲選択画面 → 曲を決定 → 直接プレイ開始(上級固定)」になる
+
+### 影響するテスト
+
+- `selecting_rhythm_menu_item_enters_ttr_splash_first` 等、`Screen::RhythmSplash` を前提にしたテストは、`Screen::SelectSong(0)` へ直接遷移することを確認する形に書き換える
+- `ttr_splash_enter_key_goes_to_song_select`・`ttr_splash_click_goes_to_song_select`・`ttr_splash_other_key_stays_on_ttr_splash`・`ttr_splash_q_returns_to_menu`・`ttr_splash_renders_without_panicking`・`ttr_splash_uses_its_own_renderer_not_the_title_one` は、統合後の画面(`Screen::SelectSong`)に対する動作(qでメニューに戻る、背景にTTR画像が使われる等)として書き換えるか、不要なら削除する
+- `ttr_splash_bgm_keeps_playing_through_song_select`・`ttr_splash_bgm_keeps_playing_through_difficulty_select` は、統合後もBGMが途切れないことを確認する形で残す
+
 ## テスト観点
 
 - Overclocked_Tempoの曲データがSONGSに含まれ、`assets/audio/bgm/rhythm/Overclocked_Tempo.mp3` が存在すること(既存の `songs_track_names_exist_in_rhythm_bgm_assets` 相当のテストで検証できる)
