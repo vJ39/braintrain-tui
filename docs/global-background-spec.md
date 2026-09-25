@@ -2,23 +2,48 @@
 
 `assets/image/background.jpeg`(暗いネイビー基調・グリッド線・発光点・脳モチーフの汎用背景)を、TTR(`Screen::SelectSong`。スプラッシュ画像を背景に使っている)以外の全画面共通の背景として敷く。
 
-## 実装方式(確定): パネル範囲をClearしてから描く
+## 前回の実装で判明した問題
 
-画像プロトコル(Sixel/iTerm2/Kitty)は、画像を描いたセル範囲に`skip`フラグを立てる。その後同じセルにテキストを描いても、`ratatui::widgets::Clear`でそのセルを一度クリアしない限り、変更が端末に送信されずテキストが表示されない(既存の`render_song_select`が`ratatui::widgets::Clear`をパネル範囲に描いてから曲選択パネルを描いているのは、この仕組みの上で動いている)。
+1回目の実装は「各画面の外枠(パネル)の範囲だけClearしてから描く」方式だったが、対象画面の外枠がほぼ`area`全体(画面いっぱい)を占めているため、Clearで背景が丸ごと消えてしまい、実質どの画面でも背景が見えない結果になった。
 
-このため、各画面で以下の順に描く。
+## 実装方式(確定): 画面全体に余白を持たせて中央配置する
 
-1. 画面全体に背景画像を描く(`Screen::SelectSong`以外)
-2. その画面の外枠(`theme::panel`等のBlockが占める範囲)に`ratatui::widgets::Clear`を描く
-3. 既存の画面別描画処理(`render_menu`・`render_difficulty_select`等)をそのまま行う
+対象画面の外枠(パネル)自体を、渡された`area`いっぱいに描くのではなく、`area`の四辺に余白を持たせて一回り小さくした中央のRectに描く。この余白の部分に背景画像がそのまま見える。
 
-この方式では、背景画像は各画面の外枠(パネル)の「外側」の余白にのみ見える。`Screen::Menu`のようにパネルがほぼ全画面を占める画面では、背景はごくわずかな端の余白にしか見えない。これは方式上の制約として許容する。
+### 新しいヘルパー関数
 
-## 対象範囲
+`src/app.rs`に、画面全体から余白を引いた中央のRectを返す関数を追加する。
 
-外枠(`theme::panel`相当のBlock)を持つトップレベルの画面が対象。
+```rust
+/// 画面全体(area)から四辺に余白を持たせた中央のRect。この余白に背景画像を見せる。
+/// 余白を引くと0以下になるほど小さい画面では、余白なし(area全体)にする
+fn screen_rect(area: Rect) -> Rect {
+    const MARGIN: u16 = 2; // 具体的な値は実装時に見た目のバランスで決めてよい
+    ...
+}
+```
 
-- `Screen::Splash`(全画面画像。背景を描いても`title.jpeg`の下に隠れて実質見えない。処理上は含めてよい)
+### 適用方法
+
+`App::render()`で、対象画面を描画する直前に、渡す`area`を`screen_rect(area)`に置き換える。背景画像自体は`area`全体(画面いっぱい)に描く。
+
+```rust
+Screen::Menu => {
+    self.background.render(frame, area); // 背景は画面全体に
+    let screen = screen_rect(area);
+    render_menu(frame, screen, &mut self.menu_state, &mut self.menu_typewriter, &mut self.menu_icons);
+}
+```
+
+対象画面の内部実装(`render_menu`・`menu_grid`・`render_difficulty_select`・`render_result`・`render_history`・`render_jukebox`・`countdown::render`)自体は変更しない。これらの関数はいずれも受け取った`area`いっぱいに外枠を描く実装になっているため、呼び出し側で`area`を`screen_rect(area)`に絞り込むだけで、内部のロジック(パネルの内側の計算・行の折り返し等)を一切変えずに「一回り小さい中央のパネル」にできる。
+
+### マウスクリック判定への適用
+
+`App::handle_mouse`側でも、各画面のクリック判定関数(`menu_card_at`・`difficulty_at_row`・`song_at_row`(対象外)等)に渡す`area`を、描画時と同じ`screen_rect(area)`に置き換える。描画とクリック判定で使う`area`がずれると、見た目の位置とクリック位置が合わなくなるため、必ず両方で同じ`screen_rect(area)`を使うこと。
+
+### 対象範囲
+
+- `Screen::Splash`(既存の`theme::panel`枠。この枠自体も`screen_rect`で一回り小さくする)
 - `Screen::Menu`・`Screen::ConfirmQuit`
 - `Screen::SelectDifficulty`
 - `Screen::Countdown`
@@ -28,11 +53,11 @@
 
 `Screen::SelectSong`(TTR)は対象外(既存のスプラッシュ画像を背景にする仕組みをそのまま使う)。
 
-`Screen::Playing(game)`(各ミニゲームのプレイ中画面)は今回のスコープ外とする。各`Game`実装がそれぞれ独自にパネルを描いており、Clear処理を個別に組み込むと実装範囲が大きくなるため、今回は対象にしない。
+`Screen::Playing(game)`(各ミニゲームのプレイ中画面)は今回のスコープ外とする。
 
 ## 対象ファイル
 
-- `src/app.rs`(`render()`の各画面描画箇所に、背景描画+Clearの処理を追加する)
+- `src/app.rs`(`screen_rect`ヘルパーの追加、`render()`・`handle_mouse`の各画面描画/クリック判定箇所への適用)
 - 新規: `src/ui/background.rs`(背景画像の読み込み・描画。`src/ui/menu_icons.rs`・`src/ui/splash.rs`の画像プロトコル対応パターンを参考にする)
 - `src/ui/mod.rs`(新モジュールの追加)
 
@@ -42,14 +67,6 @@
 - 描画は画面全体(`frame.area()`)に対して行う。`ratatui_image::Resize::Crop(None)`で画面いっぱいに敷く(`SplashRenderer`と同じ考え方)
 - 画像プロトコル非対応の端末では何もしない(フォールバックの代替表示は無し。既存の各画面の黒背景のまま)
 
-## app.rsでの適用
-
-`App::render()`で、対象の各画面ごとに「背景描画→パネル範囲へのClear→既存の描画処理」の順にする。各画面の外枠のRectは既存の`menu_block()`・`theme::panel(...)`等の`Block`の`.inner()`計算と同じ範囲(枠込みの全体)を使う。
-
-`Screen::Menu`・`Screen::ConfirmQuit`は、`render_menu`が呼ばれる前に画面全体(`menu_block()`が占める範囲、通常は`area`全体)へClearを描く。
-
-`Screen::SelectDifficulty`・`Screen::Countdown`・`Screen::Result`・`Screen::History`・`Screen::Jukebox`も同様に、それぞれの外枠のBlockが占める範囲(多くは`area`全体)にClearを描いてから既存の描画関数を呼ぶ。
-
 ## Appフィールド
 
 `App`構造体に`background: BackgroundRenderer`(仮称)を追加し、`App::new()`で1回だけ初期化する。既存の`splash_renderer`・`ttr_splash_renderer`・`menu_icons`と同じ並びに追加してよい。
@@ -57,7 +74,9 @@
 ## テスト観点
 
 - `background.jpeg`が`assets/image/`に埋め込まれ、デコードできること
+- `screen_rect`が、余白を引いた分だけ小さく・画面中央に配置されたRectを返すこと(上下左右の余白がほぼ均等)。画面が小さすぎる場合は余白なし(area全体)になり、幅・高さが0以下にならないこと
 - `Screen::SelectSong`では背景描画が呼ばれない(または描画されても`ttr_splash_renderer`の描画で完全に上書きされる)こと
-- 対象範囲に挙げた各画面で背景描画とClearの処理が呼ばれること
+- 対象範囲に挙げた各画面で、外枠が`area`いっぱいではなく`screen_rect(area)`の範囲に描かれること(四隅のセルが背景の描画対象になっていること、または外枠の位置が`area`の端と一致しないこと)
+- 各画面のクリック判定(メニューのカード選択・難易度選択・履歴/ジュークボックスの操作等)が、描画位置とずれずに機能すること
 - 画像プロトコル非対応(フォールバック)時にパニックしないこと
-- 既存の各画面のテスト(パネル位置・クリック判定・テキスト内容等)が壊れていないこと(背景描画・Clearは既存のUI描画の「前」に行うだけで、既存の位置・当たり判定・表示内容には影響しないはず)
+- 既存の各画面のテスト(パネル位置・クリック判定・テキスト内容等)のうち、`area`いっぱいの外枠を前提にしていたものは、`screen_rect(area)`基準に書き換える
