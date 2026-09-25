@@ -330,28 +330,11 @@ fn eighth_hit_at(beat_ms: u32, next_beat_ms: u32) -> Duration {
     Duration::from_micros((beat_ms as u64 + next_beat_ms as u64) * 500)
 }
 
-/// 単押しのレーン巡回パターン。完全ランダムにせず「歩く」「左右交互」「上下往復」
-/// といった認識できるフレーズを、PHRASE_SPAN_BEATS拍ごとに切り替えて使う。
-/// どのフレーズを使うかはブロック番号から決まる擬似ランダムで選び、次に来るフレーズを読めないようにする
-const LANE_PHRASES: [[Lane; 4]; 4] = [
-    // 左→下→上→右 と歩くように踏む
-    [Lane::Left, Lane::Down, Lane::Up, Lane::Right],
-    // 左右交互
-    [Lane::Left, Lane::Right, Lane::Left, Lane::Right],
-    // 上下往復
-    [Lane::Up, Lane::Down, Lane::Up, Lane::Down],
-    // 右→上→下→左 の逆歩き
-    [Lane::Right, Lane::Up, Lane::Down, Lane::Left],
-];
-
-/// 1つのレーンフレーズを使い続ける拍数(4拍×2小節)
-const PHRASE_SPAN_BEATS: usize = 8;
-
 /// 同時押しで使うレーンの組(左右・上下)
 const JUMP_LANES: [[Lane; 2]; 2] = [[Lane::Left, Lane::Right], [Lane::Up, Lane::Down]];
 
-/// 擬似ランダムの系列を単押しフレーズと同時押しで分けるための種
-const PHRASE_SEED: u64 = 0x5048_5241_5345_0001;
+/// 擬似ランダムの系列を単押しと同時押しで分けるための種
+const SINGLE_SEED: u64 = 0x5349_4e47_4c45_0001;
 const JUMP_SEED: u64 = 0x4a55_4d50_4c41_0002;
 
 /// 区切りの番号から一意に決まる擬似乱数(SplitMix64の混合関数)。
@@ -382,14 +365,10 @@ fn pick_excluding(seed: u64, index: u64, len: usize, prev: Option<usize>) -> usi
 
 /// 単押し・同時押しのレーンを払い出す
 struct LaneCycler {
-    /// 現在使っているフレーズのブロック番号(beat_index / PHRASE_SPAN_BEATS)
-    block: Option<usize>,
-    /// 現在のブロックで使っているフレーズ(LANE_PHRASESの添字)
-    phrase: Option<usize>,
-    /// フレーズ内で次に使う位置
-    step: usize,
     /// 直前に払い出した単押しレーン(同じレーンの連打を避けるため)
     last: Option<Lane>,
+    /// これまでの単押しの回数(単押しレーンを選ぶ擬似乱数の区切りの番号)
+    single_count: usize,
     /// これまでの同時押しの回数(同時押しの組を選ぶ区切りの番号)
     jump_count: usize,
 }
@@ -397,35 +376,21 @@ struct LaneCycler {
 impl LaneCycler {
     fn new() -> Self {
         Self {
-            block: None,
-            phrase: None,
-            step: 0,
             last: None,
+            single_count: 0,
             jump_count: 0,
         }
     }
 
-    /// 次の単押しレーン。ビートがフレーズの切り替わり位置を越えたらフレーズを選び直す
-    fn next_single(&mut self, beat_index: usize) -> Lane {
-        let block = beat_index / PHRASE_SPAN_BEATS;
-        if self.block != Some(block) {
-            self.block = Some(block);
-            self.step = 0;
-            self.phrase = Some(pick_excluding(
-                PHRASE_SEED,
-                block as u64,
-                LANE_PHRASES.len(),
-                self.phrase,
-            ));
-        }
-        let phrase = &LANE_PHRASES[self.phrase.expect("ブロック切り替え時に選択済み")];
-        let mut lane = phrase[self.step % phrase.len()];
-        self.step += 1;
-        // フレーズの継ぎ目で直前と同じレーンになる場合は1つ進めて連打を避ける
-        if Some(lane) == self.last {
-            lane = phrase[self.step % phrase.len()];
-            self.step += 1;
-        }
+    /// 次の単押しレーン。4レーンから擬似ランダムに1つ選ぶ(直前と同じレーンは選ばない)
+    fn next_single(&mut self) -> Lane {
+        let lanes = Lane::all();
+        let prev = self
+            .last
+            .and_then(|last| lanes.iter().position(|&lane| lane == last));
+        let pick = pick_excluding(SINGLE_SEED, self.single_count as u64, lanes.len(), prev);
+        self.single_count += 1;
+        let lane = lanes[pick];
         self.last = Some(lane);
         lane
     }
@@ -457,13 +422,13 @@ fn generate_chart(song: &RhythmSong, difficulty: Difficulty) -> Vec<Note> {
         let eighth_at = beats.get(i + 1).map(|&next| eighth_hit_at(beat_ms, next));
         match pattern {
             StepPattern::Skip => {}
-            StepPattern::Single => notes.push(Note::new(vec![cycler.next_single(i)], hit_at)),
+            StepPattern::Single => notes.push(Note::new(vec![cycler.next_single()], hit_at)),
             StepPattern::Jump => notes.push(Note::new(cycler.next_jump(), hit_at)),
             StepPattern::SingleAndEighth
             | StepPattern::JumpAndEighth
             | StepPattern::JumpAndEighthJump => {
                 let lanes = if pattern == StepPattern::SingleAndEighth {
-                    vec![cycler.next_single(i)]
+                    vec![cycler.next_single()]
                 } else {
                     cycler.next_jump()
                 };
@@ -473,7 +438,7 @@ fn generate_chart(song: &RhythmSong, difficulty: Difficulty) -> Vec<Note> {
                     let eighth_lanes = if pattern == StepPattern::JumpAndEighthJump {
                         cycler.next_jump()
                     } else {
-                        vec![cycler.next_single(i)]
+                        vec![cycler.next_single()]
                     };
                     notes.push(Note::new(eighth_lanes, eighth_at));
                 }
@@ -1595,17 +1560,10 @@ mod tests {
         seq.len() > p && (p..seq.len()).all(|i| seq[i] == seq[i - p])
     }
 
-    /// 1ブロックにつき1回next_singleを呼び、各ブロックで選ばれたフレーズ番号を集める
-    fn phrase_indices(blocks: usize) -> Vec<usize> {
+    /// next_singleだけをcount回呼んだときの単押しレーンの並び
+    fn single_sequence(count: usize) -> Vec<Lane> {
         let mut cycler = LaneCycler::new();
-        (0..blocks)
-            .map(|b| {
-                cycler.next_single(b * PHRASE_SPAN_BEATS);
-                cycler
-                    .phrase
-                    .expect("next_single後はフレーズが選ばれている")
-            })
-            .collect()
+        (0..count).map(|_| cycler.next_single()).collect()
     }
 
     fn jump_sequence(count: usize) -> Vec<Vec<Lane>> {
@@ -1613,49 +1571,105 @@ mod tests {
         (0..count).map(|_| cycler.next_jump()).collect()
     }
 
+    /// 単押しの並びに現れる「直前→次」のレーンの組(重複なし)
+    fn single_transitions(seq: &[Lane]) -> Vec<(Lane, Lane)> {
+        let mut found: Vec<(Lane, Lane)> = Vec::new();
+        for pair in seq.windows(2) {
+            let t = (pair[0], pair[1]);
+            if !found.contains(&t) {
+                found.push(t);
+            }
+        }
+        found
+    }
+
     #[test]
-    fn phrase_selection_never_repeats_previous_phrase() {
-        let seq = phrase_indices(200);
-        for (i, pair) in seq.windows(2).enumerate() {
-            assert_ne!(pair[0], pair[1], "block{i}とblock{}が同じフレーズ", i + 1);
+    fn single_selection_uses_every_lane() {
+        let seq = single_sequence(64);
+        for lane in Lane::all() {
+            assert!(seq.contains(&lane), "{lane:?}が一度も選ばれない: {seq:?}");
         }
     }
 
     #[test]
-    fn phrase_selection_is_not_a_fixed_rotation() {
-        let seq = phrase_indices(64);
-        // 全フレーズが使われる
-        for p in 0..LANE_PHRASES.len() {
-            assert!(seq.contains(&p), "フレーズ{p}が一度も選ばれない: {seq:?}");
+    fn single_selection_never_repeats_previous_lane() {
+        let seq = single_sequence(500);
+        for (i, pair) in seq.windows(2).enumerate() {
+            assert_ne!(pair[0], pair[1], "{i}回目と{}回目が同じレーン", i + 1);
         }
-        // 0,1,2,3の固定巡回や、2〜4種の決まった順の繰り返しになっていない
-        assert_ne!(
-            seq,
-            (0..64).map(|b| b % LANE_PHRASES.len()).collect::<Vec<_>>()
-        );
-        for p in 2..=LANE_PHRASES.len() {
+    }
+
+    #[test]
+    fn single_selection_is_not_a_fixed_rotation() {
+        // 決まった順の巡回(周期2〜4の繰り返し)になっていない
+        let seq = single_sequence(64);
+        for p in 2..=4 {
             assert!(!is_periodic(&seq, p), "周期{p}で繰り返している: {seq:?}");
         }
     }
 
     #[test]
-    fn phrase_selection_is_deterministic() {
-        assert_eq!(phrase_indices(64), phrase_indices(64));
+    fn single_selection_produces_every_lane_transition() {
+        // 固定フレーズ(歩く/左右交互/上下往復)では出ない ←→↑ のような組も含め、
+        // 異なる2レーンの「直前→次」12通りが全て現れる
+        let transitions = single_transitions(&single_sequence(200));
+        for from in Lane::all() {
+            for to in Lane::all() {
+                if from != to {
+                    assert!(
+                        transitions.contains(&(from, to)),
+                        "{from:?}→{to:?}が一度も現れない"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
-    fn single_lanes_follow_the_selected_phrase() {
-        // 1ブロック内の単押しは、そのブロックで選ばれたフレーズの並びで踏む
-        // (継ぎ目で連打を避けるため1つ進むことがあるので、開始位置は0か1)
+    fn single_selection_is_roughly_uniform_across_lanes() {
+        // 4レーンから偏りなく選ぶ(各レーンの出現割合が15%〜35%の範囲)
+        let seq = single_sequence(400);
+        for lane in Lane::all() {
+            let count = seq.iter().filter(|&&l| l == lane).count();
+            assert!(
+                (60..=140).contains(&count),
+                "{lane:?}の出現回数{count}/400が偏っている"
+            );
+        }
+    }
+
+    #[test]
+    fn single_selection_is_deterministic() {
+        assert_eq!(single_sequence(200), single_sequence(200));
+    }
+
+    #[test]
+    fn jump_selection_is_independent_of_single_selection() {
+        // 単押しを間に挟んでも、同時押しの組の並びは同時押しだけを呼んだときと変わらない
         let mut cycler = LaneCycler::new();
-        for block in 0..32 {
-            let lanes: Vec<Lane> = (0..4)
-                .map(|_| cycler.next_single(block * PHRASE_SPAN_BEATS))
+        let interleaved: Vec<Vec<Lane>> = (0..64)
+            .map(|i| {
+                for _ in 0..(i % 3) {
+                    cycler.next_single();
+                }
+                cycler.next_jump()
+            })
+            .collect();
+        assert_eq!(interleaved, jump_sequence(64));
+    }
+
+    #[test]
+    fn real_song_charts_single_lanes_use_every_transition() {
+        // 全3曲の中級譜面(全て単押し)で、単押しの「直前→次」12通りが全て現れる
+        for song in SONGS {
+            let lanes: Vec<Lane> = generate_chart(song, Difficulty::Intermediate)
+                .into_iter()
+                .map(|n| {
+                    assert_eq!(n.lanes.len(), 1, "{}", song.track_name);
+                    n.lanes[0]
+                })
                 .collect();
-            let phrase = LANE_PHRASES[cycler.phrase.unwrap()];
-            let matches = (0..2)
-                .any(|offset| (0..4).all(|k| lanes[k] == phrase[(offset + k) % phrase.len()]));
-            assert!(matches, "block{block}: {lanes:?} vs {phrase:?}");
+            assert_eq!(single_transitions(&lanes).len(), 12, "{}", song.track_name);
         }
     }
 
@@ -1909,7 +1923,7 @@ mod tests {
                         song.track_name
                     );
                 }
-                // 単押しが同じレーンに連続しない(規則的な巡回パターンで踏ませる)
+                // 単押しが同じレーンに連続しない(擬似ランダムでも直前と同じレーンは選ばない)
                 for pair in notes.windows(2) {
                     if pair[0].lanes.len() == 1 && pair[1].lanes.len() == 1 {
                         assert_ne!(
