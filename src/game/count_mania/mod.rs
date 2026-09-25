@@ -6,6 +6,7 @@
 mod circle_image;
 mod layout;
 mod ripple;
+mod wrong_mark;
 
 use std::cell::RefCell;
 use std::time::Duration;
@@ -27,6 +28,7 @@ use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
 use circle_image::{BoardCircle, CircleRenderer};
 use layout::{back_to_front, hit_test, layout_circles, CircleSize, Placement};
 use ripple::Ripple;
+use wrong_mark::WrongMark;
 
 pub const GAME_ID: &str = "count_mania";
 
@@ -38,7 +40,30 @@ pub const ROUNDS_PER_SESSION: u32 = 3;
 pub const ROUND_INTERVAL: Duration = Duration::from_millis(1200);
 
 /// 次に押すべき数字がこの時間を超えても押されないと、盤面の背景を赤く明滅させて焦らせる
-pub const PRESSURE_THRESHOLD: Duration = Duration::from_secs(10);
+pub const PRESSURE_THRESHOLD: Duration = Duration::from_secs(5);
+
+/// 次に押すべき数字がこの時間押されないと、時間切れでGAME OVERにする
+pub const TIMEOUT_LIMIT: Duration = Duration::from_secs(12);
+
+/// 時間切れのこの時間前から、押すべき数字の円を点滅させて警告する
+pub const TIMEOUT_WARNING: Duration = Duration::from_secs(3);
+
+/// 警告中の円の点滅1回(強調→元の色)の周期。画像表示では点滅のたびに盤面の画像を作り直すため、
+/// 作り直しが続きすぎない程度にゆっくりにする
+pub const TIMEOUT_BLINK_PERIOD: Duration = Duration::from_millis(600);
+
+/// 点滅で強調する時の円の色(白い円に黒い数字。どの円の色とも、赤く明滅する背景とも違う色にする)
+const TIMEOUT_BLINK_COLOR: [u8; 3] = [255, 255, 255];
+
+/// 次に押すべき数字になってからの経過時間に対して、その円をいま強調色で描くか。
+/// 時間切れのTIMEOUT_WARNING前から、周期の前半は強調・後半は元の色にして点滅させる
+fn target_blink_on(time_since_target: Duration) -> bool {
+    let Some(over) = time_since_target.checked_sub(TIMEOUT_LIMIT - TIMEOUT_WARNING) else {
+        return false;
+    };
+    let period = TIMEOUT_BLINK_PERIOD.as_millis().max(1);
+    over.as_millis() % period < period / 2
+}
 
 /// 背景の明滅1回(暗い→明るい→暗い)の周期
 pub const PRESSURE_PERIOD: Duration = Duration::from_millis(800);
@@ -198,9 +223,11 @@ pub struct CountManiaGame {
     feedback: AnswerFeedback,
     /// 正解クリックの位置から広がる波紋(見た目だけの演出)。Noneなら表示していない
     ripple: Option<Ripple>,
+    /// 誤クリックの位置に出すバツ印(見た目だけの演出)。Noneなら表示していない
+    wrong_mark: Option<WrongMark>,
     layout: RefCell<Option<LayoutCache>>,
     renderer: CircleRenderer,
-    /// ライフが尽きた(GAME OVER)か。trueになったら残りラウンドを待たずセッションを終える
+    /// ライフが尽きた・時間切れ(GAME OVER)か。trueになったら残りラウンドを待たずセッションを終える
     game_over: bool,
 }
 
@@ -223,6 +250,7 @@ impl CountManiaGame {
             interval: None,
             feedback: AnswerFeedback::new(),
             ripple: None,
+            wrong_mark: None,
             layout: RefCell::new(None),
             renderer: CircleRenderer::new(),
             game_over: false,
@@ -269,6 +297,9 @@ impl CountManiaGame {
         audio::play_se(SeKind::Correct);
         // 前の波紋が残っていても、新しい波紋に置き換える
         self.ripple = Some(Ripple::new(column, row));
+        // 押し間違いの印は、正解に進んだら役目を終えるので消す(画像表示では波紋と同じパッチに
+        // 重ねて描くため、離れた位置のバツ印が残ると波紋のパッチが大きくなり作り直しが重くなる)
+        self.wrong_mark = None;
         self.round.next += 1;
         // 次の数字に進んだので、焦らせる背景は最初からやり直す
         self.round.time_since_target = Duration::ZERO;
@@ -283,8 +314,11 @@ impl CountManiaGame {
         }
     }
 
-    fn click_wrong(&mut self) {
+    /// 押すべきでない円をクリックした。(column, row)はクリックしたセルで、そこにバツ印を出す
+    fn click_wrong(&mut self, column: u16, row: u16) {
         audio::play_se(SeKind::Incorrect);
+        // 前のバツ印が残っていても、新しい位置のバツ印に置き換える
+        self.wrong_mark = Some(WrongMark::new(column, row));
         self.round.lives = self.round.lives.saturating_sub(1);
         if self.round.lives == 0 {
             // GAME OVERで焦らせる背景を止める
@@ -297,6 +331,16 @@ impl CountManiaGame {
         } else {
             self.feedback.record(false, "ライフ -1");
         }
+    }
+
+    /// 次に押すべき数字がTIMEOUT_LIMITのあいだ押されなかった。ライフ切れと同じくGAME OVERにする
+    fn time_out(&mut self) {
+        audio::play_se(SeKind::Incorrect);
+        // GAME OVERで焦らせる背景・円の点滅を止める
+        self.round.time_since_target = Duration::ZERO;
+        self.tracker.record(false, self.params.fail_latency_ms);
+        self.feedback.record(false, "時間切れ");
+        self.game_over = true;
     }
 
     /// ラウンドを終える。最終ラウンドでなければ次のラウンドまでの待ち時間に入る
@@ -444,7 +488,7 @@ impl Game for CountManiaGame {
         if number == self.round.next {
             self.click_correct(mouse.column, mouse.row);
         } else {
-            self.click_wrong();
+            self.click_wrong(mouse.column, mouse.row);
         }
     }
 
@@ -452,6 +496,8 @@ impl Game for CountManiaGame {
         self.feedback.tick(dt);
         // 波紋はラウンド間の待ち時間中も時間を進め、持続時間を過ぎたら消す
         self.ripple = self.ripple.and_then(|ripple| ripple.advanced(dt));
+        // バツ印も同じく時間で消す
+        self.wrong_mark = self.wrong_mark.and_then(|mark| mark.advanced(dt));
         if let Some(remaining) = self.interval {
             let remaining = remaining.saturating_sub(dt);
             if remaining.is_zero() {
@@ -464,6 +510,10 @@ impl Game for CountManiaGame {
         if !self.is_finished() {
             self.round.elapsed += dt;
             self.round.time_since_target += dt;
+            // GAME OVERのフィードバック表示中は、もう時間切れにしない(記録は1回だけ)
+            if !self.game_over && self.round.time_since_target >= TIMEOUT_LIMIT {
+                self.time_out();
+            }
         }
     }
 
@@ -485,6 +535,8 @@ impl Game for CountManiaGame {
             self.render_interval_message(frame, board);
             return;
         }
+        // 時間切れが近い時は、押すべき数字の円を強調色と元の色で点滅させる
+        let blink = target_blink_on(self.round.time_since_target);
         // 大きい円から先に描き、小さい円ほど手前に重ねる(当たり判定hit_testの優先順位と同じ)
         let circles: Vec<BoardCircle> = back_to_front(&self.placements(board))
             .iter()
@@ -497,17 +549,26 @@ impl Game for CountManiaGame {
                     .map(|circle| BoardCircle {
                         rect: placement.rect,
                         number: circle.number,
-                        color: circle.color,
+                        color: if blink && circle.number == self.round.next {
+                            TIMEOUT_BLINK_COLOR
+                        } else {
+                            circle.color
+                        },
                     })
             })
             .collect();
-        self.renderer
-            .render_board(frame, board, &circles, self.ripple.as_ref());
+        self.renderer.render_board(
+            frame,
+            board,
+            &circles,
+            self.ripple.as_ref(),
+            self.wrong_mark.as_ref(),
+        );
     }
 
     fn is_finished(&self) -> bool {
         if self.game_over {
-            // GAME OVERの正誤フィードバック("ライフが尽きた")が消えたらセッション終了
+            // GAME OVERの正誤フィードバック("ライフが尽きた"/"時間切れ")が消えたらセッション終了
             return self.feedback.current().is_none();
         }
         self.tracker.total() >= ROUNDS_PER_SESSION
@@ -793,9 +854,16 @@ mod tests {
             let wrong = wrong_number(&game);
             click_circle(&mut game, wrong);
         }
-        assert_eq!(game.tracker.total(), 1, "3ラウンドのうち1回しか記録されない");
+        assert_eq!(
+            game.tracker.total(),
+            1,
+            "3ラウンドのうち1回しか記録されない"
+        );
         assert!(!game.is_finished(), "フィードバック表示中はまだ終了しない");
-        assert!(game.interval.is_none(), "次のラウンドへの待ち時間には入らない");
+        assert!(
+            game.interval.is_none(),
+            "次のラウンドへの待ち時間には入らない"
+        );
 
         game.update(crate::game::feedback::FEEDBACK_HOLD);
         assert!(game.is_finished(), "フィードバックが消えたらセッション終了");
@@ -1303,13 +1371,13 @@ mod tests {
     #[test]
     fn correct_click_resets_time_since_target() {
         let mut game = CountManiaGame::new(Difficulty::Beginner);
-        game.update(Duration::from_secs(12));
+        game.update(Duration::from_secs(8));
         click_circle(&mut game, 1);
         assert_eq!(game.round.next, 2);
         assert!(game.round.time_since_target.is_zero());
         assert_eq!(
             game.round.elapsed,
-            Duration::from_secs(12),
+            Duration::from_secs(8),
             "ラウンドの経過時間はリセットしない"
         );
     }
@@ -1317,17 +1385,17 @@ mod tests {
     #[test]
     fn wrong_click_keeps_time_since_target_while_lives_remain() {
         let mut game = CountManiaGame::new(Difficulty::Beginner);
-        game.update(Duration::from_secs(12));
+        game.update(Duration::from_secs(8));
         let wrong = wrong_number(&game);
         click_circle(&mut game, wrong);
         assert_eq!(game.round.lives, 2);
-        assert_eq!(game.round.time_since_target, Duration::from_secs(12));
+        assert_eq!(game.round.time_since_target, Duration::from_secs(8));
     }
 
     #[test]
     fn game_over_resets_time_since_target() {
         let mut game = CountManiaGame::new(Difficulty::Intermediate);
-        game.update(Duration::from_secs(12));
+        game.update(Duration::from_secs(8));
         for _ in 0..2 {
             let wrong = wrong_number(&game);
             click_circle(&mut game, wrong);
@@ -1339,7 +1407,7 @@ mod tests {
     #[test]
     fn pressure_background_is_none_up_to_threshold() {
         assert_eq!(pressure_background(Duration::ZERO), None);
-        assert_eq!(pressure_background(Duration::from_millis(9_999)), None);
+        assert_eq!(pressure_background(Duration::from_millis(4_999)), None);
         assert_eq!(pressure_background(PRESSURE_THRESHOLD), None);
     }
 
@@ -1359,7 +1427,10 @@ mod tests {
     #[test]
     fn pressure_background_brightness_pulses_periodically() {
         let dark = rgb(background_after_threshold(0.001)).0;
-        let bright = rgb(background_after_threshold(PRESSURE_PERIOD.as_secs_f64() / 2.0)).0;
+        let bright = rgb(background_after_threshold(
+            PRESSURE_PERIOD.as_secs_f64() / 2.0,
+        ))
+        .0;
         assert!(
             bright > dark + 50,
             "時間経過で明るさが変わる: {dark} -> {bright}"
@@ -1379,8 +1450,8 @@ mod tests {
         let mut game = CountManiaGame::new(Difficulty::Beginner);
         let normal = board_background(&game);
         assert_eq!(normal, Color::Reset);
-        game.update(Duration::from_millis(9_900));
-        assert_eq!(board_background(&game), normal, "10秒以内は変えない");
+        game.update(Duration::from_millis(4_900));
+        assert_eq!(board_background(&game), normal, "5秒以内は変えない");
     }
 
     #[test]
@@ -1425,5 +1496,347 @@ mod tests {
             Color::Reset,
             "GAME OVERで元に戻る"
         );
+    }
+
+    // --- 閾値 ---
+
+    #[test]
+    fn pressure_and_timeout_thresholds_match_spec() {
+        assert_eq!(PRESSURE_THRESHOLD, Duration::from_secs(5));
+        assert_eq!(TIMEOUT_LIMIT, Duration::from_secs(12));
+        // 点滅は時間切れの2〜3秒前から
+        assert!(TIMEOUT_WARNING >= Duration::from_secs(2));
+        assert!(TIMEOUT_WARNING <= Duration::from_secs(3));
+        assert!(
+            PRESSURE_THRESHOLD < TIMEOUT_LIMIT - TIMEOUT_WARNING,
+            "背景の明滅が先に始まり、その後で円が点滅する"
+        );
+    }
+
+    // --- 誤クリックのバツ印 ---
+
+    #[test]
+    fn wrong_click_shows_mark_at_clicked_cell() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        set_separate_layout(&game);
+        assert!(game.wrong_mark.is_none(), "始めはバツ印なし");
+        // 円2(次に押すべきでない円)をクリック
+        click_board(&mut game, 44, 4);
+        assert_eq!(game.round.lives, 2, "不正解");
+        let board = board_area(AREA);
+        let mark = game.wrong_mark.expect("誤クリックでバツ印が出る");
+        assert_eq!(
+            mark.center(),
+            (board.x + 44, board.y + 4),
+            "クリックした位置"
+        );
+    }
+
+    #[test]
+    fn wrong_mark_disappears_after_duration() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        set_separate_layout(&game);
+        click_board(&mut game, 44, 4);
+        game.update(wrong_mark::WRONG_MARK_DURATION - Duration::from_millis(1));
+        assert!(game.wrong_mark.is_some(), "持続時間内は残る");
+        game.update(Duration::from_millis(1));
+        assert!(game.wrong_mark.is_none(), "持続時間を過ぎたら消える");
+    }
+
+    #[test]
+    fn empty_or_correct_click_does_not_show_mark() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let (x, y) = set_separate_layout(&game);
+        click_board(&mut game, 25, 4);
+        assert!(
+            game.wrong_mark.is_none(),
+            "円の無い所のクリックでは出さない"
+        );
+        click_board(&mut game, x, y);
+        assert_eq!(game.round.next, 2);
+        assert!(game.wrong_mark.is_none(), "正解では出さない");
+    }
+
+    #[test]
+    fn new_wrong_click_moves_mark_and_restarts_it() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        set_layout(
+            &game,
+            &[(1, 2, 2, 10, 5), (2, 40, 2, 10, 5), (3, 60, 10, 10, 5)],
+        );
+        click_board(&mut game, 44, 4);
+        game.update(wrong_mark::WRONG_MARK_DURATION / 2);
+        click_board(&mut game, 64, 12);
+        assert_eq!(game.round.lives, 1);
+        let board = board_area(AREA);
+        assert_eq!(
+            game.wrong_mark.unwrap().center(),
+            (board.x + 64, board.y + 12),
+            "新しい位置に置き換わる"
+        );
+        game.update(wrong_mark::WRONG_MARK_DURATION / 2);
+        assert!(game.wrong_mark.is_some(), "持続時間は最初からやり直す");
+    }
+
+    #[test]
+    fn correct_click_after_wrong_click_keeps_ripple_and_feedback_unaffected() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let (x, y) = set_separate_layout(&game);
+        click_board(&mut game, 44, 4);
+        assert!(game.wrong_mark.is_some());
+        click_board(&mut game, x, y);
+        assert_eq!(game.round.next, 2);
+        let board = board_area(AREA);
+        let ripple = game.ripple.expect("正解の波紋はいつも通り出る");
+        assert_eq!(ripple.center(), (board.x + x, board.y + y));
+        assert_eq!(ripple.progress(), 0.0);
+        // 途中の正解はフィードバックを記録しない(既存の挙動)ので、直前の不正解の表示がそのまま続く
+        let flash = game.feedback.current().expect("直前の不正解の表示");
+        assert_eq!(flash.verdict, crate::game::feedback::Verdict::Incorrect);
+        assert_eq!(flash.detail, "ライフ -1");
+        // 波紋(画像表示では盤面の切り出しに重ねる)とぶつからないよう、正解に進んだらバツ印は消す
+        assert!(game.wrong_mark.is_none());
+    }
+
+    #[test]
+    fn game_over_click_shows_mark_with_life_feedback() {
+        let mut game = CountManiaGame::new(Difficulty::Intermediate);
+        click_circle(&mut game, 1);
+        for _ in 0..2 {
+            let wrong = wrong_number(&game);
+            click_circle(&mut game, wrong);
+        }
+        assert!(game.game_over);
+        assert!(
+            game.wrong_mark.is_some(),
+            "GAME OVERのクリックにもバツ印を出す"
+        );
+        let flash = game.feedback.current().unwrap();
+        assert_eq!(flash.detail, "ライフが尽きた", "ライフ切れの文言はそのまま");
+        game.update(crate::game::feedback::FEEDBACK_HOLD);
+        assert!(game.is_finished(), "バツ印が残っていてもセッションは終わる");
+    }
+
+    #[test]
+    fn fallback_render_draws_red_cross_at_wrong_click() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        set_separate_layout(&game);
+        let board = board_area(AREA);
+        let cell = (board.x + 42, board.y + 3);
+        game.handle_mouse(left_click(cell.0, cell.1), AREA);
+        assert!(game.wrong_mark.is_some());
+        let buffer = rendered_buffer(&game);
+        let [r, g, b] = wrong_mark::WRONG_MARK_COLOR;
+        assert_eq!(buffer[cell].symbol(), "✗");
+        assert_eq!(buffer[cell].fg, Color::Rgb(r, g, b));
+
+        game.update(wrong_mark::WRONG_MARK_DURATION);
+        assert_ne!(
+            rendered_buffer(&game)[cell].symbol(),
+            "✗",
+            "消えたら描かない"
+        );
+    }
+
+    // --- 時間切れ ---
+
+    #[test]
+    fn time_out_is_game_over_with_time_out_message() {
+        let mut game = CountManiaGame::new(Difficulty::Intermediate);
+        click_circle(&mut game, 1);
+        game.update(TIMEOUT_LIMIT - Duration::from_millis(1));
+        assert!(!game.game_over, "上限の直前はまだGAME OVERではない");
+        game.update(Duration::from_millis(1));
+        assert!(game.game_over, "上限に達したらGAME OVER");
+        let flash = game.feedback.current().expect("時間切れのフィードバック");
+        assert_eq!(flash.verdict, crate::game::feedback::Verdict::Incorrect);
+        assert!(
+            flash.detail.contains("時間切れ"),
+            "時間切れの文言: {}",
+            flash.detail
+        );
+        assert_ne!(flash.detail, "ライフが尽きた");
+        let text = rendered_text(&game, AREA.width, AREA.height);
+        assert!(text.contains("時間切れ"), "HUDに時間切れと出る");
+
+        let result = game.result();
+        assert_eq!((result.total, result.correct), (1, 0), "失敗として1回記録");
+        assert_eq!(
+            result.avg_latency_ms,
+            params(Difficulty::Intermediate).fail_latency_ms
+        );
+        assert_eq!(game.round.lives, 2, "ライフは減らさない");
+    }
+
+    #[test]
+    fn time_out_accumulates_over_many_ticks() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let mut elapsed = Duration::ZERO;
+        while !game.game_over {
+            game.update(crate::TICK_RATE);
+            elapsed += crate::TICK_RATE;
+            assert!(
+                elapsed <= TIMEOUT_LIMIT + crate::TICK_RATE,
+                "上限で必ず終わる"
+            );
+        }
+        assert!(elapsed >= TIMEOUT_LIMIT);
+    }
+
+    #[test]
+    fn time_out_ends_session_after_feedback_like_life_game_over() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        game.update(TIMEOUT_LIMIT);
+        assert!(game.game_over);
+        assert!(!game.is_finished(), "フィードバック表示中はまだ終了しない");
+        assert!(
+            game.interval.is_none(),
+            "次のラウンドへの待ち時間には入らない"
+        );
+        game.update(crate::game::feedback::FEEDBACK_HOLD);
+        assert!(game.is_finished(), "フィードバックが消えたらセッション終了");
+        assert_eq!(game.tracker.total(), 1, "記録は1回だけ");
+    }
+
+    #[test]
+    fn time_out_is_recorded_only_once() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        game.update(TIMEOUT_LIMIT);
+        game.update(TIMEOUT_LIMIT);
+        game.update(TIMEOUT_LIMIT);
+        assert_eq!(game.tracker.total(), 1);
+    }
+
+    #[test]
+    fn clicks_after_time_out_are_ignored() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        game.update(TIMEOUT_LIMIT);
+        click_circle(&mut game, 1);
+        assert_eq!(game.round.next, 1, "GAME OVER後のクリックは無視される");
+        assert_eq!(game.tracker.total(), 1);
+    }
+
+    #[test]
+    fn time_out_resets_pressure_background() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        game.update(TIMEOUT_LIMIT);
+        assert!(game.round.time_since_target.is_zero());
+        let buffer = rendered_buffer(&game);
+        let (_, body) = theme::split_hud(AREA);
+        assert_eq!(buffer[(body.x, body.y)].bg, Color::Reset, "背景は元に戻る");
+    }
+
+    #[test]
+    fn correct_click_resets_time_out_countdown() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        game.update(TIMEOUT_LIMIT - Duration::from_secs(1));
+        click_circle(&mut game, 1);
+        game.update(TIMEOUT_LIMIT - Duration::from_secs(1));
+        assert!(!game.game_over, "正解で時間切れまでの時間は最初から");
+        click_circle(&mut game, 2);
+        assert_eq!(game.round.next, 3);
+    }
+
+    #[test]
+    fn wrong_click_does_not_reset_time_out_countdown() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        game.update(TIMEOUT_LIMIT - Duration::from_secs(1));
+        let wrong = wrong_number(&game);
+        click_circle(&mut game, wrong);
+        assert_eq!(game.round.lives, 2);
+        game.update(Duration::from_secs(1));
+        assert!(game.game_over, "押し間違えても時間切れまでの時間は続く");
+    }
+
+    #[test]
+    fn time_out_does_not_happen_during_round_interval() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        clear_round(&mut game);
+        assert!(game.interval.is_some());
+        game.update(TIMEOUT_LIMIT);
+        assert!(!game.game_over, "待ち時間中は時間切れにならない");
+        assert!(game.interval.is_none(), "次のラウンドが始まる");
+        assert!(game.round.time_since_target.is_zero());
+    }
+
+    // --- 時間切れ前の点滅 ---
+
+    #[test]
+    fn target_does_not_blink_before_warning() {
+        assert!(!target_blink_on(Duration::ZERO));
+        assert!(!target_blink_on(PRESSURE_THRESHOLD));
+        assert!(!target_blink_on(
+            TIMEOUT_LIMIT - TIMEOUT_WARNING - Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn target_blinks_periodically_during_warning() {
+        let start = TIMEOUT_LIMIT - TIMEOUT_WARNING;
+        assert!(target_blink_on(start), "警告が始まったらすぐ強調する");
+        assert!(
+            !target_blink_on(start + TIMEOUT_BLINK_PERIOD / 2),
+            "半周期後は元の見た目に戻る"
+        );
+        assert!(
+            target_blink_on(start + TIMEOUT_BLINK_PERIOD),
+            "1周期で強調に戻る"
+        );
+        // 警告中に強調・非強調が何度も入れ替わる
+        let mut toggles = 0;
+        let mut last = target_blink_on(start);
+        let mut t = start;
+        while t < TIMEOUT_LIMIT {
+            let now = target_blink_on(t);
+            toggles += usize::from(now != last);
+            last = now;
+            t += crate::TICK_RATE;
+        }
+        assert!(toggles >= 4, "警告中に何度も点滅する: {toggles}");
+    }
+
+    /// テキスト表示で、番号numberの丸囲み数字が描かれたセルの文字色
+    fn digit_color(game: &CountManiaGame, number: u8) -> Color {
+        let digit = circle_image::circled_digit(number).unwrap().to_string();
+        let buffer = rendered_buffer(game);
+        buffer
+            .content()
+            .iter()
+            .find(|c| c.symbol() == digit)
+            .unwrap_or_else(|| panic!("{digit}が描かれていること"))
+            .fg
+    }
+
+    #[test]
+    fn target_circle_blinks_before_time_out_and_other_circles_do_not() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        set_separate_layout(&game);
+        let [r, g, b] = game.round.circles[0].color;
+        let own = Color::Rgb(r, g, b);
+        let [r2, g2, b2] = game.round.circles[1].color;
+        let other = Color::Rgb(r2, g2, b2);
+        let [hr, hg, hb] = TIMEOUT_BLINK_COLOR;
+        let highlight = Color::Rgb(hr, hg, hb);
+        assert_ne!(own, highlight);
+
+        game.update(TIMEOUT_LIMIT - TIMEOUT_WARNING - Duration::from_millis(100));
+        assert_eq!(digit_color(&game, 1), own, "警告前は元の色");
+
+        game.update(Duration::from_millis(100));
+        assert_eq!(
+            digit_color(&game, 1),
+            highlight,
+            "警告中は押すべき円が点滅する"
+        );
+        assert_eq!(digit_color(&game, 2), other, "他の円は点滅しない");
+
+        game.update(TIMEOUT_BLINK_PERIOD / 2);
+        assert_eq!(digit_color(&game, 1), own, "点滅なので元の色にも戻る");
+
+        // 正解で押すべき数字が進むと、点滅は解除される
+        game.update(TIMEOUT_BLINK_PERIOD / 2);
+        assert_eq!(digit_color(&game, 1), highlight);
+        click_circle(&mut game, 1);
+        assert_eq!(digit_color(&game, 2), other, "正解で点滅は解除される");
     }
 }
