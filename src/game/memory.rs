@@ -26,6 +26,8 @@ const SHOW_ON_DURATION: Duration = Duration::from_millis(400);
 /// 提示フェーズで次のパネルへ移る前に消灯しておく時間
 /// (同じパネルが連続するとき、一度消えないと1回の点灯か連続点灯か区別がつかないため)
 const SHOW_OFF_DURATION: Duration = Duration::from_millis(200);
+/// 正誤確定後、次のシーケンスに移るまで結果を表示しておく時間
+const RESULT_INTERVAL: Duration = Duration::from_millis(1200);
 
 fn panel_color(panel: usize) -> Color {
     PANEL_COLORS
@@ -67,6 +69,8 @@ enum Phase {
     },
     /// プレイヤーが数字キーで再現している最中。`entered` は入力済みの数
     Input { entered: usize },
+    /// 正誤確定後、次のシーケンスへ移るまでの間(結果表示)
+    Interval { is_correct: bool, elapsed: Duration },
 }
 
 pub struct MemoryGame {
@@ -119,8 +123,12 @@ impl MemoryGame {
         } else {
             SeKind::Incorrect
         });
+        self.active_panel = None;
         if !self.tracker.is_session_finished() {
-            self.next_sequence();
+            self.phase = Phase::Interval {
+                is_correct,
+                elapsed: Duration::ZERO,
+            };
         }
     }
 }
@@ -153,38 +161,46 @@ impl Game for MemoryGame {
         if self.tracker.is_session_finished() {
             return;
         }
-        if let Phase::Showing {
-            shown,
-            sub_phase,
-            elapsed_in_step,
-        } = &mut self.phase
-        {
-            *elapsed_in_step += dt;
-            match sub_phase {
-                ShowSubPhase::On => {
-                    if *elapsed_in_step >= SHOW_ON_DURATION {
-                        *elapsed_in_step = Duration::ZERO;
-                        *sub_phase = ShowSubPhase::Off;
-                        // 同じパネルが連続するとき区別がつくよう、必ず一度消灯する
-                        self.active_panel = None;
-                    }
-                }
-                ShowSubPhase::Off => {
-                    if *elapsed_in_step >= SHOW_OFF_DURATION {
-                        *elapsed_in_step = Duration::ZERO;
-                        *shown += 1;
-                        if *shown >= self.sequence.len() {
+        match &mut self.phase {
+            Phase::Showing {
+                shown,
+                sub_phase,
+                elapsed_in_step,
+            } => {
+                *elapsed_in_step += dt;
+                match sub_phase {
+                    ShowSubPhase::On => {
+                        if *elapsed_in_step >= SHOW_ON_DURATION {
+                            *elapsed_in_step = Duration::ZERO;
+                            *sub_phase = ShowSubPhase::Off;
+                            // 同じパネルが連続するとき区別がつくよう、必ず一度消灯する
                             self.active_panel = None;
-                            self.phase = Phase::Input { entered: 0 };
-                            self.input_started_at = Instant::now();
-                        } else {
-                            self.active_panel = Some(self.sequence[*shown]);
-                            audio::play_se(SeKind::Transition);
-                            *sub_phase = ShowSubPhase::On;
+                        }
+                    }
+                    ShowSubPhase::Off => {
+                        if *elapsed_in_step >= SHOW_OFF_DURATION {
+                            *elapsed_in_step = Duration::ZERO;
+                            *shown += 1;
+                            if *shown >= self.sequence.len() {
+                                self.active_panel = None;
+                                self.phase = Phase::Input { entered: 0 };
+                                self.input_started_at = Instant::now();
+                            } else {
+                                self.active_panel = Some(self.sequence[*shown]);
+                                audio::play_se(SeKind::Transition);
+                                *sub_phase = ShowSubPhase::On;
+                            }
                         }
                     }
                 }
             }
+            Phase::Interval { elapsed, .. } => {
+                *elapsed += dt;
+                if *elapsed >= RESULT_INTERVAL {
+                    self.next_sequence();
+                }
+            }
+            Phase::Input { .. } => {}
         }
     }
 
@@ -237,6 +253,13 @@ impl Game for MemoryGame {
                 "入力中: 数字キー1〜4で再現(残り{}手)",
                 self.sequence.len() - entered
             ),
+            Phase::Interval { is_correct, .. } => {
+                if *is_correct {
+                    "せいかい！   つぎいくよ…".to_string()
+                } else {
+                    "ざんねん…   つぎいくよ…".to_string()
+                }
+            }
         };
         let progress = format!(
             "{} / {}問",
@@ -380,8 +403,51 @@ mod tests {
             std::char::from_digit(wrong_first as u32, 10).unwrap(),
         )));
         assert_eq!(game.tracker.total(), 1);
-        // 不正解を記録した後、次のシーケンスへ進んでいるはず(セッションが終わっていない前提)
-        assert!(matches!(game.phase, Phase::Showing { .. }));
+        // 不正解を記録した直後はインターバル表示に入り、まだ次のシーケンスは始まらない
+        assert!(matches!(
+            game.phase,
+            Phase::Interval {
+                is_correct: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn interval_advances_to_next_sequence_after_result_interval() {
+        let mut game = MemoryGame::new(Difficulty::Beginner);
+        let len = game.sequence.len();
+        for _ in 0..len {
+            advance_one_step(&mut game);
+        }
+        let sequence = game.sequence.clone();
+        for &panel in &sequence {
+            game.handle_key(KeyEvent::from(KeyCode::Char(
+                std::char::from_digit(panel as u32, 10).unwrap(),
+            )));
+        }
+        assert!(matches!(
+            game.phase,
+            Phase::Interval {
+                is_correct: true,
+                ..
+            }
+        ));
+
+        // インターバル時間が経過するまでは次のシーケンスへ進まない
+        game.update(RESULT_INTERVAL - Duration::from_millis(1));
+        assert!(matches!(game.phase, Phase::Interval { .. }));
+
+        // インターバル時間が経過すると次のシーケンス(提示フェーズ)が始まる
+        game.update(Duration::from_millis(1));
+        assert!(matches!(
+            game.phase,
+            Phase::Showing {
+                shown: 0,
+                sub_phase: ShowSubPhase::On,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -408,6 +474,10 @@ mod tests {
                     std::char::from_digit(panel as u32, 10).unwrap(),
                 ));
                 game.handle_key(key);
+            }
+            // 正誤確定後のインターバルを経過させて次のシーケンスへ進める
+            if !game.tracker.is_session_finished() {
+                game.update(RESULT_INTERVAL);
             }
         }
         assert!(game.is_finished());
