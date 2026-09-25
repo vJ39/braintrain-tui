@@ -30,9 +30,10 @@ pub enum Lane {
 }
 
 impl Lane {
-    /// レーン並び(画面左から ←↑↓→)。表示位置と入力キーの対応はこの順序に一致させる。
+    /// レーン並び(画面左から ←↓↑→、実機のPump It Up系プレイ画面に準拠)。
+    /// 表示位置と入力キーの対応はこの順序に一致させる。
     fn all() -> [Lane; 4] {
-        [Lane::Left, Lane::Up, Lane::Down, Lane::Right]
+        [Lane::Left, Lane::Down, Lane::Up, Lane::Right]
     }
 }
 
@@ -597,7 +598,7 @@ impl Game for RhythmGame {
         let lanes = Lane::all();
 
         let header = Line::from(Span::styled(
-            "   ←      ↑      ↓      →   ",
+            "   ←      ↓      ↑      →   ",
             Style::default().add_modifier(Modifier::BOLD),
         ));
         let judge_line = Line::from(Span::styled(
