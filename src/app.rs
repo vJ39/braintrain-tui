@@ -113,7 +113,8 @@ impl App {
             Screen::Playing(game) => {
                 game.handle_key(key);
                 if game.is_finished() {
-                    self.screen = Screen::Result(game.result());
+                    let result = game.result();
+                    self.enter_result(result);
                 }
             }
             Screen::Result(_) | Screen::History => {
@@ -154,7 +155,8 @@ impl App {
             Screen::Playing(game) => {
                 game.handle_mouse(mouse, area);
                 if game.is_finished() {
-                    self.screen = Screen::Result(game.result());
+                    let result = game.result();
+                    self.enter_result(result);
                 }
             }
             Screen::Result(_) | Screen::History => {
@@ -168,6 +170,15 @@ impl App {
     fn leave_splash(&mut self) {
         audio::play_se(SeKind::Confirm);
         self.screen = Screen::Menu;
+    }
+
+    /// ゲーム終了後、リザルト画面へ進む(キー/クリック共通)。リザルト用BGMに切り替える
+    fn enter_result(&mut self, result: GameResult) {
+        if let Some(name) = audio::random_bgm_track(BgmCategory::Result) {
+            audio::play_bgm_track(&name);
+            self.current_bgm = Some(name);
+        }
+        self.screen = Screen::Result(result);
     }
 
     /// Menu画面での項目決定(キー/クリック共通)。ゲーム/ジュークボックス/履歴へ振り分ける
@@ -983,6 +994,18 @@ mod tests {
         // 選んだ曲のBGMが流れ、プレイ画面にも曲名が出る
         assert_eq!(app.current_bgm.as_deref(), Some(SONGS[1].track_name));
         assert!(rendered_text(&mut app).contains(SONGS[1].display_name));
+    }
+
+    #[test]
+    fn game_over_switches_bgm_to_result_category() {
+        let mut app = App::new();
+        app.select_menu_item(0); // shape_rotate
+        app.handle_key(KeyEvent::from(KeyCode::Char('1'))); // Beginnerでプレイ開始
+        for _ in 0..crate::game::QUESTIONS_PER_SESSION {
+            app.handle_key(KeyEvent::from(KeyCode::Left));
+        }
+        assert!(matches!(app.screen, Screen::Result(_)));
+        assert_eq!(app.current_bgm.as_deref(), Some("New_Personal_Best"));
     }
 
     #[test]

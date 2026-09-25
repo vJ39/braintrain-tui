@@ -11,7 +11,8 @@ struct Assets;
 
 /// assets/audio/bgm/ 配下は用途別にサブフォルダで分ける
 /// (menu/ = 起動画面・Playing以外、playing/ = ゲームプレイ中、
-///  rhythm/ = リズムゲームの楽曲。譜面と同期させるため曲ごとに選んで再生する)
+///  rhythm/ = リズムゲームの楽曲。譜面と同期させるため曲ごとに選んで再生する、
+///  result/ = ゲーム終了後のリザルト画面)
 #[derive(RustEmbed)]
 #[folder = "assets/audio/bgm/"]
 struct BgmAssets;
@@ -29,6 +30,8 @@ pub enum SeKind {
 pub enum BgmCategory {
     Menu,
     Playing,
+    /// ゲーム終了後のリザルト画面
+    Result,
     /// リズムゲームの楽曲。再生は譜面と対応する曲をトラック名で直接指定するため
     /// ランダム選曲には使わず、曲データとassetsの対応確認(テスト)で参照する
     #[cfg_attr(not(test), allow(dead_code))]
@@ -40,6 +43,7 @@ impl BgmCategory {
         match self {
             BgmCategory::Menu => "menu/",
             BgmCategory::Playing => "playing/",
+            BgmCategory::Result => "result/",
             BgmCategory::Rhythm => "rhythm/",
         }
     }
@@ -280,6 +284,12 @@ mod tests {
         assert!(names.iter().any(|n| n == "Method_of_Thought"));
         assert!(names.iter().any(|n| n == "The_Quiet_Calculation"));
         assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn bgm_tracks_in_result_has_new_personal_best_only() {
+        let names = bgm_tracks_in(BgmCategory::Result);
+        assert_eq!(names, vec!["New_Personal_Best".to_string()]);
     }
 
     #[test]
