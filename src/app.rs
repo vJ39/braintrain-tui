@@ -8,6 +8,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 use crate::audio::{self, BgmCategory, SeKind};
+use crate::game::color_stack::ColorStackGame;
 use crate::game::count_mania::CountManiaGame;
 use crate::game::memory::MemoryGame;
 use crate::game::mental_calc::MentalCalcGame;
@@ -23,7 +24,7 @@ use crate::game::theme;
 use crate::game::{Difficulty, Game, GameResult};
 use crate::stats::store;
 
-const MENU_ITEMS: [&str; 12] = [
+const MENU_ITEMS: [&str; 13] = [
     "図形回転判定",
     "鏡像判定",
     "イロピッタン",
@@ -33,6 +34,7 @@ const MENU_ITEMS: [&str; 12] = [
     "数列予測",
     "組み合わせパズル",
     "カウントマニア",
+    "カラーストック",
     "リズム(DDR風)",
     "ジュークボックス",
     "履歴",
@@ -40,8 +42,10 @@ const MENU_ITEMS: [&str; 12] = [
 
 /// カウントマニア(マウス専用)
 const COUNT_MANIA_ITEM_INDEX: usize = 8;
+/// カラーストック
+const COLOR_STACK_ITEM_INDEX: usize = 9;
 /// リズムゲームだけは難易度選択の前に曲選択を挟む
-const RHYTHM_ITEM_INDEX: usize = 9;
+const RHYTHM_ITEM_INDEX: usize = 10;
 const JUKEBOX_ITEM_INDEX: usize = MENU_ITEMS.len() - 2;
 const HISTORY_ITEM_INDEX: usize = MENU_ITEMS.len() - 1;
 
@@ -384,6 +388,7 @@ fn new_game(item: usize, difficulty: Difficulty) -> Box<dyn Game> {
         6 => Box::new(SequenceGame::new(difficulty)),
         7 => Box::new(PuzzleConnectGame::new(difficulty)),
         COUNT_MANIA_ITEM_INDEX => Box::new(CountManiaGame::new(difficulty)),
+        COLOR_STACK_ITEM_INDEX => Box::new(ColorStackGame::new(difficulty)),
         RHYTHM_ITEM_INDEX => unreachable!("rhythm is started via start_rhythm with a song"),
         _ => unreachable!("history is handled without creating a game"),
     }
@@ -450,6 +455,7 @@ fn render_menu(frame: &mut Frame, area: Rect, state: &mut ListState) {
         "数列の法則を見抜いて次の数を当てる",
         "完成形から2つ目のピースを当てる",
         "数字の円を1から順にクリックする(マウス専用)",
+        "色ボタンで各列の一番下のブロックを消して盤面を空にする",
         "矢印キーで曲に合わせてステップする",
         "BGMを選んで聴く",
         "ゲームごとの反応時間の推移を見る",
@@ -609,6 +615,7 @@ fn render_result(frame: &mut Frame, area: Rect, result: &GameResult) {
         (crate::game::sequence::GAME_ID, 6),
         (crate::game::puzzle_connect::GAME_ID, 7),
         (crate::game::count_mania::GAME_ID, COUNT_MANIA_ITEM_INDEX),
+        (crate::game::color_stack::GAME_ID, COLOR_STACK_ITEM_INDEX),
         (crate::game::rhythm::GAME_ID, RHYTHM_ITEM_INDEX),
     ];
     let game_name = game_names
@@ -808,9 +815,9 @@ mod tests {
     // --- カウントマニア ---
 
     #[test]
-    fn count_mania_is_the_last_game_before_rhythm() {
+    fn count_mania_comes_right_before_color_stack() {
         assert_eq!(MENU_ITEMS[COUNT_MANIA_ITEM_INDEX], "カウントマニア");
-        assert_eq!(COUNT_MANIA_ITEM_INDEX + 1, RHYTHM_ITEM_INDEX);
+        assert_eq!(COUNT_MANIA_ITEM_INDEX + 1, COLOR_STACK_ITEM_INDEX);
     }
 
     #[test]
@@ -836,6 +843,39 @@ mod tests {
         assert_eq!(game.result().game_id, crate::game::count_mania::GAME_ID);
         // 全角文字の2セル目は空白で埋まるため、空白を除いて比較する
         assert!(rendered_text(&mut app).replace(' ', "").contains("マウス専用"));
+    }
+
+    // --- カラーストック ---
+
+    #[test]
+    fn color_stack_is_the_last_game_before_rhythm() {
+        assert_eq!(MENU_ITEMS[COLOR_STACK_ITEM_INDEX], "カラーストック");
+        assert_eq!(COLOR_STACK_ITEM_INDEX + 1, RHYTHM_ITEM_INDEX);
+    }
+
+    #[test]
+    fn new_game_for_color_stack_item_creates_color_stack() {
+        let game = new_game(COLOR_STACK_ITEM_INDEX, Difficulty::Intermediate);
+        let result = game.result();
+        assert_eq!(result.game_id, crate::game::color_stack::GAME_ID);
+        assert_eq!(result.difficulty, Difficulty::Intermediate);
+    }
+
+    #[test]
+    fn selecting_color_stack_goes_to_difficulty_and_starts_it() {
+        let mut app = App::new();
+        app.select_menu_item(COLOR_STACK_ITEM_INDEX);
+        assert!(matches!(
+            app.screen,
+            Screen::SelectDifficulty(COLOR_STACK_ITEM_INDEX, None)
+        ));
+        app.handle_key(KeyEvent::from(KeyCode::Char('1')));
+        let Screen::Playing(game) = &app.screen else {
+            panic!("Playing画面のはず");
+        };
+        assert_eq!(game.result().game_id, crate::game::color_stack::GAME_ID);
+        // 全角文字の2セル目は空白で埋まるため、空白を除いて比較する
+        assert!(rendered_text(&mut app).replace(' ', "").contains("カラーストック"));
     }
 
     #[test]
