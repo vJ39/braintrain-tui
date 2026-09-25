@@ -32,18 +32,65 @@ fn split_areas(area: Rect) -> (Rect, Rect) {
 
 pub const GAME_ID: &str = "reaction";
 
-const COLORS_BEGINNER: [(&str, Color); 2] = [("赤", Color::Red), ("青", Color::Blue)];
-const COLORS_FULL: [(&str, Color); 4] = [
-    ("赤", Color::Red),
-    ("青", Color::Blue),
-    ("緑", Color::Green),
-    ("黄", Color::Yellow),
+/// 出題の文字の表記
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Notation {
+    Kanji,
+    Katakana,
+}
+
+/// パレットの1色。漢字/カタカナの表記と、背景に塗る色を持つ
+#[derive(Clone, Copy, Debug)]
+struct PaletteColor {
+    kanji: &'static str,
+    katakana: &'static str,
+    color: Color,
+}
+
+impl PaletteColor {
+    fn label(&self, notation: Notation) -> &'static str {
+        match notation {
+            Notation::Kanji => self.kanji,
+            Notation::Katakana => self.katakana,
+        }
+    }
+}
+
+const fn palette_color(kanji: &'static str, katakana: &'static str, color: Color) -> PaletteColor {
+    PaletteColor {
+        kanji,
+        katakana,
+        color,
+    }
+}
+
+/// 全色。先頭から初級は2色・中級は4色・上級は全9色を使う。
+/// 端末の名前付き色が無い茶・橙・桃はRGBで持つ(画像表示の背景色もこのRGBになる)
+const PALETTE: [PaletteColor; 9] = [
+    palette_color("赤", "レッド", Color::Red),
+    palette_color("青", "ブルー", Color::Blue),
+    palette_color("緑", "グリーン", Color::Green),
+    palette_color("黄", "イエロー", Color::Yellow),
+    palette_color("紫", "パープル", Color::Magenta),
+    palette_color("白", "ホワイト", Color::White),
+    palette_color("茶", "ブラウン", Color::Rgb(180, 120, 70)),
+    palette_color("橙", "オレンジ", Color::Rgb(255, 150, 30)),
+    palette_color("桃", "ピンク", Color::Rgb(255, 160, 200)),
 ];
 
-fn color_pool(difficulty: Difficulty) -> Vec<(&'static str, Color)> {
+fn color_pool(difficulty: Difficulty) -> &'static [PaletteColor] {
     match difficulty {
-        Difficulty::Beginner => COLORS_BEGINNER.to_vec(),
-        Difficulty::Intermediate | Difficulty::Advanced => COLORS_FULL.to_vec(),
+        Difficulty::Beginner => &PALETTE[..2],
+        Difficulty::Intermediate => &PALETTE[..4],
+        Difficulty::Advanced => &PALETTE[..],
+    }
+}
+
+/// 出題の表記を選ぶ。上級のみ漢字/カタカナを出題ごとにランダムに選び、初級/中級は常に漢字
+fn pick_notation(rng: &mut impl Rng, difficulty: Difficulty) -> Notation {
+    match difficulty {
+        Difficulty::Advanced if rng.gen_bool(0.5) => Notation::Katakana,
+        _ => Notation::Kanji,
     }
 }
 
@@ -61,24 +108,31 @@ struct Question {
     is_match: bool,
 }
 
-fn generate_question(rng: &mut impl Rng, difficulty: Difficulty) -> Question {
+/// 出題を作る。背景色は前回の出題の背景色(previous_color)を除いた色から選ぶので、
+/// 同じ背景色が連続しない
+fn generate_question(
+    rng: &mut impl Rng,
+    difficulty: Difficulty,
+    previous_color: Option<Color>,
+) -> Question {
     let pool = color_pool(difficulty);
-    let (label, label_color) = pool[rng.gen_range(0..pool.len())];
+    let display_candidates: Vec<&PaletteColor> = pool
+        .iter()
+        .filter(|p| Some(p.color) != previous_color)
+        .collect();
+    let display = display_candidates.choose(rng).copied().unwrap_or(&pool[0]);
     let is_match = rng.gen_bool(0.5);
-    let display_color = if is_match {
-        label_color
+    let notation = pick_notation(rng, difficulty);
+    let label_entry = if is_match {
+        display
     } else {
-        let mut candidates: Vec<Color> = pool
-            .iter()
-            .map(|&(_, c)| c)
-            .filter(|&c| c != label_color)
-            .collect();
-        candidates.shuffle(rng);
-        candidates[0]
+        let label_candidates: Vec<&PaletteColor> =
+            pool.iter().filter(|p| p.color != display.color).collect();
+        label_candidates.choose(rng).copied().unwrap_or(display)
     };
     Question {
-        label,
-        display_color,
+        label: label_entry.label(notation),
+        display_color: display.color,
         is_match,
     }
 }
@@ -101,7 +155,8 @@ impl ReactionGame {
         Self {
             difficulty,
             tracker: ScoreTracker::new(),
-            current: generate_question(&mut rng, difficulty),
+            // 初回は前回の出題が無い
+            current: generate_question(&mut rng, difficulty, None),
             question_started_at: Instant::now(),
             elapsed_in_question: Duration::ZERO,
             feedback: AnswerFeedback::new(),
@@ -111,7 +166,8 @@ impl ReactionGame {
 
     fn next_question(&mut self) {
         let mut rng = rand::thread_rng();
-        self.current = generate_question(&mut rng, self.difficulty);
+        self.current =
+            generate_question(&mut rng, self.difficulty, Some(self.current.display_color));
         self.question_started_at = Instant::now();
         self.elapsed_in_question = Duration::ZERO;
     }
@@ -124,7 +180,8 @@ impl ReactionGame {
         } else {
             "不一致"
         };
-        self.feedback.record(is_correct, format!("こたえ: {answer}"));
+        self.feedback
+            .record(is_correct, format!("こたえ: {answer}"));
         audio::play_se(if is_correct {
             SeKind::Correct
         } else {
@@ -293,6 +350,21 @@ fn label_image_file(label: &str) -> Option<&'static str> {
         "青" => Some("ao.png"),
         "緑" => Some("midori.png"),
         "黄" => Some("ki.png"),
+        "紫" => Some("murasaki.png"),
+        "白" => Some("shiro.png"),
+        "茶" => Some("cha.png"),
+        "橙" => Some("daidai.png"),
+        "桃" => Some("momo.png"),
+        // カタカナは横長の画像
+        "レッド" => Some("reddo.png"),
+        "ブルー" => Some("buruu.png"),
+        "グリーン" => Some("guriin.png"),
+        "イエロー" => Some("ieroo.png"),
+        "パープル" => Some("paapuru.png"),
+        "ホワイト" => Some("howaito.png"),
+        "ブラウン" => Some("buraun.png"),
+        "オレンジ" => Some("orenji.png"),
+        "ピンク" => Some("pinku.png"),
         _ => None,
     }
 }
@@ -312,23 +384,35 @@ fn background_rgb(color: Color) -> [u8; 3] {
         Color::Blue => [50, 120, 255],
         Color::Green => [40, 190, 70],
         Color::Yellow => [240, 210, 0],
+        Color::Magenta => [170, 110, 230],
+        Color::White => [245, 245, 245],
+        // 茶・橙・桃はパレットでRGBを持つのでそのまま使う
         Color::Rgb(r, g, b) => [r, g, b],
         _ => [128, 128, 128],
     }
 }
 
-/// inner(セル単位)の中央に置く、ピクセル換算で正方形になる範囲。
-/// 一辺はinnerの幅と高さ(ピクセル)の短い方。font_sizeは1セルのピクセル数(幅, 高さ)
-fn glyph_area(inner: Rect, font_size: (u16, u16)) -> Rect {
-    let cell_width = u32::from(font_size.0.max(1));
-    let cell_height = u32::from(font_size.1.max(1));
-    let side = u32::min(
-        u32::from(inner.width) * cell_width,
-        u32::from(inner.height) * cell_height,
-    );
-    // sideはinnerの幅・高さ(ピクセル)以下なので、セル数もinnerに収まる
-    let cols = (side / cell_width) as u16;
-    let rows = (side / cell_height) as u16;
+/// inner(セル単位)の中央に置く、文字の画像の縦横比(ピクセル換算)を保ったまま収まる
+/// 最大の範囲。セル数は切り捨てるので、画像の縦横比に最も近い整数セルの矩形になる。
+/// font_sizeは1セルのピクセル数(幅, 高さ)、glyph_sizeは画像のピクセル数(幅, 高さ)
+fn glyph_area(inner: Rect, font_size: (u16, u16), glyph_size: (u32, u32)) -> Rect {
+    let (glyph_width, glyph_height) = (u64::from(glyph_size.0), u64::from(glyph_size.1));
+    if glyph_width == 0 || glyph_height == 0 {
+        return Rect::new(inner.x, inner.y, 0, 0);
+    }
+    let cell_width = u64::from(font_size.0.max(1));
+    let cell_height = u64::from(font_size.1.max(1));
+    let inner_width = u64::from(inner.width) * cell_width;
+    let inner_height = u64::from(inner.height) * cell_height;
+    // 幅で決まるか高さで決まるかを、縦横比の比較(掛け算)で判定する
+    let (width, height) = if inner_width * glyph_height <= inner_height * glyph_width {
+        (inner_width, inner_width * glyph_height / glyph_width)
+    } else {
+        (inner_height * glyph_width / glyph_height, inner_height)
+    };
+    // width/heightはinnerの幅・高さ(ピクセル)以下なので、セル数もinnerに収まる
+    let cols = (width / cell_width) as u16;
+    let rows = (height / cell_height) as u16;
     Rect::new(
         inner.x + (inner.width - cols) / 2,
         inner.y + (inner.height - rows) / 2,
@@ -403,6 +487,9 @@ struct LabelCache {
 /// 出題の文字の描画器。画像プロトコルが使える端末では文字を画像で大きく表示する
 struct LabelRenderer {
     picker: Option<Picker>,
+    /// 直前に読み込んだ文字の画像(文字, 画像)。描画範囲の計算に画像の寸法が要るので、
+    /// 同じ文字の間は毎フレームPNGを読み直さないよう持っておく
+    glyph: RefCell<Option<(&'static str, RgbaImage)>>,
     cache: RefCell<Option<LabelCache>>,
 }
 
@@ -414,6 +501,7 @@ impl LabelRenderer {
     fn with_picker(picker: Option<Picker>) -> Self {
         Self {
             picker,
+            glyph: RefCell::new(None),
             cache: RefCell::new(None),
         }
     }
@@ -435,7 +523,22 @@ impl LabelRenderer {
         let Some(picker) = &self.picker else {
             return false;
         };
-        let area = glyph_area(inner.intersection(frame.area()), picker.font_size());
+        // 描画範囲は画像の縦横比で決まるので、先に画像を読み込む
+        let mut glyph_cache = self.glyph.borrow_mut();
+        if !matches!(glyph_cache.as_ref(), Some((cached, _)) if *cached == label) {
+            let Some(image) = load_label_image(label) else {
+                return false;
+            };
+            *glyph_cache = Some((label, image));
+        }
+        let Some((_, glyph)) = glyph_cache.as_ref() else {
+            return false;
+        };
+        let area = glyph_area(
+            inner.intersection(frame.area()),
+            picker.font_size(),
+            glyph.dimensions(),
+        );
         if area.is_empty() {
             return false;
         }
@@ -445,11 +548,8 @@ impl LabelRenderer {
             Some(cached) if cached.label == label && cached.bg == bg && cached.area == area
         );
         if needs_regen {
-            let Some(glyph) = load_label_image(label) else {
-                return false;
-            };
             let composed =
-                compose_label_image(&glyph, area.width, area.height, picker.font_size(), bg);
+                compose_label_image(glyph, area.width, area.height, picker.font_size(), bg);
             let protocol = picker.new_resize_protocol(DynamicImage::ImageRgba8(composed));
             *cache = Some(LabelCache {
                 label,
@@ -534,42 +634,193 @@ mod tests {
         assert_eq!(game.feedback.correct(), 1);
     }
 
+    const ALL_DIFFICULTIES: [Difficulty; 3] = [
+        Difficulty::Beginner,
+        Difficulty::Intermediate,
+        Difficulty::Advanced,
+    ];
+
+    /// 出題の文字(漢字/カタカナ)から、パレットの色と表記を引く
+    fn lookup(label: &str) -> (PaletteColor, Notation) {
+        PALETTE
+            .iter()
+            .find_map(|p| {
+                if p.kanji == label {
+                    Some((*p, Notation::Kanji))
+                } else if p.katakana == label {
+                    Some((*p, Notation::Katakana))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("「{label}」はパレットの文字であること"))
+    }
+
+    fn pool_kanji(difficulty: Difficulty) -> Vec<&'static str> {
+        color_pool(difficulty).iter().map(|p| p.kanji).collect()
+    }
+
     #[test]
-    fn match_question_uses_labels_own_color() {
-        let mut rng = StdRng::seed_from_u64(20);
-        let mut saw_match = false;
-        for _ in 0..50 {
-            let q = generate_question(&mut rng, Difficulty::Intermediate);
-            if q.is_match {
-                saw_match = true;
-                let expected = COLORS_FULL
-                    .iter()
-                    .find(|&&(label, _)| label == q.label)
-                    .unwrap()
-                    .1;
-                assert_eq!(q.display_color, expected);
+    fn color_pool_per_difficulty() {
+        assert_eq!(pool_kanji(Difficulty::Beginner), ["赤", "青"]);
+        assert_eq!(
+            pool_kanji(Difficulty::Intermediate),
+            ["赤", "青", "緑", "黄"]
+        );
+        assert_eq!(
+            pool_kanji(Difficulty::Advanced),
+            ["赤", "青", "緑", "黄", "紫", "白", "茶", "橙", "桃"]
+        );
+    }
+
+    #[test]
+    fn palette_pairs_kanji_with_katakana() {
+        let pairs: Vec<(&str, &str)> = PALETTE.iter().map(|p| (p.kanji, p.katakana)).collect();
+        assert_eq!(
+            pairs,
+            [
+                ("赤", "レッド"),
+                ("青", "ブルー"),
+                ("緑", "グリーン"),
+                ("黄", "イエロー"),
+                ("紫", "パープル"),
+                ("白", "ホワイト"),
+                ("茶", "ブラウン"),
+                ("橙", "オレンジ"),
+                ("桃", "ピンク"),
+            ]
+        );
+        assert_eq!(PALETTE[0].label(Notation::Kanji), "赤");
+        assert_eq!(PALETTE[0].label(Notation::Katakana), "レッド");
+    }
+
+    #[test]
+    fn palette_display_colors_are_distinct() {
+        for (i, a) in PALETTE.iter().enumerate() {
+            for b in &PALETTE[i + 1..] {
+                assert_ne!(a.color, b.color, "{}と{}は別の色", a.kanji, b.kanji);
             }
         }
-        assert!(saw_match);
+    }
+
+    #[test]
+    fn match_question_uses_labels_own_color() {
+        for difficulty in ALL_DIFFICULTIES {
+            let mut rng = StdRng::seed_from_u64(20);
+            let mut saw_match = false;
+            for _ in 0..100 {
+                let q = generate_question(&mut rng, difficulty, None);
+                if q.is_match {
+                    saw_match = true;
+                    assert_eq!(q.display_color, lookup(q.label).0.color);
+                }
+            }
+            assert!(saw_match);
+        }
     }
 
     #[test]
     fn mismatch_question_never_uses_labels_own_color() {
-        let mut rng = StdRng::seed_from_u64(21);
-        let mut saw_mismatch = false;
-        for _ in 0..50 {
-            let q = generate_question(&mut rng, Difficulty::Intermediate);
-            if !q.is_match {
-                saw_mismatch = true;
-                let label_color = COLORS_FULL
-                    .iter()
-                    .find(|&&(label, _)| label == q.label)
-                    .unwrap()
-                    .1;
-                assert_ne!(q.display_color, label_color);
+        for difficulty in ALL_DIFFICULTIES {
+            let mut rng = StdRng::seed_from_u64(21);
+            let mut saw_mismatch = false;
+            for _ in 0..100 {
+                let q = generate_question(&mut rng, difficulty, None);
+                if !q.is_match {
+                    saw_mismatch = true;
+                    assert_ne!(q.display_color, lookup(q.label).0.color);
+                }
+            }
+            assert!(saw_mismatch);
+        }
+    }
+
+    #[test]
+    fn question_colors_stay_within_difficulty_pool() {
+        for difficulty in ALL_DIFFICULTIES {
+            let pool = color_pool(difficulty);
+            let mut rng = StdRng::seed_from_u64(22);
+            for _ in 0..200 {
+                let q = generate_question(&mut rng, difficulty, None);
+                assert!(pool.iter().any(|p| p.color == q.display_color));
+                let (entry, _) = lookup(q.label);
+                assert!(pool.iter().any(|p| p.kanji == entry.kanji));
             }
         }
-        assert!(saw_mismatch);
+    }
+
+    #[test]
+    fn question_never_repeats_previous_display_color() {
+        for difficulty in ALL_DIFFICULTIES {
+            for previous in color_pool(difficulty) {
+                let mut rng = StdRng::seed_from_u64(23);
+                for _ in 0..100 {
+                    let q = generate_question(&mut rng, difficulty, Some(previous.color));
+                    assert_ne!(
+                        q.display_color, previous.color,
+                        "前回と同じ背景色にならない"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn consecutive_questions_change_display_color() {
+        for difficulty in ALL_DIFFICULTIES {
+            let mut rng = StdRng::seed_from_u64(24);
+            let mut previous = generate_question(&mut rng, difficulty, None).display_color;
+            let mut seen = vec![previous];
+            for _ in 0..300 {
+                let q = generate_question(&mut rng, difficulty, Some(previous));
+                assert_ne!(q.display_color, previous);
+                previous = q.display_color;
+                if !seen.contains(&previous) {
+                    seen.push(previous);
+                }
+            }
+            // 前回の色を除いても、プールの全色が出題される
+            assert_eq!(seen.len(), color_pool(difficulty).len());
+        }
+    }
+
+    #[test]
+    fn game_next_question_never_repeats_display_color() {
+        for difficulty in ALL_DIFFICULTIES {
+            let mut game = ReactionGame::new(difficulty);
+            for _ in 0..200 {
+                let before = game.current.display_color;
+                game.next_question();
+                assert_ne!(game.current.display_color, before);
+            }
+        }
+    }
+
+    #[test]
+    fn beginner_and_intermediate_always_use_kanji() {
+        for difficulty in [Difficulty::Beginner, Difficulty::Intermediate] {
+            let mut rng = StdRng::seed_from_u64(25);
+            for _ in 0..200 {
+                let q = generate_question(&mut rng, difficulty, None);
+                assert_eq!(lookup(q.label).1, Notation::Kanji, "「{}」は漢字", q.label);
+            }
+        }
+    }
+
+    #[test]
+    fn advanced_mixes_kanji_and_katakana() {
+        let mut rng = StdRng::seed_from_u64(26);
+        let (mut kanji, mut katakana) = (0, 0);
+        for _ in 0..400 {
+            let q = generate_question(&mut rng, Difficulty::Advanced, None);
+            match lookup(q.label).1 {
+                Notation::Kanji => kanji += 1,
+                Notation::Katakana => katakana += 1,
+            }
+        }
+        // 出題ごとに半々で選ぶので、どちらも十分な回数出る
+        assert!(kanji > 100, "漢字 {kanji} 回");
+        assert!(katakana > 100, "カタカナ {katakana} 回");
     }
 
     #[test]
@@ -630,30 +881,50 @@ mod tests {
     // ---- 出題の表示(背景色で色を示し、文字は黒の大きな画像) ----
 
     #[test]
-    fn all_four_label_images_are_embedded() {
-        for &(label, _) in COLORS_FULL.iter() {
-            let image = load_label_image(label)
-                .unwrap_or_else(|| panic!("「{label}」の画像が埋め込まれていること"));
-            assert_eq!(image.dimensions(), (512, 512));
+    fn all_label_images_are_embedded() {
+        for entry in PALETTE.iter() {
+            let kanji = load_label_image(entry.kanji)
+                .unwrap_or_else(|| panic!("「{}」の画像が埋め込まれていること", entry.kanji));
+            assert_eq!(kanji.dimensions(), (512, 512), "漢字は正方形");
+            let katakana = load_label_image(entry.katakana)
+                .unwrap_or_else(|| panic!("「{}」の画像が埋め込まれていること", entry.katakana));
+            assert_eq!(katakana.height(), 512);
+            assert!(katakana.width() > katakana.height(), "カタカナは横長");
         }
     }
 
     #[test]
     fn label_maps_to_its_image_file() {
-        assert_eq!(label_image_file("赤"), Some("aka.png"));
-        assert_eq!(label_image_file("青"), Some("ao.png"));
-        assert_eq!(label_image_file("緑"), Some("midori.png"));
-        assert_eq!(label_image_file("黄"), Some("ki.png"));
-        assert_eq!(label_image_file("紫"), None);
-        assert!(load_label_image("紫").is_none());
+        let expected = [
+            ("赤", "aka.png"),
+            ("青", "ao.png"),
+            ("緑", "midori.png"),
+            ("黄", "ki.png"),
+            ("紫", "murasaki.png"),
+            ("白", "shiro.png"),
+            ("茶", "cha.png"),
+            ("橙", "daidai.png"),
+            ("桃", "momo.png"),
+            ("レッド", "reddo.png"),
+            ("ブルー", "buruu.png"),
+            ("グリーン", "guriin.png"),
+            ("イエロー", "ieroo.png"),
+            ("パープル", "paapuru.png"),
+            ("ホワイト", "howaito.png"),
+            ("ブラウン", "buraun.png"),
+            ("オレンジ", "orenji.png"),
+            ("ピンク", "pinku.png"),
+        ];
+        for (label, file) in expected {
+            assert_eq!(label_image_file(label), Some(file), "「{label}」");
+        }
+        assert_eq!(label_image_file("黒"), None);
+        assert!(load_label_image("黒").is_none());
     }
 
     #[test]
     fn every_pool_color_has_distinct_background_rgb() {
-        let rgbs: Vec<[u8; 3]> = COLORS_FULL
-            .iter()
-            .map(|&(_, c)| background_rgb(c))
-            .collect();
+        let rgbs: Vec<[u8; 3]> = PALETTE.iter().map(|p| background_rgb(p.color)).collect();
         for (i, a) in rgbs.iter().enumerate() {
             for b in &rgbs[i + 1..] {
                 assert_ne!(a, b, "色ごとに違う背景色になる");
@@ -662,19 +933,92 @@ mod tests {
     }
 
     #[test]
+    fn background_rgb_is_bright_enough_for_black_text() {
+        for entry in PALETTE.iter() {
+            let [r, g, b] = background_rgb(entry.color);
+            let luma = 0.2126 * f64::from(r) + 0.7152 * f64::from(g) + 0.0722 * f64::from(b);
+            // 既存で一番暗い赤(約88)以上なら黒い文字が読める
+            assert!(
+                luma >= 85.0,
+                "{}の背景 {:?} は明るさ{luma:.0}",
+                entry.kanji,
+                [r, g, b]
+            );
+        }
+    }
+
+    #[test]
     fn glyph_area_is_centered_square_in_pixels() {
+        const SQUARE: (u32, u32) = (512, 512);
         // 40x10セル、1セル10x20ピクセル => 400x200ピクセル。正方形の一辺は200ピクセル=20x10セル
         let inner = Rect::new(2, 3, 40, 10);
-        let glyph = glyph_area(inner, (10, 20));
+        let glyph = glyph_area(inner, (10, 20), SQUARE);
         assert_eq!((glyph.width, glyph.height), (20, 10));
         assert_eq!((glyph.x, glyph.y), (12, 3), "横方向の中央に置く");
         // 縦長のエリアでも収まる
         let tall = Rect::new(0, 0, 10, 30);
-        let glyph = glyph_area(tall, (10, 20));
+        let glyph = glyph_area(tall, (10, 20), SQUARE);
         assert_eq!((glyph.width, glyph.height), (10, 5));
         assert!(glyph.y >= tall.y && glyph.bottom() <= tall.bottom());
         // 空のエリアは空のまま
-        assert!(glyph_area(Rect::new(0, 0, 0, 5), (10, 20)).is_empty());
+        assert!(glyph_area(Rect::new(0, 0, 0, 5), (10, 20), SQUARE).is_empty());
+    }
+
+    #[test]
+    fn glyph_area_keeps_aspect_ratio_of_wide_glyph() {
+        const WIDE: (u32, u32) = (1789, 512);
+        // 幅で決まる場合: 400x200ピクセル => 幅400、高さ400*512/1789=114ピクセル => 40x5セル
+        let inner = Rect::new(2, 3, 40, 10);
+        let glyph = glyph_area(inner, (10, 20), WIDE);
+        assert_eq!((glyph.width, glyph.height), (40, 5));
+        assert_eq!((glyph.x, glyph.y), (2, 5), "縦方向の中央に置く");
+        // 高さで決まる場合: 1000x100ピクセル => 高さ100、幅100*1789/512=349ピクセル => 34x5セル
+        let flat = Rect::new(0, 0, 100, 5);
+        let glyph = glyph_area(flat, (10, 20), WIDE);
+        assert_eq!((glyph.width, glyph.height), (34, 5));
+        assert_eq!((glyph.x, glyph.y), (33, 0), "横方向の中央に置く");
+        // 正方形の画像より横に広い範囲を取る
+        let square = glyph_area(flat, (10, 20), (512, 512));
+        assert!(glyph.width > square.width);
+    }
+
+    #[test]
+    fn glyph_area_fits_inside_inner_and_follows_aspect_ratio() {
+        let font_sizes = [(10, 20), (8, 16), (7, 15)];
+        let glyphs = [(512, 512), (1380, 512), (1789, 512), (512, 1380)];
+        for inner in [
+            Rect::new(1, 2, 58, 14),
+            Rect::new(0, 0, 13, 40),
+            Rect::new(5, 5, 200, 3),
+        ] {
+            for font_size in font_sizes {
+                for glyph_size in glyphs {
+                    let area = glyph_area(inner, font_size, glyph_size);
+                    assert!(area.x >= inner.x && area.y >= inner.y);
+                    assert!(area.right() <= inner.right() && area.bottom() <= inner.bottom());
+                    // ピクセル換算の縦横比が画像に近い(誤差はセルの切り捨て分だけ)
+                    let (cw, ch) = (u32::from(font_size.0), u32::from(font_size.1));
+                    let px_w = u32::from(area.width) * cw;
+                    let px_h = u32::from(area.height) * ch;
+                    let inner_w = u32::from(inner.width) * cw;
+                    let inner_h = u32::from(inner.height) * ch;
+                    let scale = f64::min(
+                        f64::from(inner_w) / f64::from(glyph_size.0),
+                        f64::from(inner_h) / f64::from(glyph_size.1),
+                    );
+                    let ideal_w = f64::from(glyph_size.0) * scale;
+                    let ideal_h = f64::from(glyph_size.1) * scale;
+                    assert!(f64::from(px_w) <= ideal_w + 1e-6 && ideal_w < f64::from(px_w + cw));
+                    assert!(f64::from(px_h) <= ideal_h + 1e-6 && ideal_h < f64::from(px_h + ch));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn glyph_area_is_empty_for_empty_glyph() {
+        assert!(glyph_area(Rect::new(0, 0, 40, 10), (10, 20), (0, 512)).is_empty());
+        assert!(glyph_area(Rect::new(0, 0, 40, 10), (10, 20), (512, 0)).is_empty());
     }
 
     #[test]
@@ -757,12 +1101,29 @@ mod tests {
             let mut game = ReactionGame::new(Difficulty::Advanced);
             game.label_renderer = LabelRenderer::with_picker(Some(picker));
             assert!(game.label_renderer.uses_image());
-            for &(label, color) in COLORS_FULL.iter() {
+            // 全18文字を描くのはHalfblocksだけにし(画像のエンコードが重いため)、他のプロトコルは
+            // 画像の形(正方形・3文字カタカナ・4文字カタカナ)ごとの代表で確かめる
+            let labels: Vec<(&'static str, Color)> = if protocol == ProtocolType::Halfblocks {
+                PALETTE
+                    .iter()
+                    .flat_map(|p| {
+                        [Notation::Kanji, Notation::Katakana].map(|n| (p.label(n), p.color))
+                    })
+                    .collect()
+            } else {
+                vec![
+                    ("紫", Color::Magenta),
+                    ("ピンク", Color::White),
+                    ("オレンジ", Color::Red),
+                ]
+            };
+            for (label, color) in labels {
                 fixed_question(&mut game, label, color);
                 render_game(&game, 60, 20);
+                // 極端に小さい画面でもパニックしない
+                render_game(&game, 4, 4);
+                render_game(&game, 12, 9);
             }
-            // 極端に小さい画面でもパニックしない
-            render_game(&game, 4, 4);
         }
     }
 
@@ -777,6 +1138,53 @@ mod tests {
         let [r, g, b] = background_rgb(Color::Red);
         // 文字画像の外(枠の内側の左端)は背景色で塗られている
         assert_eq!(buffer[(inner.x, inner.y)].bg, Color::Rgb(r, g, b));
+    }
+
+    #[test]
+    fn image_mode_draws_katakana_in_wide_area() {
+        let mut picker = Picker::from_fontsize((10, 20));
+        picker.set_protocol_type(ProtocolType::Halfblocks);
+        let mut game = ReactionGame::new(Difficulty::Advanced);
+        game.label_renderer = LabelRenderer::with_picker(Some(picker));
+        let size = |game: &ReactionGame| {
+            let cache = game.label_renderer.cache.borrow();
+            let area = cache.as_ref().expect("画像で描かれていること").area;
+            (u32::from(area.width) * 10, u32::from(area.height) * 20)
+        };
+
+        fixed_question(&mut game, "ブラウン", Color::White);
+        let (buffer, inner) = render_game(&game, 80, 24);
+        let (width, height) = size(&game);
+        assert!(
+            width > height * 2,
+            "横長の画像は横長の範囲に描く({width}x{height})"
+        );
+        let [r, g, b] = background_rgb(Color::White);
+        assert_eq!(buffer[(inner.x, inner.y)].bg, Color::Rgb(r, g, b));
+
+        // 漢字に切り替えると正方形の範囲に戻る
+        fixed_question(&mut game, "茶", Color::White);
+        render_game(&game, 80, 24);
+        let (width, height) = size(&game);
+        assert!(
+            width.abs_diff(height) < 20,
+            "正方形の画像は正方形の範囲({width}x{height})"
+        );
+    }
+
+    #[test]
+    fn fallback_shows_katakana_label_as_text() {
+        let mut game = ReactionGame::new(Difficulty::Advanced);
+        fixed_question(&mut game, "パープル", Color::Yellow);
+        let (buffer, inner) = render_game(&game, 40, 16);
+        let text: String = (inner.y..inner.bottom())
+            .flat_map(|y| (inner.x..inner.right()).map(move |x| (x, y)))
+            .map(|pos| buffer[pos].symbol().to_string())
+            .collect();
+        assert!(
+            text.contains('パ') && text.contains('ル'),
+            "カタカナの文字が描かれる"
+        );
     }
 
     #[test]
