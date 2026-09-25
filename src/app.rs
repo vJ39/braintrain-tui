@@ -371,7 +371,7 @@ impl App {
             return;
         }
         if selected == COUNT_MANIA_ITEM_INDEX {
-            // カウントマニアもROUND1〜3で難易度が自動で上がるため、難易度選択を挟まない
+            // カウントマニアもROUND1〜5で難易度・動きが自動で変わるため、難易度選択を挟まない
             self.start_playing(
                 COUNT_MANIA_ITEM_INDEX,
                 crate::game::count_mania::SESSION_DIFFICULTY,
@@ -1460,7 +1460,7 @@ mod tests {
 
     #[test]
     fn new_game_for_count_mania_item_creates_count_mania() {
-        // カウントマニアはROUND1〜3で難易度が上がる固定進行なので、渡した難易度によらず
+        // カウントマニアはROUND1〜5で難易度・動きが変わる固定進行なので、渡した難易度によらず
         // 代表値の難易度で記録する
         for difficulty in [
             Difficulty::Beginner,
@@ -1488,7 +1488,7 @@ mod tests {
         // 全角文字の2セル目は空白で埋まるため、空白を除いて比較する
         let text = rendered_text(app).replace(' ', "");
         assert!(text.contains("マウス専用"));
-        assert!(text.contains("ROUND1/3"), "ROUND1から始まる");
+        assert!(text.contains("ROUND1/5"), "ROUND1から始まる");
         assert!(text.contains("初級"), "ROUND1は初級");
     }
 
