@@ -41,6 +41,8 @@ const JUKEBOX_ITEM_INDEX: usize = MENU_ITEMS.len() - 2;
 const HISTORY_ITEM_INDEX: usize = MENU_ITEMS.len() - 1;
 
 pub enum Screen {
+    /// 起動直後のタイトル画面。Enterを押すとMenuへ進む
+    Splash,
     Menu,
     /// リズムゲームの曲選択(選択中の曲 = SONGSのインデックス)
     SelectSong(usize),
@@ -61,6 +63,7 @@ pub struct App {
     last_area: Rect,
     /// 現在再生中のBGMトラック名(ジュークボックス画面のハイライト表示に使う)
     current_bgm: Option<String>,
+    splash_renderer: crate::ui::splash::SplashRenderer,
 }
 
 impl App {
@@ -72,11 +75,12 @@ impl App {
             audio::play_bgm_track(name);
         }
         Self {
-            screen: Screen::Menu,
+            screen: Screen::Splash,
             menu_state,
             should_quit: false,
             last_area: Rect::default(),
             current_bgm,
+            splash_renderer: crate::ui::splash::SplashRenderer::new(),
         }
     }
 
@@ -91,6 +95,11 @@ impl App {
         }
 
         match &mut self.screen {
+            Screen::Splash => {
+                if matches!(key.code, KeyCode::Enter) {
+                    self.screen = Screen::Menu;
+                }
+            }
             Screen::Menu => self.handle_menu_key(key),
             Screen::SelectSong(selected) => {
                 let selected = *selected;
@@ -121,6 +130,9 @@ impl App {
         }
         let area = self.last_area;
         match &mut self.screen {
+            Screen::Splash => {
+                self.screen = Screen::Menu;
+            }
             Screen::Menu => {
                 if let Some(index) = menu_item_at_row(area, mouse.row) {
                     self.menu_state.select(Some(index));
@@ -321,6 +333,7 @@ impl App {
         self.last_area = area;
         let current_bgm = self.current_bgm.clone();
         match &mut self.screen {
+            Screen::Splash => self.splash_renderer.render(frame, area),
             Screen::Menu => render_menu(frame, area, &mut self.menu_state),
             Screen::SelectSong(selected) => render_song_select(frame, area, *selected),
             Screen::SelectDifficulty(item, song) => {
@@ -825,5 +838,46 @@ mod tests {
         app.screen = Screen::Jukebox(app.jukebox_list_state());
         app.handle_jukebox_key(KeyEvent::from(KeyCode::Esc));
         assert!(matches!(app.screen, Screen::Menu));
+    }
+
+    // --- タイトル画面(Splash) ---
+
+    #[test]
+    fn app_starts_on_splash_screen() {
+        let app = App::new();
+        assert!(matches!(app.screen, Screen::Splash));
+    }
+
+    #[test]
+    fn splash_enter_key_transitions_to_menu() {
+        let mut app = App::new();
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.screen, Screen::Menu));
+    }
+
+    #[test]
+    fn splash_other_key_stays_on_splash() {
+        let mut app = App::new();
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        assert!(matches!(app.screen, Screen::Splash));
+    }
+
+    #[test]
+    fn splash_click_transitions_to_menu() {
+        let mut app = App::new();
+        app.last_area = rect(0, 0, 40, 12);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(matches!(app.screen, Screen::Menu));
+    }
+
+    #[test]
+    fn splash_renders_without_panicking() {
+        let mut app = App::new();
+        rendered_text(&mut app);
     }
 }

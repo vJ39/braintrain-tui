@@ -13,3 +13,5 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
 rodio = "0.19"
 rust-embed = "8"
+image = "0.25"
+ratatui-image = "8"

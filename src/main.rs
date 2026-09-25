@@ -3,6 +3,7 @@ mod audio;
 mod canvas;
 mod game;
 mod stats;
+mod ui;
 
 use std::io;
 use std::time::{Duration, Instant};
