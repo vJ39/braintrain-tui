@@ -5,6 +5,7 @@
 
 mod circle_image;
 mod layout;
+mod ripple;
 
 use std::cell::RefCell;
 use std::time::Duration;
@@ -25,6 +26,7 @@ use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
 
 use circle_image::{BoardCircle, CircleRenderer};
 use layout::{back_to_front, hit_test, layout_circles, CircleSize, Placement};
+use ripple::Ripple;
 
 pub const GAME_ID: &str = "count_mania";
 
@@ -161,6 +163,8 @@ pub struct CountManiaGame {
     /// ラウンド間の待ち時間の残り。Noneならプレイ中
     interval: Option<Duration>,
     feedback: AnswerFeedback,
+    /// 正解クリックの位置から広がる波紋(見た目だけの演出)。Noneなら表示していない
+    ripple: Option<Ripple>,
     layout: RefCell<Option<LayoutCache>>,
     renderer: CircleRenderer,
 }
@@ -183,6 +187,7 @@ impl CountManiaGame {
             round_serial: 0,
             interval: None,
             feedback: AnswerFeedback::new(),
+            ripple: None,
             layout: RefCell::new(None),
             renderer: CircleRenderer::new(),
         }
@@ -223,8 +228,11 @@ impl CountManiaGame {
             .clamp(1, ROUNDS_PER_SESSION)
     }
 
-    fn click_correct(&mut self) {
+    /// 正解の円をクリックした。(column, row)はクリックしたセルで、そこから波紋を広げる
+    fn click_correct(&mut self, column: u16, row: u16) {
         audio::play_se(SeKind::Correct);
+        // 前の波紋が残っていても、新しい波紋に置き換える
+        self.ripple = Some(Ripple::new(column, row));
         self.round.next += 1;
         if self.round.next > self.params.max_number {
             let latency_ms = self.round.elapsed.as_secs_f64() * 1000.0;
@@ -394,7 +402,7 @@ impl Game for CountManiaGame {
             return;
         };
         if number == self.round.next {
-            self.click_correct();
+            self.click_correct(mouse.column, mouse.row);
         } else {
             self.click_wrong();
         }
@@ -402,6 +410,8 @@ impl Game for CountManiaGame {
 
     fn update(&mut self, dt: Duration) {
         self.feedback.tick(dt);
+        // 波紋はラウンド間の待ち時間中も時間を進め、持続時間を過ぎたら消す
+        self.ripple = self.ripple.and_then(|ripple| ripple.advanced(dt));
         if let Some(remaining) = self.interval {
             let remaining = remaining.saturating_sub(dt);
             if remaining.is_zero() {
@@ -446,7 +456,8 @@ impl Game for CountManiaGame {
                     })
             })
             .collect();
-        self.renderer.render_board(frame, board, &circles);
+        self.renderer
+            .render_board(frame, board, &circles, self.ripple.as_ref());
     }
 
     fn is_finished(&self) -> bool {
@@ -977,5 +988,116 @@ mod tests {
         let result = game.result();
         // 2ラウンド目の記録は、ラウンド開始後に進めた700msだけ
         assert!((result.avg_latency_ms - 350.0).abs() < 1e-9);
+    }
+
+    // --- 波紋 ---
+
+    /// 円1・円2が重ならない配置にし、円1の内側のセル(ボード左上からの相対位置)を返す
+    fn set_separate_layout(game: &CountManiaGame) -> (u16, u16) {
+        set_layout(game, &[(1, 2, 2, 10, 5), (2, 40, 2, 10, 5)]);
+        (6, 4)
+    }
+
+    #[test]
+    fn correct_click_starts_ripple_at_clicked_cell() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let (x, y) = set_separate_layout(&game);
+        assert!(game.ripple.is_none(), "始めは波紋なし");
+        click_board(&mut game, x, y);
+        assert_eq!(game.round.next, 2);
+        let board = board_area(AREA);
+        let ripple = game.ripple.expect("正解クリックで波紋が始まる");
+        assert_eq!(
+            ripple.center(),
+            (board.x + x, board.y + y),
+            "クリックした位置が中心"
+        );
+        assert_eq!(ripple.progress(), 0.0);
+    }
+
+    #[test]
+    fn wrong_or_empty_click_does_not_start_ripple() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        set_separate_layout(&game);
+        // 円2(次に押すべきでない円)をクリック
+        click_board(&mut game, 44, 4);
+        assert_eq!(game.round.lives, 2, "不正解");
+        assert!(game.ripple.is_none(), "不正解では波紋を出さない");
+        // 円の無い所をクリック
+        click_board(&mut game, 25, 4);
+        assert!(game.ripple.is_none(), "空白のクリックでも波紋を出さない");
+    }
+
+    #[test]
+    fn update_advances_ripple_and_removes_it_after_duration() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let (x, y) = set_separate_layout(&game);
+        click_board(&mut game, x, y);
+        game.update(ripple::RIPPLE_DURATION / 2);
+        let ripple = game.ripple.expect("持続時間内は残る");
+        assert!((ripple.progress() - 0.5).abs() < 1e-9, "経過時間が進む");
+        game.update(ripple::RIPPLE_DURATION / 2);
+        assert!(game.ripple.is_none(), "持続時間を過ぎたら消える");
+    }
+
+    #[test]
+    fn new_correct_click_replaces_previous_ripple() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let (x, y) = set_separate_layout(&game);
+        click_board(&mut game, x, y);
+        game.update(ripple::RIPPLE_DURATION / 2);
+        // 円2をクリック(正解)
+        click_board(&mut game, 44, 4);
+        let board = board_area(AREA);
+        let ripple = game.ripple.unwrap();
+        assert_eq!(
+            ripple.center(),
+            (board.x + 44, board.y + 4),
+            "新しい位置に置き換わる"
+        );
+        assert_eq!(ripple.progress(), 0.0, "最初からやり直す");
+    }
+
+    #[test]
+    fn ripple_expires_during_round_interval_without_affecting_score() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        clear_round(&mut game);
+        assert!(game.ripple.is_some(), "最後の正解クリックでも波紋は始まる");
+        assert!(game.interval.is_some());
+        game.update(ripple::RIPPLE_DURATION);
+        assert!(game.ripple.is_none(), "待ち時間中も波紋の時間は進む");
+        let result = game.result();
+        assert_eq!((result.total, result.correct), (1, 1), "記録は波紋と無関係");
+    }
+
+    #[test]
+    fn fallback_render_ignores_ripple() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        let (x, y) = set_separate_layout(&game);
+        click_board(&mut game, x, y);
+        assert!(game.ripple.is_some());
+        let with_ripple = rendered_text(&game, AREA.width, AREA.height);
+        game.ripple = None;
+        assert_eq!(rendered_text(&game, AREA.width, AREA.height), with_ripple);
+    }
+
+    #[test]
+    fn image_mode_render_with_ripple_does_not_panic() {
+        use ratatui_image::picker::{Picker, ProtocolType};
+        let mut game = CountManiaGame::new(Difficulty::Advanced);
+        let mut picker = Picker::from_fontsize((4, 8));
+        picker.set_protocol_type(ProtocolType::Halfblocks);
+        game.renderer = CircleRenderer::with_picker(picker);
+        click_circle(&mut game, 1);
+        assert!(game.ripple.is_some());
+        for _ in 0..4 {
+            rendered_text(&game, AREA.width, AREA.height);
+            game.update(ripple::RIPPLE_DURATION / 3);
+        }
+        assert!(game.ripple.is_none());
+        rendered_text(&game, AREA.width, AREA.height);
+        click_circle(&mut game, 2);
+        rendered_text(&game, 20, 6);
+        rendered_text(&game, 1, 1);
     }
 }
