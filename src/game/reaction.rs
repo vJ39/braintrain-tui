@@ -17,7 +17,7 @@ use ratatui_image::StatefulImage;
 use rust_embed::RustEmbed;
 
 use crate::audio::{self, SeKind};
-use crate::game::feedback::AnswerFeedback;
+use crate::game::feedback::{AnswerFeedback, Verdict};
 use crate::game::theme;
 use crate::game::{column_index, contains, Difficulty, Game, GameResult, ScoreTracker};
 
@@ -31,6 +31,22 @@ fn split_areas(area: Rect) -> (Rect, Rect) {
 }
 
 pub const GAME_ID: &str = "reaction";
+
+/// イロピッタンの1セッションの問題数(全ゲーム共通の問題数より多い)
+const SESSION_LENGTH: u32 = 20;
+
+/// 正誤表示中に出題文字の代わりに出す記号。画像はlabel_image_fileで引く
+const CORRECT_MARK: &str = "◯";
+const INCORRECT_MARK: &str = "✗";
+
+/// 正誤判定時に鳴らす、イロピッタン専用の効果音
+fn verdict_se(is_correct: bool) -> SeKind {
+    if is_correct {
+        SeKind::ReactionCorrect
+    } else {
+        SeKind::ReactionIncorrect
+    }
+}
 
 /// 出題の文字の表記
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,7 +170,7 @@ impl ReactionGame {
         let mut rng = rand::thread_rng();
         Self {
             difficulty,
-            tracker: ScoreTracker::new(),
+            tracker: ScoreTracker::with_session_length(SESSION_LENGTH),
             // 初回は前回の出題が無い
             current: generate_question(&mut rng, difficulty, None),
             question_started_at: Instant::now(),
@@ -182,13 +198,18 @@ impl ReactionGame {
         };
         self.feedback
             .record(is_correct, format!("こたえ: {answer}"));
-        audio::play_se(if is_correct {
-            SeKind::Correct
-        } else {
-            SeKind::Incorrect
-        });
+        audio::play_se(verdict_se(is_correct));
         if !self.tracker.is_session_finished() {
             self.next_question();
+        }
+    }
+
+    /// 出題エリアに出す文字。正誤表示中は正解=◯/不正解=✗、それ以外は出題の文字
+    fn displayed_label(&self) -> &'static str {
+        match self.feedback.current().map(|flash| flash.verdict) {
+            Some(Verdict::Correct) => CORRECT_MARK,
+            Some(Verdict::Incorrect) => INCORRECT_MARK,
+            None => self.current.label,
         }
     }
 }
@@ -249,12 +270,13 @@ impl Game for ReactionGame {
         let (label_area, footer_area) = split_areas(area);
         // HUDはクリック判定の無いラベルエリアの上端から切り出す(フッターの位置は変えない)
         let (hud_area, label_area) = theme::split_hud(label_area);
-        theme::render_hud(
+        theme::render_hud_with_session_length(
             frame,
             hud_area,
             "イロピッタン",
             self.difficulty,
             self.tracker.total(),
+            self.tracker.session_length(),
             &self.feedback,
         );
 
@@ -282,12 +304,12 @@ impl Game for ReactionGame {
         let inner = block.inner(label_area);
         frame.render_widget(block, label_area);
 
-        let drawn_as_image = image_bg.is_some_and(|bg| {
-            self.label_renderer
-                .render_image(frame, inner, self.current.label, bg)
-        });
+        // 正誤表示中は出題文字の代わりに◯/✗を同じ仕組みで出す(背景色は出題の色のまま)
+        let label = self.displayed_label();
+        let drawn_as_image =
+            image_bg.is_some_and(|bg| self.label_renderer.render_image(frame, inner, label, bg));
         if !drawn_as_image {
-            render_label_text(frame, inner, self.current.label, background);
+            render_label_text(frame, inner, label, background);
         }
 
         // フッターはcolumn_index(2列)と同じ分割の2ボタン
@@ -365,6 +387,9 @@ fn label_image_file(label: &str) -> Option<&'static str> {
         "ブラウン" => Some("buraun.png"),
         "オレンジ" => Some("orenji.png"),
         "ピンク" => Some("pinku.png"),
+        // 正誤表示の記号
+        CORRECT_MARK => Some("maru.png"),
+        INCORRECT_MARK => Some("batsu.png"),
         _ => None,
     }
 }
@@ -1192,5 +1217,206 @@ mod tests {
         let game = ReactionGame::new(Difficulty::Advanced);
         render_game(&game, 4, 4);
         render_game(&game, 1, 1);
+    }
+
+    // ---- 問題数(20問) ----
+
+    #[test]
+    fn session_finishes_after_twenty_questions() {
+        let mut game = ReactionGame::new(Difficulty::Beginner);
+        for i in 0..SESSION_LENGTH - 1 {
+            game.handle_key(KeyEvent::from(KeyCode::Left));
+            assert!(!game.is_finished(), "{}問目では終わらない", i + 1);
+        }
+        game.handle_key(KeyEvent::from(KeyCode::Left));
+        assert!(game.is_finished(), "20問で終わる");
+        assert_eq!(game.result().total, 20);
+        // 終わった後の入力は記録しない
+        game.handle_key(KeyEvent::from(KeyCode::Left));
+        assert_eq!(game.result().total, 20);
+    }
+
+    #[test]
+    fn session_length_is_twenty_not_the_shared_default() {
+        assert_eq!(SESSION_LENGTH, 20);
+        let game = ReactionGame::new(Difficulty::Beginner);
+        assert_eq!(game.tracker.session_length(), 20);
+    }
+
+    #[test]
+    fn hud_shows_progress_out_of_twenty() {
+        let mut game = ReactionGame::new(Difficulty::Beginner);
+        for _ in 0..12 {
+            game.handle_key(KeyEvent::from(KeyCode::Left));
+        }
+        let (buffer, _) = render_game(&game, 60, 20);
+        let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Q13/20"), "HUDは20問中の番号を出す");
+    }
+
+    // ---- 正誤の効果音 ----
+
+    #[test]
+    fn verdict_se_uses_reaction_specific_sounds() {
+        assert_eq!(verdict_se(true), SeKind::ReactionCorrect);
+        assert_eq!(verdict_se(false), SeKind::ReactionIncorrect);
+    }
+
+    // ---- 正誤の表示(出題文字の代わりに◯/✗) ----
+
+    /// 出題エリアの内側の文字を1本の文字列にする
+    fn inner_text(buffer: &ratatui::buffer::Buffer, inner: Rect) -> String {
+        (inner.y..inner.bottom())
+            .flat_map(|y| (inner.x..inner.right()).map(move |x| (x, y)))
+            .map(|pos| buffer[pos].symbol().to_string())
+            .collect()
+    }
+
+    /// 出題を一致の問題にして答え、正誤表示中の状態にする
+    fn answer(game: &mut ReactionGame, correct: bool) {
+        game.current.is_match = true;
+        game.handle_key(KeyEvent::from(if correct {
+            KeyCode::Left
+        } else {
+            KeyCode::Right
+        }));
+        assert!(game.feedback.current().is_some());
+    }
+
+    #[test]
+    fn feedback_mark_images_are_embedded() {
+        assert_eq!(label_image_file(CORRECT_MARK), Some("maru.png"));
+        assert_eq!(label_image_file(INCORRECT_MARK), Some("batsu.png"));
+        for mark in [CORRECT_MARK, INCORRECT_MARK] {
+            let image = load_label_image(mark)
+                .unwrap_or_else(|| panic!("「{mark}」の画像が埋め込まれていること"));
+            assert_eq!(image.dimensions(), (512, 512), "正方形");
+        }
+    }
+
+    #[test]
+    fn composed_mark_image_has_black_glyph_on_background() {
+        for mark in [CORRECT_MARK, INCORRECT_MARK] {
+            let glyph = load_label_image(mark).unwrap();
+            let image = compose_label_image(&glyph, 20, 10, (10, 20), [240, 210, 0]);
+            assert_eq!(image.get_pixel(0, 0).0, [240, 210, 0, 255], "隅は背景色");
+            let black = image
+                .pixels()
+                .filter(|p| p.0[..3].iter().all(|&c| c <= 50))
+                .count();
+            assert!(black > 1000, "「{mark}」の黒が描かれる");
+        }
+    }
+
+    #[test]
+    fn displayed_label_switches_to_mark_only_while_feedback_is_shown() {
+        let mut game = ReactionGame::new(Difficulty::Beginner);
+        assert_eq!(game.displayed_label(), game.current.label, "通常は出題文字");
+
+        answer(&mut game, true);
+        assert_eq!(game.displayed_label(), CORRECT_MARK, "正解は◯");
+
+        game.update(crate::game::feedback::FEEDBACK_HOLD);
+        assert!(game.feedback.current().is_none());
+        assert_eq!(
+            game.displayed_label(),
+            game.current.label,
+            "表示後は出題文字に戻る"
+        );
+
+        answer(&mut game, false);
+        assert_eq!(game.displayed_label(), INCORRECT_MARK, "不正解は✗");
+    }
+
+    #[test]
+    fn fallback_shows_correct_mark_instead_of_label() {
+        let mut game = ReactionGame::new(Difficulty::Beginner);
+        answer(&mut game, true);
+        fixed_question(&mut game, "赤", Color::Blue);
+        let (buffer, inner) = render_game(&game, 40, 16);
+        let text = inner_text(&buffer, inner);
+        assert!(text.contains(CORRECT_MARK), "◯が描かれる: {text:?}");
+        assert!(!text.contains('赤'), "出題文字は描かない");
+        let cell = (inner.y..inner.bottom())
+            .flat_map(|y| (inner.x..inner.right()).map(move |x| (x, y)))
+            .map(|pos| &buffer[pos])
+            .find(|c| c.symbol() == CORRECT_MARK)
+            .unwrap();
+        assert_eq!(cell.fg, Color::Black, "記号も黒");
+        // 背景は出題の色のまま
+        assert_eq!(buffer[(inner.x, inner.y)].bg, Color::Blue);
+    }
+
+    #[test]
+    fn fallback_shows_incorrect_mark_instead_of_label() {
+        let mut game = ReactionGame::new(Difficulty::Beginner);
+        answer(&mut game, false);
+        fixed_question(&mut game, "青", Color::Red);
+        let (buffer, inner) = render_game(&game, 40, 16);
+        let text = inner_text(&buffer, inner);
+        assert!(text.contains(INCORRECT_MARK), "✗が描かれる: {text:?}");
+        assert!(!text.contains('青'), "出題文字は描かない");
+        assert_eq!(buffer[(inner.x, inner.y)].bg, Color::Red);
+    }
+
+    #[test]
+    fn fallback_returns_to_label_after_feedback_hold() {
+        let mut game = ReactionGame::new(Difficulty::Beginner);
+        answer(&mut game, true);
+        game.update(crate::game::feedback::FEEDBACK_HOLD);
+        fixed_question(&mut game, "赤", Color::Blue);
+        let (buffer, inner) = render_game(&game, 40, 16);
+        let text = inner_text(&buffer, inner);
+        assert!(text.contains('赤'), "出題文字に戻る");
+        assert!(!text.contains(CORRECT_MARK) && !text.contains(INCORRECT_MARK));
+    }
+
+    #[test]
+    fn image_mode_shows_mark_image_with_question_background() {
+        let mut picker = Picker::from_fontsize((10, 20));
+        picker.set_protocol_type(ProtocolType::Halfblocks);
+        let mut game = ReactionGame::new(Difficulty::Beginner);
+        game.label_renderer = LabelRenderer::with_picker(Some(picker));
+        let cached = |game: &ReactionGame| {
+            let cache = game.label_renderer.cache.borrow();
+            let cache = cache.as_ref().expect("画像で描かれていること");
+            (cache.label, cache.bg)
+        };
+
+        for (correct, mark) in [(true, CORRECT_MARK), (false, INCORRECT_MARK)] {
+            answer(&mut game, correct);
+            fixed_question(&mut game, "青", Color::Red);
+            let (buffer, inner) = render_game(&game, 60, 20);
+            let rgb = background_rgb(Color::Red);
+            assert_eq!(cached(&game), (mark, rgb), "正誤の記号を出題の背景色で描く");
+            let [r, g, b] = rgb;
+            assert_eq!(buffer[(inner.x, inner.y)].bg, Color::Rgb(r, g, b));
+
+            // 表示時間が過ぎたら出題文字の画像に戻る
+            game.update(crate::game::feedback::FEEDBACK_HOLD);
+            render_game(&game, 60, 20);
+            assert_eq!(cached(&game), ("青", rgb));
+        }
+    }
+
+    #[test]
+    fn mark_render_does_not_panic_with_image_protocols() {
+        for protocol in [
+            ProtocolType::Halfblocks,
+            ProtocolType::Sixel,
+            ProtocolType::Kitty,
+            ProtocolType::Iterm2,
+        ] {
+            let mut picker = Picker::from_fontsize((10, 20));
+            picker.set_protocol_type(protocol);
+            let mut game = ReactionGame::new(Difficulty::Beginner);
+            game.label_renderer = LabelRenderer::with_picker(Some(picker));
+            for correct in [true, false] {
+                answer(&mut game, correct);
+                render_game(&game, 60, 20);
+                render_game(&game, 4, 4);
+                render_game(&game, 12, 9);
+            }
+        }
     }
 }

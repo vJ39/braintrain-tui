@@ -102,16 +102,39 @@ pub struct GameResult {
 }
 
 /// 正誤とレイテンシの記録を積み上げ、GameResultにまとめる共通ヘルパー
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ScoreTracker {
     correct: u32,
     total: u32,
     latencies_ms: Vec<f64>,
+    /// このセッションで出題する問題数
+    session_length: u32,
+}
+
+impl Default for ScoreTracker {
+    fn default() -> Self {
+        Self::with_session_length(QUESTIONS_PER_SESSION)
+    }
 }
 
 impl ScoreTracker {
+    /// 全ゲーム共通の問題数(QUESTIONS_PER_SESSION)のセッション
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 問題数を指定したセッション。共通の問題数と違うゲームが使う
+    pub fn with_session_length(len: u32) -> Self {
+        Self {
+            correct: 0,
+            total: 0,
+            latencies_ms: Vec::new(),
+            session_length: len,
+        }
+    }
+
+    pub fn session_length(&self) -> u32 {
+        self.session_length
     }
 
     pub fn record(&mut self, is_correct: bool, latency_ms: f64) {
@@ -127,7 +150,7 @@ impl ScoreTracker {
     }
 
     pub fn is_session_finished(&self) -> bool {
-        self.total >= QUESTIONS_PER_SESSION
+        self.total >= self.session_length
     }
 
     pub fn to_result(&self, game_id: &'static str, difficulty: Difficulty) -> GameResult {
@@ -166,6 +189,42 @@ mod tests {
     fn tracker_is_finished_after_configured_questions() {
         let mut tracker = ScoreTracker::new();
         for _ in 0..QUESTIONS_PER_SESSION - 1 {
+            tracker.record(true, 50.0);
+        }
+        assert!(!tracker.is_session_finished());
+        tracker.record(true, 50.0);
+        assert!(tracker.is_session_finished());
+    }
+
+    #[test]
+    fn tracker_new_keeps_default_session_length() {
+        // 既存のnew()/default()は全ゲーム共通の問題数のまま
+        assert_eq!(ScoreTracker::new().session_length(), QUESTIONS_PER_SESSION);
+        assert_eq!(
+            ScoreTracker::default().session_length(),
+            QUESTIONS_PER_SESSION
+        );
+    }
+
+    #[test]
+    fn tracker_with_session_length_finishes_after_given_questions() {
+        let mut tracker = ScoreTracker::with_session_length(20);
+        assert_eq!(tracker.session_length(), 20);
+        for _ in 0..19 {
+            tracker.record(true, 50.0);
+        }
+        assert!(!tracker.is_session_finished(), "19問では終わらない");
+        tracker.record(false, 50.0);
+        assert!(tracker.is_session_finished(), "20問で終わる");
+        let result = tracker.to_result("test_game", Difficulty::Beginner);
+        assert_eq!(result.total, 20);
+        assert_eq!(result.correct, 19);
+    }
+
+    #[test]
+    fn tracker_with_shorter_session_length_finishes_early() {
+        let mut tracker = ScoreTracker::with_session_length(3);
+        for _ in 0..2 {
             tracker.record(true, 50.0);
         }
         assert!(!tracker.is_session_finished());
