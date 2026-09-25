@@ -50,62 +50,69 @@ struct Question {
     correct_index: usize,
 }
 
-/// Beginner: 全9マス同じ図形の繰り返し
-fn generate_beginner(rng: &mut impl Rng, shapes: &[Shape]) -> ([Cell; GRID_SIZE], Cell) {
-    let shape_index = rng.gen_range(0..shapes.len());
-    let cell = Cell {
-        shape_index,
-        angle_deg: 0.0,
-    };
-    ([cell; GRID_SIZE], cell)
+/// 出題の規則。マス(row, col)は「行rowの図形種類」を「列colの回転角度」で回転させたものになる
+#[derive(Debug, Clone, Copy)]
+struct Rules {
+    /// 行の規則: 行ごとの図形種類(3行とも別の図形)
+    row_shapes: [usize; 3],
+    /// 列の規則: 列ごとの回転角度(度)
+    col_angles: [f64; 3],
 }
 
-/// Intermediate: 行ごとに図形が変わる(各行は同じ図形、3行で3種)
-fn generate_intermediate(
-    rng: &mut impl Rng,
-    shapes: &[Shape],
-    blank_index: usize,
-) -> ([Cell; GRID_SIZE], Cell) {
-    let mut row_indices: Vec<usize> = Vec::with_capacity(3);
-    while row_indices.len() < 3 {
-        let idx = rng.gen_range(0..shapes.len());
-        if !row_indices.contains(&idx) {
-            row_indices.push(idx);
+impl Rules {
+    fn cell(&self, row: usize, col: usize) -> Cell {
+        Cell {
+            shape_index: self.row_shapes[row],
+            angle_deg: self.col_angles[col],
         }
     }
-    let mut cells = [Cell {
-        shape_index: 0,
-        angle_deg: 0.0,
-    }; GRID_SIZE];
-    for row in 0..3 {
-        for col in 0..3 {
-            cells[row * 3 + col] = Cell {
-                shape_index: row_indices[row],
-                angle_deg: 0.0,
-            };
-        }
+
+    fn cells(&self) -> [Cell; GRID_SIZE] {
+        std::array::from_fn(|i| self.cell(i / 3, i % 3))
     }
-    (cells, cells[blank_index])
 }
 
-/// Advanced: 各セルごとに一定角度ずつ回転していく(0度→step度→2*step度…)
-fn generate_advanced(rng: &mut impl Rng, shapes: &[Shape]) -> ([Cell; GRID_SIZE], Cell) {
-    // 8ステップ分(i=0..=8)を360度未満に収め、かつ全セルの角度が重複しないステップのみ採用
-    const STEP_POOL_DEG: [f64; 3] = [30.0, 40.0, 50.0];
-    let step_deg = STEP_POOL_DEG[rng.gen_range(0..STEP_POOL_DEG.len())];
-    let shape_index = rng.gen_range(0..shapes.len());
-    let mut cells = [Cell {
-        shape_index: 0,
-        angle_deg: 0.0,
-    }; GRID_SIZE];
-    for (i, cell) in cells.iter_mut().enumerate() {
-        *cell = Cell {
-            shape_index,
-            angle_deg: normalize_angle(i as f64 * step_deg),
-        };
+/// 重複しない図形種類を3つ選ぶ(行の規則用)
+fn pick_row_shapes(rng: &mut impl Rng, shape_count: usize) -> [usize; 3] {
+    let mut indices: Vec<usize> = (0..shape_count).collect();
+    indices.shuffle(rng);
+    [indices[0], indices[1], indices[2]]
+}
+
+/// 基準角度から一定刻みで増える3列分の角度を作る(列の規則用)。
+/// 刻みの最大値×2が180度未満なので、点対称な図形でも列同士の見た目が重ならない
+fn pick_col_angles(rng: &mut impl Rng, step_pool: &[f64], base_pool: &[f64]) -> [f64; 3] {
+    let step = step_pool[rng.gen_range(0..step_pool.len())];
+    let base = base_pool[rng.gen_range(0..base_pool.len())];
+    std::array::from_fn(|col| normalize_angle(base + col as f64 * step))
+}
+
+/// Beginner: 行の規則(図形種類)のみ。列は全て0度で1軸だけの出題
+fn generate_beginner(rng: &mut impl Rng, shapes: &[Shape]) -> Rules {
+    Rules {
+        row_shapes: pick_row_shapes(rng, shapes.len()),
+        col_angles: [0.0; 3],
     }
-    let blank = cells[0]; // placeholder, replaced by caller with correct index
-    (cells, blank)
+}
+
+/// Intermediate: 行の規則(図形種類)+列の規則(45度か60度刻みの回転)
+fn generate_intermediate(rng: &mut impl Rng, shapes: &[Shape]) -> Rules {
+    const STEP_POOL_DEG: [f64; 2] = [45.0, 60.0];
+    const BASE_POOL_DEG: [f64; 4] = [0.0, 90.0, 180.0, 270.0];
+    Rules {
+        row_shapes: pick_row_shapes(rng, shapes.len()),
+        col_angles: pick_col_angles(rng, &STEP_POOL_DEG, &BASE_POOL_DEG),
+    }
+}
+
+/// Advanced: 行の規則+列の規則。回転の刻みを20度か30度に狭め、基準角度も中途半端にして見分けにくくする
+fn generate_advanced(rng: &mut impl Rng, shapes: &[Shape]) -> Rules {
+    const STEP_POOL_DEG: [f64; 2] = [20.0, 30.0];
+    let base_pool: Vec<f64> = (0..24).map(|i| i as f64 * 15.0).collect();
+    Rules {
+        row_shapes: pick_row_shapes(rng, shapes.len()),
+        col_angles: pick_col_angles(rng, &STEP_POOL_DEG, &base_pool),
+    }
 }
 
 fn normalize_angle(angle_deg: f64) -> f64 {
@@ -116,102 +123,152 @@ fn normalize_angle(angle_deg: f64) -> f64 {
     a
 }
 
-fn generate_question(rng: &mut impl Rng, difficulty: Difficulty) -> Question {
-    let shapes = base_shapes();
-    let blank_index = rng.gen_range(0..GRID_SIZE);
+/// 2つのマスが画面上で同じ見た目になるか。
+/// 回転後の頂点集合で比べるので、点対称な図形の180度差のような見た目の一致も同一とみなす
+fn looks_same(shapes: &[Shape], a: Cell, b: Cell) -> bool {
+    const EPS: f64 = 1e-6;
+    let pa = shapes[a.shape_index].rotated(a.angle_deg.to_radians()).points;
+    let pb = shapes[b.shape_index].rotated(b.angle_deg.to_radians()).points;
+    pa.len() == pb.len()
+        && pa.iter().all(|&(x, y)| {
+            pb.iter()
+                .any(|&(u, v)| (x - u).abs() < EPS && (y - v).abs() < EPS)
+        })
+}
 
-    let (cells, correct_cell) = match difficulty {
-        Difficulty::Beginner => generate_beginner(rng, &shapes),
-        Difficulty::Intermediate => generate_intermediate(rng, &shapes, blank_index),
-        Difficulty::Advanced => {
-            let (cells, _) = generate_advanced(rng, &shapes);
-            (cells, cells[blank_index])
+/// 候補の中から、既存の選択肢と見た目が被らないものを1つランダムに選んで追加する
+fn push_distinct(
+    rng: &mut impl Rng,
+    shapes: &[Shape],
+    chosen: &mut Vec<Cell>,
+    candidates: &[Cell],
+) -> bool {
+    let mut pool: Vec<Cell> = candidates
+        .iter()
+        .copied()
+        .filter(|c| !chosen.iter().any(|x| looks_same(shapes, *x, *c)))
+        .collect();
+    pool.shuffle(rng);
+    match pool.first() {
+        Some(&c) => {
+            chosen.push(c);
+            true
         }
-    };
+        None => false,
+    }
+}
 
-    // (Cell, is_correct) のペアで作ってからシャッフルし、最後にcorrect_indexを特定する
-    let mut tagged: Vec<(Cell, bool)> = vec![(correct_cell, true)];
+/// 誤答3つを作る。chosenの先頭は正解
+fn build_distractors(
+    rng: &mut impl Rng,
+    shapes: &[Shape],
+    difficulty: Difficulty,
+    rules: &Rules,
+    row: usize,
+    col: usize,
+) -> Vec<Cell> {
+    let answer = rules.cell(row, col);
+    let mut chosen = vec![answer];
+    let other_rows: Vec<usize> = (0..3).filter(|&r| r != row).collect();
+    let other_cols: Vec<usize> = (0..3).filter(|&c| c != col).collect();
+
+    // 行の規則(図形種類)だけ正しい: 同じ図形を別の列の角度で
+    let shape_only: Vec<Cell> = other_cols.iter().map(|&c| rules.cell(row, c)).collect();
+    // 列の規則(回転角度)だけ正しい: 別の行の図形を同じ角度で
+    let angle_only: Vec<Cell> = other_rows.iter().map(|&r| rules.cell(r, col)).collect();
+    // 両方とも違う(グリッド上に見えている別のマス)
+    let both_wrong: Vec<Cell> = other_rows
+        .iter()
+        .flat_map(|&r| other_cols.iter().map(move |&c| (r, c)))
+        .map(|(r, c)| rules.cell(r, c))
+        .collect();
+
     match difficulty {
         Difficulty::Beginner => {
-            let mut used = vec![correct_cell.shape_index];
-            while tagged.len() < CHOICE_COUNT {
-                let idx = rng.gen_range(0..shapes.len());
-                if !used.contains(&idx) {
-                    used.push(idx);
-                    tagged.push((
-                        Cell {
-                            shape_index: idx,
-                            angle_deg: 0.0,
-                        },
-                        false,
-                    ));
-                }
+            // 角度は全て0度なので、グリッドの他の行の図形+グリッドに無い図形で埋める
+            let others: Vec<Cell> = rules
+                .row_shapes
+                .iter()
+                .enumerate()
+                .filter(|&(r, _)| r != row)
+                .map(|(_, &s)| Cell {
+                    shape_index: s,
+                    angle_deg: 0.0,
+                })
+                .collect();
+            for c in others {
+                chosen.push(c);
             }
         }
         Difficulty::Intermediate => {
-            // グリッドに使われている行の図形(正解含む)を集め、正解以外の行の図形2つ+
-            // グリッドに登場しない図形1つを不正解選択肢にする
-            let mut row_shape_indices: Vec<usize> = (0..3).map(|row| cells[row * 3].shape_index).collect();
-            row_shape_indices.dedup();
-            for &idx in &row_shape_indices {
-                if idx != correct_cell.shape_index && tagged.len() < CHOICE_COUNT - 1 + 1 {
-                    tagged.push((
-                        Cell {
-                            shape_index: idx,
-                            angle_deg: 0.0,
-                        },
-                        false,
-                    ));
-                }
-            }
-            let mut used: Vec<usize> = row_shape_indices.clone();
-            while tagged.len() < CHOICE_COUNT {
-                let idx = rng.gen_range(0..shapes.len());
-                if !used.contains(&idx) {
-                    used.push(idx);
-                    tagged.push((
-                        Cell {
-                            shape_index: idx,
-                            angle_deg: 0.0,
-                        },
-                        false,
-                    ));
-                }
-            }
+            push_distinct(rng, shapes, &mut chosen, &shape_only);
+            push_distinct(rng, shapes, &mut chosen, &angle_only);
+            let rest: Vec<Cell> = shape_only
+                .iter()
+                .chain(&angle_only)
+                .chain(&both_wrong)
+                .copied()
+                .collect();
+            push_distinct(rng, shapes, &mut chosen, &rest);
         }
         Difficulty::Advanced => {
-            let mut candidate_angles: Vec<f64> = cells
+            push_distinct(rng, shapes, &mut chosen, &shape_only);
+            push_distinct(rng, shapes, &mut chosen, &angle_only);
+            // 同じ図形で、列の角度の並びを1歩はみ出した(グリッドに無い)角度。
+            // 角度の刻みが狭いので、どの列の角度かを正確に見ないと区別できない
+            let step = normalize_angle(rules.col_angles[1] - rules.col_angles[0]);
+            let off_grid: Vec<Cell> = [-step, 3.0 * step]
                 .iter()
-                .filter(|c| (c.angle_deg - correct_cell.angle_deg).abs() > 1e-9)
-                .map(|c| c.angle_deg)
+                .map(|&d| Cell {
+                    shape_index: answer.shape_index,
+                    angle_deg: normalize_angle(rules.col_angles[0] + d),
+                })
                 .collect();
-            candidate_angles.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
-            candidate_angles.shuffle(rng);
-            for angle in candidate_angles.into_iter().take(CHOICE_COUNT - 1) {
-                tagged.push((
-                    Cell {
-                        shape_index: correct_cell.shape_index,
-                        angle_deg: angle,
-                    },
-                    false,
-                ));
-            }
-            // グリッド内に十分な数の異なる角度が無い場合のフォールバック
-            while tagged.len() < CHOICE_COUNT {
-                let extra = normalize_angle(correct_cell.angle_deg + rng.gen_range(10..350) as f64);
-                if !tagged.iter().any(|(c, _)| (c.angle_deg - extra).abs() < 1e-9) {
-                    tagged.push((
-                        Cell {
-                            shape_index: correct_cell.shape_index,
-                            angle_deg: extra,
-                        },
-                        false,
-                    ));
-                }
+            if !push_distinct(rng, shapes, &mut chosen, &off_grid) {
+                let rest: Vec<Cell> = shape_only.iter().chain(&both_wrong).copied().collect();
+                push_distinct(rng, shapes, &mut chosen, &rest);
             }
         }
     }
 
+    // 候補不足時のフォールバック: グリッドに登場しない図形を正解と同じ角度で足す
+    let mut unused: Vec<usize> = (0..shapes.len())
+        .filter(|s| !rules.row_shapes.contains(s))
+        .collect();
+    unused.shuffle(rng);
+    for s in unused {
+        if chosen.len() >= CHOICE_COUNT {
+            break;
+        }
+        let c = Cell {
+            shape_index: s,
+            angle_deg: answer.angle_deg,
+        };
+        if !chosen.iter().any(|x| looks_same(shapes, *x, c)) {
+            chosen.push(c);
+        }
+    }
+    chosen.truncate(CHOICE_COUNT);
+    chosen.split_off(1)
+}
+
+fn generate_question(rng: &mut impl Rng, difficulty: Difficulty) -> Question {
+    let shapes = base_shapes();
+    let blank_index = rng.gen_range(0..GRID_SIZE);
+    let (row, col) = (blank_index / 3, blank_index % 3);
+
+    let rules = match difficulty {
+        Difficulty::Beginner => generate_beginner(rng, &shapes),
+        Difficulty::Intermediate => generate_intermediate(rng, &shapes),
+        Difficulty::Advanced => generate_advanced(rng, &shapes),
+    };
+    let cells = rules.cells();
+    let correct_cell = cells[blank_index];
+    let distractors = build_distractors(rng, &shapes, difficulty, &rules, row, col);
+
+    // (Cell, is_correct) のペアで作ってからシャッフルし、最後にcorrect_indexを特定する
+    let mut tagged: Vec<(Cell, bool)> = vec![(correct_cell, true)];
+    tagged.extend(distractors.into_iter().map(|c| (c, false)));
     tagged.shuffle(rng);
     let correct_index = tagged.iter().position(|(_, is_correct)| *is_correct).unwrap();
     let choices: [Cell; CHOICE_COUNT] = tagged
@@ -494,23 +551,65 @@ mod tests {
         }
     }
 
+    const ALL_DIFFICULTIES: [Difficulty; 3] = [
+        Difficulty::Beginner,
+        Difficulty::Intermediate,
+        Difficulty::Advanced,
+    ];
+
+    /// 角度が360度を法として等しいか
+    fn same_angle(a: f64, b: f64) -> bool {
+        let d = normalize_angle(a - b);
+        d < 1e-6 || (360.0 - d) < 1e-6
+    }
+
+    /// 行ごとの図形種類(同じ行の3マスは同じ図形であることも検証する)
+    fn row_shapes_of(q: &Question) -> [usize; 3] {
+        std::array::from_fn(|row| {
+            let expected = q.cells[row * 3].shape_index;
+            for col in 0..3 {
+                assert_eq!(
+                    q.cells[row * 3 + col].shape_index,
+                    expected,
+                    "行{row}の図形種類が揃っていない"
+                );
+            }
+            expected
+        })
+    }
+
+    /// 列ごとの回転角度(同じ列の3マスは同じ角度であることも検証する)
+    fn col_angles_of(q: &Question) -> [f64; 3] {
+        std::array::from_fn(|col| {
+            let expected = q.cells[col].angle_deg;
+            for row in 0..3 {
+                assert!(
+                    same_angle(q.cells[row * 3 + col].angle_deg, expected),
+                    "列{col}の回転角度が揃っていない"
+                );
+            }
+            expected
+        })
+    }
+
     #[test]
-    fn beginner_grid_is_a_single_repeated_shape() {
+    fn beginner_uses_only_the_row_rule_with_all_angles_zero() {
         let mut rng = StdRng::seed_from_u64(11);
-        for _ in 0..50 {
+        for _ in 0..100 {
             let q = generate_question(&mut rng, Difficulty::Beginner);
-            let expected = q.cells[0].shape_index;
-            assert!(q.cells.iter().all(|c| c.shape_index == expected));
+            let mut shapes = row_shapes_of(&q).to_vec();
+            shapes.sort();
+            shapes.dedup();
+            assert_eq!(shapes.len(), 3, "行ごとに別の図形種類であること");
             assert!(q.cells.iter().all(|c| c.angle_deg == 0.0));
-            let correct = q.choices[q.correct_index];
-            assert_eq!(correct.shape_index, expected);
+            assert!(q.choices.iter().all(|c| c.angle_deg == 0.0));
         }
     }
 
     #[test]
     fn beginner_choices_have_no_duplicate_shapes() {
         let mut rng = StdRng::seed_from_u64(12);
-        for _ in 0..50 {
+        for _ in 0..100 {
             let q = generate_question(&mut rng, Difficulty::Beginner);
             let mut indices: Vec<usize> = q.choices.iter().map(|c| c.shape_index).collect();
             indices.sort();
@@ -520,80 +619,150 @@ mod tests {
     }
 
     #[test]
-    fn intermediate_rows_share_the_same_shape() {
+    fn intermediate_and_advanced_follow_both_row_and_column_rules() {
         let mut rng = StdRng::seed_from_u64(13);
-        for _ in 0..50 {
-            let q = generate_question(&mut rng, Difficulty::Intermediate);
-            for row in 0..3 {
-                let expected = q.cells[row * 3].shape_index;
-                for col in 0..3 {
-                    assert_eq!(q.cells[row * 3 + col].shape_index, expected);
+        for difficulty in [Difficulty::Intermediate, Difficulty::Advanced] {
+            for _ in 0..100 {
+                let q = generate_question(&mut rng, difficulty);
+                let mut shapes = row_shapes_of(&q).to_vec();
+                shapes.sort();
+                shapes.dedup();
+                assert_eq!(shapes.len(), 3, "{difficulty:?}: 行の図形種類が重複している");
+
+                let angles = col_angles_of(&q);
+                for i in 0..3 {
+                    for j in (i + 1)..3 {
+                        let d = normalize_angle(angles[i] - angles[j]);
+                        assert!(
+                            !same_angle(d, 0.0) && !same_angle(d, 180.0),
+                            "{difficulty:?}: 列{i}と列{j}の角度が同一か180度差で見分けがつかない"
+                        );
+                    }
                 }
             }
-            let blank_row = q.blank_index / 3;
-            let expected_shape = q.cells[blank_row * 3].shape_index;
-            let correct = q.choices[q.correct_index];
-            assert_eq!(correct.shape_index, expected_shape);
         }
     }
 
     #[test]
-    fn intermediate_uses_three_distinct_row_shapes() {
+    fn advanced_uses_finer_angle_steps_than_intermediate() {
+        // Advancedは隣接列の角度差を小さくして見分けにくくする
+        let min_step = |q: &Question| {
+            let a = col_angles_of(q);
+            (0..2)
+                .map(|i| {
+                    let d = normalize_angle(a[i + 1] - a[i]);
+                    d.min(360.0 - d)
+                })
+                .fold(f64::MAX, f64::min)
+        };
         let mut rng = StdRng::seed_from_u64(14);
-        for _ in 0..50 {
-            let q = generate_question(&mut rng, Difficulty::Intermediate);
-            let mut row_shapes: Vec<usize> = (0..3).map(|row| q.cells[row * 3].shape_index).collect();
-            row_shapes.sort();
-            row_shapes.dedup();
-            assert_eq!(row_shapes.len(), 3, "行の図形が重複している");
+        for _ in 0..100 {
+            let inter = generate_question(&mut rng, Difficulty::Intermediate);
+            let adv = generate_question(&mut rng, Difficulty::Advanced);
+            assert!(min_step(&inter) >= 45.0 - 1e-6);
+            assert!(min_step(&adv) <= 30.0 + 1e-6);
+            assert!(min_step(&adv) > 0.0);
         }
     }
 
     #[test]
-    fn advanced_cells_rotate_by_a_constant_step() {
+    fn correct_choice_satisfies_the_blank_row_and_column_rules() {
         let mut rng = StdRng::seed_from_u64(15);
-        for _ in 0..50 {
-            let q = generate_question(&mut rng, Difficulty::Advanced);
-            let shape_index = q.cells[0].shape_index;
-            assert!(q.cells.iter().all(|c| c.shape_index == shape_index));
+        for difficulty in ALL_DIFFICULTIES {
+            for _ in 0..100 {
+                let q = generate_question(&mut rng, difficulty);
+                let row = q.blank_index / 3;
+                let col = q.blank_index % 3;
+                let correct = q.choices[q.correct_index];
+                // 空欄以外の同じ行のマスから図形種類、同じ列のマスから角度が決まる
+                let other_in_row = (0..3).find(|&c| c != col).unwrap();
+                let other_in_col = (0..3).find(|&r| r != row).unwrap();
+                assert_eq!(correct.shape_index, q.cells[row * 3 + other_in_row].shape_index);
+                assert!(same_angle(
+                    correct.angle_deg,
+                    q.cells[other_in_col * 3 + col].angle_deg
+                ));
+                assert_eq!(correct, q.cells[q.blank_index]);
+            }
+        }
+    }
 
-            let step = {
-                // i=1のセルの角度を基準ステップとみなす(全セル同一ステップである前提)
-                let mut d = q.cells[1].angle_deg - q.cells[0].angle_deg;
-                if d < 0.0 {
-                    d += 360.0;
+    #[test]
+    fn exactly_one_choice_looks_like_the_answer_and_choices_are_distinct() {
+        let shapes = base_shapes();
+        let mut rng = StdRng::seed_from_u64(16);
+        for difficulty in ALL_DIFFICULTIES {
+            for _ in 0..200 {
+                let q = generate_question(&mut rng, difficulty);
+                let answer = q.cells[q.blank_index];
+                let matching = q
+                    .choices
+                    .iter()
+                    .filter(|c| looks_same(&shapes, **c, answer))
+                    .count();
+                assert_eq!(matching, 1, "{difficulty:?}: 正解と同じ見た目の選択肢が1つでない");
+                for i in 0..CHOICE_COUNT {
+                    for j in (i + 1)..CHOICE_COUNT {
+                        assert!(
+                            !looks_same(&shapes, q.choices[i], q.choices[j]),
+                            "{difficulty:?}: 選択肢{i}と{j}が同じ見た目"
+                        );
+                    }
                 }
-                d
-            };
-            for i in 0..GRID_SIZE {
-                let expected = normalize_angle(i as f64 * step);
-                let actual = q.cells[i].angle_deg;
+            }
+        }
+    }
+
+    #[test]
+    fn intermediate_and_advanced_mix_in_one_axis_only_distractors() {
+        let mut rng = StdRng::seed_from_u64(17);
+        for difficulty in [Difficulty::Intermediate, Difficulty::Advanced] {
+            for _ in 0..100 {
+                let q = generate_question(&mut rng, difficulty);
+                let correct = q.choices[q.correct_index];
+                let wrongs: Vec<Cell> = (0..CHOICE_COUNT)
+                    .filter(|&i| i != q.correct_index)
+                    .map(|i| q.choices[i])
+                    .collect();
+                // 行の規則(図形種類)だけ正しい誤答
                 assert!(
-                    (expected - actual).abs() < 1e-6,
-                    "セル{i}の角度が規則から外れている: expected={expected}, actual={actual}"
+                    wrongs.iter().any(|c| c.shape_index == correct.shape_index
+                        && !same_angle(c.angle_deg, correct.angle_deg)),
+                    "{difficulty:?}: 図形種類だけ正しい誤答が無い"
+                );
+                // 列の規則(回転角度)だけ正しい誤答
+                assert!(
+                    wrongs.iter().any(|c| c.shape_index != correct.shape_index
+                        && same_angle(c.angle_deg, correct.angle_deg)),
+                    "{difficulty:?}: 回転角度だけ正しい誤答が無い"
                 );
             }
-
-            let correct = q.choices[q.correct_index];
-            assert_eq!(correct.shape_index, shape_index);
-            assert!((correct.angle_deg - q.cells[q.blank_index].angle_deg).abs() < 1e-6);
         }
     }
 
     #[test]
-    fn advanced_choices_have_distinct_angles() {
-        let mut rng = StdRng::seed_from_u64(16);
-        for _ in 0..50 {
-            let q = generate_question(&mut rng, Difficulty::Advanced);
-            let mut angles: Vec<i64> = q
-                .choices
-                .iter()
-                .map(|c| (c.angle_deg.round()) as i64)
-                .collect();
-            angles.sort();
-            angles.dedup();
-            assert_eq!(angles.len(), CHOICE_COUNT, "選択肢の回転角が重複している");
-        }
+    fn looks_same_compares_rendered_appearance() {
+        // 点対称な図形(平行四辺形)は180度回転しても同じ見た目になる
+        let symmetric = vec![Shape::new(vec![
+            (-0.6, -0.4),
+            (0.4, -0.4),
+            (0.6, 0.4),
+            (-0.4, 0.4),
+        ])];
+        let a = Cell { shape_index: 0, angle_deg: 30.0 };
+        let b = Cell { shape_index: 0, angle_deg: 210.0 };
+        assert!(looks_same(&symmetric, a, b));
+        let shapes = base_shapes();
+        // 非対称な直角三角形は180度回転で見た目が変わる
+        let t0 = Cell { shape_index: 0, angle_deg: 30.0 };
+        let t1 = Cell { shape_index: 0, angle_deg: 210.0 };
+        assert!(!looks_same(&shapes, t0, t1));
+        // 360度回転は同じ見た目
+        let t2 = Cell { shape_index: 0, angle_deg: 390.0 };
+        assert!(looks_same(&shapes, t0, t2));
+        // 別の図形は同じ見た目にならない
+        let other = Cell { shape_index: 1, angle_deg: 30.0 };
+        assert!(!looks_same(&shapes, t0, other));
     }
 
     #[test]
@@ -602,6 +771,26 @@ mod tests {
         assert!((normalize_angle(370.0) - 10.0).abs() < 1e-9);
         assert!((normalize_angle(-30.0) - 330.0).abs() < 1e-9);
         assert!((normalize_angle(720.0) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pressing_number_key_answers_with_that_choice() {
+        let mut game = PatternFillGame::new(Difficulty::Intermediate);
+        let correct = game.current.correct_index;
+        let key = KeyEvent::new(
+            KeyCode::Char(char::from_digit(correct as u32 + 1, 10).unwrap()),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        game.handle_key(key);
+        let result = game.tracker.to_result(GAME_ID, game.difficulty);
+        assert_eq!(result.total, 1);
+        assert_eq!(result.correct, 1);
+        // 範囲外のキーは無視される
+        game.handle_key(KeyEvent::new(
+            KeyCode::Char('5'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(game.tracker.total(), 1);
     }
 
     #[test]
