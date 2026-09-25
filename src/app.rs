@@ -23,6 +23,7 @@ use crate::game::shape_rotate::ShapeRotateGame;
 use crate::game::theme;
 use crate::game::{Difficulty, Game, GameResult};
 use crate::stats::store;
+use crate::ui::countdown::{self, CountdownState};
 
 const MENU_ITEMS: [&str; 13] = [
     "図形回転判定",
@@ -57,6 +58,14 @@ pub enum Screen {
     SelectSong(usize),
     /// (メニュー項目, リズムゲームの場合は選んだ曲)
     SelectDifficulty(usize, Option<usize>),
+    /// ゲーム開始前のカウントダウン(リズムゲーム以外)。終わるとitemのゲームを
+    /// difficultyで作ってPlayingへ進む。ゲームは生成時に回答時間の計測を始めるため、
+    /// カウントダウンが終わってから作る
+    Countdown {
+        item: usize,
+        difficulty: Difficulty,
+        state: CountdownState,
+    },
     Playing(Box<dyn Game>),
     Result(GameResult),
     History,
@@ -118,6 +127,8 @@ impl App {
                 let (item, song) = (*item, *song);
                 self.handle_difficulty_key(key, item, song);
             }
+            // カウントダウン中はスキップ不可なので入力を無視する
+            Screen::Countdown { .. } => {}
             Screen::Playing(game) => {
                 game.handle_key(key);
                 if game.is_finished() {
@@ -160,6 +171,7 @@ impl App {
                     self.start_playing(item, difficulty, song);
                 }
             }
+            Screen::Countdown { .. } => {}
             Screen::Playing(game) => {
                 game.handle_mouse(mouse, area);
                 if game.is_finished() {
@@ -209,10 +221,11 @@ impl App {
         self.screen = Screen::SelectDifficulty(RHYTHM_ITEM_INDEX, Some(song));
     }
 
-    /// 難易度決定後、指定ゲームを開始しPlaying用BGMに切り替える(キー/クリック共通)
+    /// 難易度決定後、指定ゲームを開始する(キー/クリック共通)。リズムゲームはすぐに
+    /// プレイを始め、それ以外はPlaying用BGMに切り替えてカウントダウンを挟む
     fn start_playing(&mut self, item: usize, difficulty: Difficulty, song: Option<usize>) {
-        audio::play_se(SeKind::Transition);
         if item == RHYTHM_ITEM_INDEX {
+            audio::play_se(SeKind::Transition);
             self.start_rhythm(song.unwrap_or(0), difficulty);
             return;
         }
@@ -220,7 +233,16 @@ impl App {
             audio::play_bgm_track(&name);
             self.current_bgm = Some(name);
         }
-        self.screen = Screen::Playing(new_game(item, difficulty));
+        let state = CountdownState::new();
+        // 最初のフェーズ「3」の音。画面遷移の音(Transition)も兼ねる
+        if let Some(phase) = state.phase() {
+            audio::play_se(phase.se());
+        }
+        self.screen = Screen::Countdown {
+            item,
+            difficulty,
+            state,
+        };
     }
 
     /// リズムゲームを開始する。譜面生成を先に済ませ、選んだ曲のBGM再生を始めた直後に
@@ -349,8 +371,22 @@ impl App {
     }
 
     pub fn update(&mut self, dt: Duration) {
-        if let Screen::Playing(game) = &mut self.screen {
-            game.update(dt);
+        match &mut self.screen {
+            Screen::Playing(game) => game.update(dt),
+            Screen::Countdown {
+                item,
+                difficulty,
+                state,
+            } => {
+                if let Some(phase) = state.tick(dt) {
+                    audio::play_se(phase.se());
+                }
+                if state.is_finished() {
+                    let (item, difficulty) = (*item, *difficulty);
+                    self.screen = Screen::Playing(new_game(item, difficulty));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -369,6 +405,7 @@ impl App {
                 };
                 render_difficulty_select(frame, area, &title)
             }
+            Screen::Countdown { state, .. } => countdown::render(frame, area, state),
             Screen::Playing(game) => game.render(frame, area),
             Screen::Result(result) => render_result(frame, area, result),
             Screen::History => render_history(frame, area),
@@ -837,6 +874,7 @@ mod tests {
             Screen::SelectDifficulty(COUNT_MANIA_ITEM_INDEX, None)
         ));
         app.handle_key(KeyEvent::from(KeyCode::Char('1')));
+        finish_countdown(&mut app);
         let Screen::Playing(game) = &app.screen else {
             panic!("Playing画面のはず");
         };
@@ -870,6 +908,7 @@ mod tests {
             Screen::SelectDifficulty(COLOR_STACK_ITEM_INDEX, None)
         ));
         app.handle_key(KeyEvent::from(KeyCode::Char('1')));
+        finish_countdown(&mut app);
         let Screen::Playing(game) = &app.screen else {
             panic!("Playing画面のはず");
         };
@@ -1081,6 +1120,7 @@ mod tests {
         let mut app = App::new();
         app.select_menu_item(0); // shape_rotate
         app.handle_key(KeyEvent::from(KeyCode::Char('1'))); // Beginnerでプレイ開始
+        finish_countdown(&mut app);
         for _ in 0..crate::game::QUESTIONS_PER_SESSION {
             app.handle_key(KeyEvent::from(KeyCode::Left));
         }
@@ -1308,5 +1348,204 @@ mod tests {
                 .unwrap_or_else(|| panic!("{}が描かれていること", song.display_name));
             assert_eq!(song_at_row(area, row as u16), Some(i));
         }
+    }
+
+    // --- ゲーム開始前のカウントダウン ---
+
+    use crate::ui::countdown::{Phase, PHASE_DURATION};
+
+    /// カウントダウン全体の長さ(3/2/1/GO!!の4フェーズ)
+    const COUNTDOWN_TOTAL: Duration = Duration::from_millis(2400);
+
+    /// カウントダウンを最後まで進めてPlaying画面にする
+    fn finish_countdown(app: &mut App) {
+        assert!(
+            matches!(app.screen, Screen::Countdown { .. }),
+            "カウントダウン画面のはず"
+        );
+        app.update(COUNTDOWN_TOTAL);
+        assert!(matches!(app.screen, Screen::Playing(_)), "Playing画面のはず");
+    }
+
+    /// DDR以外のゲームのメニュー項目一覧
+    fn non_rhythm_game_items() -> impl Iterator<Item = usize> {
+        (0..JUKEBOX_ITEM_INDEX).filter(|&item| item != RHYTHM_ITEM_INDEX)
+    }
+
+    fn left_click(row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn countdown_total_matches_four_phases() {
+        assert_eq!(PHASE_DURATION * 4, COUNTDOWN_TOTAL);
+    }
+
+    #[test]
+    fn starting_any_non_rhythm_game_goes_through_countdown() {
+        for item in non_rhythm_game_items() {
+            let mut app = App::new();
+            app.screen = Screen::SelectDifficulty(item, None);
+            app.handle_key(KeyEvent::from(KeyCode::Char('2')));
+            let Screen::Countdown {
+                item: counting_item,
+                difficulty,
+                state,
+            } = &app.screen
+            else {
+                panic!("item={item}: カウントダウン画面のはず");
+            };
+            assert_eq!(*counting_item, item);
+            assert_eq!(*difficulty, Difficulty::Intermediate);
+            assert_eq!(state.phase(), Some(Phase::Three), "item={item}: 3から始まる");
+        }
+    }
+
+    #[test]
+    fn clicking_difficulty_also_goes_through_countdown() {
+        let mut app = App::new();
+        app.screen = Screen::SelectDifficulty(0, None);
+        app.last_area = rect(0, 0, 80, 24);
+        let inner_top = Block::default()
+            .borders(Borders::ALL)
+            .inner(app.last_area)
+            .y;
+        app.handle_mouse(left_click(inner_top + DIFFICULTY_ROWS_OFFSET + 2));
+        assert!(matches!(
+            app.screen,
+            Screen::Countdown {
+                item: 0,
+                difficulty: Difficulty::Advanced,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn starting_rhythm_goes_straight_to_playing_without_countdown() {
+        let mut app = App::new();
+        app.screen = Screen::SelectDifficulty(RHYTHM_ITEM_INDEX, Some(0));
+        app.handle_key(KeyEvent::from(KeyCode::Char('1')));
+        let Screen::Playing(game) = &app.screen else {
+            panic!("DDRはカウントダウンを挟まずPlaying画面になるはず");
+        };
+        assert_eq!(game.result().game_id, crate::game::rhythm::GAME_ID);
+    }
+
+    #[test]
+    fn countdown_advances_phases_with_update_and_stays_until_total() {
+        let mut app = App::new();
+        app.screen = Screen::SelectDifficulty(0, None);
+        app.handle_key(KeyEvent::from(KeyCode::Char('1')));
+        let phase_of = |app: &App| match &app.screen {
+            Screen::Countdown { state, .. } => state.phase(),
+            _ => None,
+        };
+        assert_eq!(phase_of(&app), Some(Phase::Three));
+        app.update(PHASE_DURATION);
+        assert_eq!(phase_of(&app), Some(Phase::Two));
+        app.update(PHASE_DURATION);
+        assert_eq!(phase_of(&app), Some(Phase::One));
+        app.update(PHASE_DURATION);
+        assert_eq!(phase_of(&app), Some(Phase::Go));
+        app.update(PHASE_DURATION - Duration::from_millis(1));
+        assert!(
+            matches!(app.screen, Screen::Countdown { .. }),
+            "2.4秒経つまではカウントダウンのまま"
+        );
+        app.update(Duration::from_millis(1));
+        assert!(matches!(app.screen, Screen::Playing(_)));
+    }
+
+    #[test]
+    fn countdown_finishes_into_the_selected_game_for_every_item() {
+        for item in non_rhythm_game_items() {
+            let mut app = App::new();
+            app.screen = Screen::SelectDifficulty(item, None);
+            app.handle_key(KeyEvent::from(KeyCode::Char('3')));
+            finish_countdown(&mut app);
+            let Screen::Playing(game) = &app.screen else {
+                unreachable!();
+            };
+            let expected = new_game(item, Difficulty::Advanced).result();
+            let result = game.result();
+            assert_eq!(result.game_id, expected.game_id, "item={item}");
+            assert_eq!(result.difficulty, Difficulty::Advanced, "item={item}");
+            assert!(!game.is_finished(), "item={item}: 始まったばかり");
+        }
+    }
+
+    #[test]
+    fn keys_during_countdown_are_ignored() {
+        let mut app = App::new();
+        app.screen = Screen::SelectDifficulty(0, None); // shape_rotate
+        app.handle_key(KeyEvent::from(KeyCode::Char('1')));
+        // ゲームを最後まで回答し切れる回数ぶん押しても、カウントダウン中は何も起きない
+        for _ in 0..crate::game::QUESTIONS_PER_SESSION {
+            app.handle_key(KeyEvent::from(KeyCode::Left));
+            app.handle_key(KeyEvent::from(KeyCode::Enter));
+            app.handle_key(KeyEvent::from(KeyCode::Esc));
+        }
+        let Screen::Countdown { state, .. } = &app.screen else {
+            panic!("キー入力でカウントダウンが飛ばされないこと");
+        };
+        assert_eq!(state.phase(), Some(Phase::Three), "キー入力でフェーズが進まないこと");
+
+        finish_countdown(&mut app);
+        let Screen::Playing(game) = &app.screen else {
+            unreachable!();
+        };
+        assert!(!game.is_finished(), "カウントダウン中のキーがゲームに届いていないこと");
+        assert_eq!(game.result().total, 0, "回答数0のまま");
+    }
+
+    #[test]
+    fn mouse_clicks_during_countdown_are_ignored() {
+        let mut app = App::new();
+        app.screen = Screen::SelectDifficulty(COUNT_MANIA_ITEM_INDEX, None); // マウス専用ゲーム
+        app.handle_key(KeyEvent::from(KeyCode::Char('1')));
+        app.last_area = rect(0, 0, 80, 24);
+        for row in 0..24 {
+            app.handle_mouse(left_click(row));
+        }
+        let Screen::Countdown { state, .. } = &app.screen else {
+            panic!("クリックでカウントダウンが飛ばされないこと");
+        };
+        assert_eq!(state.phase(), Some(Phase::Three));
+
+        finish_countdown(&mut app);
+        let Screen::Playing(game) = &app.screen else {
+            unreachable!();
+        };
+        assert_eq!(game.result().game_id, crate::game::count_mania::GAME_ID);
+        assert!(!game.is_finished());
+    }
+
+    #[test]
+    fn game_is_playable_after_countdown() {
+        let mut app = App::new();
+        app.screen = Screen::SelectDifficulty(0, None); // shape_rotate
+        app.handle_key(KeyEvent::from(KeyCode::Char('1')));
+        finish_countdown(&mut app);
+        for _ in 0..crate::game::QUESTIONS_PER_SESSION {
+            app.handle_key(KeyEvent::from(KeyCode::Left));
+        }
+        let Screen::Result(result) = &app.screen else {
+            panic!("全問回答したらリザルト画面になるはず");
+        };
+        assert_eq!(result.total, crate::game::QUESTIONS_PER_SESSION);
+    }
+
+    #[test]
+    fn countdown_screen_renders_big_text() {
+        let mut app = App::new();
+        app.screen = Screen::SelectDifficulty(0, None);
+        app.handle_key(KeyEvent::from(KeyCode::Char('1')));
+        assert!(rendered_text(&mut app).contains('█'));
     }
 }
