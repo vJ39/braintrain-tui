@@ -37,6 +37,18 @@ pub const WAITING_TEXT: &str = "まだ待て";
 /// 合図の表示
 pub const SIGNAL_TEXT: &str = "今だ!";
 
+/// 合図の文字と文字の間の区切り。全角スペースで間隔を広げ、目立つ見た目にする
+const SIGNAL_TEXT_GAP: &str = "　";
+
+/// 合図表示用に、文字間を広げた見出し文字列("今　だ　！")を作る
+fn signal_headline() -> String {
+    SIGNAL_TEXT
+        .chars()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(SIGNAL_TEXT_GAP)
+}
+
 /// 合図までの待機時間のパターン。ラウンドごとにランダムで選ぶ
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitPattern {
@@ -147,13 +159,14 @@ impl QuickDrawGame {
     }
 
     fn render_board(&self, frame: &mut Frame, area: Rect) {
-        let (background, headline, text_color) = match &self.phase {
+        let (background, headline, text_color, show_hint) = match &self.phase {
             Phase::Countdown { state } => {
                 countdown::render(frame, area, state);
                 return;
             }
-            Phase::Waiting { .. } => (WAITING_BG, WAITING_TEXT, theme::TEXT),
-            Phase::Signal { .. } => (SIGNAL_BG, SIGNAL_TEXT, Color::Black),
+            Phase::Waiting { .. } => (WAITING_BG, WAITING_TEXT.to_string(), theme::TEXT, true),
+            // 合図は文字間を広げて単独表示し、操作説明を消して見出しだけに注目を集める
+            Phase::Signal { .. } => (SIGNAL_BG, signal_headline(), Color::Black, false),
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -163,17 +176,17 @@ impl QuickDrawGame {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let lines = vec![
-            Line::from(Span::styled(
-                headline,
-                Style::default().fg(text_color).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
+        let mut lines = vec![Line::from(Span::styled(
+            headline,
+            Style::default().fg(text_color).add_modifier(Modifier::BOLD),
+        ))];
+        if show_hint {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
                 "合図が出たら Enter / Space / クリック",
                 Style::default().fg(text_color),
-            )),
-        ];
+            )));
+        }
         let text_area = theme::vertical_center(inner, lines.len() as u16);
         frame.render_widget(
             Paragraph::new(lines).alignment(Alignment::Center),
@@ -783,9 +796,54 @@ mod tests {
         show_signal_since(&mut game, ms(0));
         let buffer = rendered(&game);
         let text = text_of(&buffer);
-        assert!(text.contains(SIGNAL_TEXT), "合図後は「今だ!」");
+        for c in SIGNAL_TEXT.chars() {
+            assert!(text.contains(c), "合図後は「今だ!」の文字を含む: {c}");
+        }
         assert!(!text.contains(WAITING_TEXT));
         assert_eq!(body_center_bg(&buffer), SIGNAL_BG);
+    }
+
+    #[test]
+    fn signal_headline_spaces_out_each_character() {
+        assert_eq!(signal_headline(), "今　だ　!");
+    }
+
+    #[test]
+    fn signal_text_is_shown_in_black_and_bold() {
+        let mut game = QuickDrawGame::new();
+        show_signal_since(&mut game, ms(0));
+        let buffer = rendered(&game);
+        let cell = (0..buffer.area().height)
+            .flat_map(|y| (0..buffer.area().width).map(move |x| (x, y)))
+            .map(|pos| &buffer[pos])
+            .find(|c| c.symbol() == "今")
+            .expect("「今」が描かれること");
+        assert_eq!(cell.fg, Color::Black, "合図の文字は黒");
+        assert!(
+            cell.modifier.contains(Modifier::BOLD),
+            "合図の文字は太字で強調する"
+        );
+    }
+
+    #[test]
+    fn signal_hides_the_hint_line_to_emphasize_the_headline() {
+        let mut game = QuickDrawGame::new();
+        show_signal_since(&mut game, ms(0));
+        let buffer = rendered(&game);
+        let text = text_of(&buffer);
+        assert!(
+            !text.contains("Enter"),
+            "合図表示中は見出しだけを目立たせ、操作説明は出さない"
+        );
+    }
+
+    #[test]
+    fn waiting_still_shows_the_hint_line() {
+        let mut game = QuickDrawGame::new();
+        finish_countdown(&mut game);
+        let buffer = rendered(&game);
+        let text = text_of(&buffer);
+        assert!(text.contains("Enter"), "待機中は従来通り操作説明を出す");
     }
 
     #[test]
@@ -796,7 +854,10 @@ mod tests {
         game.update(ms(50));
         let buffer = rendered(&game);
         assert_eq!(body_center_bg(&buffer), SIGNAL_BG);
-        assert!(text_of(&buffer).contains(SIGNAL_TEXT));
+        let text = text_of(&buffer);
+        for c in SIGNAL_TEXT.chars() {
+            assert!(text.contains(c));
+        }
     }
 
     #[test]
