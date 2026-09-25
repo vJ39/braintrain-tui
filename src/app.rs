@@ -24,6 +24,7 @@ use crate::game::theme;
 use crate::game::{Difficulty, Game, GameResult};
 use crate::stats::store;
 use crate::ui::countdown::{self, CountdownState};
+use crate::ui::splash::{self, SplashRenderer};
 
 const MENU_ITEMS: [&str; 13] = [
     "図形回転判定",
@@ -54,6 +55,9 @@ pub enum Screen {
     /// 起動直後のタイトル画面。Enterを押すとMenuへ進む
     Splash,
     Menu,
+    /// メニューでTTR(リズムゲーム)を選んだ直後のスプラッシュ画面。
+    /// Enter/クリックで曲選択(SelectSong)へ進む
+    RhythmSplash,
     /// リズムゲームの曲選択(選択中の曲 = SONGSのインデックス)
     SelectSong(usize),
     /// (メニュー項目, リズムゲームの場合は選んだ曲)
@@ -85,7 +89,9 @@ pub struct App {
     last_area: Rect,
     /// 現在再生中のBGMトラック名(ジュークボックス画面のハイライト表示に使う)
     current_bgm: Option<String>,
-    splash_renderer: crate::ui::splash::SplashRenderer,
+    splash_renderer: SplashRenderer,
+    /// TTRスプラッシュ画面(Screen::RhythmSplash)用
+    ttr_splash_renderer: SplashRenderer,
     /// メニューへ戻った直後にtrueになる。main.rsがtake_pending_scrollback_clear()で
     /// 検知して端末のスクロールバッファをクリアする(画像プロトコルの残留対策)
     pending_scrollback_clear: bool,
@@ -105,7 +111,11 @@ impl App {
             should_quit: false,
             last_area: Rect::default(),
             current_bgm,
-            splash_renderer: crate::ui::splash::SplashRenderer::new(),
+            splash_renderer: SplashRenderer::new(splash::TITLE_IMAGE_PATH, splash::TITLE_FALLBACK),
+            ttr_splash_renderer: SplashRenderer::new(
+                splash::TTR_SPLASH_IMAGE_PATH,
+                splash::TTR_FALLBACK,
+            ),
             pending_scrollback_clear: false,
         }
     }
@@ -144,6 +154,11 @@ impl App {
             Screen::Splash => {
                 if matches!(key.code, KeyCode::Enter) {
                     self.leave_splash();
+                }
+            }
+            Screen::RhythmSplash => {
+                if matches!(key.code, KeyCode::Enter) {
+                    self.leave_rhythm_splash();
                 }
             }
             Screen::Menu => self.handle_menu_key(key),
@@ -208,6 +223,9 @@ impl App {
             Screen::Splash => {
                 self.leave_splash();
             }
+            Screen::RhythmSplash => {
+                self.leave_rhythm_splash();
+            }
             Screen::Menu => {
                 if let Some(index) = menu_item_at_row(area, mouse.row) {
                     self.menu_state.select(Some(index));
@@ -247,6 +265,12 @@ impl App {
         self.enter_menu();
     }
 
+    /// TTRスプラッシュ画面から曲選択へ進む(Enter/クリック共通)
+    fn leave_rhythm_splash(&mut self) {
+        audio::play_se(SeKind::Confirm);
+        self.screen = Screen::SelectSong(0);
+    }
+
     /// ゲーム終了後、リザルト画面へ進む(キー/クリック共通)。リザルト用BGMに切り替える。
     /// 履歴への保存はここで1回だけ行う(描画のたびに保存し直さない)
     fn enter_result(&mut self, result: GameResult) {
@@ -276,7 +300,8 @@ impl App {
         } else if selected == JUKEBOX_ITEM_INDEX {
             self.screen = Screen::Jukebox(self.jukebox_list_state());
         } else if selected == RHYTHM_ITEM_INDEX {
-            self.screen = Screen::SelectSong(0);
+            // 曲選択の前にTTR専用のスプラッシュ画面を挟む
+            self.screen = Screen::RhythmSplash;
         } else {
             self.screen = Screen::SelectDifficulty(selected, None);
         }
@@ -471,6 +496,7 @@ impl App {
         let current_bgm = self.current_bgm.clone();
         match &mut self.screen {
             Screen::Splash => self.splash_renderer.render(frame, area),
+            Screen::RhythmSplash => self.ttr_splash_renderer.render(frame, area),
             Screen::Menu => render_menu(frame, area, &mut self.menu_state),
             Screen::SelectSong(selected) => render_song_select(frame, area, *selected),
             Screen::SelectDifficulty(item, song) => {
@@ -1199,9 +1225,42 @@ mod tests {
     }
 
     #[test]
-    fn selecting_rhythm_menu_item_enters_song_select_instead_of_difficulty() {
+    fn selecting_rhythm_menu_item_enters_ttr_splash_first() {
         let mut app = App::new();
         app.select_menu_item(RHYTHM_ITEM_INDEX);
+        assert!(
+            matches!(app.screen, Screen::RhythmSplash),
+            "曲選択に直接進まず、TTRスプラッシュ画面を挟む"
+        );
+    }
+
+    #[test]
+    fn clicking_rhythm_menu_item_enters_ttr_splash_first() {
+        let mut app = App::new();
+        app.screen = Screen::Menu;
+        let area = rect(0, 0, 80, 30);
+        app.last_area = area;
+        let row = (0..area.height)
+            .find(|&row| menu_item_at_row(area, row) == Some(RHYTHM_ITEM_INDEX))
+            .expect("TTR項目の行があるはず");
+        app.handle_mouse(left_click(row));
+        assert!(matches!(app.screen, Screen::RhythmSplash));
+    }
+
+    #[test]
+    fn ttr_splash_enter_key_goes_to_song_select() {
+        let mut app = App::new();
+        app.screen = Screen::RhythmSplash;
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.screen, Screen::SelectSong(0)));
+    }
+
+    #[test]
+    fn ttr_splash_click_goes_to_song_select() {
+        let mut app = App::new();
+        app.screen = Screen::RhythmSplash;
+        app.last_area = rect(0, 0, 40, 12);
+        app.handle_mouse(left_click(5));
         assert!(matches!(app.screen, Screen::SelectSong(0)));
     }
 
@@ -1215,6 +1274,46 @@ mod tests {
         assert!(matches!(app.screen, Screen::SelectSong(0)));
         app.handle_key(KeyEvent::from(KeyCode::Down));
         assert!(matches!(app.screen, Screen::SelectSong(1)));
+    }
+
+    #[test]
+    fn ttr_splash_other_key_stays_on_ttr_splash() {
+        let mut app = App::new();
+        app.screen = Screen::RhythmSplash;
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        app.handle_key(KeyEvent::from(KeyCode::Char('1')));
+        assert!(matches!(app.screen, Screen::RhythmSplash));
+    }
+
+    #[test]
+    fn ttr_splash_q_returns_to_menu() {
+        let mut app = App::new();
+        app.select_menu_item(RHYTHM_ITEM_INDEX);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(matches!(app.screen, Screen::Menu));
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn ttr_splash_renders_without_panicking() {
+        let mut app = App::new();
+        app.screen = Screen::RhythmSplash;
+        rendered_text(&mut app);
+    }
+
+    #[test]
+    fn ttr_splash_uses_its_own_renderer_not_the_title_one() {
+        // 実行環境によりImage/Fallbackどちらになるかは変わるが、Fallbackであれば
+        // タイトル画面とは別の(TTR用の)文言が出ること
+        let app = App::new();
+        if let (
+            crate::ui::splash::SplashRenderer::Fallback(title),
+            crate::ui::splash::SplashRenderer::Fallback(ttr),
+        ) = (&app.splash_renderer, &app.ttr_splash_renderer)
+        {
+            assert_eq!(*title, crate::ui::splash::TITLE_FALLBACK);
+            assert_eq!(*ttr, crate::ui::splash::TTR_FALLBACK);
+        }
     }
 
     #[test]
@@ -1289,6 +1388,7 @@ mod tests {
     fn full_rhythm_flow_starts_selected_song_with_its_bgm() {
         let mut app = App::new();
         app.select_menu_item(RHYTHM_ITEM_INDEX);
+        app.handle_key(KeyEvent::from(KeyCode::Enter)); // TTRスプラッシュ -> 曲選択
         app.handle_key(KeyEvent::from(KeyCode::Down));
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         app.handle_key(KeyEvent::from(KeyCode::Char('3')));
@@ -1855,6 +1955,11 @@ mod tests {
         let mut app = App::new();
         app.screen = Screen::History;
         apps.push(("History", app));
+
+        let mut app = App::new();
+        app.select_menu_item(RHYTHM_ITEM_INDEX);
+        assert!(matches!(app.screen, Screen::RhythmSplash));
+        apps.push(("RhythmSplash", app));
 
         let mut app = App::new();
         app.screen = Screen::Jukebox(app.jukebox_list_state());
