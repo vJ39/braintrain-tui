@@ -6,7 +6,7 @@ use rand::Rng;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::audio::{self, SeKind};
@@ -142,13 +142,27 @@ impl Game for ReactionGame {
             .constraints([Constraint::Min(3), Constraint::Length(3)])
             .split(area);
 
+        // 表示エリアいっぱいを使い、縦方向中央に文字を配置して大きく見せる
+        let label_area = rows[0];
+        let vertical_padding = label_area.height.saturating_sub(3) / 2;
+        let mut lines: Vec<Line> = (0..vertical_padding).map(|_| Line::from("")).collect();
         let label_style = Style::default()
             .fg(self.current.display_color)
+            .bg(Color::Black)
             .add_modifier(Modifier::BOLD);
-        let label_paragraph = Paragraph::new(Line::from(Span::styled(self.current.label, label_style)))
+        lines.push(Line::from(Span::styled(self.current.label, label_style)));
+
+        let label_paragraph = Paragraph::new(lines)
             .alignment(ratatui::layout::Alignment::Center)
-            .block(Block::default().borders(Borders::ALL).title("この文字色と文字の意味は一致？"));
-        frame.render_widget(label_paragraph, rows[0]);
+            .style(Style::default().bg(Color::Black))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Thick)
+                    .border_style(Style::default().fg(self.current.display_color))
+                    .title("この文字色と文字の意味は一致？"),
+            );
+        frame.render_widget(label_paragraph, label_area);
 
         let progress = format!(
             "{} / {}問",
