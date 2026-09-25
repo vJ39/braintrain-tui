@@ -4,6 +4,7 @@ use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+use crate::game::color_stack::GAME_ID as COLOR_STACK_ID;
 use crate::game::count_mania::GAME_ID as COUNT_MANIA_ID;
 use crate::game::memory::GAME_ID as MEMORY_ID;
 use crate::game::mental_calc::GAME_ID as MENTAL_CALC_ID;
@@ -17,7 +18,7 @@ use crate::game::shape_rotate::GAME_ID as SHAPE_ROTATE_ID;
 use crate::game::GameResult;
 use crate::stats::store;
 
-const GAME_IDS: [&str; 10] = [
+const GAME_IDS: [&str; 11] = [
     SHAPE_ROTATE_ID,
     MIRROR_MATCH_ID,
     REACTION_ID,
@@ -27,6 +28,7 @@ const GAME_IDS: [&str; 10] = [
     SEQUENCE_ID,
     PUZZLE_CONNECT_ID,
     COUNT_MANIA_ID,
+    COLOR_STACK_ID,
     RHYTHM_ID,
 ];
 
@@ -134,11 +136,15 @@ mod tests {
     }
 
     #[test]
-    fn game_ids_covers_all_ten_games() {
-        assert_eq!(GAME_IDS.len(), 10);
+    fn game_ids_covers_all_eleven_games() {
+        assert_eq!(GAME_IDS.len(), 11);
         assert!(
             GAME_IDS.contains(&COUNT_MANIA_ID),
             "カウントマニアも履歴に出す"
+        );
+        assert!(
+            GAME_IDS.contains(&COLOR_STACK_ID),
+            "カラーストックも履歴に出す"
         );
     }
 
