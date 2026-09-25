@@ -32,9 +32,9 @@ pub enum Lane {
 }
 
 impl Lane {
-    /// DDR標準のレーン並び(画面左から ←↓↑→)。表示位置と入力キーの対応はこの順序に一致させる。
+    /// レーン並び(画面左から ←↑↓→)。表示位置と入力キーの対応はこの順序に一致させる。
     fn all() -> [Lane; 4] {
-        [Lane::Left, Lane::Down, Lane::Up, Lane::Right]
+        [Lane::Left, Lane::Up, Lane::Down, Lane::Right]
     }
 }
 
@@ -132,7 +132,7 @@ const PHRASE_ALT_LR: Phrase = Phrase {
     span_beats: 4.0,
 };
 
-/// ←↓↑→ と歩くように踏む基本パターン(4分音符)
+/// 左→下→上→右 と歩くように踏む基本パターン(4分音符)
 const PHRASE_WALK: Phrase = Phrase {
     notes: &[
         (0.0, &[Lane::Left] as &[Lane]),
@@ -420,7 +420,7 @@ impl Game for RhythmGame {
         let lanes = Lane::all();
 
         let header = Line::from(Span::styled(
-            "   ←      ↓      ↑      →   ",
+            "   ←      ↑      ↓      →   ",
             Style::default().add_modifier(Modifier::BOLD),
         ));
         let judge_line = Line::from(Span::styled(
