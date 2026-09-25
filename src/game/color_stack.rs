@@ -2,7 +2,7 @@
 //!
 //! 1セッション=3ラウンドで、ラウンドごとに盤面の形とルールが決まっている(難易度選択は無い)。
 //! - ROUND1: 4列。各列は専用の色で、1段に1列だけブロックがある(同時押しは無い)。
-//!   押した色の列の一番下のブロックが消え、その列が空ならミスでその列の一番上に1個追加される
+//!   盤面の最下段にある色を押した時だけ最下段が消え、それ以外の色はミスでその列の一番上に1個追加される
 //! - ROUND2: 1列。最下段と同じ色を押せば消え、違えばパレットからランダムな色が一番上に積まれる
 //! - ROUND3: ROUND2と同じ1列のルールで、1段の高さを半分にして初期のブロック数を倍にする
 //!
@@ -240,26 +240,21 @@ enum PressOutcome {
 }
 
 /// 4列盤面でcolumn列目のボタンを押した時の処理。
-/// その列の一番下のブロック(空白セルは飛ばす)を消し、空になった段は詰める。
-/// その列にブロックが無ければ、その列の専用色を一番上の新しい段に置く(1段1列を保つ)
+/// 盤面全体の最下段(rows[0])のブロックがcolumn列にある時だけ、その段を消して上の段を詰める。
+/// それ以外(押した列の順番がまだ来ていない・盤面が空)はミスとして、
+/// その列の専用色を一番上の新しい段に置く(1段1列を保つ)
 fn press_lane(board: &mut Board, column: usize) -> PressOutcome {
-    let lowest = board
+    let bottom_matches = board
         .rows
-        .iter()
-        .position(|row| row.get(column).is_some_and(|c| c.is_some()));
-    match lowest {
-        Some(level) => {
-            board.rows[level][column] = None;
-            if board.rows[level].iter().all(|c| c.is_none()) {
-                // 段が空いたら上の段が1段ずつ下りてくる
-                board.rows.remove(level);
-            }
-            PressOutcome::Removed
-        }
-        None => {
-            board.rows.push(lane_row(column));
-            PressOutcome::Added
-        }
+        .first()
+        .is_some_and(|row| row.get(column).is_some_and(|c| c.is_some()));
+    if bottom_matches {
+        // 1段1列なので最下段はこの1個だけ。消した段には上の段が1段ずつ下りてくる
+        board.rows.remove(0);
+        PressOutcome::Removed
+    } else {
+        board.rows.push(lane_row(column));
+        PressOutcome::Added
     }
 }
 
@@ -1018,27 +1013,90 @@ mod tests {
     // --- ROUND1: 4列の消去・追加ルール ---
 
     #[test]
-    fn pressing_a_lane_removes_its_lowest_block_skipping_blanks() {
+    fn pressing_the_lane_of_the_bottom_row_removes_it_and_drops_the_rest() {
         // 下から: 列0, 列1, 列0
         let mut board = Board::lanes([0, 1, 0]);
         assert_eq!(press_lane(&mut board, 0), PressOutcome::Removed);
         assert_eq!(
             lane_of_each_row(&board),
             vec![1, 0],
-            "最下段の列0が消え、空いた段は詰まる"
+            "最下段の列0が消え、上の段が1段ずつ下りてくる"
         );
-        // 列0の一番下は、列0が空白の段(列1の段)を飛ばした先
-        assert_eq!(press_lane(&mut board, 0), PressOutcome::Removed);
-        assert_eq!(lane_of_each_row(&board), vec![1]);
+        assert_eq!(press_lane(&mut board, 1), PressOutcome::Removed);
+        assert_eq!(lane_of_each_row(&board), vec![0]);
         assert_lane_invariants(&board);
     }
 
     #[test]
-    fn pressing_a_lane_above_the_bottom_row_removes_that_block() {
-        // 下から: 列0, 列2, 列3。最下段でなくても、押した列の一番下のブロックが消える
-        let mut board = Board::lanes([0, 2, 3]);
-        assert_eq!(press_lane(&mut board, 3), PressOutcome::Removed);
-        assert_eq!(lane_of_each_row(&board), vec![0, 2]);
+    fn pressing_a_lane_whose_block_is_not_yet_at_the_bottom_is_a_miss() {
+        // 下から: 列2(黄), 列0(赤), 列3(緑)。今一番下にあるのは黄なので、赤・緑は順番がまだ来ていない
+        for column in [0, 3] {
+            let mut board = Board::lanes([2, 0, 3]);
+            assert_eq!(
+                press_lane(&mut board, column),
+                PressOutcome::Added,
+                "列{column}: 最下段に無い列はミス"
+            );
+            assert_eq!(
+                lane_of_each_row(&board),
+                vec![2, 0, 3, column],
+                "列{column}: 既存の段は変わらず、押した列が一番上に1個増える"
+            );
+            assert_lane_invariants(&board);
+        }
+    }
+
+    #[test]
+    fn pressing_a_lane_that_is_used_only_above_the_bottom_does_not_remove_it() {
+        // 下から: 列0, 列1, 列0。列0の2個目は最下段ではないので、列1より先には消せない
+        let mut board = Board::lanes([0, 1, 0]);
+        assert_eq!(press_lane(&mut board, 0), PressOutcome::Removed);
+        assert_eq!(
+            press_lane(&mut board, 0),
+            PressOutcome::Added,
+            "最下段は列1なので列0はミス"
+        );
+        assert_eq!(lane_of_each_row(&board), vec![1, 0, 0]);
+        assert_lane_invariants(&board);
+    }
+
+    #[test]
+    fn miss_adds_the_pressed_lanes_own_color_on_top_and_keeps_other_lanes() {
+        let before = Board::lanes([2, 0, 3, 1]);
+        for column in [0, 1, 3] {
+            let mut board = before.clone();
+            assert_eq!(press_lane(&mut board, column), PressOutcome::Added);
+            assert_eq!(
+                &board.rows[..before.rows.len()],
+                before.rows.as_slice(),
+                "列{column}: 既存の段は1セルも変わらない"
+            );
+            assert_eq!(
+                board.rows.last().unwrap(),
+                &lane_row(column),
+                "列{column}: 一番上に押した列の専用色だけの段が追加される"
+            );
+            assert_eq!(
+                board.rows.last().unwrap()[column],
+                Some(StackColor::ALL[column])
+            );
+            assert_lane_invariants(&board);
+        }
+    }
+
+    #[test]
+    fn pressing_any_lane_on_an_empty_board_is_a_miss() {
+        for column in 0..LANE_COUNT {
+            let mut board = Board::lanes([]);
+            assert!(board.is_cleared());
+            assert_eq!(
+                press_lane(&mut board, column),
+                PressOutcome::Added,
+                "列{column}: 空の盤面ではミス"
+            );
+            assert_eq!(lane_of_each_row(&board), vec![column]);
+            assert_lane_invariants(&board);
+        }
     }
 
     #[test]
@@ -1066,7 +1124,14 @@ mod tests {
         for _ in 0..500 {
             let column = rng.gen_range(0..LANE_COUNT);
             let before = board.block_count();
-            match press_lane(&mut board, column) {
+            let bottom_lane = lane_of_each_row(&board).first().copied();
+            let outcome = press_lane(&mut board, column);
+            assert_eq!(
+                outcome == PressOutcome::Removed,
+                bottom_lane == Some(column),
+                "消えるのは押した列が最下段の列と一致した時だけ"
+            );
+            match outcome {
                 PressOutcome::Removed => assert_eq!(board.block_count(), before - 1),
                 PressOutcome::Added => assert_eq!(board.block_count(), before + 1),
             }
@@ -1077,13 +1142,35 @@ mod tests {
     #[test]
     fn lane_board_is_cleared_when_every_lane_is_empty() {
         let mut board = Board::lanes([0, 1, 2, 3]);
-        for column in [3, 1, 0] {
-            press_lane(&mut board, column);
+        for column in [0, 1, 2] {
+            assert_eq!(press_lane(&mut board, column), PressOutcome::Removed);
             assert!(!board.is_cleared());
         }
-        press_lane(&mut board, 2);
+        assert_eq!(press_lane(&mut board, 3), PressOutcome::Removed);
         assert!(board.is_cleared());
         assert_eq!(board.block_count(), 0);
+    }
+
+    #[test]
+    fn pressing_lanes_from_the_top_down_does_not_clear_the_board() {
+        // 下から: 列0, 列1, 列2, 列3 を上から(逆順に)押すと、最下段の列0以外は全部ミスになる
+        let mut board = Board::lanes([0, 1, 2, 3]);
+        let outcomes: Vec<PressOutcome> = [3, 2, 1, 0]
+            .into_iter()
+            .map(|column| press_lane(&mut board, column))
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                PressOutcome::Added,
+                PressOutcome::Added,
+                PressOutcome::Added,
+                PressOutcome::Removed
+            ]
+        );
+        assert!(!board.is_cleared());
+        assert_eq!(lane_of_each_row(&board), vec![1, 2, 3, 3, 2, 1]);
+        assert_lane_invariants(&board);
     }
 
     // --- ROUND2/3: 1列の初期盤面 ---
@@ -1334,16 +1421,102 @@ mod tests {
     // --- ROUND1のキー入力 ---
 
     #[test]
-    fn round1_number_keys_remove_the_lowest_block_of_the_matching_lane() {
+    fn round1_number_key_of_the_bottom_lane_removes_the_bottom_row() {
         for column in 0..LANE_COUNT {
+            let mut game = game_at(ROUND1);
+            // 最下段を列columnにし、その上に残りの列を1段ずつ積む
+            let others: Vec<usize> = (0..LANE_COUNT).filter(|&c| c != column).collect();
+            game.round.board = Board::lanes(std::iter::once(column).chain(others.iter().copied()));
+            press_key(&mut game, key_for(StackColor::ALL[column]));
+            assert_eq!(
+                lane_of_each_row(&game.round.board),
+                others,
+                "列{column}: 最下段が消え、残りが詰まる"
+            );
+            assert_eq!(
+                game.feedback.current().map(|f| f.verdict),
+                None,
+                "列{column}: 消えた時はミス表示しない"
+            );
+            assert_eq!(game.result().total, 0);
+        }
+    }
+
+    #[test]
+    fn round1_number_key_of_a_lane_not_at_the_bottom_is_a_miss() {
+        for column in 1..LANE_COUNT {
             let mut game = game_at(ROUND1);
             game.round.board = Board::lanes([0, 1, 2, 3]);
             press_key(&mut game, key_for(StackColor::ALL[column]));
-            let lanes = lane_of_each_row(&game.round.board);
-            assert_eq!(lanes.len(), 3, "列{column}: 1個消える");
-            assert!(!lanes.contains(&column), "列{column}のブロックが消える");
+            assert_eq!(
+                lane_of_each_row(&game.round.board),
+                vec![0, 1, 2, 3, column],
+                "列{column}: 何も消えず、押した列が一番上に1個増える"
+            );
+            assert_eq!(
+                game.feedback.current().map(|f| f.verdict),
+                Some(crate::game::feedback::Verdict::Incorrect),
+                "列{column}: 順番が来ていない列はミス"
+            );
             assert_eq!(game.result().total, 0);
         }
+    }
+
+    #[test]
+    fn round1_full_play_pressing_the_bottom_color_every_time_clears_without_misses() {
+        for _ in 0..20 {
+            let mut game = game_at(ROUND1);
+            let height = game.round.board.block_count();
+            let mut presses = 0;
+            while let Some(color) = game.round.board.bottom_color() {
+                press_key(&mut game, key_for(color));
+                presses += 1;
+                assert!(presses <= height, "最下段だけ押せばミスは起きない");
+            }
+            assert_eq!(presses, height, "1回押すごとに1段消える");
+            let result = game.result();
+            assert_eq!(result.total, 1);
+            assert_eq!(result.correct, 1, "ROUND1クリアが記録される");
+            assert!(game.interval.is_some());
+        }
+    }
+
+    #[test]
+    fn round1_full_play_pressing_from_the_top_down_does_not_clear() {
+        let mut game = game_at(ROUND1);
+        // 下から: 黄, 赤, 緑, 青
+        game.round.board = Board::lanes([2, 0, 3, 1]);
+        // 上の段から順に(逆順に)押す: 青・緑・赤はミスで一番上に増え、最後の黄だけ最下段と一致して消える
+        for color in [Blue, Green, Red, Yellow] {
+            press_key(&mut game, key_for(color));
+        }
+        assert!(
+            !game.round.board.is_cleared(),
+            "逆順に押しても盤面は空にならない"
+        );
+        assert_eq!(lane_of_each_row(&game.round.board), vec![0, 3, 1, 1, 3, 0]);
+        assert_eq!(game.result().total, 0, "クリアは記録されない");
+        assert!(game.interval.is_none(), "ラウンドは続く");
+        assert_lane_invariants(&game.round.board);
+    }
+
+    #[test]
+    fn round1_wrong_color_press_during_full_play_is_recorded_as_a_miss() {
+        let mut game = game_at(ROUND1);
+        game.round.board = Board::lanes([2, 0, 3]);
+        // 最下段は黄。赤を押すとミス(赤の段が一番上に増える)
+        press_key(&mut game, key_for(Red));
+        assert_eq!(lane_of_each_row(&game.round.board), vec![2, 0, 3, 0]);
+        assert_eq!(
+            game.feedback.current().map(|f| f.verdict),
+            Some(crate::game::feedback::Verdict::Incorrect)
+        );
+        // 以後は最下段の色を押し続ければクリアできる
+        for color in [Yellow, Red, Green, Red] {
+            press_key(&mut game, key_for(color));
+        }
+        assert!(game.round.board.is_cleared());
+        assert_eq!(game.result().correct, 1);
     }
 
     #[test]
@@ -1502,8 +1675,11 @@ mod tests {
         for round in ALL_ROUNDS {
             for (column, &color) in StackColor::ALL.iter().enumerate() {
                 let mut game = game_at(round);
+                // ROUND1は、押す色の列を最下段にし、その上に残りの列を1段ずつ積む
+                let others: Vec<usize> = (0..LANE_COUNT).filter(|&c| c != column).collect();
                 if round == ROUND1 {
-                    game.round.board = Board::lanes([0, 1, 2, 3]);
+                    game.round.board =
+                        Board::lanes(std::iter::once(column).chain(others.iter().copied()));
                 } else {
                     game.round.board = sample_board();
                 }
@@ -1512,9 +1688,11 @@ mod tests {
                 let (x, y) = button_label_position(&buffer, color);
                 game.handle_mouse(left_click(x, y), AREA);
                 if round == ROUND1 {
-                    let lanes = lane_of_each_row(&game.round.board);
-                    assert!(!lanes.contains(&column), "{color:?}の列のブロックが消える");
-                    assert_eq!(lanes.len(), 3);
+                    assert_eq!(
+                        lane_of_each_row(&game.round.board),
+                        others,
+                        "{color:?}の列(最下段)のブロックが消える"
+                    );
                 } else {
                     assert_press_outcome(&before, &game.round.board, color);
                 }
