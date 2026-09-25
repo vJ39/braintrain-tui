@@ -26,6 +26,7 @@ use crate::stats::store;
 use crate::ui::background::BackgroundRenderer;
 use crate::ui::countdown::{self, CountdownState};
 use crate::ui::menu_icons::MenuIcons;
+use crate::ui::result_sprite::ResultSprite;
 use crate::ui::splash::{self, SplashRenderer};
 use crate::ui::typewriter::{self, Typewriter};
 
@@ -148,6 +149,9 @@ pub struct App {
     menu_icons: MenuIcons,
     /// TTR(曲選択)・プレイ中以外の画面に共通で敷く背景画像。起動時に1回だけ読み込み、以後は使い回す
     background: BackgroundRenderer,
+    /// リザルト画面のキャラクターのコマ送りアニメーション。起動時に1回だけ全コマを読み込み、
+    /// 経過時間はshow_resultでリセットする
+    result_sprite: ResultSprite,
 }
 
 impl App {
@@ -173,6 +177,7 @@ impl App {
             result_typewriter: Typewriter::completed(typewriter::CHAR_INTERVAL),
             menu_icons: MenuIcons::new(&MENU_ICON_PATHS),
             background: BackgroundRenderer::new(),
+            result_sprite: ResultSprite::new(),
         }
     }
 
@@ -342,9 +347,11 @@ impl App {
         self.show_result(result, save_error);
     }
 
-    /// リザルト画面を表示し、結果の本文をタイプライターで流し始める(履歴への保存はしない)
+    /// リザルト画面を表示し、結果の本文のタイプライターとキャラクターのアニメーションを
+    /// 最初から始める(履歴への保存はしない)
     fn show_result(&mut self, result: GameResult, save_error: Option<String>) {
         self.result_typewriter = Typewriter::new(typewriter::char_count(&result_lines(&result)));
+        self.result_sprite.reset();
         self.screen = Screen::Result(result, save_error);
     }
 
@@ -553,7 +560,10 @@ impl App {
                 }
             }
             Screen::Menu => self.menu_typewriter.tick(dt),
-            Screen::Result(..) => self.result_typewriter.tick(dt),
+            Screen::Result(..) => {
+                self.result_typewriter.tick(dt);
+                self.result_sprite.tick(dt);
+            }
             _ => {}
         }
     }
@@ -610,6 +620,7 @@ impl App {
                     result,
                     save_error.as_deref(),
                     &mut self.result_typewriter,
+                    &mut self.result_sprite,
                 )
             }
             Screen::History => {
@@ -1247,12 +1258,18 @@ fn result_lines(result: &GameResult) -> Vec<Line<'static>> {
     ]
 }
 
+/// リザルト画面のテキストカードの範囲。外枠の内側(inner)の中央に、幅48以内・本文の行数+枠の高さで置く
+fn result_card_rect(inner: Rect, content_height: u16) -> Rect {
+    centered_rect(inner, inner.width.min(48), (content_height + 2).min(inner.height))
+}
+
 fn render_result(
     frame: &mut Frame,
     area: Rect,
     result: &GameResult,
     save_error: Option<&str>,
     typing: &mut Typewriter,
+    sprite: &mut ResultSprite,
 ) {
     // 保存(呼び出し側のenter_resultで1回だけ実施済み)に失敗していれば、
     // その内容を結果の描画後に下端へ重ねて表示する
@@ -1269,7 +1286,9 @@ fn render_result(
     // 中央寄せなので、まだ出していない部分を空白で埋めて行の位置がずれないようにする
     let text = typewriter::truncate_lines_keep_width(&lines, typing.visible_chars());
     let content_height = text.len() as u16;
-    let card = centered_rect(inner, inner.width.min(48), (content_height + 2).min(inner.height));
+    let card = result_card_rect(inner, content_height);
+    // キャラクターはカードの左側の余白に描く(余白が狭ければsprite側で省略する)
+    sprite.render(frame, inner, card);
     let paragraph = Paragraph::new(text)
         .alignment(Alignment::Center)
         .block(theme::sub_panel());
@@ -3765,6 +3784,123 @@ mod tests {
         app.handle_mouse(left_click(0));
         app.handle_mouse(left_click(area_based_beginner));
         assert!(matches!(app.screen, Screen::SelectDifficulty(0, None)));
+    }
+
+    // --- リザルト画面のキャラクターのコマ送りアニメーション ---
+
+    use crate::ui::result_sprite::{self, ResultSprite};
+
+    /// キャラクターを描けるResultSprite(ハーフブロック描画)
+    fn halfblocks_sprite() -> ResultSprite {
+        ResultSprite::with_picker(Some(test_picker(ProtocolType::Halfblocks)))
+    }
+
+    /// appをwidth x heightで描いたバッファ
+    fn rendered_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap().buffer.clone()
+    }
+
+    /// width x heightの画面に描いたリザルト画面のテキストカードの範囲(render_resultと同じ計算)
+    fn result_card_for(app: &App, width: u16, height: u16) -> Rect {
+        let Screen::Result(result, _) = &app.screen else {
+            unreachable!();
+        };
+        let inner = theme::panel("").inner(screen_rect(rect(0, 0, width, height)));
+        result_card_rect(inner, result_lines(result).len() as u16)
+    }
+
+    #[test]
+    fn result_sprite_advances_only_on_the_result_screen() {
+        let mut app = app_showing_result();
+        assert_eq!(app.result_sprite.elapsed(), Duration::ZERO);
+        app.update(result_sprite::FRAME_DURATION);
+        assert_eq!(app.result_sprite.elapsed(), result_sprite::FRAME_DURATION);
+        assert_eq!(app.result_sprite.current_frame(), 1, "リザルト画面ではコマが進む");
+
+        for screen in [Screen::History, Screen::Menu, Screen::ConfirmQuit, Screen::Splash] {
+            let mut app = app_showing_result();
+            app.screen = screen;
+            app.update(result_sprite::FRAME_DURATION * 3);
+            assert_eq!(app.result_sprite.elapsed(), Duration::ZERO, "リザルト以外では進まない");
+        }
+    }
+
+    #[test]
+    fn show_result_restarts_the_sprite_animation() {
+        let mut app = app_showing_result();
+        app.update(result_sprite::FRAME_DURATION * 2);
+        assert_eq!(app.result_sprite.current_frame(), 2);
+        app.show_result(sample_result(), None);
+        assert_eq!(app.result_sprite.elapsed(), Duration::ZERO, "入るたびに最初のコマから");
+        assert_eq!(app.result_sprite.current_frame(), 0);
+    }
+
+    #[test]
+    fn wide_result_screen_draws_the_sprite_left_of_the_card_without_touching_the_text() {
+        let (width, height) = (120u16, 40u16);
+        let mut app = app_showing_result();
+        app.update(LONG_ENOUGH); // テキストを全部出しておく
+        let without = rendered_buffer(&mut app, width, height);
+        app.result_sprite = halfblocks_sprite();
+        let with = rendered_buffer(&mut app, width, height);
+
+        let card = result_card_for(&app, width, height);
+        let changed: Vec<_> = with.area.positions().filter(|p| with[*p] != without[*p]).collect();
+        assert!(!changed.is_empty(), "広い画面ではキャラクターが描かれる");
+        let inner = theme::panel("").inner(screen_rect(rect(0, 0, width, height)));
+        for p in &changed {
+            assert!(p.x < card.x, "({},{}): カードの左側だけに描く", p.x, p.y);
+            assert!(inner.contains(*p), "({},{}): 外枠の内側に描く", p.x, p.y);
+        }
+        for p in card.positions() {
+            assert_eq!(with[p], without[p], "カード({},{})はキャラクターの有無で変わらない", p.x, p.y);
+        }
+    }
+
+    #[test]
+    fn narrow_result_screen_omits_the_sprite_and_keeps_the_card_intact() {
+        for (width, height) in [(80u16, 30u16), (80, 24), (60, 30), (120, 11)] {
+            let mut app = app_showing_result();
+            app.update(LONG_ENOUGH);
+            let without = rendered_buffer(&mut app, width, height);
+            app.result_sprite = halfblocks_sprite();
+            let with = rendered_buffer(&mut app, width, height);
+            assert_eq!(with, without, "{width}x{height}: 余白が狭ければキャラクターを描かない");
+            let text = rendered_compact(&mut app);
+            assert!(text.contains("平均反応時間"), "{width}x{height}: テキストは読める");
+        }
+    }
+
+    #[test]
+    fn result_screen_with_sprite_renders_without_panicking_at_any_size() {
+        let mut sprite = halfblocks_sprite();
+        for (width, height) in [(1u16, 1u16), (5, 3), (10, 6), (20, 8), (80, 24), (100, 30), (200, 60)] {
+            for save_error in [None, Some("保存エラー".to_string())] {
+                let mut app = app_showing_result();
+                app.screen = Screen::Result(sample_result(), save_error);
+                std::mem::swap(&mut app.result_sprite, &mut sprite);
+                rendered_cells(&mut app, width, height);
+                std::mem::swap(&mut app.result_sprite, &mut sprite);
+            }
+        }
+    }
+
+    #[test]
+    fn result_screen_with_an_image_protocol_sprite_still_shows_the_text() {
+        // 画像プロトコルのキャラクターはカードと重ならないので、カードの文字は端末へ出力される
+        let (width, height) = (120u16, 40u16);
+        let mut app = app_showing_result();
+        app.update(LONG_ENOUGH);
+        app.result_sprite = ResultSprite::with_picker(Some(test_picker(ProtocolType::Iterm2)));
+        let buffer = rendered_buffer(&mut app, width, height);
+        let card = result_card_for(&app, width, height);
+        assert!(card.positions().all(|p| !buffer[p].skip), "カードのセルは出力される");
+        assert!(
+            buffer.area.positions().any(|p| buffer[p].symbol().starts_with('\x1b')),
+            "キャラクターの画像データが入る"
+        );
     }
 
     #[test]
