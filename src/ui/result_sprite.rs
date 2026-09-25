@@ -42,15 +42,17 @@ pub fn frame_index(elapsed: Duration) -> usize {
 }
 
 /// 外枠の内側(inner)のうち、テキストカード(card)の左側でキャラクターを置ける範囲。
-/// カードとの間・外枠との間に隙間を空け、最小の幅・高さに満たなければNone(表示しない)
+/// カードとの間・外枠との間に隙間を空け、最小の幅・高さに満たなければNone(表示しない)。
+/// 縦はカードと同じ高さ・同じ位置にする(innerいっぱいにすると、画面が縦に大きい時に
+/// キャラクターがカードよりかなり大きく描かれてしまうため)
 pub fn sprite_area(inner: Rect, card: Rect) -> Option<Rect> {
     let left = inner.x.saturating_add(PADDING_LEFT);
     let right = card.x.saturating_sub(GAP_TO_CARD).min(inner.right());
     let width = right.saturating_sub(left);
-    if width < MIN_WIDTH || inner.height < MIN_HEIGHT {
+    if width < MIN_WIDTH || card.height < MIN_HEIGHT {
         return None;
     }
-    Some(Rect::new(left, inner.y, width, inner.height))
+    Some(Rect::new(left, card.y, width, card.height))
 }
 
 /// 画像プロトコル(sixel/kitty/iTerm2)が使える端末ならそのpicker。端末への問い合わせは
@@ -289,10 +291,19 @@ mod tests {
         assert_eq!(area.right(), card.x - GAP_TO_CARD, "カードとの間を空ける");
         assert_eq!(
             (area.y, area.height),
-            (inner.y, inner.height),
-            "縦はinnerいっぱい"
+            (card.y, card.height),
+            "縦はカードと同じ高さ・同じ位置(カードよりキャラクターが大きくならないように)"
         );
         assert!(area.right() <= card.x, "カードと重ならない");
+    }
+
+    #[test]
+    fn sprite_area_height_does_not_exceed_the_card_even_on_a_tall_screen() {
+        // 画面が縦に大きくても、キャラクターの表示範囲はカードの高さを超えない
+        let inner = Rect::new(2, 1, 150, 60);
+        let card = Rect::new(60, 20, 48, 16);
+        let area = sprite_area(inner, card).expect("十分な余白があれば表示する");
+        assert_eq!(area.height, card.height);
     }
 
     #[test]
