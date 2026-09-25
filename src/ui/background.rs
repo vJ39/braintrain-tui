@@ -8,7 +8,7 @@ use ratatui::layout::Rect;
 use ratatui::Frame;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
-use ratatui_image::{Resize, StatefulImage};
+use ratatui_image::{CropOptions, Resize, StatefulImage};
 
 use super::splash;
 
@@ -59,7 +59,9 @@ impl BackgroundRenderer {
         self.protocol.is_none()
     }
 
-    /// 背景画像をareaいっぱいに敷く(はみ出す部分は切り取る)。画像を描けなければ何もしない
+    /// 背景画像をareaいっぱいに敷く(はみ出す部分は切り取る)。画像を描けなければ何もしない。
+    /// 画像の主なモチーフ(脳のアイコン)が右下寄りにあるため、クロップは右下基準(下側・
+    /// 右側を残す)にする。既定の左上基準だと画面より画像が大きい時にモチーフが見切れる
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         let Some(protocol) = self.protocol.as_mut() else {
             return;
@@ -67,7 +69,10 @@ impl BackgroundRenderer {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let widget = StatefulImage::default().resize(Resize::Crop(None));
+        let widget = StatefulImage::default().resize(Resize::Crop(Some(CropOptions {
+            clip_top: true,
+            clip_left: true,
+        })));
         frame.render_stateful_widget(widget, area, protocol.as_mut());
     }
 }
