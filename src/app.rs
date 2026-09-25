@@ -355,7 +355,12 @@ impl App {
         } else if selected == JUKEBOX_ITEM_INDEX {
             self.screen = Screen::Jukebox(self.jukebox_list_state());
         } else if selected == RHYTHM_ITEM_INDEX {
-            // 曲選択の前にTTR専用のスプラッシュ画面を挟む
+            // 曲選択の前にTTR専用のスプラッシュ画面を挟む。BGMもTTR専用のものに切り替え、
+            // 実際に曲を選んでプレイが始まるまで(start_rhythmで曲のBGMに切り替わるまで)流し続ける
+            if let Some(name) = audio::random_bgm_track(BgmCategory::RhythmSplash) {
+                audio::play_bgm_track(&name);
+                self.current_bgm = Some(name);
+            }
             self.screen = Screen::RhythmSplash;
         } else {
             self.screen = Screen::SelectDifficulty(selected, None);
@@ -1377,6 +1382,47 @@ mod tests {
             matches!(app.screen, Screen::RhythmSplash),
             "曲選択に直接進まず、TTRスプラッシュ画面を挟む"
         );
+    }
+
+    #[test]
+    fn selecting_rhythm_menu_item_starts_the_ttr_splash_bgm() {
+        let mut app = App::new();
+        app.select_menu_item(RHYTHM_ITEM_INDEX);
+        assert_eq!(app.current_bgm.as_deref(), Some("Overclocked_Tempo"));
+    }
+
+    #[test]
+    fn ttr_splash_bgm_keeps_playing_through_song_select() {
+        let mut app = App::new();
+        app.select_menu_item(RHYTHM_ITEM_INDEX);
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.screen, Screen::SelectSong(0)));
+        assert_eq!(
+            app.current_bgm.as_deref(),
+            Some("Overclocked_Tempo"),
+            "曲選択画面でもTTR専用BGMのまま"
+        );
+    }
+
+    #[test]
+    fn ttr_splash_bgm_keeps_playing_through_difficulty_select() {
+        let mut app = App::new();
+        app.select_menu_item(RHYTHM_ITEM_INDEX);
+        app.select_song(1);
+        assert!(matches!(
+            app.screen,
+            Screen::SelectDifficulty(RHYTHM_ITEM_INDEX, Some(1))
+        ));
+        assert_eq!(app.current_bgm.as_deref(), Some("Overclocked_Tempo"));
+    }
+
+    #[test]
+    fn starting_the_song_switches_from_ttr_splash_bgm_to_the_song() {
+        let mut app = App::new();
+        app.select_menu_item(RHYTHM_ITEM_INDEX);
+        app.select_song(1);
+        app.start_playing(RHYTHM_ITEM_INDEX, Difficulty::Beginner, Some(1));
+        assert_eq!(app.current_bgm.as_deref(), Some(SONGS[1].track_name));
     }
 
     #[test]

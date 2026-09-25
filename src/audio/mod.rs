@@ -12,6 +12,7 @@ struct Assets;
 /// assets/audio/bgm/ 配下は用途別にサブフォルダで分ける
 /// (menu/ = 起動画面・Playing以外、playing/ = ゲームプレイ中、
 ///  rhythm/ = リズムゲームの楽曲。譜面と同期させるため曲ごとに選んで再生する、
+///  rhythm_splash/ = TTR専用スプラッシュ画面〜曲選択画面、
 ///  result/ = ゲーム終了後のリザルト画面)
 #[derive(RustEmbed)]
 #[folder = "assets/audio/bgm/"]
@@ -36,6 +37,8 @@ pub enum BgmCategory {
     /// ランダム選曲には使わず、曲データとassetsの対応確認(テスト)で参照する
     #[cfg_attr(not(test), allow(dead_code))]
     Rhythm,
+    /// TTR専用スプラッシュ画面〜曲選択画面の間に流す専用BGM
+    RhythmSplash,
 }
 
 impl BgmCategory {
@@ -45,6 +48,7 @@ impl BgmCategory {
             BgmCategory::Playing => "playing/",
             BgmCategory::Result => "result/",
             BgmCategory::Rhythm => "rhythm/",
+            BgmCategory::RhythmSplash => "rhythm_splash/",
         }
     }
 }
@@ -302,6 +306,12 @@ mod tests {
                 "Top_of_the_Leaderboard".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn bgm_tracks_in_rhythm_splash_has_overclocked_tempo_only() {
+        let names = bgm_tracks_in(BgmCategory::RhythmSplash);
+        assert_eq!(names, vec!["Overclocked_Tempo".to_string()]);
     }
 
     #[test]
