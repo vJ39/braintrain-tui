@@ -293,6 +293,99 @@ pub fn circle_contains(rect: Rect, column: u16, row: u16) -> bool {
     dx * dx + dy * dy <= 1.0
 }
 
+/// 端末のセルの縦横比(縦の長さ÷横の長さ)。円の幅を高さのこの倍にするとほぼ正円に見える。
+/// 動く円の向き・距離も、縦の行数をこの倍にして見た目の距離(横のセル数)に直して扱う
+pub const CELL_ASPECT: f64 = 2.0;
+
+/// 幅width・高さheightの円の左上(x, y)を、円がboardからはみ出さない範囲に収める
+pub fn clamp_position(board: Rect, width: u16, height: u16, x: f64, y: f64) -> (f64, f64) {
+    let (min_x, max_x) = position_range(board.x, board.width, width);
+    let (min_y, max_y) = position_range(board.y, board.height, height);
+    (x.clamp(min_x, max_x), y.clamp(min_y, max_y))
+}
+
+/// 進めた後の左上の位置(x, y)が盤面からはみ出していたら、盤面の端で跳ね返す。
+/// はみ出した軸だけ、はみ出した分を押し戻して速度(vx, vy)のその成分を反転する。
+/// 1回で盤面の幅以上に進んでも、最後は盤面の範囲内に収める
+pub fn reflect_position(
+    board: Rect,
+    width: u16,
+    height: u16,
+    (x, y): (f64, f64),
+    (vx, vy): (f64, f64),
+) -> ((f64, f64), (f64, f64)) {
+    let (x, vx) = reflect_axis(x, vx, position_range(board.x, board.width, width));
+    let (y, vy) = reflect_axis(y, vy, position_range(board.y, board.height, height));
+    ((x, y), (vx, vy))
+}
+
+/// 盤面の1つの軸(start から len セル)に長さsizeの円を置く時、左上が取れる範囲(最小, 最大)
+fn position_range(start: u16, len: u16, size: u16) -> (f64, f64) {
+    let min = f64::from(start);
+    (min, min + f64::from(len.saturating_sub(size)))
+}
+
+/// 1つの軸の位置posが範囲(min, max)を出ていたら跳ね返す。戻り値は(位置, 速度)
+fn reflect_axis(pos: f64, velocity: f64, (min, max): (f64, f64)) -> (f64, f64) {
+    if pos < min {
+        ((min + (min - pos)).min(max), -velocity)
+    } else if pos > max {
+        ((max - (pos - max)).max(min), -velocity)
+    } else {
+        (pos, velocity)
+    }
+}
+
+/// クリック位置clickから見て、中心がcenterの円を離す移動量(横のセル数, 縦の行数)。
+/// 距離は縦の行数をCELL_ASPECT倍した見た目の距離で測り、radius以内の円だけを対象にする。
+/// 向きはクリック位置→円の中心で、見た目の距離でdistanceだけ動かす。
+/// 中心がクリック位置と重なって向きが決まらない時は、fallback(見た目の向きの単位ベクトル)に動かす。
+/// radiusより遠い円はNone(動かさない)
+pub fn scatter_offset(
+    click: (f64, f64),
+    center: (f64, f64),
+    radius: f64,
+    distance: f64,
+    fallback: (f64, f64),
+) -> Option<(f64, f64)> {
+    let dx = center.0 - click.0;
+    let dy = (center.1 - click.1) * CELL_ASPECT;
+    let length = dx.hypot(dy);
+    if length > radius {
+        return None;
+    }
+    let (ux, uy) = if length > f64::EPSILON {
+        (dx / length, dy / length)
+    } else {
+        fallback
+    };
+    Some((ux * distance, uy * distance / CELL_ASPECT))
+}
+
+/// 配置の並びのindex番目の円をrectへ動かしても、残っている(is_visibleがtrueの)どの円の数字も
+/// 隠れないか。配置の時と同じく、手前の円が奥の円の数字の範囲を覆うのを許さない。
+/// 前後関係はback_to_front・hit_testと同じ(面積の大きい円が奥、同じ大きさなら並びの後ろが手前)
+pub fn numbers_stay_readable(
+    placements: &[Placement],
+    index: usize,
+    rect: Rect,
+    is_visible: impl Fn(u8) -> bool,
+) -> bool {
+    let moved_key = (rect.area(), Reverse(index));
+    placements
+        .iter()
+        .enumerate()
+        .filter(|&(i, other)| i != index && is_visible(other.number))
+        .all(|(i, other)| {
+            if moved_key < (other.rect.area(), Reverse(i)) {
+                // 動かす円が手前
+                !hides_number(rect, other.rect)
+            } else {
+                !hides_number(other.rect, rect)
+            }
+        })
+}
+
 /// クリック座標にある円の番号を返す。is_visibleがfalseの円(消えた円)は対象外。
 /// 複数の円が重なっている場合は、見た目で手前にある円を返す。
 /// つまり最も面積の小さい円で、同じ大きさどうしなら並びの後ろ(後に描かれる方)を優先する
@@ -859,5 +952,163 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- 動く円(ROUND4・ROUND5)の位置の計算 ---
+
+    #[test]
+    fn cell_aspect_matches_circle_width_to_height() {
+        // 円の幅は高さの2倍。動きの向き・距離も同じ比率で見た目の距離に直す
+        assert_eq!(CELL_ASPECT, 2.0);
+        let (w, h) = size_dims(0, CircleSize::Large);
+        assert_eq!(f64::from(w), f64::from(h) * CELL_ASPECT);
+    }
+
+    #[test]
+    fn clamp_position_keeps_circle_inside_board() {
+        // 盤面(1,4)-(99,35)に幅10・高さ5の円を置く。左上が取れる範囲は x=1〜89, y=4〜30
+        let board = Rect::new(1, 4, 98, 31);
+        assert_eq!(clamp_position(board, 10, 5, -3.0, 50.0), (1.0, 30.0));
+        assert_eq!(clamp_position(board, 10, 5, 200.0, 0.0), (89.0, 4.0));
+        assert_eq!(
+            clamp_position(board, 10, 5, 20.5, 10.25),
+            (20.5, 10.25),
+            "範囲内ならそのまま"
+        );
+    }
+
+    #[test]
+    fn reflect_position_bounces_only_the_axis_that_went_out() {
+        // 盤面40x20に幅10・高さ4の円。左上が取れる範囲は x=0〜30, y=0〜16
+        let board = Rect::new(0, 0, 40, 20);
+        assert_eq!(
+            reflect_position(board, 10, 4, (32.0, 5.0), (3.0, 1.0)),
+            ((28.0, 5.0), (-3.0, 1.0)),
+            "右端をはみ出したらx成分だけ反転し、はみ出した分だけ押し戻す"
+        );
+        assert_eq!(
+            reflect_position(board, 10, 4, (5.0, -1.5), (1.0, -2.0)),
+            ((5.0, 1.5), (1.0, 2.0)),
+            "上端をはみ出したらy成分だけ反転する"
+        );
+        assert_eq!(
+            reflect_position(board, 10, 4, (-2.0, 17.0), (-1.0, 0.5)),
+            ((2.0, 15.0), (1.0, -0.5)),
+            "角では両方反転する"
+        );
+        assert_eq!(
+            reflect_position(board, 10, 4, (12.0, 8.0), (-1.0, 0.5)),
+            ((12.0, 8.0), (-1.0, 0.5)),
+            "範囲内なら何も変えない"
+        );
+    }
+
+    #[test]
+    fn reflect_position_stays_inside_even_when_overshooting_far() {
+        let board = Rect::new(0, 0, 40, 20);
+        let ((x, y), _) = reflect_position(board, 10, 4, (95.0, -60.0), (5.0, -5.0));
+        assert!((0.0..=30.0).contains(&x), "x={x}");
+        assert!((0.0..=16.0).contains(&y), "y={y}");
+    }
+
+    #[test]
+    fn scatter_offset_pushes_away_from_click_within_radius() {
+        let click = (10.0, 10.0);
+        // 真右の円は右へ、距離ぶんそのまま
+        assert_eq!(
+            scatter_offset(click, (20.0, 10.0), 24.0, 12.0, (1.0, 0.0)),
+            Some((12.0, 0.0))
+        );
+        // 真下の円は下へ。縦はセルが縦長なので、見た目の距離に合わせて半分の行数だけ動く
+        assert_eq!(
+            scatter_offset(click, (10.0, 15.0), 24.0, 12.0, (1.0, 0.0)),
+            Some((0.0, 6.0))
+        );
+        // 斜め(横3・縦2行=見た目4)の円は、クリック位置→円の中心の向きに動く
+        let (dx, dy) = scatter_offset(click, (13.0, 12.0), 24.0, 12.0, (1.0, 0.0)).unwrap();
+        assert!(
+            (dx - 7.2).abs() < 1e-9 && (dy - 4.8).abs() < 1e-9,
+            "({dx},{dy})"
+        );
+        // 左上の円は左上へ
+        let (dx, dy) = scatter_offset(click, (4.0, 7.0), 24.0, 12.0, (1.0, 0.0)).unwrap();
+        assert!(dx < 0.0 && dy < 0.0);
+    }
+
+    #[test]
+    fn scatter_offset_ignores_circles_outside_radius() {
+        let click = (10.0, 10.0);
+        assert_eq!(
+            scatter_offset(click, (40.0, 10.0), 24.0, 12.0, (1.0, 0.0)),
+            None
+        );
+        // 縦は見た目の距離(行数×2)で測る。13行下は見た目26で範囲外
+        assert_eq!(
+            scatter_offset(click, (10.0, 23.0), 24.0, 12.0, (1.0, 0.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn numbers_stay_readable_rejects_front_circle_over_number_below() {
+        // 大きい円1(奥)の数字の上に、小さい円2(手前)を動かすと数字が隠れる
+        let placements = [placement(1, 0, 0, 14, 7), placement(2, 30, 0, 6, 3)];
+        assert!(!numbers_stay_readable(
+            &placements,
+            1,
+            Rect::new(4, 2, 6, 3),
+            |_| true
+        ));
+        assert!(
+            numbers_stay_readable(&placements, 1, Rect::new(20, 0, 6, 3), |_| true),
+            "離れた所なら隠れない"
+        );
+    }
+
+    #[test]
+    fn numbers_stay_readable_rejects_moving_behind_front_circle_number() {
+        // 奥の大きい円1を、手前の小さい円2が数字を覆う位置へ動かすと、円1の数字が隠れる
+        let placements = [placement(1, 30, 0, 14, 7), placement(2, 4, 2, 6, 3)];
+        assert!(!numbers_stay_readable(
+            &placements,
+            0,
+            Rect::new(0, 0, 14, 7),
+            |_| true
+        ));
+    }
+
+    #[test]
+    fn numbers_stay_readable_uses_order_for_same_size_circles() {
+        // 同じ大きさなら並びの後ろが手前。ぴったり重ねると奥の円の数字が隠れる
+        let placements = [placement(1, 0, 0, 10, 5), placement(2, 30, 0, 10, 5)];
+        assert!(!numbers_stay_readable(
+            &placements,
+            1,
+            Rect::new(0, 0, 10, 5),
+            |_| true
+        ));
+        assert!(!numbers_stay_readable(
+            &placements,
+            0,
+            Rect::new(30, 0, 10, 5),
+            |_| true
+        ));
+    }
+
+    #[test]
+    fn numbers_stay_readable_ignores_removed_circles() {
+        let placements = [placement(1, 0, 0, 14, 7), placement(2, 30, 0, 6, 3)];
+        assert!(
+            numbers_stay_readable(&placements, 1, Rect::new(4, 2, 6, 3), |n| n != 1),
+            "消えた円の数字は守らなくてよい"
+        );
+    }
+
+    #[test]
+    fn scatter_offset_uses_fallback_direction_when_center_is_at_click() {
+        assert_eq!(
+            scatter_offset((10.0, 10.0), (10.0, 10.0), 24.0, 12.0, (0.0, -1.0)),
+            Some((0.0, -6.0))
+        );
     }
 }
