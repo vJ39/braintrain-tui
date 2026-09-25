@@ -147,7 +147,7 @@ mod tests {
         );
         assert!(
             GAME_IDS.contains(&COLOR_STACK_ID),
-            "カラーストックも履歴に出す"
+            "ソコヌキも履歴に出す"
         );
     }
 

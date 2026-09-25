@@ -1,4 +1,4 @@
-//! カラーストック: 積まれた色ブロックを、色ボタンで「一番下」から消していくタイムアタック。
+//! ソコヌキ: 積まれた色ブロックを、色ボタンで「一番下」から消していくタイムアタック。
 //!
 //! 1セッション=3ラウンドで、難易度選択は無い。ラウンドごとに盤面の構成と段数が決まっている。
 //! - ROUND1(36段)・ROUND2(72段): 4列。各列は専用の色で、1段に1列だけブロックがある(同時押しは無い)。
@@ -26,7 +26,7 @@ use crate::game::{column_index, contains, Difficulty, Game, GameResult, ScoreTra
 
 pub const GAME_ID: &str = "color_stack";
 
-/// 結果に記録する難易度。カラーストックは難易度を選ばないので固定値にする
+/// 結果に記録する難易度。ソコヌキは難易度を選ばないので固定値にする
 /// (これまでの記録と同じ扱いになるよう中級のままにする)
 pub const SESSION_DIFFICULTY: Difficulty = Difficulty::Intermediate;
 
@@ -473,7 +473,7 @@ impl ColorStackGame {
     }
 
     fn render_hud(&self, frame: &mut Frame, area: Rect) {
-        let block = theme::panel(" ◆ カラーストック ")
+        let block = theme::panel(" ◆ ソコヌキ ")
             .border_style(Style::default().fg(theme::flash_border_color(self.feedback.current())))
             .title(
                 Line::from(Span::styled(
