@@ -9,17 +9,30 @@ use std::time::Duration;
 
 use image::{Rgba, RgbaImage};
 
+use super::layout::CircleSize;
+
 /// 波紋が広がり切って消えるまでの時間
 pub const RIPPLE_DURATION: Duration = Duration::from_millis(500);
 /// 波紋の画像を作り直す間隔(1コマの長さ)。画像プロトコルのエンコード・端末への送信は重いため、
 /// 毎tick(33ms)ではなくこの間隔ごとにだけ作り直す
 pub const RIPPLE_FRAME_INTERVAL: Duration = Duration::from_millis(50);
-/// 広がり切った時の半径。1セルの高さ(ピクセル)に対する倍率
-pub const RIPPLE_MAX_RADIUS_CELLS: f64 = 3.0;
 /// リングの線の太さ。1セルの高さ(ピクセル)に対する倍率
 pub const RIPPLE_THICKNESS_CELLS: f64 = 0.3;
 /// リングの色(正解フィードバックの明るい緑に合わせる)
 pub const RIPPLE_COLOR: [u8; 3] = [120, 235, 150];
+
+/// 押した円のサイズ段階ごとの、広がり切った時の半径。1セルの高さ(ピクセル)に対する倍率。
+/// 大きい円を押した時ほど大きく広がる。小は変更前の全ての波紋と同じ大きさ。
+/// 波紋が大きいほど画像表示で作り直すパッチも大きくなる(エンコードが重くなる)ため、
+/// 特大でも小の2倍強に抑えている
+pub fn max_radius_cells_for(size: CircleSize) -> f64 {
+    match size {
+        CircleSize::Huge => 7.0,
+        CircleSize::Large => 5.0,
+        CircleSize::Medium => 4.0,
+        CircleSize::Small => 3.0,
+    }
+}
 
 /// 表示中の波紋1つ
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -28,20 +41,28 @@ pub struct Ripple {
     center: (u16, u16),
     /// 開始からの経過時間
     elapsed: Duration,
+    /// 広がり切った時の半径(1セルの高さに対する倍率)。押した円のサイズで決まる
+    max_radius_cells: f64,
 }
 
 impl Ripple {
-    /// クリックしたセル(column, row)を中心に、波紋を始める
-    pub fn new(column: u16, row: u16) -> Self {
+    /// クリックしたセル(column, row)を中心に、押した円のサイズsizeに応じた大きさの波紋を始める
+    pub fn new(column: u16, row: u16, size: CircleSize) -> Self {
         Self {
             center: (column, row),
             elapsed: Duration::ZERO,
+            max_radius_cells: max_radius_cells_for(size),
         }
     }
 
     /// 中心のセル座標
     pub fn center(&self) -> (u16, u16) {
         self.center
+    }
+
+    /// 広がり切った時の半径(1セルの高さに対する倍率)
+    pub fn max_radius_cells(&self) -> f64 {
+        self.max_radius_cells
     }
 
     /// dtだけ時間を進めた波紋。持続時間を過ぎたらNone
@@ -64,7 +85,7 @@ impl Ripple {
     /// いまの半径(1セルの高さに対する倍率)。0から最大半径まで、初めは速く後はゆっくり広がる
     pub fn radius_cells(&self) -> f64 {
         let remaining = 1.0 - self.progress();
-        RIPPLE_MAX_RADIUS_CELLS * (1.0 - remaining * remaining)
+        self.max_radius_cells * (1.0 - remaining * remaining)
     }
 
     /// いまの不透明度(1.0から0.0へ減っていく)
@@ -181,7 +202,7 @@ mod tests {
 
     #[test]
     fn new_ripple_starts_at_center_with_zero_radius_and_full_opacity() {
-        let ripple = Ripple::new(12, 7);
+        let ripple = Ripple::new(12, 7, CircleSize::Small);
         assert_eq!(ripple.center(), (12, 7));
         assert_eq!(ripple.progress(), 0.0);
         assert_eq!(ripple.radius_cells(), 0.0);
@@ -190,7 +211,7 @@ mod tests {
 
     #[test]
     fn ripple_grows_and_fades_over_time() {
-        let mut ripple = Ripple::new(0, 0);
+        let mut ripple = Ripple::new(0, 0, CircleSize::Small);
         let step = RIPPLE_DURATION / 5;
         let mut last_radius = ripple.radius_cells();
         let mut last_opacity = ripple.opacity();
@@ -198,7 +219,7 @@ mod tests {
             ripple = ripple.advanced(step).expect("持続時間内は残る");
             assert!(ripple.radius_cells() > last_radius, "半径は広がっていく");
             assert!(ripple.opacity() < last_opacity, "不透明度は減っていく");
-            assert!(ripple.radius_cells() <= RIPPLE_MAX_RADIUS_CELLS);
+            assert!(ripple.radius_cells() <= ripple.max_radius_cells());
             last_radius = ripple.radius_cells();
             last_opacity = ripple.opacity();
         }
@@ -207,7 +228,7 @@ mod tests {
 
     #[test]
     fn ripple_disappears_after_duration() {
-        let ripple = Ripple::new(3, 4);
+        let ripple = Ripple::new(3, 4, CircleSize::Small);
         let almost = ripple
             .advanced(RIPPLE_DURATION - Duration::from_millis(1))
             .expect("持続時間の直前はまだ残る");
@@ -223,7 +244,7 @@ mod tests {
 
     #[test]
     fn frame_advances_once_per_frame_interval() {
-        let ripple = Ripple::new(0, 0);
+        let ripple = Ripple::new(0, 0, CircleSize::Small);
         assert_eq!(ripple.frame(), 0);
         let just_before = ripple
             .advanced(RIPPLE_FRAME_INTERVAL - Duration::from_millis(1))
@@ -246,10 +267,75 @@ mod tests {
 
     #[test]
     fn ripple_reaches_max_radius_at_end() {
-        let almost = Ripple::new(0, 0)
+        let almost = Ripple::new(0, 0, CircleSize::Small)
             .advanced(RIPPLE_DURATION - Duration::from_millis(1))
             .unwrap();
-        assert!((almost.radius_cells() - RIPPLE_MAX_RADIUS_CELLS).abs() < 0.01);
+        assert!((almost.radius_cells() - almost.max_radius_cells()).abs() < 0.01);
         assert!(almost.opacity() < 0.01);
+    }
+
+    // --- 円のサイズに応じた波紋の大きさ ---
+
+    const SIZES_LARGE_TO_SMALL: [CircleSize; 4] = [
+        CircleSize::Huge,
+        CircleSize::Large,
+        CircleSize::Medium,
+        CircleSize::Small,
+    ];
+
+    #[test]
+    fn ripple_keeps_max_radius_of_clicked_circle_size() {
+        for size in SIZES_LARGE_TO_SMALL {
+            let ripple = Ripple::new(4, 2, size);
+            assert_eq!(ripple.max_radius_cells(), max_radius_cells_for(size));
+            let later = ripple.advanced(RIPPLE_DURATION / 2).unwrap();
+            assert_eq!(
+                later.max_radius_cells(),
+                ripple.max_radius_cells(),
+                "時間が進んでも最大半径は変わらない"
+            );
+        }
+    }
+
+    #[test]
+    fn larger_circle_gives_larger_max_radius() {
+        let radii: Vec<f64> = SIZES_LARGE_TO_SMALL
+            .iter()
+            .map(|&size| max_radius_cells_for(size))
+            .collect();
+        assert!(
+            radii.windows(2).all(|w| w[0] > w[1]),
+            "特大>大>中>小の順に大きく広がる: {radii:?}"
+        );
+        // 特大と小の差がはっきり分かること(半径で2倍以上)
+        assert!(
+            max_radius_cells_for(CircleSize::Huge) >= max_radius_cells_for(CircleSize::Small) * 2.0,
+            "特大の波紋は小の2倍以上: {radii:?}"
+        );
+        assert!(radii.iter().all(|&r| r > 0.0));
+    }
+
+    #[test]
+    fn huge_ripple_is_wider_than_small_ripple_at_the_same_time() {
+        let at = |size: CircleSize| {
+            Ripple::new(0, 0, size)
+                .advanced(RIPPLE_DURATION / 2)
+                .unwrap()
+                .radius_cells()
+        };
+        assert!(at(CircleSize::Huge) > at(CircleSize::Small) * 2.0);
+    }
+
+    #[test]
+    fn every_size_reaches_its_own_max_radius_at_end() {
+        for size in SIZES_LARGE_TO_SMALL {
+            let almost = Ripple::new(0, 0, size)
+                .advanced(RIPPLE_DURATION - Duration::from_millis(1))
+                .unwrap();
+            assert!(
+                (almost.radius_cells() - max_radius_cells_for(size)).abs() < 0.02,
+                "{size:?}"
+            );
+        }
     }
 }

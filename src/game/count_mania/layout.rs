@@ -31,12 +31,13 @@ pub struct Placement {
 
 /// サイズ段階ごとの高さ(セル数)の候補。大きい組から順に試し、プレイエリアに収まらなければ
 /// 1段小さい組に落とす。各組は[特大, 大, 中, 小]の高さで、どの組でも 特大 > 大 > 中 > 小 を保ち、
-/// サイズ段階の違いが見えるようにする。幅は高さの2倍にする
+/// サイズ段階の違いが見えるようにする。幅は高さの2倍にする。
+/// 特大は大との差がはっきり見えるよう、大きい端末で使う組ほど大きく離している
 const SIZE_TIERS: [[u16; 4]; 5] = [
-    [9, 7, 5, 3],
-    [8, 6, 4, 3],
-    [7, 5, 4, 2],
-    [5, 4, 3, 2],
+    [12, 7, 5, 3],
+    [10, 6, 4, 3],
+    [9, 5, 4, 2],
+    [6, 4, 3, 2],
     [4, 3, 2, 1],
 ];
 
@@ -52,8 +53,9 @@ const LOOSE_MAX_COVERAGE: f64 = 0.8;
 const DENSE_MAX_COVERAGE: f64 = 1.4;
 
 /// 密集配置のとき、円を寄せるプレイエリア中央の領域の割合(幅・高さそれぞれ)。
-/// 狭い領域に置くほど円どうしの重なりが強くなる
-const DENSE_REGION_RATIO: f64 = 0.6;
+/// 狭くしすぎると画面の中央だけに固まって窮屈に見えるため、画面の大部分を使う広さにする。
+/// 密集配置は円の数が多く、面積の上限(DENSE_MAX_COVERAGE)も高いので、この広さでも重なりは強くなる
+const DENSE_REGION_RATIO: f64 = 0.9;
 
 /// 数字の範囲(手前の円に覆わせない範囲)の、円の幅・高さに対する割合。
 /// 円の画像の2桁の数字は幅約42%・高さ約30%を占めるので、少し余裕を持たせている
@@ -593,7 +595,7 @@ mod tests {
         // 広いエリアなら、密集配置の円は全て中央の領域に収まる
         let area = Rect::new(0, 0, 160, 50);
         let region = central_region(area, DENSE_REGION_RATIO);
-        assert_eq!(region, Rect::new(32, 10, 96, 30));
+        assert_eq!(region, Rect::new(8, 2, 144, 45));
         for seed in 0..5 {
             let mut rng = StdRng::seed_from_u64(seed);
             let placements = layout_circles(&mut rng, area, &circles(20, &ALL), true);
@@ -745,5 +747,117 @@ mod tests {
     fn hit_test_falls_through_to_circle_below_when_top_is_removed() {
         let placements = [placement(1, 0, 0, 14, 7), placement(2, 4, 2, 6, 3)];
         assert_eq!(hit_test(&placements, |n| n != 2, 7, 3), Some(1));
+    }
+
+    // --- 上級(密集配置)の広さ・特大円の大きさ ---
+
+    /// 変更前の特大の高さ(組ごと)
+    const OLD_HUGE_HEIGHTS: [u16; 5] = [9, 8, 7, 5, 4];
+
+    #[test]
+    fn huge_circles_are_larger_than_before() {
+        for (tier, old) in OLD_HUGE_HEIGHTS.into_iter().enumerate() {
+            let (_, h) = size_dims(tier, CircleSize::Huge);
+            assert!(
+                h >= old,
+                "tier={tier}: 特大{h}が変更前{old}より小さくならない"
+            );
+        }
+        // 大きい端末で使う組では、はっきり大きくする
+        for (tier, old) in OLD_HUGE_HEIGHTS.into_iter().enumerate().take(3) {
+            let (_, h) = size_dims(tier, CircleSize::Huge);
+            assert!(
+                h >= old + 2,
+                "tier={tier}: 特大{h}は変更前{old}より2段以上大きい"
+            );
+        }
+    }
+
+    /// 円(楕円)の内側にあるセルが、エリアの全セルに占める割合
+    fn covered_ratio(area: Rect, placements: &[Placement]) -> f64 {
+        let covered = cells(area)
+            .filter(|&(x, y)| placements.iter().any(|p| circle_contains(p.rect, x, y)))
+            .count();
+        covered as f64 / f64::from(area.area())
+    }
+
+    /// 全ての円の外接矩形がエリアに占める割合
+    fn spread_ratio(area: Rect, placements: &[Placement]) -> f64 {
+        let bounds = placements
+            .iter()
+            .map(|p| p.rect)
+            .reduce(|a, b| a.union(b))
+            .unwrap_or_default();
+        f64::from(bounds.area()) / f64::from(area.area())
+    }
+
+    /// 複数のseedで配置し、measureの平均を取る
+    fn average(
+        area: Rect,
+        (n, levels, dense): (u8, &[CircleSize], bool),
+        measure: fn(Rect, &[Placement]) -> f64,
+    ) -> f64 {
+        let seeds = 0..12u64;
+        let count = seeds.clone().count() as f64;
+        seeds
+            .map(|seed| {
+                let mut rng = StdRng::seed_from_u64(seed);
+                measure(
+                    area,
+                    &layout_circles(&mut rng, area, &circles(n, levels), dense),
+                )
+            })
+            .sum::<f64>()
+            / count
+    }
+
+    /// ゲームで使う大きさの盤面(100x36の画面・大きめの端末)
+    const GAME_BOARDS: [Rect; 2] = [Rect::new(1, 4, 98, 31), Rect::new(1, 4, 158, 45)];
+
+    #[test]
+    fn advanced_layout_spreads_over_most_of_the_board() {
+        // 上級(密集配置)も盤面の中央に固まらず、盤面の大部分に広がる
+        // (変更前は中央の60%四方=面積36%以内に収まっていた)
+        let [_, _, advanced] = CONFIGS;
+        for area in GAME_BOARDS {
+            let spread = average(area, advanced, spread_ratio);
+            assert!(spread >= 0.7, "{area:?}: 上級の広がり{spread:.2}");
+        }
+    }
+
+    #[test]
+    fn advanced_layout_covers_clearly_more_of_the_board_than_beginner() {
+        // 上級は円が多く、中央に固めずに置くので、初級より画面の広い範囲を円で埋める
+        // (実測は盤面98x31で上級約0.52/初級約0.41、158x45で約0.25/約0.18)
+        let [beginner, _, advanced] = CONFIGS;
+        for area in GAME_BOARDS {
+            let b = average(area, beginner, covered_ratio);
+            let a = average(area, advanced, covered_ratio);
+            assert!(a >= b * 1.2, "{area:?}: 上級{a:.2} / 初級{b:.2}");
+        }
+    }
+
+    #[test]
+    fn advanced_layout_keeps_largest_tier_on_game_boards() {
+        // 円の数が多い上級でも、ゲームの盤面では組を落とさず最大の特大円を使う
+        let [_, _, (n, levels, dense)] = CONFIGS;
+        let input = circles(n, levels);
+        let huge_number = input
+            .iter()
+            .find(|(_, s)| *s == CircleSize::Huge)
+            .unwrap()
+            .0;
+        for area in GAME_BOARDS {
+            for seed in 0..5 {
+                let mut rng = StdRng::seed_from_u64(seed);
+                let placements = layout_circles(&mut rng, area, &input, dense);
+                let huge = placements.iter().find(|p| p.number == huge_number).unwrap();
+                assert_eq!(
+                    (huge.rect.width, huge.rect.height),
+                    size_dims(0, CircleSize::Huge),
+                    "{area:?} seed={seed}"
+                );
+            }
+        }
     }
 }
