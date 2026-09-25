@@ -302,6 +302,7 @@ mod tests {
             names,
             vec![
                 "Apex_Movement".to_string(),
+                "Overclocked_Tempo".to_string(),
                 "Redline_Response_Time".to_string(),
                 "Top_of_the_Leaderboard".to_string()
             ]
