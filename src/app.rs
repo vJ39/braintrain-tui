@@ -42,7 +42,7 @@ const MENU_ITEMS: [&str; 14] = [
     "カウントマニア",
     "ソコヌキ",
     "TTR",
-    "反射神経",
+    "ハヤウチ",
     "ジュークボックス",
     "履歴",
 ];
@@ -53,7 +53,7 @@ const COUNT_MANIA_ITEM_INDEX: usize = 8;
 const COLOR_STACK_ITEM_INDEX: usize = 9;
 /// リズムゲーム(TTR)は難易度選択の代わりに曲選択を挟む(難易度は常に上級)
 const RHYTHM_ITEM_INDEX: usize = 10;
-/// 反射神経
+/// ハヤウチ
 const QUICK_DRAW_ITEM_INDEX: usize = 11;
 const JUKEBOX_ITEM_INDEX: usize = MENU_ITEMS.len() - 2;
 const HISTORY_ITEM_INDEX: usize = MENU_ITEMS.len() - 1;
@@ -371,6 +371,14 @@ impl App {
             self.start_playing(
                 COUNT_MANIA_ITEM_INDEX,
                 crate::game::count_mania::SESSION_DIFFICULTY,
+            );
+            return;
+        }
+        if selected == QUICK_DRAW_ITEM_INDEX {
+            // ハヤウチも難易度を持たず10問固定で進むため、難易度選択を挟まない
+            self.start_playing(
+                QUICK_DRAW_ITEM_INDEX,
+                crate::game::quick_draw::SESSION_DIFFICULTY,
             );
             return;
         }
@@ -734,7 +742,8 @@ fn new_game(item: usize, difficulty: Difficulty) -> Box<dyn Game> {
         // ソコヌキは難易度を持たず、ROUND1〜3が固定の内容で進む
         COLOR_STACK_ITEM_INDEX => Box::new(ColorStackGame::new()),
         RHYTHM_ITEM_INDEX => unreachable!("rhythm is started via start_rhythm with a song"),
-        QUICK_DRAW_ITEM_INDEX => Box::new(QuickDrawGame::new(difficulty)),
+        // ハヤウチは難易度を持たず、10問固定で進む
+        QUICK_DRAW_ITEM_INDEX => Box::new(QuickDrawGame::new()),
         _ => unreachable!("history is handled without creating a game"),
     }
 }
@@ -1840,11 +1849,11 @@ mod tests {
         assert_eq!(MENU_ITEMS[RHYTHM_ITEM_INDEX], "TTR");
     }
 
-    // --- 反射神経 ---
+    // --- ハヤウチ ---
 
     #[test]
     fn quick_draw_comes_right_after_ttr_and_before_jukebox() {
-        assert_eq!(MENU_ITEMS[QUICK_DRAW_ITEM_INDEX], "反射神経");
+        assert_eq!(MENU_ITEMS[QUICK_DRAW_ITEM_INDEX], "ハヤウチ");
         assert_eq!(RHYTHM_ITEM_INDEX + 1, QUICK_DRAW_ITEM_INDEX);
         assert_eq!(QUICK_DRAW_ITEM_INDEX + 1, JUKEBOX_ITEM_INDEX);
         // 先頭側の既存インデックスはずれない
@@ -1853,39 +1862,75 @@ mod tests {
     }
 
     #[test]
-    fn new_game_for_quick_draw_item_creates_quick_draw() {
-        let game = new_game(QUICK_DRAW_ITEM_INDEX, Difficulty::Advanced);
-        let result = game.result();
-        assert_eq!(result.game_id, crate::game::quick_draw::GAME_ID);
-        assert_eq!(result.difficulty, Difficulty::Advanced);
+    fn quick_draw_menu_texts_no_longer_use_old_name() {
+        assert!(!MENU_ITEMS.contains(&"反射神経"));
+        assert!(!MENU_DESCRIPTIONS[QUICK_DRAW_ITEM_INDEX].contains("反射神経"));
     }
 
     #[test]
-    fn selecting_quick_draw_goes_to_difficulty_then_countdown_then_playing() {
-        let mut app = App::new();
-        app.select_menu_item(QUICK_DRAW_ITEM_INDEX);
-        assert!(matches!(
-            app.screen,
-            Screen::SelectDifficulty(QUICK_DRAW_ITEM_INDEX, None)
-        ));
-        app.handle_key(KeyEvent::from(KeyCode::Char('3')));
-        assert!(
-            matches!(
-                app.screen,
-                Screen::Countdown {
-                    item: QUICK_DRAW_ITEM_INDEX,
-                    difficulty: Difficulty::Advanced,
-                    ..
-                }
-            ),
-            "反射神経も通常のカウントダウンを経由する"
-        );
-        finish_countdown(&mut app);
+    fn new_game_for_quick_draw_item_creates_quick_draw() {
+        // ハヤウチは難易度を選ばないので、渡した難易度によらず代表値の難易度で記録する
+        for difficulty in [
+            Difficulty::Beginner,
+            Difficulty::Intermediate,
+            Difficulty::Advanced,
+        ] {
+            let game = new_game(QUICK_DRAW_ITEM_INDEX, difficulty);
+            let result = game.result();
+            assert_eq!(result.game_id, crate::game::quick_draw::GAME_ID);
+            assert_eq!(
+                result.difficulty,
+                crate::game::quick_draw::SESSION_DIFFICULTY
+            );
+        }
+    }
+
+    /// ハヤウチが始まり、1問目(10問中)が表示されていることを確かめる
+    fn assert_quick_draw_round1_is_playing(app: &mut App) {
+        finish_countdown(app);
         let Screen::Playing(game) = &app.screen else {
             panic!("Playing画面のはず");
         };
         assert_eq!(game.result().game_id, crate::game::quick_draw::GAME_ID);
-        assert!(rendered_text(&mut app).replace(' ', "").contains("まだ待て"));
+        assert!(!game.is_finished());
+        // 全角文字の2セル目は空白で埋まるため、空白を除いて比較する
+        let text = rendered_text(app).replace(' ', "");
+        assert!(text.contains("ハヤウチ"));
+        assert!(text.contains("Q1/10"), "10問制の1問目から始まる");
+    }
+
+    #[test]
+    fn selecting_quick_draw_skips_difficulty_and_starts_after_countdown() {
+        let mut app = App::new();
+        app.select_menu_item(QUICK_DRAW_ITEM_INDEX);
+        let Screen::Countdown {
+            item,
+            difficulty,
+            state,
+        } = &app.screen
+        else {
+            panic!("難易度選択を挟まずカウントダウンになるはず");
+        };
+        assert_eq!(*item, QUICK_DRAW_ITEM_INDEX);
+        assert_eq!(*difficulty, crate::game::quick_draw::SESSION_DIFFICULTY);
+        assert_eq!(state.phase(), Some(Phase::Three), "3から始まる");
+        assert_quick_draw_round1_is_playing(&mut app);
+    }
+
+    #[test]
+    fn enter_on_quick_draw_in_menu_goes_straight_to_countdown() {
+        let mut app = App::new();
+        app.screen = Screen::Menu;
+        app.menu_state.select(QUICK_DRAW_ITEM_INDEX);
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(
+            app.screen,
+            Screen::Countdown {
+                item: QUICK_DRAW_ITEM_INDEX,
+                ..
+            }
+        ));
+        assert_quick_draw_round1_is_playing(&mut app);
     }
 
     #[test]
@@ -1895,7 +1940,9 @@ mod tests {
             new_game(QUICK_DRAW_ITEM_INDEX, Difficulty::Beginner).result(),
             None,
         );
-        assert!(rendered_text(&mut app).replace(' ', "").contains("反射神経"));
+        let text = rendered_text(&mut app).replace(' ', "");
+        assert!(text.contains("ハヤウチ"));
+        assert!(!text.contains("反射神経"));
     }
 
     #[test]
@@ -2713,10 +2760,13 @@ mod tests {
         (0..JUKEBOX_ITEM_INDEX).filter(|&item| item != RHYTHM_ITEM_INDEX)
     }
 
-    /// 難易度選択画面を経由するゲームのメニュー項目一覧(DDR・ソコヌキ・カウントマニア以外)
+    /// 難易度選択画面を経由するゲームのメニュー項目一覧(DDR・ソコヌキ・カウントマニア・ハヤウチ以外)
     fn difficulty_select_game_items() -> impl Iterator<Item = usize> {
-        non_rhythm_game_items()
-            .filter(|&item| item != COLOR_STACK_ITEM_INDEX && item != COUNT_MANIA_ITEM_INDEX)
+        non_rhythm_game_items().filter(|&item| {
+            item != COLOR_STACK_ITEM_INDEX
+                && item != COUNT_MANIA_ITEM_INDEX
+                && item != QUICK_DRAW_ITEM_INDEX
+        })
     }
 
     fn left_click(row: u16) -> MouseEvent {
@@ -2735,7 +2785,7 @@ mod tests {
 
     #[test]
     fn starting_any_non_rhythm_game_goes_through_countdown() {
-        // ソコヌキ・カウントマニアは難易度選択を経由しないので別のテストで確認する
+        // ソコヌキ・カウントマニア・ハヤウチは難易度選択を経由しないので別のテストで確認する
         for item in difficulty_select_game_items() {
             let mut app = App::new();
             app.screen = Screen::SelectDifficulty(item, None);
@@ -2812,7 +2862,7 @@ mod tests {
 
     #[test]
     fn countdown_finishes_into_the_selected_game_for_every_item() {
-        // ソコヌキ・カウントマニアは難易度選択を経由しないので別のテストで確認する
+        // ソコヌキ・カウントマニア・ハヤウチは難易度選択を経由しないので別のテストで確認する
         for item in difficulty_select_game_items() {
             let mut app = App::new();
             app.screen = Screen::SelectDifficulty(item, None);

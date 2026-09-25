@@ -1,5 +1,5 @@
-//! 反射神経(quick_draw): いつ来るかわからない合図を待ち、合図が出た瞬間に反応する。
-//! 仕様は docs/quick-draw-spec.md
+//! ハヤウチ(quick_draw): いつ来るかわからない合図を待ち、合図が出た瞬間に反応する。
+//! 仕様は docs/quick-draw-spec.md・docs/quick-draw-fixed-rounds-spec.md
 
 use std::time::{Duration, Instant};
 
@@ -15,11 +15,18 @@ use crate::audio::{self, SeKind};
 use crate::game::feedback::AnswerFeedback;
 use crate::game::theme;
 use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
+use crate::ui::countdown::{self, CountdownState};
 
 pub const GAME_ID: &str = "quick_draw";
 
 /// 1セッションのラウンド数
-pub const ROUNDS_PER_SESSION: u32 = 3;
+pub const ROUNDS_PER_SESSION: u32 = 10;
+
+/// 結果に記録する難易度・HUDに出す難易度。ハヤウチは難易度を選ばないので代表値にする
+pub const SESSION_DIFFICULTY: Difficulty = Difficulty::Advanced;
+
+/// 各ラウンドで超短時間パターンを選ぶ確率
+pub const VERY_SHORT_RATE: f64 = 0.2;
 
 /// 待機中の背景(暗いグレー)
 pub const WAITING_BG: Color = Color::Rgb(48, 48, 48);
@@ -30,38 +37,52 @@ pub const WAITING_TEXT: &str = "まだ待て";
 /// 合図の表示
 pub const SIGNAL_TEXT: &str = "今だ!";
 
-/// 難易度ごとの待機時間の範囲(最小, 最大)
-pub fn wait_range(difficulty: Difficulty) -> (Duration, Duration) {
-    let (min_ms, max_ms) = match difficulty {
-        Difficulty::Beginner => (1000, 2500),
-        Difficulty::Intermediate => (1000, 4000),
-        Difficulty::Advanced => (800, 5000),
-    };
-    (Duration::from_millis(min_ms), Duration::from_millis(max_ms))
+/// 合図までの待機時間のパターン。ラウンドごとにランダムで選ぶ
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitPattern {
+    /// 通常の待機時間
+    Normal,
+    /// 超短時間。合図がほぼ待たずに来る
+    VeryShort,
 }
 
-/// フライング時に反応時間の代わりに記録する固定ペナルティ値(ms)。
-/// その難易度の最大待機時間と同じ値にし、どんなに遅い反応よりも悪い記録になるようにする
-pub fn fail_latency_ms(difficulty: Difficulty) -> f64 {
-    let (_, max) = wait_range(difficulty);
-    max.as_millis() as f64
-}
+impl WaitPattern {
+    /// 待機時間の範囲(最小, 最大)
+    pub fn wait_range(self) -> (Duration, Duration) {
+        let (min_ms, max_ms) = match self {
+            WaitPattern::Normal => (800, 4000),
+            WaitPattern::VeryShort => (200, 500),
+        };
+        (Duration::from_millis(min_ms), Duration::from_millis(max_ms))
+    }
 
-/// 待機時間を難易度の範囲内からランダムに決める
-fn random_wait(rng: &mut impl Rng, difficulty: Difficulty) -> Duration {
-    let (min, max) = wait_range(difficulty);
-    Duration::from_millis(rng.gen_range(min.as_millis() as u64..=max.as_millis() as u64))
-}
-
-fn new_waiting(difficulty: Difficulty) -> Phase {
-    Phase::Waiting {
-        remaining: random_wait(&mut rand::thread_rng(), difficulty),
+    /// フライング時に反応時間の代わりに記録する固定ペナルティ値(ms)。
+    /// このパターンの最大待機時間と同じ値にする
+    pub fn fail_latency_ms(self) -> f64 {
+        let (_, max) = self.wait_range();
+        max.as_millis() as f64
     }
 }
 
+/// ラウンドの待機時間パターンをランダムに選ぶ(超短時間はVERY_SHORT_RATEの確率)
+fn random_pattern(rng: &mut impl Rng) -> WaitPattern {
+    if rng.gen_bool(VERY_SHORT_RATE) {
+        WaitPattern::VeryShort
+    } else {
+        WaitPattern::Normal
+    }
+}
+
+/// 待機時間をパターンの範囲内からランダムに決める
+fn random_wait(rng: &mut impl Rng, pattern: WaitPattern) -> Duration {
+    let (min, max) = pattern.wait_range();
+    Duration::from_millis(rng.gen_range(min.as_millis() as u64..=max.as_millis() as u64))
+}
+
 /// ラウンド内の状態
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
+    /// ラウンド冒頭の「3.2.1.GO!!」。終わると合図待ちへ進む
+    Countdown { state: CountdownState },
     /// 合図待ち。残りの待機時間
     Waiting { remaining: Duration },
     /// 合図が出ている。合図が出た時刻
@@ -69,31 +90,48 @@ enum Phase {
 }
 
 pub struct QuickDrawGame {
-    difficulty: Difficulty,
     tracker: ScoreTracker,
     phase: Phase,
+    /// 現在のラウンドの待機時間パターン(ラウンド開始時に選ぶ)
+    pattern: WaitPattern,
     /// 直前のラウンドの結果表示(描画専用)
     feedback: AnswerFeedback,
 }
 
 impl QuickDrawGame {
-    pub fn new(difficulty: Difficulty) -> Self {
-        Self {
-            difficulty,
+    pub fn new() -> Self {
+        let mut game = Self {
             tracker: ScoreTracker::with_session_length(ROUNDS_PER_SESSION),
-            phase: new_waiting(difficulty),
+            phase: Phase::Countdown {
+                state: CountdownState::new(),
+            },
+            pattern: WaitPattern::Normal,
             feedback: AnswerFeedback::new(),
-        }
+        };
+        game.start_round();
+        game
     }
 
-    /// キー/クリックで押された時の処理。合図前ならフライング、合図後なら反応時間を記録する
+    /// 新しいラウンドを始める。待機時間パターンを選び直し、カウントダウンから始める
+    fn start_round(&mut self) {
+        self.pattern = random_pattern(&mut rand::thread_rng());
+        let state = CountdownState::new();
+        // 最初のフェーズ「3」の音
+        if let Some(phase) = state.phase() {
+            audio::play_se(phase.se());
+        }
+        self.phase = Phase::Countdown { state };
+    }
+
+    /// キー/クリックで押された時の処理。合図前(カウントダウン中・待機中)ならフライング、
+    /// 合図後なら反応時間を記録する
     fn press(&mut self) {
         if self.is_finished() {
             return;
         }
-        match self.phase {
-            Phase::Waiting { .. } => {
-                self.tracker.record(false, fail_latency_ms(self.difficulty));
+        match &self.phase {
+            Phase::Countdown { .. } | Phase::Waiting { .. } => {
+                self.tracker.record(false, self.pattern.fail_latency_ms());
                 self.feedback.record(false, "フライング");
                 audio::play_se(SeKind::Incorrect);
             }
@@ -104,12 +142,16 @@ impl QuickDrawGame {
                 audio::play_se(SeKind::Correct);
             }
         }
-        // 最終ラウンドの後も待機状態にしておく(is_finishedで入力と時間経過は止まる)
-        self.phase = new_waiting(self.difficulty);
+        // 最終ラウンドの後も次のラウンドの状態にしておく(is_finishedで入力と時間経過は止まる)
+        self.start_round();
     }
 
     fn render_board(&self, frame: &mut Frame, area: Rect) {
-        let (background, headline, text_color) = match self.phase {
+        let (background, headline, text_color) = match &self.phase {
+            Phase::Countdown { state } => {
+                countdown::render(frame, area, state);
+                return;
+            }
             Phase::Waiting { .. } => (WAITING_BG, WAITING_TEXT, theme::TEXT),
             Phase::Signal { .. } => (SIGNAL_BG, SIGNAL_TEXT, Color::Black),
         };
@@ -140,6 +182,12 @@ impl QuickDrawGame {
     }
 }
 
+impl Default for QuickDrawGame {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Game for QuickDrawGame {
     fn handle_key(&mut self, key: KeyEvent) {
         if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
@@ -159,16 +207,29 @@ impl Game for QuickDrawGame {
             return;
         }
         self.feedback.tick(dt);
-        if let Phase::Waiting { remaining } = self.phase {
-            let remaining = remaining.saturating_sub(dt);
-            self.phase = if remaining.is_zero() {
-                // 反応時間は合図が画面に出た時刻から測る
-                Phase::Signal {
-                    shown_at: Instant::now(),
+        match &mut self.phase {
+            Phase::Countdown { state } => {
+                if let Some(phase) = state.tick(dt) {
+                    audio::play_se(phase.se());
                 }
-            } else {
-                Phase::Waiting { remaining }
-            };
+                if state.is_finished() {
+                    self.phase = Phase::Waiting {
+                        remaining: random_wait(&mut rand::thread_rng(), self.pattern),
+                    };
+                }
+            }
+            Phase::Waiting { remaining } => {
+                let remaining = remaining.saturating_sub(dt);
+                self.phase = if remaining.is_zero() {
+                    // 反応時間は合図が画面に出た時刻から測る
+                    Phase::Signal {
+                        shown_at: Instant::now(),
+                    }
+                } else {
+                    Phase::Waiting { remaining }
+                };
+            }
+            Phase::Signal { .. } => {}
         }
     }
 
@@ -177,8 +238,8 @@ impl Game for QuickDrawGame {
         theme::render_hud_with_session_length(
             frame,
             hud_area,
-            "反射神経",
-            self.difficulty,
+            "ハヤウチ",
+            SESSION_DIFFICULTY,
             self.tracker.total(),
             self.tracker.session_length(),
             &self.feedback,
@@ -191,13 +252,14 @@ impl Game for QuickDrawGame {
     }
 
     fn result(&self) -> GameResult {
-        self.tracker.to_result(GAME_ID, self.difficulty)
+        self.tracker.to_result(GAME_ID, SESSION_DIFFICULTY)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::countdown::{self as countdown_ui, PHASE_DURATION};
     use crossterm::event::KeyModifiers;
     use rand::rngs::StdRng;
     use rand::SeedableRng;
@@ -205,12 +267,10 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::Terminal;
 
-    const ALL_DIFFICULTIES: [Difficulty; 3] = [
-        Difficulty::Beginner,
-        Difficulty::Intermediate,
-        Difficulty::Advanced,
-    ];
+    const ALL_PATTERNS: [WaitPattern; 2] = [WaitPattern::Normal, WaitPattern::VeryShort];
     const AREA: Rect = Rect::new(0, 0, 60, 20);
+    /// 1ラウンドのカウントダウン全体の長さ(3/2/1/GO!!の4フェーズ)
+    const COUNTDOWN_TOTAL: Duration = Duration::from_millis(2400);
 
     fn ms(value: u64) -> Duration {
         Duration::from_millis(value)
@@ -241,14 +301,35 @@ mod tests {
         game.phase = Phase::Signal { shown_at };
     }
 
+    /// ラウンド冒頭のカウントダウンを最後まで進め、合図待ちにする
+    fn finish_countdown(game: &mut QuickDrawGame) {
+        assert!(is_countdown(game), "カウントダウン中のはず");
+        game.update(COUNTDOWN_TOTAL);
+        assert!(
+            matches!(game.phase, Phase::Waiting { .. }),
+            "カウントダウンが終わったら合図待ち"
+        );
+    }
+
+    fn is_countdown(game: &QuickDrawGame) -> bool {
+        matches!(game.phase, Phase::Countdown { .. })
+    }
+
+    fn countdown_phase(game: &QuickDrawGame) -> Option<countdown_ui::Phase> {
+        match &game.phase {
+            Phase::Countdown { state } => state.phase(),
+            _ => panic!("カウントダウン中のはず"),
+        }
+    }
+
     fn assert_waiting_within_range(game: &QuickDrawGame) {
-        let (min, max) = wait_range(game.difficulty);
+        let (min, max) = game.pattern.wait_range();
         match game.phase {
             Phase::Waiting { remaining } => assert!(
                 (min..=max).contains(&remaining),
                 "待機時間{remaining:?}が範囲{min:?}〜{max:?}に入っていない"
             ),
-            Phase::Signal { .. } => panic!("待機状態のはず"),
+            _ => panic!("待機状態のはず"),
         }
     }
 
@@ -274,67 +355,113 @@ mod tests {
         buffer[(body.x + body.width / 2, body.y + body.height - 2)].bg
     }
 
-    // --- 難易度別パラメータ ---
+    // --- 待機時間パターン ---
 
     #[test]
-    fn wait_range_matches_spec_for_each_difficulty() {
-        assert_eq!(wait_range(Difficulty::Beginner), (ms(1000), ms(2500)));
-        assert_eq!(wait_range(Difficulty::Intermediate), (ms(1000), ms(4000)));
-        assert_eq!(wait_range(Difficulty::Advanced), (ms(800), ms(5000)));
+    fn wait_range_matches_spec_for_each_pattern() {
+        assert_eq!(WaitPattern::Normal.wait_range(), (ms(800), ms(4000)));
+        assert_eq!(WaitPattern::VeryShort.wait_range(), (ms(200), ms(500)));
     }
 
     #[test]
-    fn random_wait_stays_within_range_for_each_difficulty() {
+    fn random_wait_stays_within_range_for_each_pattern() {
         let mut rng = StdRng::seed_from_u64(7);
-        for difficulty in ALL_DIFFICULTIES {
-            let (min, max) = wait_range(difficulty);
-            let waits: Vec<Duration> = (0..500)
-                .map(|_| random_wait(&mut rng, difficulty))
-                .collect();
+        for pattern in ALL_PATTERNS {
+            let (min, max) = pattern.wait_range();
+            let waits: Vec<Duration> = (0..500).map(|_| random_wait(&mut rng, pattern)).collect();
             assert!(
                 waits.iter().all(|w| (min..=max).contains(w)),
-                "{difficulty:?}: 範囲外の待機時間がある"
+                "{pattern:?}: 範囲外の待機時間がある"
             );
-            // 毎回同じ値ではなくランダムに散らばる
+            // 毎回同じ値ではなくランダムに散らばる(範囲の半分以上に広がる)
             let shortest = waits.iter().min().unwrap();
             let longest = waits.iter().max().unwrap();
             assert!(
-                *longest - *shortest > ms(500),
-                "{difficulty:?}: 待機時間がばらついていない"
+                *longest - *shortest > (max - min) / 2,
+                "{pattern:?}: 待機時間がばらついていない"
             );
         }
     }
 
     #[test]
-    fn fail_latency_is_the_longest_wait_of_each_difficulty() {
-        // フライングのペナルティは、その難易度の最大待機時間と同じ値にする
-        for difficulty in ALL_DIFFICULTIES {
-            let (_, max) = wait_range(difficulty);
-            assert_eq!(fail_latency_ms(difficulty), max.as_millis() as f64);
-        }
-        assert_eq!(fail_latency_ms(Difficulty::Beginner), 2500.0);
-        assert_eq!(fail_latency_ms(Difficulty::Intermediate), 4000.0);
-        assert_eq!(fail_latency_ms(Difficulty::Advanced), 5000.0);
+    fn very_short_pattern_appears_about_20_percent() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let draws = 2000;
+        let very_short = (0..draws)
+            .filter(|_| random_pattern(&mut rng) == WaitPattern::VeryShort)
+            .count();
+        // 10問中に体感できる頻度(目安20%)。乱数のゆれを見込んで15〜25%に収まること
+        assert!(
+            (draws * 15 / 100..=draws * 25 / 100).contains(&very_short),
+            "超短時間パターンの出現数: {very_short}/{draws}"
+        );
+        assert_eq!(VERY_SHORT_RATE, 0.2);
     }
 
-    // --- 開始時と合図への切り替え ---
+    #[test]
+    fn fail_latency_is_the_longest_wait_of_each_pattern() {
+        // フライングのペナルティは、そのラウンドのパターンの最大待機時間と同じ値にする
+        for pattern in ALL_PATTERNS {
+            let (_, max) = pattern.wait_range();
+            assert_eq!(pattern.fail_latency_ms(), max.as_millis() as f64);
+        }
+        assert_eq!(WaitPattern::Normal.fail_latency_ms(), 4000.0);
+        assert_eq!(WaitPattern::VeryShort.fail_latency_ms(), 500.0);
+    }
 
     #[test]
-    fn new_game_starts_waiting_within_difficulty_range() {
-        for difficulty in ALL_DIFFICULTIES {
-            let game = QuickDrawGame::new(difficulty);
+    fn session_difficulty_is_advanced() {
+        assert_eq!(SESSION_DIFFICULTY, Difficulty::Advanced);
+    }
+
+    // --- 開始時のカウントダウンと合図への切り替え ---
+
+    #[test]
+    fn new_game_starts_with_countdown_from_three() {
+        let game = QuickDrawGame::new();
+        assert!(is_countdown(&game), "最初のラウンドはカウントダウンから");
+        assert_eq!(countdown_phase(&game), Some(countdown_ui::Phase::Three));
+        assert!(!game.is_finished());
+        assert_eq!(game.tracker.total(), 0);
+    }
+
+    #[test]
+    fn countdown_keeps_going_until_all_phases_elapse() {
+        let mut game = QuickDrawGame::new();
+        game.update(PHASE_DURATION);
+        assert_eq!(countdown_phase(&game), Some(countdown_ui::Phase::Two));
+        game.update(PHASE_DURATION);
+        assert_eq!(countdown_phase(&game), Some(countdown_ui::Phase::One));
+        game.update(PHASE_DURATION);
+        assert_eq!(countdown_phase(&game), Some(countdown_ui::Phase::Go));
+        game.update(PHASE_DURATION - ms(1));
+        assert!(
+            is_countdown(&game),
+            "GO!!の表示時間が終わるまではカウントダウン"
+        );
+        game.update(ms(1));
+        assert_waiting_within_range(&game);
+        assert_eq!(game.tracker.total(), 0, "カウントダウンだけでは記録しない");
+    }
+
+    #[test]
+    fn countdown_finishes_into_waiting_within_pattern_range() {
+        for _ in 0..50 {
+            let mut game = QuickDrawGame::new();
+            finish_countdown(&mut game);
             assert_waiting_within_range(&game);
-            assert!(!game.is_finished());
-            assert_eq!(game.tracker.total(), 0);
         }
     }
 
     #[test]
     fn update_switches_to_signal_after_wait_elapses() {
-        let mut game = QuickDrawGame::new(Difficulty::Beginner);
+        let mut game = QuickDrawGame::new();
         game.phase = Phase::Waiting { remaining: ms(100) };
         game.update(ms(60));
-        assert_eq!(game.phase, Phase::Waiting { remaining: ms(40) });
+        assert!(
+            matches!(game.phase, Phase::Waiting { remaining } if remaining == ms(40)),
+            "待機時間が経過分だけ減る"
+        );
         game.update(ms(60));
         assert!(
             matches!(game.phase, Phase::Signal { .. }),
@@ -345,7 +472,7 @@ mod tests {
     #[test]
     fn signal_has_no_timeout() {
         // 合図後は押すまで待つ(時間切れで勝手に次のラウンドへ進まない)
-        let mut game = QuickDrawGame::new(Difficulty::Beginner);
+        let mut game = QuickDrawGame::new();
         show_signal_since(&mut game, ms(0));
         game.update(Duration::from_secs(60));
         assert!(matches!(game.phase, Phase::Signal { .. }));
@@ -356,7 +483,7 @@ mod tests {
 
     #[test]
     fn enter_after_signal_records_reaction_time() {
-        let mut game = QuickDrawGame::new(Difficulty::Intermediate);
+        let mut game = QuickDrawGame::new();
         show_signal_since(&mut game, ms(300));
         game.handle_key(key(KeyCode::Enter));
         let result = game.result();
@@ -371,23 +498,26 @@ mod tests {
 
     #[test]
     fn space_after_signal_also_counts_as_reaction() {
-        let mut game = QuickDrawGame::new(Difficulty::Beginner);
+        let mut game = QuickDrawGame::new();
         show_signal_since(&mut game, ms(200));
         game.handle_key(key(KeyCode::Char(' ')));
         assert_eq!(game.result().correct, 1);
     }
 
     #[test]
-    fn reacting_starts_next_round_waiting() {
-        let mut game = QuickDrawGame::new(Difficulty::Advanced);
+    fn reacting_starts_next_round_with_countdown() {
+        let mut game = QuickDrawGame::new();
         show_signal_since(&mut game, ms(250));
         game.handle_key(key(KeyCode::Enter));
+        assert!(is_countdown(&game), "次のラウンドもカウントダウンから");
+        assert_eq!(countdown_phase(&game), Some(countdown_ui::Phase::Three));
+        finish_countdown(&mut game);
         assert_waiting_within_range(&game);
     }
 
     #[test]
     fn reacting_shows_reaction_time_in_feedback() {
-        let mut game = QuickDrawGame::new(Difficulty::Beginner);
+        let mut game = QuickDrawGame::new();
         show_signal_since(&mut game, ms(250));
         game.handle_key(key(KeyCode::Enter));
         let flash = game.feedback.current().expect("反応直後は結果を表示する");
@@ -402,54 +532,123 @@ mod tests {
     // --- フライング(合図前) ---
 
     #[test]
-    fn key_before_signal_is_false_start_with_fixed_penalty() {
-        for difficulty in ALL_DIFFICULTIES {
-            let mut game = QuickDrawGame::new(difficulty);
+    fn key_while_waiting_is_false_start_with_pattern_penalty() {
+        for pattern in ALL_PATTERNS {
+            let mut game = QuickDrawGame::new();
+            finish_countdown(&mut game);
+            game.pattern = pattern;
             game.handle_key(key(KeyCode::Enter));
             let result = game.result();
-            assert_eq!(result.total, 1, "{difficulty:?}");
-            assert_eq!(result.correct, 0, "{difficulty:?}: フライングは失敗");
-            assert_eq!(result.avg_latency_ms, fail_latency_ms(difficulty));
+            assert_eq!(result.total, 1, "{pattern:?}");
+            assert_eq!(result.correct, 0, "{pattern:?}: フライングは失敗");
+            assert_eq!(result.avg_latency_ms, pattern.fail_latency_ms());
         }
     }
 
     #[test]
-    fn click_before_signal_is_false_start() {
-        let mut game = QuickDrawGame::new(Difficulty::Intermediate);
+    fn key_during_countdown_is_false_start() {
+        // カウントダウン中もまだ合図が出ていないので、待機中と同じくフライング
+        for pattern in ALL_PATTERNS {
+            let mut game = QuickDrawGame::new();
+            game.pattern = pattern;
+            game.update(PHASE_DURATION * 3); // GO!!の表示中
+            assert!(is_countdown(&game));
+            game.handle_key(key(KeyCode::Char(' ')));
+            let result = game.result();
+            assert_eq!(result.total, 1, "{pattern:?}");
+            assert_eq!(
+                result.correct, 0,
+                "{pattern:?}: カウントダウン中の入力は失敗"
+            );
+            assert_eq!(result.avg_latency_ms, pattern.fail_latency_ms());
+            assert!(!game.is_finished(), "{pattern:?}: GAME OVERにはならない");
+            let flash = game
+                .feedback
+                .current()
+                .expect("フライング直後は結果を表示する");
+            assert!(flash.detail.contains("フライング"), "{}", flash.detail);
+        }
+    }
+
+    #[test]
+    fn click_during_countdown_is_false_start() {
+        let mut game = QuickDrawGame::new();
         game.handle_mouse(left_click(10, 10), AREA);
         let result = game.result();
         assert_eq!(result.total, 1);
         assert_eq!(result.correct, 0);
-        assert_eq!(
-            result.avg_latency_ms,
-            fail_latency_ms(Difficulty::Intermediate)
-        );
     }
 
     #[test]
-    fn false_start_starts_next_round_and_shows_feedback() {
-        let mut game = QuickDrawGame::new(Difficulty::Beginner);
+    fn click_while_waiting_is_false_start() {
+        let mut game = QuickDrawGame::new();
+        finish_countdown(&mut game);
+        game.pattern = WaitPattern::Normal;
+        game.handle_mouse(left_click(10, 10), AREA);
+        let result = game.result();
+        assert_eq!(result.total, 1);
+        assert_eq!(result.correct, 0);
+        assert_eq!(result.avg_latency_ms, WaitPattern::Normal.fail_latency_ms());
+    }
+
+    #[test]
+    fn false_start_starts_next_round_with_countdown_and_shows_feedback() {
+        let mut game = QuickDrawGame::new();
+        finish_countdown(&mut game);
         game.handle_key(key(KeyCode::Char(' ')));
-        assert_waiting_within_range(&game);
+        assert!(
+            is_countdown(&game),
+            "フライング後も次のラウンドのカウントダウンへ進む"
+        );
+        assert_eq!(countdown_phase(&game), Some(countdown_ui::Phase::Three));
         let flash = game
             .feedback
             .current()
             .expect("フライング直後は結果を表示する");
         assert_eq!(flash.verdict, crate::game::feedback::Verdict::Incorrect);
         assert!(flash.detail.contains("フライング"), "{}", flash.detail);
+        finish_countdown(&mut game);
+        assert_waiting_within_range(&game);
+    }
+
+    #[test]
+    fn false_starts_never_end_the_session_early() {
+        // フライングはMISSとして数えるだけで、GAME OVERにはならない。10問全部フライングでも最後まで進む
+        let mut game = QuickDrawGame::new();
+        for round in 0..ROUNDS_PER_SESSION {
+            assert!(!game.is_finished(), "{round}問目の前は終わっていない");
+            finish_countdown(&mut game);
+            game.handle_key(key(KeyCode::Enter));
+            assert_eq!(game.tracker.total(), round + 1);
+            assert_eq!(game.result().correct, 0, "フライングでは正答数が増えない");
+        }
+        assert!(game.is_finished());
+        let result = game.result();
+        assert_eq!(result.total, ROUNDS_PER_SESSION);
+        assert_eq!(result.correct, 0);
     }
 
     // --- 入力の種類 ---
 
     #[test]
     fn other_keys_are_ignored() {
-        let mut game = QuickDrawGame::new(Difficulty::Beginner);
-        for code in [
+        let mut game = QuickDrawGame::new();
+        let ignored = [
             KeyCode::Left,
             KeyCode::Char('a'),
             KeyCode::Esc,
             KeyCode::Tab,
-        ] {
+        ];
+        for code in ignored {
+            game.handle_key(key(code));
+        }
+        assert_eq!(
+            game.tracker.total(),
+            0,
+            "カウントダウン中でも対象外のキーはフライングにしない"
+        );
+        finish_countdown(&mut game);
+        for code in ignored {
             game.handle_key(key(code));
         }
         assert_eq!(
@@ -473,7 +672,7 @@ mod tests {
             (AREA.width + 10, AREA.height + 10),
         ];
         for (column, row) in positions {
-            let mut game = QuickDrawGame::new(Difficulty::Beginner);
+            let mut game = QuickDrawGame::new();
             show_signal_since(&mut game, ms(200));
             game.handle_mouse(left_click(column, row), AREA);
             assert_eq!(game.result().correct, 1, "({column},{row})のクリック");
@@ -482,7 +681,7 @@ mod tests {
 
     #[test]
     fn non_left_press_mouse_events_are_ignored() {
-        let mut game = QuickDrawGame::new(Difficulty::Beginner);
+        let mut game = QuickDrawGame::new();
         for kind in [
             MouseEventKind::Down(MouseButton::Right),
             MouseEventKind::Up(MouseButton::Left),
@@ -498,25 +697,32 @@ mod tests {
     // --- セッション ---
 
     #[test]
-    fn session_finishes_after_three_rounds() {
-        let mut game = QuickDrawGame::new(Difficulty::Beginner);
+    fn session_has_ten_rounds() {
+        assert_eq!(ROUNDS_PER_SESSION, 10);
+    }
+
+    #[test]
+    fn session_finishes_after_ten_rounds() {
+        let mut game = QuickDrawGame::new();
         for round in 0..ROUNDS_PER_SESSION {
             assert!(!game.is_finished(), "{round}ラウンド目の前は終わっていない");
+            finish_countdown(&mut game);
             show_signal_since(&mut game, ms(200));
             game.handle_key(key(KeyCode::Enter));
         }
         assert!(game.is_finished());
         let result = game.result();
         assert_eq!(result.game_id, GAME_ID);
-        assert_eq!(result.difficulty, Difficulty::Beginner);
-        assert_eq!(result.total, 3);
-        assert_eq!(result.correct, 3);
+        assert_eq!(result.difficulty, SESSION_DIFFICULTY);
+        assert_eq!(result.total, 10);
+        assert_eq!(result.correct, 10);
     }
 
     #[test]
     fn mixed_session_averages_reaction_and_penalty() {
-        let mut game = QuickDrawGame::new(Difficulty::Beginner);
-        game.handle_key(key(KeyCode::Enter)); // フライング
+        let mut game = QuickDrawGame::new();
+        game.pattern = WaitPattern::Normal;
+        game.handle_key(key(KeyCode::Enter)); // フライング(ペナルティ4000ms)
         show_signal_since(&mut game, ms(300));
         game.handle_key(key(KeyCode::Enter));
         show_signal_since(&mut game, ms(300));
@@ -524,9 +730,9 @@ mod tests {
         let result = game.result();
         assert_eq!(result.total, 3);
         assert_eq!(result.correct, 2);
-        // (2500 + 300 + 300) / 3 ≒ 1033
+        // (4000 + 300 + 300) / 3 ≒ 1533
         assert!(
-            (1033.0..1100.0).contains(&result.avg_latency_ms),
+            (1533.0..1600.0).contains(&result.avg_latency_ms),
             "{}",
             result.avg_latency_ms
         );
@@ -534,7 +740,7 @@ mod tests {
 
     #[test]
     fn input_after_session_finished_is_ignored() {
-        let mut game = QuickDrawGame::new(Difficulty::Beginner);
+        let mut game = QuickDrawGame::new();
         for _ in 0..ROUNDS_PER_SESSION {
             game.handle_key(key(KeyCode::Enter));
         }
@@ -548,8 +754,22 @@ mod tests {
     // --- 描画 ---
 
     #[test]
+    fn countdown_renders_big_countdown_glyph() {
+        let game = QuickDrawGame::new();
+        let buffer = rendered(&game);
+        let text = text_of(&buffer);
+        assert!(text.contains('█'), "カウントダウンの大きな文字を描く");
+        assert!(
+            !text.contains(WAITING_TEXT),
+            "カウントダウン中は「まだ待て」を出さない"
+        );
+        assert!(!text.contains(SIGNAL_TEXT));
+    }
+
+    #[test]
     fn waiting_renders_gray_background_and_wait_text() {
-        let game = QuickDrawGame::new(Difficulty::Beginner);
+        let mut game = QuickDrawGame::new();
+        finish_countdown(&mut game);
         let buffer = rendered(&game);
         let text = text_of(&buffer);
         assert!(text.contains(WAITING_TEXT), "待機中は「まだ待て」");
@@ -559,7 +779,7 @@ mod tests {
 
     #[test]
     fn signal_renders_green_background_and_now_text() {
-        let mut game = QuickDrawGame::new(Difficulty::Beginner);
+        let mut game = QuickDrawGame::new();
         show_signal_since(&mut game, ms(0));
         let buffer = rendered(&game);
         let text = text_of(&buffer);
@@ -570,7 +790,7 @@ mod tests {
 
     #[test]
     fn render_switches_when_wait_elapses() {
-        let mut game = QuickDrawGame::new(Difficulty::Beginner);
+        let mut game = QuickDrawGame::new();
         game.phase = Phase::Waiting { remaining: ms(50) };
         assert_eq!(body_center_bg(&rendered(&game)), WAITING_BG);
         game.update(ms(50));
@@ -581,20 +801,36 @@ mod tests {
 
     #[test]
     fn render_shows_hud_with_game_name_and_round_count() {
-        let game = QuickDrawGame::new(Difficulty::Beginner);
+        let game = QuickDrawGame::new();
         let text = text_of(&rendered(&game));
-        assert!(text.contains("反射神経"));
-        assert!(text.contains("Q1/3"), "3ラウンド制の進捗: {text}");
+        assert!(text.contains("ハヤウチ"), "HUDのタイトルはハヤウチ: {text}");
+        assert!(!text.contains("反射神経"));
+        assert!(text.contains("Q1/10"), "10問制の進捗: {text}");
+    }
+
+    #[test]
+    fn game_id_stays_quick_draw() {
+        // 名称をハヤウチに変えても、統計・履歴の互換のため内部識別子は変えない
+        assert_eq!(GAME_ID, "quick_draw");
+        assert_eq!(QuickDrawGame::new().result().game_id, "quick_draw");
     }
 
     #[test]
     fn render_does_not_panic_in_tiny_area() {
-        let game = QuickDrawGame::new(Difficulty::Beginner);
-        for (width, height) in [(1, 1), (5, 2), (10, 4)] {
-            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            terminal
-                .draw(|frame| game.render(frame, Rect::new(0, 0, width, height)))
-                .unwrap();
+        let mut game = QuickDrawGame::new();
+        for _ in 0..3 {
+            for (width, height) in [(1, 1), (5, 2), (10, 4)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| game.render(frame, Rect::new(0, 0, width, height)))
+                    .unwrap();
+            }
+            // カウントダウン→待機→合図の各状態で描く
+            if is_countdown(&game) {
+                finish_countdown(&mut game);
+            } else {
+                show_signal_since(&mut game, ms(0));
+            }
         }
     }
 }
