@@ -70,6 +70,8 @@ pub enum Screen {
     Result(GameResult),
     History,
     Jukebox(ListState),
+    /// メニュー画面で[q]を押した時の終了確認ダイアログ。メニューの上に重ねて描く
+    ConfirmQuit,
 }
 
 pub struct App {
@@ -107,8 +109,15 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        // [q]はメニューでは終了確認を開き、それ以外の画面ではメニューへ戻る。
+        // カウントダウン中も特例として受け付ける(カウントダウンを中断する)
         if key.code == KeyCode::Char('q') {
-            self.should_quit = true;
+            match self.screen {
+                Screen::Menu => self.screen = Screen::ConfirmQuit,
+                // 終了確認中の[q]は無視する(y/Enter・n/Escでのみ閉じる)
+                Screen::ConfirmQuit => {}
+                _ => self.quit_to_menu(),
+            }
             return;
         }
 
@@ -142,6 +151,32 @@ impl App {
                 }
             }
             Screen::Jukebox(_) => self.handle_jukebox_key(key),
+            Screen::ConfirmQuit => self.handle_confirm_quit_key(key),
+        }
+    }
+
+    /// 終了確認ダイアログ: y/Enterで終了、n/Escでメニューに戻る。それ以外は無視する
+    fn handle_confirm_quit_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => self.should_quit = true,
+            KeyCode::Char('n') | KeyCode::Esc => self.screen = Screen::Menu,
+            _ => {}
+        }
+    }
+
+    /// メニュー以外の画面で[q]を押した時にメニューへ戻る。既にメニュー用BGMが
+    /// 流れていれば(タイトル画面など)曲を差し替えず、そうでなければ切り替える
+    fn quit_to_menu(&mut self) {
+        let menu_tracks = audio::bgm_tracks_in(BgmCategory::Menu);
+        let playing_menu_bgm = self
+            .current_bgm
+            .as_ref()
+            .is_some_and(|name| menu_tracks.contains(name));
+        if playing_menu_bgm {
+            audio::play_se(SeKind::Transition);
+            self.screen = Screen::Menu;
+        } else {
+            self.return_to_menu();
         }
     }
 
@@ -182,7 +217,8 @@ impl App {
             Screen::Result(_) | Screen::History => {
                 self.return_to_menu();
             }
-            Screen::Jukebox(_) => {}
+            // 終了確認中はクリックで背後のメニュー項目を選ばないよう無視する
+            Screen::Jukebox(_) | Screen::ConfirmQuit => {}
         }
     }
 
@@ -428,8 +464,44 @@ impl App {
             Screen::Result(result) => render_result(frame, area, result),
             Screen::History => render_history(frame, area),
             Screen::Jukebox(state) => render_jukebox(frame, area, state, current_bgm.as_deref()),
+            Screen::ConfirmQuit => {
+                render_menu(frame, area, &mut self.menu_state);
+                render_confirm_quit(frame, area);
+            }
         }
     }
+}
+
+/// 終了確認ダイアログ。背景のメニューが見えるよう、中央に小さなパネルを重ねて描く
+fn render_confirm_quit(frame: &mut Frame, area: Rect) {
+    let hints = theme::hints_line(&[("y / Enter", "終了"), ("n / Esc", "キャンセル")]);
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled("終了しますか？", theme::title_style())),
+        Line::from(""),
+        hints,
+    ];
+    // 枠(上下左右1セル)ぶんを足した大きさ。画面が小さければ画面に収まるよう縮める
+    let content_width = text.iter().map(|l| l.width() as u16).max().unwrap_or(0);
+    let width = (content_width + 4).min(area.width);
+    let height = (text.len() as u16 + 2).min(area.height);
+    let dialog = centered_rect(area, width, height);
+    // 背景の全角文字がダイアログの左端をまたいでいると、端末出力時にその2セル目
+    // (=ダイアログの左枠)が飛ばされて枠が欠ける。またいでいる文字は空白に置き換える
+    if dialog.x > area.x {
+        let buffer = frame.buffer_mut();
+        for y in dialog.top()..dialog.bottom() {
+            let cell = &mut buffer[(dialog.x - 1, y)];
+            if Span::raw(cell.symbol()).width() > 1 {
+                cell.set_symbol(" ");
+            }
+        }
+    }
+    frame.render_widget(ratatui::widgets::Clear, dialog);
+    let paragraph = Paragraph::new(text)
+        .alignment(Alignment::Center)
+        .block(theme::panel(Line::from(" 終了確認 ").centered()));
+    frame.render_widget(paragraph, dialog);
 }
 
 fn new_game(item: usize, difficulty: Difficulty) -> Box<dyn Game> {
@@ -1647,5 +1719,298 @@ mod tests {
         app.screen = Screen::SelectDifficulty(0, None);
         app.handle_key(KeyEvent::from(KeyCode::Char('1')));
         assert!(rendered_text(&mut app).contains('█'));
+    }
+
+    // --- [q]キーの終了フロー(メニュー以外→メニューへ戻る / メニュー→終了確認) ---
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_key(KeyEvent::from(code));
+    }
+
+    fn is_menu_bgm(name: Option<&str>) -> bool {
+        name.is_some_and(|n| audio::bgm_tracks_in(BgmCategory::Menu).iter().any(|t| t == n))
+    }
+
+    /// メニュー以外の各画面にしたAppを(画面の説明, App)で返す
+    fn apps_on_every_non_menu_screen() -> Vec<(&'static str, App)> {
+        let mut apps = Vec::new();
+
+        apps.push(("Splash", App::new()));
+
+        let mut app = App::new();
+        app.screen = Screen::SelectSong(1);
+        apps.push(("SelectSong", app));
+
+        let mut app = App::new();
+        app.screen = Screen::SelectDifficulty(0, None);
+        apps.push(("SelectDifficulty", app));
+
+        let mut app = App::new();
+        app.screen = Screen::SelectDifficulty(RHYTHM_ITEM_INDEX, Some(1));
+        apps.push(("SelectDifficulty(リズム)", app));
+
+        let mut app = App::new();
+        app.screen = Screen::SelectDifficulty(0, None);
+        press(&mut app, KeyCode::Char('1'));
+        assert!(matches!(app.screen, Screen::Countdown { .. }));
+        apps.push(("Countdown", app));
+
+        let mut app = App::new();
+        app.screen = Screen::SelectDifficulty(0, None);
+        press(&mut app, KeyCode::Char('1'));
+        finish_countdown(&mut app);
+        apps.push(("Playing", app));
+
+        let mut app = App::new();
+        app.screen = Screen::SelectDifficulty(RHYTHM_ITEM_INDEX, Some(0));
+        press(&mut app, KeyCode::Char('1'));
+        assert!(matches!(app.screen, Screen::Playing(_)));
+        apps.push(("Playing(リズム)", app));
+
+        let mut app = App::new();
+        app.screen = Screen::Result(new_game(0, Difficulty::Beginner).result());
+        apps.push(("Result", app));
+
+        let mut app = App::new();
+        app.screen = Screen::History;
+        apps.push(("History", app));
+
+        let mut app = App::new();
+        app.screen = Screen::Jukebox(app.jukebox_list_state());
+        apps.push(("Jukebox", app));
+
+        apps
+    }
+
+    #[test]
+    fn q_on_every_non_menu_screen_returns_to_menu_without_quitting() {
+        for (name, mut app) in apps_on_every_non_menu_screen() {
+            press(&mut app, KeyCode::Char('q'));
+            assert!(matches!(app.screen, Screen::Menu), "{name}: メニューへ戻る");
+            assert!(!app.should_quit(), "{name}: 即終了しない");
+        }
+    }
+
+    #[test]
+    fn q_on_every_non_menu_screen_switches_to_menu_bgm() {
+        for (name, mut app) in apps_on_every_non_menu_screen() {
+            press(&mut app, KeyCode::Char('q'));
+            assert!(
+                is_menu_bgm(app.current_bgm.as_deref()),
+                "{name}: メニュー用BGMになる(実際: {:?})",
+                app.current_bgm
+            );
+        }
+    }
+
+    #[test]
+    fn q_while_playing_switches_bgm_from_playing_to_menu() {
+        let mut app = App::new();
+        app.screen = Screen::SelectDifficulty(0, None);
+        press(&mut app, KeyCode::Char('1'));
+        finish_countdown(&mut app);
+        assert!(!is_menu_bgm(app.current_bgm.as_deref()), "プレイ中はプレイ用BGM");
+        press(&mut app, KeyCode::Char('q'));
+        assert!(is_menu_bgm(app.current_bgm.as_deref()));
+    }
+
+    #[test]
+    fn q_on_splash_keeps_the_menu_bgm_already_playing() {
+        // タイトル画面では既にメニュー用BGMが流れているので、曲を途中で差し替えない
+        let mut app = App::new();
+        let before = app.current_bgm.clone();
+        assert!(is_menu_bgm(before.as_deref()));
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(app.current_bgm, before);
+    }
+
+    #[test]
+    fn q_on_jukebox_after_stopping_bgm_starts_menu_bgm() {
+        let mut app = App::new();
+        app.screen = Screen::Jukebox(app.jukebox_list_state());
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.current_bgm, None);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(matches!(app.screen, Screen::Menu));
+        assert!(is_menu_bgm(app.current_bgm.as_deref()));
+    }
+
+    #[test]
+    fn q_during_countdown_aborts_it_and_no_game_starts() {
+        let mut app = App::new();
+        app.screen = Screen::SelectDifficulty(0, None);
+        press(&mut app, KeyCode::Char('1'));
+        app.update(PHASE_DURATION);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(matches!(app.screen, Screen::Menu));
+        // 残りのカウントダウン時間が経ってもゲームは始まらない
+        app.update(COUNTDOWN_TOTAL);
+        assert!(matches!(app.screen, Screen::Menu), "中断後にゲームが始まらないこと");
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn q_on_menu_opens_confirm_quit_without_quitting() {
+        let mut app = App::new();
+        app.screen = Screen::Menu;
+        press(&mut app, KeyCode::Char('q'));
+        assert!(matches!(app.screen, Screen::ConfirmQuit));
+        assert!(!app.should_quit(), "確認ダイアログではまだ終了しない");
+    }
+
+    #[test]
+    fn q_twice_from_a_non_menu_screen_ends_at_confirm_quit() {
+        // メニュー以外 → [q]でメニュー → [q]で終了確認、の2段階になる
+        let mut app = App::new();
+        app.screen = Screen::History;
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Char('q'));
+        assert!(matches!(app.screen, Screen::ConfirmQuit));
+        assert!(!app.should_quit());
+    }
+
+    /// メニューで[q]を押して終了確認ダイアログを開いたAppを作る
+    fn app_on_confirm_quit() -> App {
+        let mut app = App::new();
+        app.screen = Screen::Menu;
+        press(&mut app, KeyCode::Char('q'));
+        assert!(matches!(app.screen, Screen::ConfirmQuit));
+        app
+    }
+
+    #[test]
+    fn confirm_quit_y_or_enter_quits() {
+        for code in [KeyCode::Char('y'), KeyCode::Enter] {
+            let mut app = app_on_confirm_quit();
+            press(&mut app, code);
+            assert!(app.should_quit(), "{code:?}で終了する");
+        }
+    }
+
+    #[test]
+    fn confirm_quit_n_or_esc_returns_to_menu_without_quitting() {
+        for code in [KeyCode::Char('n'), KeyCode::Esc] {
+            let mut app = app_on_confirm_quit();
+            press(&mut app, code);
+            assert!(matches!(app.screen, Screen::Menu), "{code:?}でメニューに戻る");
+            assert!(!app.should_quit(), "{code:?}では終了しない");
+        }
+    }
+
+    #[test]
+    fn confirm_quit_ignores_other_keys() {
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Char('q'),
+            KeyCode::Char('x'),
+            KeyCode::Char('1'),
+        ] {
+            let mut app = app_on_confirm_quit();
+            press(&mut app, code);
+            assert!(matches!(app.screen, Screen::ConfirmQuit), "{code:?}では閉じない");
+            assert!(!app.should_quit(), "{code:?}では終了しない");
+        }
+    }
+
+    #[test]
+    fn cancelling_confirm_quit_keeps_menu_selection() {
+        let mut app = App::new();
+        app.screen = Screen::Menu;
+        app.menu_state.select(Some(5));
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Down); // ダイアログ中はメニューのカーソルが動かない
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.menu_state.selected(), Some(5));
+    }
+
+    #[test]
+    fn confirm_quit_does_not_change_bgm() {
+        let mut app = app_on_confirm_quit();
+        let before = app.current_bgm.clone();
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.current_bgm, before);
+    }
+
+    #[test]
+    fn mouse_clicks_on_confirm_quit_are_ignored() {
+        let mut app = app_on_confirm_quit();
+        app.last_area = rect(0, 0, 80, 30);
+        for row in 0..30 {
+            app.handle_mouse(left_click(row));
+        }
+        assert!(matches!(app.screen, Screen::ConfirmQuit), "背後のメニュー項目が選ばれないこと");
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn confirm_quit_is_drawn_over_the_menu() {
+        let mut app = app_on_confirm_quit();
+        let rows = rendered_rows_without_spaces(&mut app, 80, 30);
+        let text = rows.concat();
+        assert!(text.contains("終了しますか"), "確認メッセージが出ること");
+        // ダイアログの外側には背景としてメニューが見えている
+        assert!(text.contains("BRAINTRAIN"), "背景にメニューが見えること");
+        assert!(text.contains(MENU_ITEMS[0]), "背景にメニュー項目が見えること");
+    }
+
+    #[test]
+    fn confirm_quit_renders_without_panicking_at_any_size() {
+        for (width, height) in [
+            (1u16, 1u16),
+            (2, 2),
+            (5, 3),
+            (10, 5),
+            (20, 8),
+            (40, 12),
+            (80, 24),
+            (120, 40),
+            (250, 80),
+        ] {
+            let mut app = app_on_confirm_quit();
+            rendered_rows_without_spaces(&mut app, width, height);
+        }
+    }
+
+    /// 描画結果(TestBackendに実際に出力されたセル)を行ごとの文字の並びで返す。
+    /// 全角文字の2セル目は出力されないので、空白を詰めずセル単位で見る
+    fn rendered_cells(app: &mut App, width: u16, height: u16) -> Vec<Vec<String>> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol().to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn confirm_quit_dialog_border_is_not_hidden_by_wide_menu_text() {
+        // 背景メニューの全角文字がダイアログの左端をまたいでいても、枠線が欠けないこと
+        for width in 60u16..=100 {
+            for height in [20u16, 24, 30] {
+                let mut app = app_on_confirm_quit();
+                let rows = rendered_cells(&mut app, width, height);
+                let top = rows
+                    .iter()
+                    .position(|r| r.contains(&"╮".to_string()))
+                    .unwrap_or_else(|| panic!("{width}x{height}: 右上の角が描かれていること"));
+                let left = rows[top]
+                    .iter()
+                    .position(|c| c == "╭")
+                    .unwrap_or_else(|| panic!("{width}x{height}: 左上の角が描かれていること"));
+                let bottom = (top + 1..rows.len())
+                    .find(|&y| rows[y][left] != "│")
+                    .unwrap_or_else(|| panic!("{width}x{height}: 下端があること"));
+                assert_eq!(rows[bottom][left], "╰", "{width}x{height}: 左辺が途切れないこと");
+            }
+        }
+    }
+
+    #[test]
+    fn update_on_confirm_quit_keeps_the_dialog_open() {
+        let mut app = app_on_confirm_quit();
+        app.update(Duration::from_secs(10));
+        assert!(matches!(app.screen, Screen::ConfirmQuit));
     }
 }
