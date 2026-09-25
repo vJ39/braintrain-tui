@@ -47,6 +47,10 @@ const MENU_ITEMS: [&str; 14] = [
     "履歴",
 ];
 
+/// イロピッタン(3問→4問→3問で難易度が上がる固定10問)
+const REACTION_ITEM_INDEX: usize = 2;
+/// 記憶(位置と色)(3問→4問→3問で手数が増える固定10問)
+const MEMORY_ITEM_INDEX: usize = 5;
 /// カウントマニア(マウス専用)
 const COUNT_MANIA_ITEM_INDEX: usize = 8;
 /// ソコヌキ
@@ -380,6 +384,16 @@ impl App {
                 QUICK_DRAW_ITEM_INDEX,
                 crate::game::quick_draw::SESSION_DIFFICULTY,
             );
+            return;
+        }
+        if selected == MEMORY_ITEM_INDEX {
+            // 記憶は3問→4問→3問で手数が自動で増えるため、難易度選択を挟まない
+            self.start_playing(MEMORY_ITEM_INDEX, crate::game::memory::SESSION_DIFFICULTY);
+            return;
+        }
+        if selected == REACTION_ITEM_INDEX {
+            // イロピッタンも3問→4問→3問で難易度が自動で上がるため、難易度選択を挟まない
+            self.start_playing(REACTION_ITEM_INDEX, crate::game::reaction::SESSION_DIFFICULTY);
             return;
         }
         audio::play_se(SeKind::Transition);
@@ -731,10 +745,11 @@ fn new_game(item: usize, difficulty: Difficulty) -> Box<dyn Game> {
     match item {
         0 => Box::new(ShapeRotateGame::new(difficulty)),
         1 => Box::new(MirrorMatchGame::new(difficulty)),
-        2 => Box::new(ReactionGame::new(difficulty)),
+        // イロピッタン・記憶は難易度を選ばず、3問→4問→3問で初級→中級→上級相当と進む
+        REACTION_ITEM_INDEX => Box::new(ReactionGame::new()),
         3 => Box::new(MentalCalcGame::new(difficulty)),
         4 => Box::new(PatternFillGame::new(difficulty)),
-        5 => Box::new(MemoryGame::new(difficulty)),
+        MEMORY_ITEM_INDEX => Box::new(MemoryGame::new()),
         6 => Box::new(SequenceGame::new(difficulty)),
         7 => Box::new(PuzzleConnectGame::new(difficulty)),
         // カウントマニアは難易度を選ばず、ROUND1=初級・ROUND2=中級・ROUND3=上級と進む
@@ -1600,6 +1615,85 @@ mod tests {
             }
         ));
         assert_color_stack_round1_is_playing(&mut app);
+    }
+
+    // --- 記憶・イロピッタン(3問→4問→3問の固定10問構成) ---
+
+    /// 難易度選択を挟まない固定進行のゲーム(メニュー項目, GAME_ID, 記録する難易度)
+    fn fixed_progression_games() -> [(usize, &'static str, Difficulty); 2] {
+        [
+            (
+                MEMORY_ITEM_INDEX,
+                crate::game::memory::GAME_ID,
+                crate::game::memory::SESSION_DIFFICULTY,
+            ),
+            (
+                REACTION_ITEM_INDEX,
+                crate::game::reaction::GAME_ID,
+                crate::game::reaction::SESSION_DIFFICULTY,
+            ),
+        ]
+    }
+
+    #[test]
+    fn memory_and_reaction_item_indices_match_menu() {
+        assert_eq!(MENU_ITEMS[MEMORY_ITEM_INDEX], "記憶(位置と色)");
+        assert_eq!(MENU_ITEMS[REACTION_ITEM_INDEX], "イロピッタン");
+    }
+
+    #[test]
+    fn new_game_for_memory_and_reaction_records_session_difficulty() {
+        // 難易度を選ばないので、渡した難易度によらず代表値の難易度で記録する
+        for (item, game_id, session_difficulty) in fixed_progression_games() {
+            for difficulty in [
+                Difficulty::Beginner,
+                Difficulty::Intermediate,
+                Difficulty::Advanced,
+            ] {
+                let result = new_game(item, difficulty).result();
+                assert_eq!(result.game_id, game_id);
+                assert_eq!(result.difficulty, session_difficulty, "item={item}");
+            }
+        }
+    }
+
+    #[test]
+    fn selecting_memory_or_reaction_skips_difficulty_and_starts_after_countdown() {
+        for (item, game_id, session_difficulty) in fixed_progression_games() {
+            let mut app = App::new();
+            app.select_menu_item(item);
+            let Screen::Countdown {
+                item: counting_item,
+                difficulty,
+                state,
+            } = &app.screen
+            else {
+                panic!("item={item}: 難易度選択を挟まずカウントダウンになるはず");
+            };
+            assert_eq!(*counting_item, item);
+            assert_eq!(*difficulty, session_difficulty);
+            assert_eq!(state.phase(), Some(Phase::Three), "3から始まる");
+            finish_countdown(&mut app);
+            let Screen::Playing(game) = &app.screen else {
+                panic!("Playing画面のはず");
+            };
+            assert_eq!(game.result().game_id, game_id);
+            assert!(!game.is_finished());
+        }
+    }
+
+    #[test]
+    fn enter_on_memory_or_reaction_in_menu_goes_straight_to_countdown() {
+        for (item, _, _) in fixed_progression_games() {
+            let mut app = App::new();
+            app.screen = Screen::Menu;
+            app.menu_state.select(item);
+            app.handle_key(KeyEvent::from(KeyCode::Enter));
+            assert!(
+                matches!(app.screen, Screen::Countdown { item: i, .. } if i == item),
+                "item={item}"
+            );
+        }
     }
 
     #[test]
@@ -2760,12 +2854,15 @@ mod tests {
         (0..JUKEBOX_ITEM_INDEX).filter(|&item| item != RHYTHM_ITEM_INDEX)
     }
 
-    /// 難易度選択画面を経由するゲームのメニュー項目一覧(DDR・ソコヌキ・カウントマニア・ハヤウチ以外)
+    /// 難易度選択画面を経由するゲームのメニュー項目一覧
+    /// (DDR・ソコヌキ・カウントマニア・ハヤウチ・記憶・イロピッタン以外)
     fn difficulty_select_game_items() -> impl Iterator<Item = usize> {
         non_rhythm_game_items().filter(|&item| {
             item != COLOR_STACK_ITEM_INDEX
                 && item != COUNT_MANIA_ITEM_INDEX
                 && item != QUICK_DRAW_ITEM_INDEX
+                && item != MEMORY_ITEM_INDEX
+                && item != REACTION_ITEM_INDEX
         })
     }
 

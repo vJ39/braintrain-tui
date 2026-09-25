@@ -10,10 +10,14 @@ use ratatui::Frame;
 
 use crate::audio::{self, SeKind};
 use crate::game::feedback::AnswerFeedback;
+use crate::game::mark_display::MarkRenderer;
 use crate::game::theme;
 use crate::game::{contains, Difficulty, Game, GameResult, ScoreTracker};
 
 pub const GAME_ID: &str = "memory";
+
+/// 結果・HUDに出す難易度。問題が進むと手数が増えるため、最後の区間の上級を代表値にする
+pub const SESSION_DIFFICULTY: Difficulty = Difficulty::Advanced;
 
 /// 描画エリアを「2x2パネル」「フッター」に分割する。
 /// 上端のHUD(theme::split_hud)を除いた残りを分ける。renderはHUDを同じsplit_hudで切り出す
@@ -72,19 +76,32 @@ fn panel_color(panel: usize) -> Color {
         .unwrap_or(Color::White)
 }
 
-/// 難易度ごとの手順数
-fn sequence_len(difficulty: Difficulty) -> usize {
-    match difficulty {
-        Difficulty::Beginner => 3,
-        Difficulty::Intermediate => 5,
-        Difficulty::Advanced => 7,
+/// 何問目(0始まり)のシーケンスの手数。
+/// 1〜3問目=3手(初級相当)、4〜7問目=5手(中級相当)、8〜10問目=7手(上級相当)
+fn sequence_len_for_question(question_index: u32) -> usize {
+    match question_index {
+        0..=2 => 3,
+        3..=6 => 5,
+        _ => 7,
     }
 }
 
-/// ランダムなパネル番号(1〜4)の並びを生成する
-fn generate_sequence(rng: &mut impl Rng, difficulty: Difficulty) -> Vec<usize> {
-    let len = sequence_len(difficulty);
+/// 何問目(0始まり)の、ランダムなパネル番号(1〜4)の並びを生成する
+fn generate_sequence(rng: &mut impl Rng, question_index: u32) -> Vec<usize> {
+    let len = sequence_len_for_question(question_index);
     (0..len).map(|_| rng.gen_range(1..=4)).collect()
+}
+
+/// 正誤の記号を出す時にパネルのエリアを塗る色。画像表示の時は画像の背景と周りのセルを
+/// 同じ色で塗れるようRGBにし、テキスト表示の時は端末の名前付き色にする。
+/// 記号は黒なので、黒が読みやすい明るさの緑(正解)/赤(不正解)にする
+fn mark_background(is_correct: bool, uses_image: bool) -> Color {
+    match (is_correct, uses_image) {
+        (true, true) => Color::Rgb(40, 190, 70),
+        (false, true) => Color::Rgb(230, 50, 50),
+        (true, false) => Color::Green,
+        (false, false) => Color::Red,
+    }
 }
 
 /// 提示フェーズ内で、いま点灯中か消灯中か
@@ -109,7 +126,6 @@ enum Phase {
 }
 
 pub struct MemoryGame {
-    difficulty: Difficulty,
     tracker: ScoreTracker,
     sequence: Vec<usize>,
     phase: Phase,
@@ -118,16 +134,23 @@ pub struct MemoryGame {
     input_started_at: Instant,
     /// 正解数・連続正解のHUD表示用(描画専用)
     feedback: AnswerFeedback,
+    /// 正誤確定後の大きな◯/✗の描画器(描画専用)
+    mark_renderer: MarkRenderer,
+}
+
+impl Default for MemoryGame {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MemoryGame {
-    pub fn new(difficulty: Difficulty) -> Self {
+    pub fn new() -> Self {
         let mut rng = rand::thread_rng();
-        let sequence = generate_sequence(&mut rng, difficulty);
+        let sequence = generate_sequence(&mut rng, 0);
         let active_panel = sequence.first().copied();
         audio::play_se(SeKind::Transition);
         Self {
-            difficulty,
             tracker: ScoreTracker::new(),
             sequence,
             phase: Phase::Showing {
@@ -138,12 +161,14 @@ impl MemoryGame {
             active_panel,
             input_started_at: Instant::now(),
             feedback: AnswerFeedback::new(),
+            mark_renderer: MarkRenderer::new(),
         }
     }
 
     fn next_sequence(&mut self) {
         let mut rng = rand::thread_rng();
-        self.sequence = generate_sequence(&mut rng, self.difficulty);
+        // 記録済みの問題数が、次に出す問題の0始まりの番号になる
+        self.sequence = generate_sequence(&mut rng, self.tracker.total());
         self.active_panel = self.sequence.first().copied();
         audio::play_se(SeKind::Transition);
         self.phase = Phase::Showing {
@@ -186,6 +211,43 @@ impl MemoryGame {
         *entered += 1;
         if *entered >= self.sequence.len() {
             self.finish_question(true);
+        }
+    }
+
+    /// 2x2のパネルを描く(提示中・入力中)
+    fn render_panels(&self, frame: &mut Frame, grid_area: Rect) {
+        let is_showing = matches!(self.phase, Phase::Showing { .. });
+        for (panel, panel_area) in panel_areas(grid_area) {
+            let is_active = self.active_panel == Some(panel);
+            let color = panel_color(panel);
+            // 点灯中=太枠+塗りつぶし。提示中の消灯パネルは暗くして点灯パネルを際立たせる
+            let (border_type, border_color, style) = if is_active {
+                (
+                    BorderType::Thick,
+                    color,
+                    Style::default()
+                        .bg(color)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else if is_showing {
+                (BorderType::Rounded, theme::MUTED, Style::default().fg(theme::MUTED))
+            } else {
+                (BorderType::Rounded, color, Style::default().fg(color))
+            };
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(border_type)
+                .border_style(Style::default().fg(border_color))
+                .style(style);
+            let inner = block.inner(panel_area);
+            frame.render_widget(block, panel_area);
+            let number = Paragraph::new(Line::from(Span::styled(
+                format!(" {panel} "),
+                Style::default().add_modifier(Modifier::BOLD),
+            )))
+            .alignment(Alignment::Center);
+            frame.render_widget(number, theme::vertical_center(inner, 1));
         }
     }
 }
@@ -275,43 +337,17 @@ impl Game for MemoryGame {
             frame,
             hud_area,
             "記憶(位置と色)",
-            self.difficulty,
+            SESSION_DIFFICULTY,
             self.tracker.total(),
             &self.feedback,
         );
 
-        let is_showing = matches!(self.phase, Phase::Showing { .. });
-        for (panel, panel_area) in panel_areas(grid_area) {
-            let is_active = self.active_panel == Some(panel);
-            let color = panel_color(panel);
-            // 点灯中=太枠+塗りつぶし。提示中の消灯パネルは暗くして点灯パネルを際立たせる
-            let (border_type, border_color, style) = if is_active {
-                (
-                    BorderType::Thick,
-                    color,
-                    Style::default()
-                        .bg(color)
-                        .fg(Color::Black)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else if is_showing {
-                (BorderType::Rounded, theme::MUTED, Style::default().fg(theme::MUTED))
-            } else {
-                (BorderType::Rounded, color, Style::default().fg(color))
-            };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(border_type)
-                .border_style(Style::default().fg(border_color))
-                .style(style);
-            let inner = block.inner(panel_area);
-            frame.render_widget(block, panel_area);
-            let number = Paragraph::new(Line::from(Span::styled(
-                format!(" {panel} "),
-                Style::default().add_modifier(Modifier::BOLD),
-            )))
-            .alignment(Alignment::Center);
-            frame.render_widget(number, theme::vertical_center(inner, 1));
+        if let Phase::Interval { is_correct, .. } = self.phase {
+            // 正誤確定後はパネルの代わりに、グリッドのエリアいっぱいに大きな◯/✗を出す
+            let background = mark_background(is_correct, self.mark_renderer.uses_image());
+            self.mark_renderer.render(frame, grid_area, is_correct, background);
+        } else {
+            self.render_panels(frame, grid_area);
         }
 
         let (status, status_color) = match &self.phase {
@@ -359,7 +395,7 @@ impl Game for MemoryGame {
     }
 
     fn result(&self) -> GameResult {
-        self.tracker.to_result(GAME_ID, self.difficulty)
+        self.tracker.to_result(GAME_ID, SESSION_DIFFICULTY)
     }
 }
 
@@ -375,22 +411,62 @@ mod tests {
         game.update(SHOW_OFF_DURATION);
     }
 
+    /// 何問目(0始まり)ごとの手数。3問(初級相当)→4問(中級相当)→3問(上級相当)
+    const EXPECTED_LENGTHS: [usize; 10] = [3, 3, 3, 5, 5, 5, 5, 7, 7, 7];
+
+    /// 提示フェーズを最後まで進め、現在のシーケンスを入力する。
+    /// correct=falseなら最初の1手を間違えて即不正解にする
+    fn play_current_sequence(game: &mut MemoryGame, correct: bool) {
+        let len = game.sequence.len();
+        for _ in 0..len {
+            advance_one_step(game);
+        }
+        assert!(matches!(game.phase, Phase::Input { entered: 0 }));
+        if !correct {
+            let wrong_first = if game.sequence[0] == 1 { 2 } else { 1 };
+            game.handle_key(KeyEvent::from(KeyCode::Char(
+                std::char::from_digit(wrong_first as u32, 10).unwrap(),
+            )));
+            return;
+        }
+        let sequence = game.sequence.clone();
+        for &panel in &sequence {
+            game.handle_key(KeyEvent::from(KeyCode::Char(
+                std::char::from_digit(panel as u32, 10).unwrap(),
+            )));
+        }
+    }
+
     #[test]
-    fn generated_sequence_has_expected_length_per_difficulty() {
+    fn sequence_len_follows_three_four_three_questions() {
+        for (index, expected) in EXPECTED_LENGTHS.iter().enumerate() {
+            assert_eq!(
+                sequence_len_for_question(index as u32),
+                *expected,
+                "{}問目",
+                index + 1
+            );
+        }
+    }
+
+    #[test]
+    fn generated_sequence_has_expected_length_per_question() {
         let mut rng = StdRng::seed_from_u64(1);
-        assert_eq!(generate_sequence(&mut rng, Difficulty::Beginner).len(), 3);
-        assert_eq!(
-            generate_sequence(&mut rng, Difficulty::Intermediate).len(),
-            5
-        );
-        assert_eq!(generate_sequence(&mut rng, Difficulty::Advanced).len(), 7);
+        for (index, expected) in EXPECTED_LENGTHS.iter().enumerate() {
+            assert_eq!(
+                generate_sequence(&mut rng, index as u32).len(),
+                *expected,
+                "{}問目",
+                index + 1
+            );
+        }
     }
 
     #[test]
     fn generated_sequence_only_contains_valid_panel_numbers() {
         let mut rng = StdRng::seed_from_u64(2);
         for _ in 0..50 {
-            let seq = generate_sequence(&mut rng, Difficulty::Advanced);
+            let seq = generate_sequence(&mut rng, 9);
             for &p in &seq {
                 assert!((1..=4).contains(&p));
             }
@@ -398,8 +474,33 @@ mod tests {
     }
 
     #[test]
+    fn session_sequences_follow_fixed_progression() {
+        // 正解・不正解に関わらず、何問目かだけで手数が決まる
+        let mut game = MemoryGame::new();
+        for (index, expected) in EXPECTED_LENGTHS.iter().enumerate() {
+            assert_eq!(game.sequence.len(), *expected, "{}問目の手数", index + 1);
+            play_current_sequence(&mut game, index % 2 == 0);
+            assert_eq!(game.tracker.total(), index as u32 + 1);
+            if !game.is_finished() {
+                game.update(RESULT_INTERVAL);
+            }
+        }
+        assert!(game.is_finished(), "10問で終わる");
+        assert_eq!(game.result().total, 10);
+    }
+
+    #[test]
+    fn result_records_session_difficulty() {
+        assert_eq!(SESSION_DIFFICULTY, Difficulty::Advanced);
+        let mut game = MemoryGame::new();
+        assert_eq!(game.result().difficulty, SESSION_DIFFICULTY);
+        play_current_sequence(&mut game, true);
+        assert_eq!(game.result().difficulty, SESSION_DIFFICULTY);
+    }
+
+    #[test]
     fn showing_phase_advances_to_input_after_all_steps_shown() {
-        let mut game = MemoryGame::new(Difficulty::Beginner);
+        let mut game = MemoryGame::new();
         let len = game.sequence.len();
         for _ in 0..len {
             advance_one_step(&mut game);
@@ -409,7 +510,7 @@ mod tests {
 
     #[test]
     fn showing_phase_does_not_advance_before_interval_elapses() {
-        let mut game = MemoryGame::new(Difficulty::Beginner);
+        let mut game = MemoryGame::new();
         game.update(SHOW_ON_DURATION / 2);
         assert!(matches!(game.phase, Phase::Showing { shown: 0, .. }));
     }
@@ -418,7 +519,7 @@ mod tests {
     fn consecutive_same_panel_blinks_off_between_repeats() {
         // 同じパネルが連続するシーケンスでも、1回の点灯なのか連続点灯なのか
         // 区別できるよう、次の点灯前に必ず一度消灯を経由することを確認する
-        let mut game = MemoryGame::new(Difficulty::Beginner);
+        let mut game = MemoryGame::new();
         game.sequence = vec![1, 1, 3];
         game.active_panel = Some(1);
         game.phase = Phase::Showing {
@@ -457,7 +558,7 @@ mod tests {
 
     #[test]
     fn correct_full_sequence_input_records_correct_answer() {
-        let mut game = MemoryGame::new(Difficulty::Beginner);
+        let mut game = MemoryGame::new();
         let len = game.sequence.len();
         for _ in 0..len {
             advance_one_step(&mut game);
@@ -474,7 +575,7 @@ mod tests {
 
     #[test]
     fn wrong_key_during_input_immediately_finalizes_as_incorrect() {
-        let mut game = MemoryGame::new(Difficulty::Beginner);
+        let mut game = MemoryGame::new();
         let len = game.sequence.len();
         for _ in 0..len {
             advance_one_step(&mut game);
@@ -497,7 +598,7 @@ mod tests {
 
     #[test]
     fn interval_advances_to_next_sequence_after_result_interval() {
-        let mut game = MemoryGame::new(Difficulty::Beginner);
+        let mut game = MemoryGame::new();
         let len = game.sequence.len();
         for _ in 0..len {
             advance_one_step(&mut game);
@@ -534,7 +635,7 @@ mod tests {
 
     #[test]
     fn finishing_a_sequence_updates_hud_feedback() {
-        let mut game = MemoryGame::new(Difficulty::Beginner);
+        let mut game = MemoryGame::new();
         let len = game.sequence.len();
         for _ in 0..len {
             advance_one_step(&mut game);
@@ -557,14 +658,14 @@ mod tests {
 
     #[test]
     fn key_input_is_ignored_during_showing_phase() {
-        let mut game = MemoryGame::new(Difficulty::Beginner);
+        let mut game = MemoryGame::new();
         game.handle_key(KeyEvent::from(KeyCode::Char('1')));
         assert_eq!(game.tracker.total(), 0);
     }
 
     #[test]
     fn session_finishes_after_configured_question_count() {
-        let mut game = MemoryGame::new(Difficulty::Beginner);
+        let mut game = MemoryGame::new();
         for _ in 0..crate::game::QUESTIONS_PER_SESSION {
             let len = game.sequence.len();
             for _ in 0..len {
@@ -600,7 +701,7 @@ mod tests {
 
     #[test]
     fn clicking_correct_panel_sequence_via_mouse_records_correct_answer() {
-        let mut game = MemoryGame::new(Difficulty::Beginner);
+        let mut game = MemoryGame::new();
         let len = game.sequence.len();
         for _ in 0..len {
             advance_one_step(&mut game);
@@ -613,18 +714,174 @@ mod tests {
             let (_, panel_area) = areas.iter().find(|(p, _)| *p == panel).unwrap();
             game.handle_mouse(left_click(panel_area.x, panel_area.y), area);
         }
-        let result = game.tracker.to_result(GAME_ID, game.difficulty);
+        let result = game.tracker.to_result(GAME_ID, SESSION_DIFFICULTY);
         assert_eq!(result.total, 1);
         assert_eq!(result.correct, 1);
     }
 
     #[test]
     fn clicking_panel_during_showing_phase_is_ignored() {
-        let mut game = MemoryGame::new(Difficulty::Beginner);
+        let mut game = MemoryGame::new();
         let area = Rect::new(0, 0, 40, 12);
         let (grid_area, _) = split_areas(area);
         let (_, panel_area) = panel_areas(grid_area)[0];
         game.handle_mouse(left_click(panel_area.x, panel_area.y), area);
         assert_eq!(game.tracker.total(), 0);
+    }
+
+    // ---- 正誤確定後の大きな◯/✗表示 ----
+
+    use crate::game::mark_display::{MarkRenderer, CORRECT_MARK, INCORRECT_MARK};
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::Terminal;
+    use ratatui_image::picker::{Picker, ProtocolType};
+
+    /// ゲームを描き、バッファとパネルの2x2グリッドのエリアを返す
+    fn render_game(game: &MemoryGame, width: u16, height: u16) -> (Buffer, Rect) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| game.render(frame, frame.area()))
+            .unwrap();
+        let (grid_area, _) = split_areas(Rect::new(0, 0, width, height));
+        (terminal.backend().buffer().clone(), grid_area)
+    }
+
+    fn area_text(buffer: &Buffer, area: Rect) -> String {
+        (area.y..area.bottom())
+            .flat_map(|y| (area.x..area.right()).map(move |x| (x, y)))
+            .map(|pos| buffer[pos].symbol().to_string())
+            .collect()
+    }
+
+    fn halfblocks_renderer() -> MarkRenderer {
+        let mut picker = Picker::from_fontsize((10, 20));
+        picker.set_protocol_type(ProtocolType::Halfblocks);
+        MarkRenderer::with_picker(Some(picker))
+    }
+
+    #[test]
+    fn interval_shows_big_mark_in_grid_area_instead_of_panels() {
+        for (correct, mark, other) in [
+            (true, CORRECT_MARK, INCORRECT_MARK),
+            (false, INCORRECT_MARK, CORRECT_MARK),
+        ] {
+            let mut game = MemoryGame::new();
+            play_current_sequence(&mut game, correct);
+            assert!(matches!(
+                game.phase,
+                Phase::Interval { is_correct, .. } if is_correct == correct
+            ));
+            let (buffer, grid_area) = render_game(&game, 40, 16);
+            let text = area_text(&buffer, grid_area);
+            assert!(text.contains(mark), "「{mark}」が描かれる: {text:?}");
+            assert!(!text.contains(other), "反対の記号は描かない");
+            // パネルの番号は隠れ、◯/✗がメインの表示になる
+            for number in ['1', '2', '3', '4'] {
+                assert!(!text.contains(number), "パネル{number}は描かない");
+            }
+            let cell = (grid_area.y..grid_area.bottom())
+                .flat_map(|y| (grid_area.x..grid_area.right()).map(move |x| (x, y)))
+                .map(|pos| &buffer[pos])
+                .find(|c| c.symbol() == mark)
+                .unwrap();
+            assert_eq!(cell.fg, Color::Black, "記号は黒");
+            // グリッドのエリア全体を正誤の色で塗る
+            let expected_bg = mark_background(correct, false);
+            assert_eq!(buffer[(grid_area.x, grid_area.y)].bg, expected_bg);
+            assert_eq!(
+                buffer[(grid_area.right() - 1, grid_area.bottom() - 1)].bg,
+                expected_bg
+            );
+        }
+    }
+
+    #[test]
+    fn mark_backgrounds_differ_between_correct_and_incorrect() {
+        assert_ne!(mark_background(true, false), mark_background(false, false));
+        assert_ne!(mark_background(true, true), mark_background(false, true));
+        // 画像表示の時は画像の背景と同じ色で塗れるようRGBにする
+        assert!(matches!(mark_background(true, true), Color::Rgb(..)));
+        assert!(matches!(mark_background(false, true), Color::Rgb(..)));
+    }
+
+    #[test]
+    fn interval_footer_keeps_supplementary_text() {
+        let mut game = MemoryGame::new();
+        play_current_sequence(&mut game, true);
+        let (buffer, _) = render_game(&game, 60, 16);
+        let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.replace(' ', "").contains("せいかい"), "footerに補足を残す");
+    }
+
+    #[test]
+    fn mark_disappears_after_interval_and_panels_return() {
+        let mut game = MemoryGame::new();
+        play_current_sequence(&mut game, true);
+        game.update(RESULT_INTERVAL);
+        assert!(matches!(game.phase, Phase::Showing { shown: 0, .. }));
+        let (buffer, grid_area) = render_game(&game, 40, 16);
+        let text = area_text(&buffer, grid_area);
+        assert!(!text.contains(CORRECT_MARK) && !text.contains(INCORRECT_MARK));
+        for number in ['1', '2', '3', '4'] {
+            assert!(text.contains(number), "パネル{number}が戻る");
+        }
+    }
+
+    #[test]
+    fn no_mark_is_shown_outside_interval() {
+        let mut game = MemoryGame::new();
+        let (buffer, grid_area) = render_game(&game, 40, 16);
+        let text = area_text(&buffer, grid_area);
+        assert!(!text.contains(CORRECT_MARK) && !text.contains(INCORRECT_MARK), "提示中");
+        let len = game.sequence.len();
+        for _ in 0..len {
+            advance_one_step(&mut game);
+        }
+        let (buffer, grid_area) = render_game(&game, 40, 16);
+        let text = area_text(&buffer, grid_area);
+        assert!(!text.contains(CORRECT_MARK) && !text.contains(INCORRECT_MARK), "入力中");
+    }
+
+    #[test]
+    fn interval_mark_is_drawn_as_image_with_image_protocol() {
+        for correct in [true, false] {
+            let mut game = MemoryGame::new();
+            game.mark_renderer = halfblocks_renderer();
+            play_current_sequence(&mut game, correct);
+            let (buffer, grid_area) = render_game(&game, 60, 20);
+            let (cached_correct, bg, drawn) =
+                game.mark_renderer.cached_mark().expect("画像で描かれていること");
+            assert_eq!(cached_correct, correct);
+            let expected_bg = mark_background(correct, true);
+            assert_eq!(Color::Rgb(bg[0], bg[1], bg[2]), expected_bg);
+            assert!(drawn.x >= grid_area.x && drawn.y >= grid_area.y);
+            assert!(drawn.right() <= grid_area.right() && drawn.bottom() <= grid_area.bottom());
+            assert_eq!(buffer[(grid_area.x, grid_area.y)].bg, expected_bg);
+        }
+    }
+
+    #[test]
+    fn interval_render_does_not_panic_on_small_screens_or_image_protocols() {
+        for protocol in [
+            ProtocolType::Halfblocks,
+            ProtocolType::Sixel,
+            ProtocolType::Kitty,
+            ProtocolType::Iterm2,
+        ] {
+            for correct in [true, false] {
+                let mut picker = Picker::from_fontsize((10, 20));
+                picker.set_protocol_type(protocol);
+                let mut game = MemoryGame::new();
+                game.mark_renderer = MarkRenderer::with_picker(Some(picker));
+                play_current_sequence(&mut game, correct);
+                for (width, height) in [(60u16, 20u16), (12, 9), (4, 4), (1, 1)] {
+                    render_game(&game, width, height);
+                }
+            }
+        }
+        let mut game = MemoryGame::new();
+        play_current_sequence(&mut game, false);
+        render_game(&game, 1, 1);
     }
 }
