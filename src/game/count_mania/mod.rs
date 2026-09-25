@@ -23,8 +23,8 @@ use crate::game::feedback::AnswerFeedback;
 use crate::game::theme;
 use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
 
-use circle_image::CircleRenderer;
-use layout::{hit_test, layout_circles, CircleSize, Placement};
+use circle_image::{BoardCircle, CircleRenderer};
+use layout::{back_to_front, hit_test, layout_circles, CircleSize, Placement};
 
 pub const GAME_ID: &str = "count_mania";
 
@@ -430,21 +430,23 @@ impl Game for CountManiaGame {
             self.render_interval_message(frame, board);
             return;
         }
-        let placements = self.placements(board);
-        for placement in &placements {
-            if !self.is_visible(placement.number) {
-                continue;
-            }
-            if let Some(circle) = self
-                .round
-                .circles
-                .iter()
-                .find(|c| c.number == placement.number)
-            {
-                self.renderer
-                    .render(frame, placement.rect, circle.number, circle.color);
-            }
-        }
+        // 大きい円から先に描き、小さい円ほど手前に重ねる(当たり判定hit_testの優先順位と同じ)
+        let circles: Vec<BoardCircle> = back_to_front(&self.placements(board))
+            .iter()
+            .filter(|placement| self.is_visible(placement.number))
+            .filter_map(|placement| {
+                self.round
+                    .circles
+                    .iter()
+                    .find(|c| c.number == placement.number)
+                    .map(|circle| BoardCircle {
+                        rect: placement.rect,
+                        number: circle.number,
+                        color: circle.color,
+                    })
+            })
+            .collect();
+        self.renderer.render_board(frame, board, &circles);
     }
 
     fn is_finished(&self) -> bool {
@@ -500,6 +502,42 @@ mod tests {
             .flat_map(|y| (board.x..board.right()).map(move |x| (x, y)))
             .find(|&(x, y)| hit_test(&placements, |_| true, x, y).is_none())
             .expect("円の無いセルがあること")
+    }
+
+    /// 配置を差し替える(乱数に頼らず、重なり具合を決めて確かめるため)。
+    /// rectsはボード左上からの相対位置で(番号, x, y, 幅, 高さ)
+    fn set_layout(game: &CountManiaGame, rects: &[(u8, u16, u16, u16, u16)]) {
+        let board = board_area(AREA);
+        let placements = rects
+            .iter()
+            .map(|&(number, x, y, width, height)| Placement {
+                number,
+                rect: Rect::new(board.x + x, board.y + y, width, height),
+            })
+            .collect();
+        *game.layout.borrow_mut() = Some(LayoutCache {
+            board,
+            round_serial: game.round_serial,
+            placements,
+        });
+    }
+
+    /// ボード左上からの相対位置(x, y)を左クリックする
+    fn click_board(game: &mut CountManiaGame, x: u16, y: u16) {
+        let board = board_area(AREA);
+        game.handle_mouse(left_click(board.x + x, board.y + y), AREA);
+    }
+
+    /// 大きい円(14x7)の左側に小さい円(6x3)が重なった配置。OVERLAPは両方の円の内側のセル
+    const LARGE_AT: (u16, u16, u16, u16) = (10, 5, 14, 7);
+    const SMALL_AT: (u16, u16, u16, u16) = (10, 7, 6, 3);
+    const OVERLAP: (u16, u16) = (12, 8);
+
+    fn set_overlap_layout(game: &CountManiaGame, large: u8, small: u8) {
+        let (lx, ly, lw, lh) = LARGE_AT;
+        let (sx, sy, sw, sh) = SMALL_AT;
+        // 小さい円を先に渡しても、描画・当たり判定は大きさで決まる
+        set_layout(game, &[(small, sx, sy, sw, sh), (large, lx, ly, lw, lh)]);
     }
 
     fn clear_round(game: &mut CountManiaGame) {
@@ -783,8 +821,54 @@ mod tests {
     }
 
     #[test]
+    fn clicking_overlap_hits_smaller_circle_then_circle_below_after_removal() {
+        // 小さい円1が大きい円2の上に重なっている
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        set_overlap_layout(&game, 2, 1);
+        let (x, y) = OVERLAP;
+        click_board(&mut game, x, y);
+        assert_eq!(game.round.next, 2, "手前の小さい円1に当たる");
+        click_board(&mut game, x, y);
+        assert_eq!(game.round.next, 3, "円1が消えた後は下の円2に当たる");
+        assert_eq!(game.round.lives, 3);
+    }
+
+    #[test]
+    fn clicking_overlap_never_hits_larger_circle_below() {
+        // 次に押すべき円1が大きい方で、その上に小さい円2が重なっている。重なった所は円2扱い
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        set_overlap_layout(&game, 1, 2);
+        let (x, y) = OVERLAP;
+        click_board(&mut game, x, y);
+        assert_eq!(game.round.next, 1);
+        assert_eq!(game.round.lives, 2, "手前の円2を押した扱いでライフが減る");
+    }
+
+    #[test]
+    fn render_draws_smaller_circle_on_top_of_larger() {
+        let mut game = CountManiaGame::new(Difficulty::Beginner);
+        game.round.circles[0].color = [200, 50, 50];
+        game.round.circles[1].color = [50, 50, 200];
+        set_overlap_layout(&game, 2, 1);
+        let backend = ratatui::backend::TestBackend::new(AREA.width, AREA.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| game.render(frame, frame.area()))
+            .unwrap();
+        let board = board_area(AREA);
+        let (x, y) = OVERLAP;
+        assert_eq!(
+            terminal.backend().buffer()[(board.x + x, board.y + y)].fg,
+            Color::Rgb(200, 50, 50),
+            "重なった所は小さい円1の色"
+        );
+    }
+
+    #[test]
     fn clicking_removed_circle_does_nothing() {
         let mut game = CountManiaGame::new(Difficulty::Beginner);
+        // 円1の下に他の円が無い配置にする(下に円があればそちらに当たるのが正しい動作のため)
+        set_layout(&game, &[(1, 2, 2, 10, 5), (2, 40, 2, 10, 5)]);
         click_circle(&mut game, 1);
         click_circle(&mut game, 1);
         assert_eq!(game.round.next, 2);
