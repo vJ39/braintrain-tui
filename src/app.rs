@@ -382,7 +382,15 @@ impl App {
 
     pub fn update(&mut self, dt: Duration) {
         match &mut self.screen {
-            Screen::Playing(game) => game.update(dt),
+            Screen::Playing(game) => {
+                game.update(dt);
+                // 時間経過だけで終了する場合がある(DDRの曲が最後まで流れ切った時等)ので、
+                // キー/クリック入力を待たずここでも終了を確認する
+                if game.is_finished() {
+                    let result = game.result();
+                    self.enter_result(result);
+                }
+            }
             Screen::Countdown {
                 item,
                 difficulty,
