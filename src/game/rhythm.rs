@@ -331,7 +331,8 @@ fn eighth_hit_at(beat_ms: u32, next_beat_ms: u32) -> Duration {
 }
 
 /// 単押しのレーン巡回パターン。完全ランダムにせず「歩く」「左右交互」「上下往復」
-/// といった認識できるフレーズを、PHRASE_SPAN_BEATS拍ごとに順番に切り替えて使う
+/// といった認識できるフレーズを、PHRASE_SPAN_BEATS拍ごとに切り替えて使う。
+/// どのフレーズを使うかはブロック番号から決まる擬似ランダムで選び、次に来るフレーズを読めないようにする
 const LANE_PHRASES: [[Lane; 4]; 4] = [
     // 左→下→上→右 と歩くように踏む
     [Lane::Left, Lane::Down, Lane::Up, Lane::Right],
@@ -346,17 +347,50 @@ const LANE_PHRASES: [[Lane; 4]; 4] = [
 /// 1つのレーンフレーズを使い続ける拍数(4拍×2小節)
 const PHRASE_SPAN_BEATS: usize = 8;
 
-/// 同時押しで使うレーンの組(左右・上下を交互に使う)
+/// 同時押しで使うレーンの組(左右・上下)
 const JUMP_LANES: [[Lane; 2]; 2] = [[Lane::Left, Lane::Right], [Lane::Up, Lane::Down]];
 
-/// 単押しのレーンを規則的に払い出す
+/// 擬似ランダムの系列を単押しフレーズと同時押しで分けるための種
+const PHRASE_SEED: u64 = 0x5048_5241_5345_0001;
+const JUMP_SEED: u64 = 0x4a55_4d50_4c41_0002;
+
+/// 区切りの番号から一意に決まる擬似乱数(SplitMix64の混合関数)。
+/// 同じ入力なら常に同じ値を返すので、譜面は毎回同じになる
+fn mix64(seed: u64, index: u64) -> u64 {
+    let mut z = seed.wrapping_add(index.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// 0..lenから擬似ランダムに1つ選ぶ。prevがあればそれ以外の中から選ぶ(同じものを連続させない)
+fn pick_excluding(seed: u64, index: u64, len: usize, prev: Option<usize>) -> usize {
+    let r = mix64(seed, index);
+    match prev {
+        None => (r % len as u64) as usize,
+        Some(prev) => {
+            // prevを除いたlen-1個の中で選び、prev以上なら1つずらしてprevを飛ばす
+            let pick = (r % (len as u64 - 1)) as usize;
+            if pick >= prev {
+                pick + 1
+            } else {
+                pick
+            }
+        }
+    }
+}
+
+/// 単押し・同時押しのレーンを払い出す
 struct LaneCycler {
     /// 現在使っているフレーズのブロック番号(beat_index / PHRASE_SPAN_BEATS)
     block: Option<usize>,
+    /// 現在のブロックで使っているフレーズ(LANE_PHRASESの添字)
+    phrase: Option<usize>,
     /// フレーズ内で次に使う位置
     step: usize,
     /// 直前に払い出した単押しレーン(同じレーンの連打を避けるため)
     last: Option<Lane>,
+    /// これまでの同時押しの回数(同時押しの組を選ぶ区切りの番号)
     jump_count: usize,
 }
 
@@ -364,20 +398,27 @@ impl LaneCycler {
     fn new() -> Self {
         Self {
             block: None,
+            phrase: None,
             step: 0,
             last: None,
             jump_count: 0,
         }
     }
 
-    /// 次の単押しレーン。ビートがフレーズの切り替わり位置を越えたらフレーズを変える
+    /// 次の単押しレーン。ビートがフレーズの切り替わり位置を越えたらフレーズを選び直す
     fn next_single(&mut self, beat_index: usize) -> Lane {
         let block = beat_index / PHRASE_SPAN_BEATS;
         if self.block != Some(block) {
             self.block = Some(block);
             self.step = 0;
+            self.phrase = Some(pick_excluding(
+                PHRASE_SEED,
+                block as u64,
+                LANE_PHRASES.len(),
+                self.phrase,
+            ));
         }
-        let phrase = &LANE_PHRASES[block % LANE_PHRASES.len()];
+        let phrase = &LANE_PHRASES[self.phrase.expect("ブロック切り替え時に選択済み")];
         let mut lane = phrase[self.step % phrase.len()];
         self.step += 1;
         // フレーズの継ぎ目で直前と同じレーンになる場合は1つ進めて連打を避ける
@@ -389,16 +430,18 @@ impl LaneCycler {
         lane
     }
 
+    /// 次の同時押しレーン。同時押し1回ごとに、左右・上下のどちらかを擬似ランダムに選ぶ。
+    /// 2種しかないので直前と違う組に限ると交互の固定巡回になってしまう。そのため排他はせず、同じ組が偶然続くこともある
     fn next_jump(&mut self) -> Vec<Lane> {
-        let lanes = JUMP_LANES[self.jump_count % JUMP_LANES.len()].to_vec();
+        let pick = (mix64(JUMP_SEED, self.jump_count as u64) % JUMP_LANES.len() as u64) as usize;
         self.jump_count += 1;
         // 同時押しの後の単押しは、どのレーンから始めても連打にはならない
         self.last = None;
-        lanes
+        JUMP_LANES[pick].to_vec()
     }
 }
 
-/// 曲の実測ビートと難易度から譜面を作る純粋関数(乱数を使わないので毎回同じ譜面になる)
+/// 曲の実測ビートと難易度から譜面を作る純粋関数(レーン選択は区切り番号から決まる擬似ランダムなので毎回同じ譜面になる)
 fn generate_chart(song: &RhythmSong, difficulty: Difficulty) -> Vec<Note> {
     let beats = song.beat_times_ms;
     let mut cycler = LaneCycler::new();
@@ -1545,6 +1588,128 @@ mod tests {
         }
     }
 
+    // --- レーン選択の擬似ランダム化(LaneCycler) ---
+
+    /// 列が周期pで繰り返しているか(固定順の巡回になっていないかの判定に使う)
+    fn is_periodic<T: PartialEq>(seq: &[T], p: usize) -> bool {
+        seq.len() > p && (p..seq.len()).all(|i| seq[i] == seq[i - p])
+    }
+
+    /// 1ブロックにつき1回next_singleを呼び、各ブロックで選ばれたフレーズ番号を集める
+    fn phrase_indices(blocks: usize) -> Vec<usize> {
+        let mut cycler = LaneCycler::new();
+        (0..blocks)
+            .map(|b| {
+                cycler.next_single(b * PHRASE_SPAN_BEATS);
+                cycler
+                    .phrase
+                    .expect("next_single後はフレーズが選ばれている")
+            })
+            .collect()
+    }
+
+    fn jump_sequence(count: usize) -> Vec<Vec<Lane>> {
+        let mut cycler = LaneCycler::new();
+        (0..count).map(|_| cycler.next_jump()).collect()
+    }
+
+    #[test]
+    fn phrase_selection_never_repeats_previous_phrase() {
+        let seq = phrase_indices(200);
+        for (i, pair) in seq.windows(2).enumerate() {
+            assert_ne!(pair[0], pair[1], "block{i}とblock{}が同じフレーズ", i + 1);
+        }
+    }
+
+    #[test]
+    fn phrase_selection_is_not_a_fixed_rotation() {
+        let seq = phrase_indices(64);
+        // 全フレーズが使われる
+        for p in 0..LANE_PHRASES.len() {
+            assert!(seq.contains(&p), "フレーズ{p}が一度も選ばれない: {seq:?}");
+        }
+        // 0,1,2,3の固定巡回や、2〜4種の決まった順の繰り返しになっていない
+        assert_ne!(
+            seq,
+            (0..64).map(|b| b % LANE_PHRASES.len()).collect::<Vec<_>>()
+        );
+        for p in 2..=LANE_PHRASES.len() {
+            assert!(!is_periodic(&seq, p), "周期{p}で繰り返している: {seq:?}");
+        }
+    }
+
+    #[test]
+    fn phrase_selection_is_deterministic() {
+        assert_eq!(phrase_indices(64), phrase_indices(64));
+    }
+
+    #[test]
+    fn single_lanes_follow_the_selected_phrase() {
+        // 1ブロック内の単押しは、そのブロックで選ばれたフレーズの並びで踏む
+        // (継ぎ目で連打を避けるため1つ進むことがあるので、開始位置は0か1)
+        let mut cycler = LaneCycler::new();
+        for block in 0..32 {
+            let lanes: Vec<Lane> = (0..4)
+                .map(|_| cycler.next_single(block * PHRASE_SPAN_BEATS))
+                .collect();
+            let phrase = LANE_PHRASES[cycler.phrase.unwrap()];
+            let matches = (0..2)
+                .any(|offset| (0..4).all(|k| lanes[k] == phrase[(offset + k) % phrase.len()]));
+            assert!(matches, "block{block}: {lanes:?} vs {phrase:?}");
+        }
+    }
+
+    #[test]
+    fn jump_selection_uses_a_jump_lane_pair() {
+        // 同時押しは常にJUMP_LANES(左右・上下)のどちらかで、2つの異なるレーンを踏む
+        for lanes in jump_sequence(200) {
+            assert!(
+                JUMP_LANES
+                    .iter()
+                    .any(|pair| pair.as_slice() == lanes.as_slice()),
+                "{lanes:?}"
+            );
+            assert_ne!(lanes[0], lanes[1]);
+        }
+    }
+
+    #[test]
+    fn jump_selection_is_not_a_fixed_alternation() {
+        let seq = jump_sequence(64);
+        // 左右・上下の両方が使われる
+        for pair in JUMP_LANES {
+            assert!(
+                seq.iter().any(|lanes| lanes.as_slice() == pair.as_slice()),
+                "{pair:?}が一度も選ばれない"
+            );
+        }
+        // 0,1,0,1...の固定の交互や、ずっと同じ組にならない
+        for p in 1..=2 {
+            assert!(!is_periodic(&seq, p), "周期{p}で繰り返している: {seq:?}");
+        }
+        assert_eq!(seq, jump_sequence(64), "同時押しの選択も決定論的");
+    }
+
+    #[test]
+    fn real_song_charts_jump_pairs_are_not_a_fixed_alternation() {
+        // 全3曲の上級譜面で、同時押しの組が交互の固定巡回になっていない
+        for song in SONGS {
+            let jumps: Vec<Vec<Lane>> = generate_chart(song, Difficulty::Advanced)
+                .into_iter()
+                .filter(|n| n.lanes.len() == 2)
+                .map(|n| n.lanes)
+                .collect();
+            assert!(jumps.len() > 10, "{}", song.track_name);
+            for p in 1..=2 {
+                assert!(
+                    !is_periodic(&jumps, p),
+                    "{}: 周期{p}の固定巡回",
+                    song.track_name
+                );
+            }
+        }
+    }
+
     /// TEST_SONGと同じビートで、全区間をExtremeにした曲
     const TEST_SONG_EXTREME: RhythmSong = RhythmSong {
         track_name: "test",
@@ -1586,10 +1751,8 @@ mod tests {
                 assert_eq!(eighth.hit_at, eighth_hit_at(beat_ms, *next_ms));
                 let expected_lanes = if i % 4 == 3 { 2 } else { 1 };
                 assert_eq!(eighth.lanes.len(), expected_lanes, "beat{i}の8分音符");
-                // 連続する同時押しは同じレーンの組を続けない(左右→上下と交互)
                 if expected_lanes == 2 {
-                    assert_ne!(eighth.lanes, on_beat.lanes, "beat{i}");
-                    assert_ne!(eighth.lanes, notes[i * 2 + 2].lanes, "beat{i}");
+                    assert_ne!(eighth.lanes[0], eighth.lanes[1], "beat{i}");
                 }
             }
         }
