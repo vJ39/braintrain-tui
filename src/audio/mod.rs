@@ -24,6 +24,10 @@ pub enum SeKind {
     Transition,
     /// タイトル画面(Splash)でEnter/クリックした時の決定音
     Confirm,
+    /// イロピッタン専用の正解音(ピンポン風の2音チャイム)
+    ReactionCorrect,
+    /// イロピッタン専用の不正解音(ブブー風のブザー)
+    ReactionIncorrect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +99,8 @@ impl SeKind {
             SeKind::Incorrect => "se_incorrect.wav",
             SeKind::Transition => "se_transition.wav",
             SeKind::Confirm => "se_confirm.wav",
+            SeKind::ReactionCorrect => "se_reaction_correct.wav",
+            SeKind::ReactionIncorrect => "se_reaction_incorrect.wav",
         }
     }
 }
@@ -185,14 +191,18 @@ pub fn stop_bgm() {
 mod tests {
     use super::*;
 
+    const ALL_SE_KINDS: [SeKind; 6] = [
+        SeKind::Correct,
+        SeKind::Incorrect,
+        SeKind::Transition,
+        SeKind::Confirm,
+        SeKind::ReactionCorrect,
+        SeKind::ReactionIncorrect,
+    ];
+
     #[test]
     fn asset_paths_are_distinct_per_se_kind() {
-        let paths = [
-            SeKind::Correct.asset_path(),
-            SeKind::Incorrect.asset_path(),
-            SeKind::Transition.asset_path(),
-            SeKind::Confirm.asset_path(),
-        ];
+        let paths = ALL_SE_KINDS.map(SeKind::asset_path);
         for i in 0..paths.len() {
             for j in (i + 1)..paths.len() {
                 assert_ne!(paths[i], paths[j]);
@@ -201,13 +211,23 @@ mod tests {
     }
 
     #[test]
+    fn reaction_se_kinds_use_their_own_assets() {
+        assert_eq!(
+            SeKind::ReactionCorrect.asset_path(),
+            "se_reaction_correct.wav"
+        );
+        assert_eq!(
+            SeKind::ReactionIncorrect.asset_path(),
+            "se_reaction_incorrect.wav"
+        );
+        // 既存の正解/不正解の音は変えない
+        assert_eq!(SeKind::Correct.asset_path(), "se_correct.wav");
+        assert_eq!(SeKind::Incorrect.asset_path(), "se_incorrect.wav");
+    }
+
+    #[test]
     fn every_se_asset_is_embedded() {
-        for se in [
-            SeKind::Correct,
-            SeKind::Incorrect,
-            SeKind::Transition,
-            SeKind::Confirm,
-        ] {
+        for se in ALL_SE_KINDS {
             assert!(
                 Assets::get(se.asset_path()).is_some(),
                 "{:?}のasset({})が埋め込まれていること",

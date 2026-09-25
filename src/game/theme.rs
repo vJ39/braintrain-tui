@@ -263,6 +263,28 @@ pub fn render_hud(
     answered: u32,
     feedback: &AnswerFeedback,
 ) {
+    render_hud_with_session_length(
+        frame,
+        area,
+        game_name,
+        difficulty,
+        answered,
+        QUESTIONS_PER_SESSION,
+        feedback,
+    );
+}
+
+/// 問題数(session_length)を指定するHUD。共通の問題数と違うゲームが使う。
+/// 進捗バーの幅は問題数によらず共通の幅にする(左の列に収まるように)
+pub fn render_hud_with_session_length(
+    frame: &mut Frame,
+    area: Rect,
+    game_name: &str,
+    difficulty: Difficulty,
+    answered: u32,
+    session_length: u32,
+    feedback: &AnswerFeedback,
+) {
     let (difficulty_text, difficulty_color) = difficulty_label(difficulty);
     let block = panel(format!(" ◆ {game_name} "))
         .border_style(Style::default().fg(flash_border_color(feedback.current())))
@@ -288,14 +310,14 @@ pub fn render_hud(
         .split(inner);
 
     // いま解いている問題の番号(全問解き終えたら最終問のまま)
-    let current_question = (answered + 1).min(QUESTIONS_PER_SESSION);
+    let current_question = (answered + 1).min(session_length);
     let progress = Line::from(vec![
         Span::styled(
-            format!(" Q{current_question:>2}/{QUESTIONS_PER_SESSION} "),
+            format!(" Q{current_question:>2}/{session_length} "),
             title_style(),
         ),
         Span::styled(
-            progress_bar(answered, QUESTIONS_PER_SESSION, QUESTIONS_PER_SESSION as usize),
+            progress_bar(answered, session_length, QUESTIONS_PER_SESSION as usize),
             Style::default().fg(ACCENT),
         ),
     ]);
@@ -389,6 +411,56 @@ pub fn vertical_center(area: Rect, content_height: u16) -> Rect {
 mod tests {
     use super::*;
     use crate::game::{column_index, row_index};
+
+    fn hud_text(answered: u32, session_length: Option<u32>) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut terminal = Terminal::new(TestBackend::new(60, HUD_HEIGHT)).unwrap();
+        let feedback = AnswerFeedback::new();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                match session_length {
+                    Some(len) => render_hud_with_session_length(
+                        frame,
+                        area,
+                        "テスト",
+                        Difficulty::Beginner,
+                        answered,
+                        len,
+                        &feedback,
+                    ),
+                    None => render_hud(
+                        frame,
+                        area,
+                        "テスト",
+                        Difficulty::Beginner,
+                        answered,
+                        &feedback,
+                    ),
+                }
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn render_hud_keeps_shared_session_length() {
+        assert!(hud_text(3, None).contains("Q 4/10"));
+    }
+
+    #[test]
+    fn render_hud_with_session_length_shows_given_total() {
+        assert!(hud_text(12, Some(20)).contains("Q13/20"));
+        // 全問解き終えたら最終問のまま
+        assert!(hud_text(20, Some(20)).contains("Q20/20"));
+    }
 
     #[test]
     fn progress_bar_fills_proportionally() {
