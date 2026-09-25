@@ -200,6 +200,8 @@ pub struct CountManiaGame {
     ripple: Option<Ripple>,
     layout: RefCell<Option<LayoutCache>>,
     renderer: CircleRenderer,
+    /// ライフが尽きた(GAME OVER)か。trueになったら残りラウンドを待たずセッションを終える
+    game_over: bool,
 }
 
 /// ゲームの描画エリアのうち、円を並べるボード(枠の内側)。renderとhandle_mouseで共有する
@@ -223,6 +225,7 @@ impl CountManiaGame {
             ripple: None,
             layout: RefCell::new(None),
             renderer: CircleRenderer::new(),
+            game_over: false,
         }
     }
 
@@ -288,7 +291,9 @@ impl CountManiaGame {
             self.round.time_since_target = Duration::ZERO;
             self.tracker.record(false, self.params.fail_latency_ms);
             self.feedback.record(false, "ライフが尽きた");
-            self.finish_round();
+            // GAME OVERは残りラウンドを待たずセッションを即終了する(次のラウンドへの
+            // 待ち時間には入らない。フィードバック表示が消えたらis_finished()がtrueになる)
+            self.game_over = true;
         } else {
             self.feedback.record(false, "ライフ -1");
         }
@@ -391,19 +396,17 @@ impl CountManiaGame {
     }
 
     /// ラウンド間の待ち時間中にボード中央へ出す案内
+    ///
+    /// ここに来るのは最後の数字まで押し切ってクリアした時のみ(ライフ切れはGAME OVERとして
+    /// セッションを即終了するため、この待ち時間には入らない)
     fn render_interval_message(&self, frame: &mut Frame, board: Rect) {
-        // 最後の数字まで押し切っていればクリア、そうでなければライフ切れ
-        let cleared = self.round.next > self.params.max_number;
-        let (headline, color) = if cleared {
-            ("CLEAR!", theme::CORRECT)
-        } else {
-            ("MISS...", theme::INCORRECT)
-        };
         let next_round = (self.tracker.total() + 1).min(ROUNDS_PER_SESSION);
         let lines = vec![
             Line::from(Span::styled(
-                headline,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
+                "CLEAR!",
+                Style::default()
+                    .fg(theme::CORRECT)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(
@@ -421,8 +424,8 @@ impl Game for CountManiaGame {
     fn handle_key(&mut self, _key: KeyEvent) {}
 
     fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
-        // 待ち時間中・セッション終了後のクリックは受け付けない
-        if self.is_finished() || self.interval.is_some() {
+        // 待ち時間中・セッション終了後・GAME OVER後のクリックは受け付けない
+        if self.is_finished() || self.interval.is_some() || self.game_over {
             return;
         }
         if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
@@ -503,6 +506,10 @@ impl Game for CountManiaGame {
     }
 
     fn is_finished(&self) -> bool {
+        if self.game_over {
+            // GAME OVERの正誤フィードバック("ライフが尽きた")が消えたらセッション終了
+            return self.feedback.current().is_none();
+        }
         self.tracker.total() >= ROUNDS_PER_SESSION
     }
 
@@ -762,6 +769,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn game_over_ends_the_session_without_waiting_for_remaining_rounds() {
+        // GAME OVER(ライフ0)は、3ラウンド構成の途中でも次のラウンドへ進まず、
+        // フィードバック("ライフが尽きた")が消えたらセッション全体が終了する
+        let mut game = CountManiaGame::new(Difficulty::Intermediate);
+        click_circle(&mut game, 1);
+        for _ in 0..2 {
+            let wrong = wrong_number(&game);
+            click_circle(&mut game, wrong);
+        }
+        assert_eq!(game.tracker.total(), 1, "3ラウンドのうち1回しか記録されない");
+        assert!(!game.is_finished(), "フィードバック表示中はまだ終了しない");
+        assert!(game.interval.is_none(), "次のラウンドへの待ち時間には入らない");
+
+        game.update(crate::game::feedback::FEEDBACK_HOLD);
+        assert!(game.is_finished(), "フィードバックが消えたらセッション終了");
+        assert_eq!(
+            game.tracker.total(),
+            1,
+            "次のラウンドは始まらないので記録は1回のまま"
+        );
+    }
+
+    #[test]
+    fn clicks_after_game_over_are_ignored() {
+        let mut game = CountManiaGame::new(Difficulty::Intermediate);
+        click_circle(&mut game, 1);
+        for _ in 0..2 {
+            let wrong = wrong_number(&game);
+            click_circle(&mut game, wrong);
+        }
+        let next_before = game.round.next;
+        click_circle(&mut game, next_before);
+        assert_eq!(game.tracker.total(), 1, "GAME OVER後のクリックは無視される");
+    }
+
     // --- ラウンド進行 ---
 
     #[test]
@@ -1000,21 +1043,12 @@ mod tests {
     }
 
     #[test]
-    fn interval_message_tells_clear_or_miss_and_hides_circles() {
+    fn interval_message_tells_clear_and_hides_circles() {
         let mut game = CountManiaGame::new(Difficulty::Beginner);
         clear_round(&mut game);
         let text = rendered_text(&game, AREA.width, AREA.height);
         assert!(text.contains("CLEAR!"));
         assert!(text.contains("NEXTROUND2/3"));
-
-        game.update(ROUND_INTERVAL);
-        for _ in 0..3 {
-            let wrong = wrong_number(&game);
-            click_circle(&mut game, wrong);
-        }
-        assert!(game.interval.is_some(), "ライフ切れでも待ち時間に入る");
-        let text = rendered_text(&game, AREA.width, AREA.height);
-        assert!(text.contains("MISS..."));
         assert!(!text.contains('②'), "待ち時間中は円を描かない");
     }
 
@@ -1369,7 +1403,7 @@ mod tests {
             let wrong = wrong_number(&game);
             click_circle(&mut game, wrong);
         }
-        assert!(game.interval.is_some());
+        assert!(game.game_over, "ライフ切れでGAME OVERになる");
         let buffer = rendered_buffer(&game);
         let (_, body) = theme::split_hud(AREA);
         assert_eq!(
