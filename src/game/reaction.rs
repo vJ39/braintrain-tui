@@ -39,12 +39,12 @@ const SESSION_LENGTH: u32 = 20;
 const CORRECT_MARK: &str = "◯";
 const INCORRECT_MARK: &str = "✗";
 
-/// 正誤判定時に鳴らす、イロピッタン専用の効果音
+/// 正誤判定時に鳴らす効果音
 fn verdict_se(is_correct: bool) -> SeKind {
     if is_correct {
-        SeKind::ReactionCorrect
+        SeKind::Correct
     } else {
-        SeKind::ReactionIncorrect
+        SeKind::Incorrect
     }
 }
 
@@ -1257,9 +1257,9 @@ mod tests {
     // ---- 正誤の効果音 ----
 
     #[test]
-    fn verdict_se_uses_reaction_specific_sounds() {
-        assert_eq!(verdict_se(true), SeKind::ReactionCorrect);
-        assert_eq!(verdict_se(false), SeKind::ReactionIncorrect);
+    fn verdict_se_uses_common_correct_and_incorrect_sounds() {
+        assert_eq!(verdict_se(true), SeKind::Correct);
+        assert_eq!(verdict_se(false), SeKind::Incorrect);
     }
 
     // ---- 正誤の表示(出題文字の代わりに◯/✗) ----

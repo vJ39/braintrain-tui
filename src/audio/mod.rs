@@ -24,10 +24,6 @@ pub enum SeKind {
     Transition,
     /// タイトル画面(Splash)でEnter/クリックした時の決定音
     Confirm,
-    /// イロピッタン専用の正解音(ピンポン風の2音チャイム)
-    ReactionCorrect,
-    /// イロピッタン専用の不正解音(ブブー風のブザー)
-    ReactionIncorrect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,8 +95,6 @@ impl SeKind {
             SeKind::Incorrect => "se_incorrect.wav",
             SeKind::Transition => "se_transition.wav",
             SeKind::Confirm => "se_confirm.wav",
-            SeKind::ReactionCorrect => "se_reaction_correct.wav",
-            SeKind::ReactionIncorrect => "se_reaction_incorrect.wav",
         }
     }
 }
@@ -191,13 +185,11 @@ pub fn stop_bgm() {
 mod tests {
     use super::*;
 
-    const ALL_SE_KINDS: [SeKind; 6] = [
+    const ALL_SE_KINDS: [SeKind; 4] = [
         SeKind::Correct,
         SeKind::Incorrect,
         SeKind::Transition,
         SeKind::Confirm,
-        SeKind::ReactionCorrect,
-        SeKind::ReactionIncorrect,
     ];
 
     #[test]
@@ -208,21 +200,6 @@ mod tests {
                 assert_ne!(paths[i], paths[j]);
             }
         }
-    }
-
-    #[test]
-    fn reaction_se_kinds_use_their_own_assets() {
-        assert_eq!(
-            SeKind::ReactionCorrect.asset_path(),
-            "se_reaction_correct.wav"
-        );
-        assert_eq!(
-            SeKind::ReactionIncorrect.asset_path(),
-            "se_reaction_incorrect.wav"
-        );
-        // 既存の正解/不正解の音は変えない
-        assert_eq!(SeKind::Correct.asset_path(), "se_correct.wav");
-        assert_eq!(SeKind::Incorrect.asset_path(), "se_incorrect.wav");
     }
 
     #[test]
