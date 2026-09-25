@@ -23,6 +23,10 @@ use super::layout::{circle_contains, label_area};
 use super::ripple::{
     ring_image, Ripple, RIPPLE_COLOR, RIPPLE_MAX_RADIUS_CELLS, RIPPLE_THICKNESS_CELLS,
 };
+use super::wrong_mark::{
+    cross_image, WrongMark, WRONG_MARK_COLOR, WRONG_MARK_HALF_SIZE_CELLS,
+    WRONG_MARK_THICKNESS_CELLS,
+};
 
 #[derive(RustEmbed)]
 #[folder = "assets/image/count_mania/"]
@@ -96,12 +100,16 @@ struct BoardCache {
     protocol: StatefulProtocol,
 }
 
-/// 直前に作った波紋のパッチ(盤面の一部を切り出してリングを重ねた画像)
+/// パッチに描いた演出の組み合わせ。(波紋の(中心, コマ), バツ印の中心)。
+/// どちらもNoneは演出が消えた後の、何も重ねていない切り出し
+type EffectsKey = (Option<((u16, u16), u32)>, Option<(u16, u16)>);
+
+/// 直前に作った演出のパッチ(盤面の一部を切り出して波紋のリング・バツ印を重ねた画像)
 struct RippleCache {
     /// パッチを置くセル範囲
     rect: Rect,
-    /// 描いた波紋の(中心, コマ)。Noneは波紋が消えた後の、リングの無い切り出し
-    key: Option<((u16, u16), u32)>,
+    /// 描いた演出
+    key: EffectsKey,
     protocol: StatefulProtocol,
 }
 
@@ -115,7 +123,9 @@ struct RippleCache {
 /// 盤面全体を作り直すと画像のエンコード・端末への送信が1回あたり数十〜数百msかかり
 /// (sixelでは盤面全体で約230ms)、tick(33ms)に間に合わずちらつくため。
 /// パッチはコマ(RIPPLE_FRAME_INTERVAL)が変わった時だけ作り直す。
-/// 波紋が消えた後は、端末に残った最後のリングを消すため、リングの無い切り出しを1回描いて置いておく
+/// 波紋が消えた後は、端末に残った最後のリングを消すため、リングの無い切り出しを1回描いて置いておく。
+/// 誤クリックのバツ印も同じパッチに重ねて描く(パッチ同士が重なると、後に描いた方の起点セルが
+/// 先の方の画像データを上書きして端末へ送られなくなるため、演出は1枚のパッチにまとめる)
 pub struct CircleRenderer {
     picker: Option<Picker>,
     board: RefCell<Option<BoardCache>>,
@@ -151,10 +161,16 @@ impl CircleRenderer {
         self.board_encodes.get()
     }
 
-    /// テスト用: 波紋のパッチを作り直した回数
+    /// テスト用: 波紋・バツ印のパッチを作り直した回数
     #[cfg(test)]
     pub fn ripple_encode_count(&self) -> usize {
         self.ripple_encodes.get()
+    }
+
+    /// テスト用: 直前に描いた演出のパッチの範囲
+    #[cfg(test)]
+    pub fn patch_rect(&self) -> Option<Rect> {
+        self.ripple.borrow().as_ref().map(|cached| cached.rect)
     }
 
     /// 画像プロトコルを使うか(false=丸囲み数字のテキスト表示)。テストでの確認用
@@ -170,20 +186,22 @@ impl CircleRenderer {
     }
 
     /// board内にcirclesを並び順に描く。後の円ほど手前に重なる。
-    /// rippleがあれば円の手前に波紋を重ねる(画像プロトコルが使える時だけ。テキスト表示では描かない)
+    /// rippleがあれば円の手前に波紋を重ねる(画像プロトコルが使える時だけ。テキスト表示では描かない)。
+    /// markがあれば円の手前にバツ印を重ねる(テキスト表示では、クリックしたセルに赤い✗を置く)
     pub fn render_board(
         &self,
         frame: &mut Frame,
         board: Rect,
         circles: &[BoardCircle],
         ripple: Option<&Ripple>,
+        mark: Option<&WrongMark>,
     ) {
         // 描画先がフレームからはみ出さないよう切り詰める
         let board = board.intersection(frame.area());
         if board.is_empty() {
             return;
         }
-        if self.render_board_image(frame, board, circles, ripple) {
+        if self.render_board_image(frame, board, circles, ripple, mark) {
             return;
         }
         for circle in circles {
@@ -191,6 +209,9 @@ impl CircleRenderer {
             if !rect.is_empty() {
                 render_text(frame, rect, circle.number, circle.color);
             }
+        }
+        if let Some(mark) = mark {
+            render_mark_text(frame, board, mark);
         }
     }
 
@@ -201,11 +222,12 @@ impl CircleRenderer {
         board: Rect,
         circles: &[BoardCircle],
         ripple: Option<&Ripple>,
+        mark: Option<&WrongMark>,
     ) -> bool {
         let Some(picker) = &self.picker else {
             return false;
         };
-        if circles.is_empty() && ripple.is_none() {
+        if circles.is_empty() && ripple.is_none() && mark.is_none() {
             return true;
         }
         let mut cache = self.board.borrow_mut();
@@ -235,40 +257,45 @@ impl CircleRenderer {
         };
         frame.render_stateful_widget(StatefulImage::default(), board, &mut cached.protocol);
         // パッチは盤面の画像より後に描き、盤面の上に重ねる
-        self.render_ripple_patch(frame, picker, cached, ripple);
+        self.render_effects_patch(frame, picker, cached, ripple, mark);
         true
     }
 
-    /// 波紋の周りを切り出したパッチを盤面の上に描く。コマが変わった時だけ作り直す。
-    /// 波紋が消えた後は、リングの無い切り出しを同じ範囲に描き続ける
-    /// (描くのをやめると端末に最後のリングが残るため。盤面が変わった時に破棄する)
-    fn render_ripple_patch(
+    /// 波紋・バツ印の周りを切り出したパッチを盤面の上に描く。演出の見た目
+    /// (波紋のコマ・バツ印の位置)が変わった時だけ作り直す。
+    /// 演出が消えた後は、何も重ねていない切り出しを同じ範囲に描き続ける
+    /// (描くのをやめると端末に最後のリング・バツ印が残るため。盤面が変わった時に破棄する)
+    fn render_effects_patch(
         &self,
         frame: &mut Frame,
         picker: &Picker,
         board: &BoardCache,
         ripple: Option<&Ripple>,
+        mark: Option<&WrongMark>,
     ) {
         let font_size = picker.font_size();
         let mut cache = self.ripple.borrow_mut();
-        let (rect, key) = match ripple {
-            Some(ripple) => {
-                let own = ripple_patch_rect(board.board, font_size, ripple);
-                // 盤面が同じまま波紋の位置が変わった時は、前のパッチの範囲も含めて描き直し、
-                // 前のリングを端末に残さない
-                let rect = match cache.as_ref() {
-                    Some(cached) if !cached.rect.is_empty() && !own.is_empty() => {
-                        cached.rect.union(own)
-                    }
-                    Some(cached) if own.is_empty() => cached.rect,
-                    _ => own,
-                };
-                (rect, Some((ripple.center(), ripple.frame())))
-            }
-            None => match cache.as_ref() {
-                Some(cached) => (cached.rect, None),
+        let (rect, key) = if ripple.is_some() || mark.is_some() {
+            let own = effects_rect(board.board, font_size, ripple, mark);
+            // 盤面が同じまま演出の位置が変わった時は、前のパッチの範囲も含めて描き直し、
+            // 前のリング・バツ印を端末に残さない
+            let rect = match cache.as_ref() {
+                Some(cached) if !cached.rect.is_empty() && !own.is_empty() => {
+                    cached.rect.union(own)
+                }
+                Some(cached) if own.is_empty() => cached.rect,
+                _ => own,
+            };
+            let key = (
+                ripple.map(|ripple| (ripple.center(), ripple.frame())),
+                mark.map(WrongMark::center),
+            );
+            (rect, key)
+        } else {
+            match cache.as_ref() {
+                Some(cached) => (cached.rect, (None, None)),
                 None => return,
-            },
+            }
         };
         if rect.is_empty() {
             return;
@@ -276,7 +303,7 @@ impl CircleRenderer {
         let same =
             matches!(cache.as_ref(), Some(cached) if cached.rect == rect && cached.key == key);
         if !same {
-            let patch = ripple_patch(&board.composed, board.board, font_size, rect, ripple);
+            let patch = effects_patch(&board.composed, board.board, font_size, rect, ripple, mark);
             let protocol = picker.new_resize_protocol(DynamicImage::ImageRgba8(patch));
             *cache = Some(RippleCache {
                 rect,
@@ -359,11 +386,54 @@ fn ring_thickness(cell_height: f64) -> f64 {
 /// 起点のすぐ右の列にパッチの起点を置くとパッチが端末へ送られない。
 /// 範囲が無い(ボードが2列以下等)時は空のRect
 fn ripple_patch_rect(board: Rect, font_size: (u16, u16), ripple: &Ripple) -> Rect {
-    let cell_width = f64::from(font_size.0.max(1));
     let cell_height = f64::from(font_size.1.max(1));
     // 中心からリングの外側の端までの距離(ピクセル)。丸め誤差の分として1ピクセル足す
     let reach = RIPPLE_MAX_RADIUS_CELLS * cell_height + ring_thickness(cell_height) / 2.0 + 1.0;
-    let (column, row) = ripple.center();
+    patch_rect_around(board, font_size, ripple.center(), reach)
+}
+
+/// バツ印の線の太さ(ピクセル)。細くなりすぎて消えないよう1ピクセル以上にする
+fn mark_thickness(cell_height: f64) -> f64 {
+    (WRONG_MARK_THICKNESS_CELLS * cell_height).max(1.0)
+}
+
+/// バツ印が届く範囲(セル)。範囲の決め方(ボードの左端2列を含めない等)は波紋と同じ
+fn mark_patch_rect(board: Rect, font_size: (u16, u16), mark: &WrongMark) -> Rect {
+    let cell_height = f64::from(font_size.1.max(1));
+    // 腕の先に線の太さぶん(斜めの線は縦横に太さ/√2ずつはみ出す)と丸め誤差の1ピクセルを足す
+    let reach = WRONG_MARK_HALF_SIZE_CELLS * cell_height + mark_thickness(cell_height) + 1.0;
+    patch_rect_around(board, font_size, mark.center(), reach)
+}
+
+/// いま表示している演出(波紋・バツ印)が届く範囲を合わせたもの。どれも範囲が無ければ空のRect
+fn effects_rect(
+    board: Rect,
+    font_size: (u16, u16),
+    ripple: Option<&Ripple>,
+    mark: Option<&WrongMark>,
+) -> Rect {
+    let rects = [
+        ripple.map(|ripple| ripple_patch_rect(board, font_size, ripple)),
+        mark.map(|mark| mark_patch_rect(board, font_size, mark)),
+    ];
+    rects
+        .into_iter()
+        .flatten()
+        .filter(|rect| !rect.is_empty())
+        .reduce(|a, b| a.union(b))
+        .unwrap_or_default()
+}
+
+/// セル(column, row)の中央からreachピクセル以内に届く範囲(セル)。ボードの中に収め、
+/// ボードの左端の2列は含めない(理由はripple_patch_rectを参照)。範囲が無い時は空のRect
+fn patch_rect_around(
+    board: Rect,
+    font_size: (u16, u16),
+    (column, row): (u16, u16),
+    reach: f64,
+) -> Rect {
+    let cell_width = f64::from(font_size.0.max(1));
+    let cell_height = f64::from(font_size.1.max(1));
     let center_x = (f64::from(column) + 0.5) * cell_width;
     let center_y = (f64::from(row) + 0.5) * cell_height;
     let left = ((center_x - reach) / cell_width)
@@ -389,13 +459,15 @@ fn ripple_patch_rect(board: Rect, font_size: (u16, u16), ripple: &Ripple) -> Rec
     )
 }
 
-/// 盤面の画像(円だけ)からセル範囲rectを切り出し、rippleがあればリングを重ねたパッチを作る
-fn ripple_patch(
+/// 盤面の画像(円だけ)からセル範囲rectを切り出し、rippleがあればリングを、markがあれば
+/// バツ印を重ねたパッチを作る(バツ印が手前)
+fn effects_patch(
     board_image: &RgbaImage,
     board: Rect,
     font_size: (u16, u16),
     rect: Rect,
     ripple: Option<&Ripple>,
+    mark: Option<&WrongMark>,
 ) -> RgbaImage {
     let cell_width = u32::from(font_size.0.max(1));
     let cell_height = u32::from(font_size.1.max(1));
@@ -410,7 +482,32 @@ fn ripple_patch(
     if let Some(ripple) = ripple {
         add_ripple(&mut patch, rect, font_size, ripple);
     }
+    if let Some(mark) = mark {
+        add_mark(&mut patch, rect, font_size, mark);
+    }
     patch
+}
+
+/// area(セル範囲)を写したimageに、バツ印を重ねる。
+/// 腕の長さ・線の太さはセルの高さを単位にし、ピクセル上で正方形のバツ印になるようにする
+fn add_mark(image: &mut RgbaImage, area: Rect, font_size: (u16, u16), mark: &WrongMark) {
+    let cell_width = f64::from(font_size.0.max(1));
+    let cell_height = f64::from(font_size.1.max(1));
+    let (column, row) = mark.center();
+    // クリックしたセルの中央を交点にする
+    let center = (
+        (f64::from(column) - f64::from(area.x) + 0.5) * cell_width,
+        (f64::from(row) - f64::from(area.y) + 0.5) * cell_height,
+    );
+    let cross = cross_image(
+        u32::from(area.width) * cell_width as u32,
+        u32::from(area.height) * cell_height as u32,
+        center,
+        WRONG_MARK_HALF_SIZE_CELLS * cell_height,
+        mark_thickness(cell_height),
+        WRONG_MARK_COLOR,
+    );
+    imageops::overlay(image, &cross, 0, 0);
 }
 
 /// area(セル範囲)を写したimageに、波紋のいまのリングを重ねる
@@ -524,6 +621,20 @@ fn render_text(frame: &mut Frame, rect: Rect, number: u8, color: [u8; 3]) {
     );
 }
 
+/// 画像プロトコル非対応の端末向けのバツ印。クリックしたセルに赤い✗を置く(ボードの外なら描かない)
+fn render_mark_text(frame: &mut Frame, board: Rect, mark: &WrongMark) {
+    let (column, row) = mark.center();
+    if !board.contains(ratatui::layout::Position::new(column, row)) {
+        return;
+    }
+    let [r, g, b] = WRONG_MARK_COLOR;
+    frame.buffer_mut()[(column, row)].set_symbol("✗").set_style(
+        Style::default()
+            .fg(Color::Rgb(r, g, b))
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::ripple::RIPPLE_DURATION;
@@ -603,7 +714,7 @@ mod tests {
         let renderer = CircleRenderer::new();
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| renderer.render_board(frame, frame.area(), circles, None))
+            .draw(|frame| renderer.render_board(frame, frame.area(), circles, None, None))
             .unwrap();
         terminal.backend().buffer().clone()
     }
@@ -797,7 +908,7 @@ mod tests {
         for _ in 0..8 {
             terminal
                 .draw(|frame| {
-                    renderer.render_board(frame, frame.area(), &[circle], ripple.as_ref())
+                    renderer.render_board(frame, frame.area(), &[circle], ripple.as_ref(), None)
                 })
                 .unwrap();
             ripple = ripple.and_then(|r| r.advanced(RIPPLE_DURATION / 6));
@@ -806,10 +917,10 @@ mod tests {
         // 端のセルを中心にした波紋・小さすぎる画面でもパニックしない
         let edge = Ripple::new(29, 11);
         terminal
-            .draw(|frame| renderer.render_board(frame, frame.area(), &[circle], Some(&edge)))
+            .draw(|frame| renderer.render_board(frame, frame.area(), &[circle], Some(&edge), None))
             .unwrap();
         let mut tiny = Terminal::new(TestBackend::new(1, 1)).unwrap();
-        tiny.draw(|frame| renderer.render_board(frame, frame.area(), &[circle], Some(&edge)))
+        tiny.draw(|frame| renderer.render_board(frame, frame.area(), &[circle], Some(&edge), None))
             .unwrap();
     }
 
@@ -894,12 +1005,13 @@ mod tests {
         let images = recolored_images(&[big]).unwrap();
         let circles_only = compose_circles(RIPPLE_BOARD, RIPPLE_FONT, &[big], &images);
         let rect = ripple_patch_rect(RIPPLE_BOARD, RIPPLE_FONT, &ripple);
-        let patch = ripple_patch(
+        let patch = effects_patch(
             &circles_only,
             RIPPLE_BOARD,
             RIPPLE_FONT,
             rect,
             Some(&ripple),
+            None,
         );
         let full = build_board_image(RIPPLE_BOARD, RIPPLE_FONT, &[big], Some(&ripple)).unwrap();
         assert_eq!(patch, crop_cells(&full, RIPPLE_BOARD, RIPPLE_FONT, rect));
@@ -909,7 +1021,7 @@ mod tests {
             "リングが重なっている"
         );
         // 波紋が消えた後のパッチはリングの無いボードの切り出し
-        let clean = ripple_patch(&circles_only, RIPPLE_BOARD, RIPPLE_FONT, rect, None);
+        let clean = effects_patch(&circles_only, RIPPLE_BOARD, RIPPLE_FONT, rect, None, None);
         assert_eq!(
             clean,
             crop_cells(&circles_only, RIPPLE_BOARD, RIPPLE_FONT, rect)
@@ -923,8 +1035,19 @@ mod tests {
         circles: &[BoardCircle],
         ripple: Option<&Ripple>,
     ) -> ratatui::buffer::Buffer {
+        draw_image_board_with_mark(renderer, terminal, circles, ripple, None)
+    }
+
+    /// 画像表示の描画器で、circlesと波紋・バツ印を描いたバッファを返す
+    fn draw_image_board_with_mark(
+        renderer: &CircleRenderer,
+        terminal: &mut Terminal<TestBackend>,
+        circles: &[BoardCircle],
+        ripple: Option<&Ripple>,
+        mark: Option<&WrongMark>,
+    ) -> ratatui::buffer::Buffer {
         terminal
-            .draw(|frame| renderer.render_board(frame, frame.area(), circles, ripple))
+            .draw(|frame| renderer.render_board(frame, frame.area(), circles, ripple, mark))
             .unwrap();
         terminal.backend().buffer().clone()
     }
@@ -1048,8 +1171,18 @@ mod tests {
         terminal: &mut Terminal<ImageDedupBackend<RecordingBackend>>,
         ripple: Option<&Ripple>,
     ) -> Vec<(u16, u16)> {
+        draw_sent_with_mark(renderer, terminal, ripple, None)
+    }
+
+    /// 波紋・バツ印を指定して1フレーム描き、端末へ送られた画像データのセル位置を返す
+    fn draw_sent_with_mark(
+        renderer: &CircleRenderer,
+        terminal: &mut Terminal<ImageDedupBackend<RecordingBackend>>,
+        ripple: Option<&Ripple>,
+        mark: Option<&WrongMark>,
+    ) -> Vec<(u16, u16)> {
         terminal
-            .draw(|frame| renderer.render_board(frame, frame.area(), &PATCH_CIRCLES, ripple))
+            .draw(|frame| renderer.render_board(frame, frame.area(), &PATCH_CIRCLES, ripple, mark))
             .unwrap();
         terminal.backend().inner().last_payload_positions()
     }
@@ -1066,7 +1199,9 @@ mod tests {
         let ripple = Ripple::new(20, 8);
         let patch = ripple_patch_rect(PIPE_BOARD, PIPE_FONT, &ripple);
         let completed = terminal
-            .draw(|frame| renderer.render_board(frame, frame.area(), &PATCH_CIRCLES, Some(&ripple)))
+            .draw(|frame| {
+                renderer.render_board(frame, frame.area(), &PATCH_CIRCLES, Some(&ripple), None)
+            })
             .unwrap();
         let origin = &completed.buffer[(patch.x, patch.y)];
         assert!(
@@ -1195,12 +1330,200 @@ mod tests {
             let renderer = CircleRenderer::new();
             let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
             terminal
-                .draw(|frame| renderer.render_board(frame, frame.area(), &[circle], ripple))
+                .draw(|frame| renderer.render_board(frame, frame.area(), &[circle], ripple, None))
                 .unwrap();
             terminal.backend().buffer().clone()
         };
         let ripple = half_way_ripple();
         assert_eq!(draw(Some(&ripple)), draw(None));
+    }
+
+    // --- 誤クリックのバツ印 ---
+
+    #[test]
+    fn fallback_draws_red_cross_symbol_at_mark_cell() {
+        // テキスト表示でも、クリックしたセルに赤い✗を円の手前に重ねて描く
+        let circle = BoardCircle {
+            rect: Rect::new(4, 2, 8, 4),
+            number: 5,
+            color: [1, 2, 3],
+        };
+        let draw = |mark: Option<&WrongMark>| {
+            let renderer = CircleRenderer::new();
+            let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
+            terminal
+                .draw(|frame| renderer.render_board(frame, frame.area(), &[circle], None, mark))
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let mark = WrongMark::new(5, 3);
+        let with = draw(Some(&mark));
+        let [r, g, b] = WRONG_MARK_COLOR;
+        assert_eq!(with[(5, 3)].symbol(), "✗", "クリックしたセルに✗");
+        assert_eq!(with[(5, 3)].fg, Color::Rgb(r, g, b), "赤系の色");
+        let without = draw(None);
+        assert_ne!(without[(5, 3)].symbol(), "✗");
+        for y in 0..10 {
+            for x in 0..30 {
+                if (x, y) != (5, 3) {
+                    assert_eq!(
+                        with[(x, y)],
+                        without[(x, y)],
+                        "他のセル({x},{y})は変わらない"
+                    );
+                }
+            }
+        }
+        // ボードの外のバツ印は描かない(パニックしない)
+        let outside = WrongMark::new(100, 100);
+        draw(Some(&outside));
+    }
+
+    #[test]
+    fn mark_patch_has_red_cross_over_board_image() {
+        let mark = WrongMark::new(10, 5);
+        let big = BoardCircle {
+            rect: RIPPLE_BOARD,
+            number: 2,
+            color: [0, 0, 255],
+        };
+        let images = recolored_images(&[big]).unwrap();
+        let circles_only = compose_circles(RIPPLE_BOARD, RIPPLE_FONT, &[big], &images);
+        let rect = mark_patch_rect(RIPPLE_BOARD, RIPPLE_FONT, &mark);
+        assert!(!rect.is_empty());
+        assert_eq!(
+            rect.intersection(RIPPLE_BOARD),
+            rect,
+            "ボードからはみ出さない"
+        );
+        assert!(
+            rect.contains(ratatui::layout::Position::new(10, 5)),
+            "クリックしたセルを含む: {rect:?}"
+        );
+        let patch = effects_patch(
+            &circles_only,
+            RIPPLE_BOARD,
+            RIPPLE_FONT,
+            rect,
+            None,
+            Some(&mark),
+        );
+        // セル(10, 5)の中心のピクセル = ボード画像の(105, 110)。パッチの中での位置に直す
+        let (cw, ch) = (u32::from(RIPPLE_FONT.0), u32::from(RIPPLE_FONT.1));
+        let center = (105 - u32::from(rect.x) * cw, 110 - u32::from(rect.y) * ch);
+        let [r, g, b] = WRONG_MARK_COLOR;
+        assert_eq!(
+            patch.get_pixel(center.0, center.1).0,
+            [r, g, b, 255],
+            "バツ印の交点は赤"
+        );
+        let clean = crop_cells(&circles_only, RIPPLE_BOARD, RIPPLE_FONT, rect);
+        assert_ne!(patch, clean, "バツ印が重なっている");
+        // バツ印が無ければ、盤面の切り出しそのまま
+        assert_eq!(
+            effects_patch(&circles_only, RIPPLE_BOARD, RIPPLE_FONT, rect, None, None),
+            clean
+        );
+    }
+
+    #[test]
+    fn mark_patch_covers_whole_cross() {
+        let mark = WrongMark::new(10, 5);
+        let rect = mark_patch_rect(RIPPLE_BOARD, RIPPLE_FONT, &mark);
+        let board_image = RgbaImage::new(200, 200);
+        let full = effects_patch(
+            &board_image,
+            RIPPLE_BOARD,
+            RIPPLE_FONT,
+            RIPPLE_BOARD,
+            None,
+            Some(&mark),
+        );
+        let (cw, ch) = (u32::from(RIPPLE_FONT.0), u32::from(RIPPLE_FONT.1));
+        let painted: Vec<(u32, u32)> = full
+            .enumerate_pixels()
+            .filter(|(_, _, p)| p.0[3] > 0)
+            .map(|(x, y, _)| (x, y))
+            .collect();
+        assert!(!painted.is_empty());
+        for (x, y) in painted {
+            assert!(
+                (u32::from(rect.x) * cw..u32::from(rect.right()) * cw).contains(&x)
+                    && (u32::from(rect.y) * ch..u32::from(rect.bottom()) * ch).contains(&y),
+                "バツ印の({x},{y})がパッチ{rect:?}の外にある"
+            );
+        }
+    }
+
+    #[test]
+    fn static_mark_patch_is_encoded_once_and_board_is_kept() {
+        let renderer = image_renderer();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        let mut mark = Some(WrongMark::new(20, 8));
+        while let Some(m) = mark {
+            draw_image_board_with_mark(&renderer, &mut terminal, &PATCH_CIRCLES, None, Some(&m));
+            mark = m.advanced(crate::TICK_RATE);
+        }
+        assert_eq!(renderer.board_encode_count(), 1, "盤面全体は最初の1回だけ");
+        assert_eq!(
+            renderer.ripple_encode_count(),
+            1,
+            "バツ印は動かないので、表示中のパッチは1回だけ作る"
+        );
+        // バツ印が消えたら、バツ印の無いパッチを1回だけ描き直して残りを消す
+        for _ in 0..3 {
+            draw_image_board_with_mark(&renderer, &mut terminal, &PATCH_CIRCLES, None, None);
+        }
+        assert_eq!(renderer.board_encode_count(), 1);
+        assert_eq!(renderer.ripple_encode_count(), 2);
+    }
+
+    #[test]
+    fn mark_patch_is_sent_to_terminal_and_cleared_after_mark_ends() {
+        for protocol in [ProtocolType::Sixel, ProtocolType::Iterm2] {
+            let renderer = protocol_renderer(protocol);
+            let mut terminal = pipeline_terminal();
+            draw_sent(&renderer, &mut terminal, None);
+            let mark = WrongMark::new(20, 8);
+            let patch = mark_patch_rect(PIPE_BOARD, PIPE_FONT, &mark);
+            assert!(!patch.is_empty());
+            assert_eq!(
+                draw_sent_with_mark(&renderer, &mut terminal, None, Some(&mark)),
+                vec![(patch.x, patch.y)],
+                "{protocol:?}: バツ印が出るとパッチだけを送る"
+            );
+            assert!(
+                draw_sent_with_mark(&renderer, &mut terminal, None, Some(&mark)).is_empty(),
+                "{protocol:?}: バツ印が変わらない間は送り直さない"
+            );
+            assert_eq!(
+                draw_sent(&renderer, &mut terminal, None),
+                vec![(patch.x, patch.y)],
+                "{protocol:?}: 消えたらバツ印の無いパッチを1回送る"
+            );
+            assert!(draw_sent(&renderer, &mut terminal, None).is_empty());
+        }
+    }
+
+    #[test]
+    fn moving_mark_redraws_previous_position_too() {
+        // 別の場所を押し間違えた時は、前のバツ印を端末に残さないよう前の範囲も含めて描き直す
+        let renderer = image_renderer();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        let first = WrongMark::new(20, 8);
+        let second = WrongMark::new(40, 15);
+        draw_image_board_with_mark(&renderer, &mut terminal, &PATCH_CIRCLES, None, Some(&first));
+        let first_rect = renderer.patch_rect().expect("パッチを描いている");
+        draw_image_board_with_mark(
+            &renderer,
+            &mut terminal,
+            &PATCH_CIRCLES,
+            None,
+            Some(&second),
+        );
+        let rect = renderer.patch_rect().unwrap();
+        assert_eq!(rect.union(first_rect), rect, "前のバツ印の範囲も含む");
+        assert!(rect.contains(ratatui::layout::Position::new(40, 15)));
     }
 
     #[test]
@@ -1217,7 +1540,7 @@ mod tests {
             color: [1, 2, 3],
         };
         terminal
-            .draw(|frame| renderer.render_board(frame, frame.area(), &[circle], None))
+            .draw(|frame| renderer.render_board(frame, frame.area(), &[circle], None, None))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let cell = (rect.x..rect.right())
