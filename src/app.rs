@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -15,6 +15,7 @@ use crate::game::pattern_fill::PatternFillGame;
 use crate::game::puzzle_connect::PuzzleConnectGame;
 use crate::game::reaction::ReactionGame;
 use crate::game::rhythm::RhythmGame;
+use crate::game::row_index;
 use crate::game::sequence::SequenceGame;
 use crate::game::shape_rotate::ShapeRotateGame;
 use crate::game::{Difficulty, Game, GameResult};
@@ -47,6 +48,9 @@ pub struct App {
     screen: Screen,
     menu_state: ListState,
     should_quit: bool,
+    /// 直近のrender()で描画したフルスクリーンのエリア。マウス座標からのヒット
+    /// テストに使う(render()より前にhandle_mouseが呼ばれることは無い前提)
+    last_area: Rect,
 }
 
 impl App {
@@ -57,6 +61,7 @@ impl App {
             screen: Screen::Menu,
             menu_state,
             should_quit: false,
+            last_area: Rect::default(),
         }
     }
 
@@ -87,6 +92,43 @@ impl App {
                     audio::play_se(SeKind::Transition);
                     self.screen = Screen::Menu;
                 }
+            }
+        }
+    }
+
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return;
+        }
+        let area = self.last_area;
+        match &mut self.screen {
+            Screen::Menu => {
+                if let Some(index) = menu_item_at_row(area, mouse.row) {
+                    self.menu_state.select(Some(index));
+                    audio::play_se(SeKind::Transition);
+                    if index == HISTORY_ITEM_INDEX {
+                        self.screen = Screen::History;
+                    } else {
+                        self.screen = Screen::SelectDifficulty(index);
+                    }
+                }
+            }
+            Screen::SelectDifficulty(item) => {
+                let item = *item;
+                if let Some(difficulty) = difficulty_at_row(area, mouse.row) {
+                    audio::play_se(SeKind::Transition);
+                    self.screen = Screen::Playing(new_game(item, difficulty));
+                }
+            }
+            Screen::Playing(game) => {
+                game.handle_mouse(mouse, area);
+                if game.is_finished() {
+                    self.screen = Screen::Result(game.result());
+                }
+            }
+            Screen::Result(_) | Screen::History => {
+                audio::play_se(SeKind::Transition);
+                self.screen = Screen::Menu;
             }
         }
     }
@@ -138,6 +180,7 @@ impl App {
 
     pub fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
+        self.last_area = area;
         match &self.screen {
             Screen::Menu => render_menu(frame, area, &mut self.menu_state),
             Screen::SelectDifficulty(item) => render_difficulty_select(frame, area, MENU_ITEMS[*item]),
@@ -171,16 +214,42 @@ fn render_menu(frame: &mut Frame, area: Rect, state: &mut ListState) {
     frame.render_stateful_widget(list, area, state);
 }
 
+/// SelectDifficulty画面で、難易度の行(初級/中級/上級)が内部エリアの何行目から
+/// 始まるか。render_difficulty_selectとdifficulty_at_rowで一致させること
+const DIFFICULTY_ROWS_OFFSET: u16 = 2;
+
 fn render_difficulty_select(frame: &mut Frame, area: Rect, game_name: &str) {
     let text = vec![
         Line::from(Span::raw(format!("{game_name} - 難易度を選択"))),
         Line::from(""),
-        Line::from("1: 初級  2: 中級  3: 上級  (Escで戻る)"),
+        Line::from("1: 初級"),
+        Line::from("2: 中級"),
+        Line::from("3: 上級"),
+        Line::from(""),
+        Line::from("(Escで戻る)"),
     ];
     let paragraph = Paragraph::new(text)
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(paragraph, area);
+}
+
+/// SelectDifficulty画面でのクリック行(area基準、Block枠含む)から難易度を求める
+fn difficulty_at_row(area: Rect, mouse_row: u16) -> Option<Difficulty> {
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let relative = mouse_row.checked_sub(inner.y)?.checked_sub(DIFFICULTY_ROWS_OFFSET)?;
+    match relative {
+        0 => Some(Difficulty::Beginner),
+        1 => Some(Difficulty::Intermediate),
+        2 => Some(Difficulty::Advanced),
+        _ => None,
+    }
+}
+
+/// Menu画面でのクリック行(area基準、Block枠含む)からメニュー項目インデックスを求める
+fn menu_item_at_row(area: Rect, mouse_row: u16) -> Option<usize> {
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    row_index(inner, mouse_row, MENU_ITEMS.len() as u16)
 }
 
 fn render_result(frame: &mut Frame, area: Rect, result: &GameResult) {
@@ -244,5 +313,56 @@ mod tests {
     fn history_item_index_is_the_last_menu_item() {
         assert_eq!(HISTORY_ITEM_INDEX, MENU_ITEMS.len() - 1);
         assert_eq!(MENU_ITEMS[HISTORY_ITEM_INDEX], "履歴");
+    }
+
+    fn rect(x: u16, y: u16, width: u16, height: u16) -> Rect {
+        Rect::new(x, y, width, height)
+    }
+
+    #[test]
+    fn menu_item_at_row_maps_each_row_to_its_index() {
+        // area(0,0,20,12)、Block枠込みなので内部は(1,1,18,10)
+        let area = rect(0, 0, 20, 12);
+        for (offset, expected) in (0..MENU_ITEMS.len()).enumerate() {
+            let row = 1 + offset as u16;
+            assert_eq!(menu_item_at_row(area, row), Some(expected));
+        }
+    }
+
+    #[test]
+    fn menu_item_at_row_on_border_is_none() {
+        let area = rect(0, 0, 20, 12);
+        assert_eq!(menu_item_at_row(area, 0), None, "上端の枠線上はNone");
+        assert_eq!(menu_item_at_row(area, 11), None, "下端の枠線上はNone");
+    }
+
+    #[test]
+    fn difficulty_at_row_maps_beginner_intermediate_advanced() {
+        let area = rect(0, 0, 30, 10);
+        let inner_top = Block::default().borders(Borders::ALL).inner(area).y;
+        assert_eq!(
+            difficulty_at_row(area, inner_top + DIFFICULTY_ROWS_OFFSET),
+            Some(Difficulty::Beginner)
+        );
+        assert_eq!(
+            difficulty_at_row(area, inner_top + DIFFICULTY_ROWS_OFFSET + 1),
+            Some(Difficulty::Intermediate)
+        );
+        assert_eq!(
+            difficulty_at_row(area, inner_top + DIFFICULTY_ROWS_OFFSET + 2),
+            Some(Difficulty::Advanced)
+        );
+    }
+
+    #[test]
+    fn difficulty_at_row_outside_options_is_none() {
+        let area = rect(0, 0, 30, 10);
+        let inner_top = Block::default().borders(Borders::ALL).inner(area).y;
+        // タイトル行・空行・「(Escで戻る)」行はどの難易度にも当たらない
+        assert_eq!(difficulty_at_row(area, inner_top), None);
+        assert_eq!(
+            difficulty_at_row(area, inner_top + DIFFICULTY_ROWS_OFFSET + 3),
+            None
+        );
     }
 }

@@ -11,7 +11,7 @@ pub mod shape_rotate;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
 use ratatui::Frame;
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,9 @@ pub enum Difficulty {
 pub trait Game {
     /// キー入力を受け取り、内部状態を更新する
     fn handle_key(&mut self, key: KeyEvent);
+    /// マウス入力を受け取り、内部状態を更新する。`area`はこのゲームに割り当てられた
+    /// 描画領域で、renderに渡されるものと同じ。既定では何もしない
+    fn handle_mouse(&mut self, _mouse: MouseEvent, _area: Rect) {}
     /// tick駆動の更新(タイマー等)。経過時間を渡す
     fn update(&mut self, dt: Duration);
     /// 描画。Frame全体でなく割り当てられたRectのみ使う
@@ -36,6 +39,42 @@ pub trait Game {
     fn is_finished(&self) -> bool;
     /// 終了後にスコアを取り出す
     fn result(&self) -> GameResult;
+}
+
+/// エリアを横方向にN列に等分し、クリック座標(column)がどの列(0-indexed)に
+/// 属するかを返す。選択肢を横並びに表示するゲーム(2択等)のクリック判定に使う
+pub fn column_index(area: Rect, column: u16, column_count: u16) -> Option<usize> {
+    if column_count == 0 || area.width == 0 {
+        return None;
+    }
+    if column < area.x || column >= area.x + area.width {
+        return None;
+    }
+    let relative = column - area.x;
+    let column_width = area.width / column_count;
+    if column_width == 0 {
+        return None;
+    }
+    let index = (relative / column_width) as usize;
+    Some(index.min(column_count as usize - 1))
+}
+
+/// エリアを縦方向にN行に等分し、クリック座標(row)がどの行(0-indexed)に
+/// 属するかを返す。選択肢を縦並びに表示するゲーム(4択等)のクリック判定に使う
+pub fn row_index(area: Rect, row: u16, row_count: u16) -> Option<usize> {
+    if row_count == 0 || area.height == 0 {
+        return None;
+    }
+    if row < area.y || row >= area.y + area.height {
+        return None;
+    }
+    let relative = row - area.y;
+    let row_height = area.height / row_count;
+    if row_height == 0 {
+        return None;
+    }
+    let index = (relative / row_height) as usize;
+    Some(index.min(row_count as usize - 1))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,5 +165,62 @@ mod tests {
         let result = tracker.to_result("test_game", Difficulty::Beginner);
         assert_eq!(result.total, 0);
         assert_eq!(result.avg_latency_ms, 0.0);
+    }
+
+    fn rect(x: u16, y: u16, width: u16, height: u16) -> Rect {
+        Rect::new(x, y, width, height)
+    }
+
+    #[test]
+    fn column_index_splits_area_into_equal_columns() {
+        let area = rect(0, 0, 20, 5);
+        assert_eq!(column_index(area, 0, 2), Some(0));
+        assert_eq!(column_index(area, 9, 2), Some(0));
+        assert_eq!(column_index(area, 10, 2), Some(1));
+        assert_eq!(column_index(area, 19, 2), Some(1));
+    }
+
+    #[test]
+    fn column_index_respects_area_offset() {
+        let area = rect(100, 0, 20, 5);
+        assert_eq!(column_index(area, 99, 2), None, "エリアより左は範囲外");
+        assert_eq!(column_index(area, 100, 2), Some(0));
+        assert_eq!(column_index(area, 120, 2), None, "エリアより右は範囲外");
+    }
+
+    #[test]
+    fn column_index_clamps_rounding_remainder_to_last_column() {
+        // 幅が列数で割り切れない場合、余りは最後の列に含める
+        let area = rect(0, 0, 7, 5);
+        assert_eq!(column_index(area, 6, 3), Some(2));
+    }
+
+    #[test]
+    fn column_index_with_zero_columns_or_width_is_none() {
+        assert_eq!(column_index(rect(0, 0, 10, 5), 0, 0), None);
+        assert_eq!(column_index(rect(0, 0, 0, 5), 0, 2), None);
+    }
+
+    #[test]
+    fn row_index_splits_area_into_equal_rows() {
+        let area = rect(0, 0, 10, 8);
+        assert_eq!(row_index(area, 0, 4), Some(0));
+        assert_eq!(row_index(area, 1, 4), Some(0));
+        assert_eq!(row_index(area, 2, 4), Some(1));
+        assert_eq!(row_index(area, 7, 4), Some(3));
+    }
+
+    #[test]
+    fn row_index_respects_area_offset() {
+        let area = rect(0, 50, 10, 8);
+        assert_eq!(row_index(area, 49, 4), None, "エリアより上は範囲外");
+        assert_eq!(row_index(area, 50, 4), Some(0));
+        assert_eq!(row_index(area, 58, 4), None, "エリアより下は範囲外");
+    }
+
+    #[test]
+    fn row_index_with_zero_rows_or_height_is_none() {
+        assert_eq!(row_index(rect(0, 0, 10, 8), 0, 0), None);
+        assert_eq!(row_index(rect(0, 0, 10, 0), 0, 4), None);
     }
 }
