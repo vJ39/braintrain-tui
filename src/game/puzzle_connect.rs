@@ -10,7 +10,10 @@ use ratatui::Frame;
 
 use crate::audio::{self, SeKind};
 use crate::canvas::renderer::ShapeCanvas;
-use crate::canvas::shapes::{base_shapes, Shape};
+use crate::canvas::shapes::{
+    edges_interlock, jigsaw_piece_left, jigsaw_piece_right, jigsaw_profile_count,
+    jigsaw_profile_name, jigsaw_similar_profiles, JigsawEdge, Knob, Shape,
+};
 use crate::game::feedback::{AnswerFeedback, Flash};
 use crate::game::theme;
 use crate::game::{column_index, contains, Difficulty, Game, GameResult, ScoreTracker};
@@ -19,8 +22,6 @@ pub const GAME_ID: &str = "puzzle_connect";
 
 const CHOICE_COUNT: usize = 4;
 
-/// ピースAの右端とピースBの左端の間にあける隙間
-const CONNECT_GAP: f64 = 0.1;
 /// 図形の外接矩形から描画範囲の端までの余白
 const BOUNDS_MARGIN: f64 = 0.2;
 /// 端末の1セルの縦横比(縦/横)。文字セルはおおむね横1:縦2なので、
@@ -28,13 +29,13 @@ const BOUNDS_MARGIN: f64 = 0.2;
 const CELL_HEIGHT_PER_WIDTH: f64 = 2.0;
 
 /// 描画エリアを「お手本」「選択肢」「フッター」に分割する。
-/// 完成形は横長なので、横に4つ並ぶ選択肢は幅で大きさが決まる。高さは控えめにしてお手本へ回す
+/// 選択肢は凹凸の細かな違いを見比べる必要があるので、お手本と同程度の高さを確保する
 fn split_areas(area: Rect) -> (Rect, Rect, Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),
-            Constraint::Percentage(35),
+            Constraint::Percentage(45),
             Constraint::Length(3),
         ])
         .split(area);
@@ -46,138 +47,125 @@ fn choice_areas(choices_area: Rect) -> Vec<Rect> {
     theme::column_bands(choices_area, CHOICE_COUNT as u16)
 }
 
-/// base_shapes()のインデックス順と対応する図形名(回答後のフィードバック文言に使う)
-const SHAPE_NAMES: [&str; 8] = [
-    "三角形", "矢印", "L字", "T字", "稲妻", "旗", "階段", "フック",
-];
-
-/// ピースAの右端とピースBの左端が接するように、ピースBをX軸方向へ平行移動する。
-/// Shape自体は編集せず、このファイル内だけで完結するローカルヘルパー。
-fn translate_x(shape: &Shape, dx: f64) -> Shape {
-    let points = shape.points.iter().map(|&(x, y)| (x + dx, y)).collect();
-    Shape::new(points)
-}
-
-fn shape_max_x(shape: &Shape) -> f64 {
-    shape
-        .points
-        .iter()
-        .map(|p| p.0)
-        .fold(f64::NEG_INFINITY, f64::max)
-}
-
-fn shape_min_x(shape: &Shape) -> f64 {
-    shape
-        .points
-        .iter()
-        .map(|p| p.0)
-        .fold(f64::INFINITY, f64::min)
-}
-
-/// 回転済みのピースBを、ピースAの右端+隙間の位置へ平行移動する
-fn connect_to_right_of(piece_a: &Shape, piece_b_rotated: &Shape) -> Shape {
-    let dx = shape_max_x(piece_a) - shape_min_x(piece_b_rotated) + CONNECT_GAP;
-    translate_x(piece_b_rotated, dx)
-}
-
-/// 難易度に応じた回転角(ラジアン)を1つ決める
-fn rotation_angle_rad(rng: &mut impl Rng, difficulty: Difficulty) -> f64 {
+/// 難易度ごとに出題に使う形状番号の数(0..この値の形状番号を使う)。
+/// 形状番号は shapes.rs で「基本形 → そのサイズ違い → 紛らわしい形」の順に並んでいる
+fn profile_pool_size(difficulty: Difficulty) -> usize {
     match difficulty {
-        Difficulty::Beginner => 0.0,
-        Difficulty::Intermediate => {
-            let step = rng.gen_range(0..8); // 45度刻み x 8方向
-            (step as f64 * 45.0).to_radians()
-        }
-        Difficulty::Advanced => {
-            let deg = rng.gen_range(0..360); // 1度刻み
-            (deg as f64).to_radians()
-        }
+        // 三角・四角・丸だけ。形の違いが一目で分かる
+        Difficulty::Beginner => 3,
+        // サイズ違い(小さな三角・四角・丸)を加える
+        Difficulty::Intermediate => 6,
+        // あり型・キノコ型・二つ山など輪郭の近い形まで全部使う
+        Difficulty::Advanced => jigsaw_profile_count(),
     }
 }
 
 struct Question {
-    /// お手本描画用: 回転後のピースA(選択肢の完成形でも同じものを使う)
-    demo_piece_a: Shape,
-    /// お手本描画用: 回転+平行移動後のピースB
-    demo_piece_b: Shape,
-    /// お手本のピースBの回転角。選択肢の候補ピースBも全てこの角度で回す
-    angle_b: f64,
-    /// 選択肢として提示するbase_shapes()インデックス4つ(重複なし)
-    choices: [usize; CHOICE_COUNT],
-    /// choices中で正解ピースBが入っている位置
+    /// お手本のピースAの右辺
+    piece_a_edge: JigsawEdge,
+    /// 選択肢として提示するピースBの左辺4つ(重複なし)
+    choices: [JigsawEdge; CHOICE_COUNT],
+    /// choices中で正解(ピースAの右辺と噛み合う左辺)がある位置
     correct_choice_position: usize,
 }
 
 impl Question {
-    /// 選択肢positionの完成形に使う候補ピースB。お手本と同じ角度で回転させ、
-    /// ピースAの右端に接続する。正解の位置ではdemo_piece_bと同じ形になる
-    fn choice_piece_b(&self, position: usize) -> Shape {
-        let rotated = base_shapes()[self.choices[position]].rotated(self.angle_b);
-        connect_to_right_of(&self.demo_piece_a, &rotated)
+    /// お手本のピースA(右辺に接続部を持つ正方形)
+    fn piece_a(&self) -> Shape {
+        jigsaw_piece_right(self.piece_a_edge)
+    }
+
+    /// 選択肢positionのピースB(左辺に接続部を持つ正方形。ピースAには接続しない)
+    fn choice_piece(&self, position: usize) -> Shape {
+        jigsaw_piece_left(self.choices[position])
     }
 }
 
-fn generate_question(rng: &mut impl Rng, difficulty: Difficulty) -> Question {
-    let shapes = base_shapes();
-    let shape_count = shapes.len();
+/// 誤答の左辺を3つ選ぶ。難易度が上がるほど紛らわしいものを混ぜる
+fn pick_decoys(
+    rng: &mut impl Rng,
+    difficulty: Difficulty,
+    piece_a_edge: JigsawEdge,
+) -> Vec<JigsawEdge> {
+    let pool = profile_pool_size(difficulty);
+    let similar: Vec<usize> = jigsaw_similar_profiles(piece_a_edge.profile)
+        .iter()
+        .copied()
+        .filter(|&p| p < pool)
+        .collect();
+    let mut decoys = Vec::with_capacity(CHOICE_COUNT - 1);
 
-    let piece_a_idx = rng.gen_range(0..shape_count);
-    let piece_b_idx = rng.gen_range(0..shape_count);
-
-    let angle_a = rotation_angle_rad(rng, difficulty);
-    let angle_b = rotation_angle_rad(rng, difficulty);
-
-    let demo_piece_a = shapes[piece_a_idx].rotated(angle_a);
-    let demo_piece_b = connect_to_right_of(&demo_piece_a, &shapes[piece_b_idx].rotated(angle_b));
-
-    // 選択肢: 正解ピースB + 重複しない別図形3つ
-    let mut choices = vec![piece_b_idx];
-    while choices.len() < CHOICE_COUNT {
-        let candidate = rng.gen_range(0..shape_count);
-        if !choices.contains(&candidate) {
-            choices.push(candidate);
+    // 上級: 同じ形で凹凸も同じ(タブ同士・ブランク同士で噛み合わない)ものを必ず1つ
+    if difficulty == Difficulty::Advanced {
+        decoys.push(piece_a_edge);
+    }
+    // 中級以上: 似た形(サイズ違い等)で凹凸の向きは合っているものを必ず1つ
+    if difficulty != Difficulty::Beginner {
+        if let Some(&p) = similar.choose(rng) {
+            decoys.push(JigsawEdge::new(p, piece_a_edge.knob.opposite()));
         }
     }
+
+    // 残りは別の形から選ぶ。初級は似た形を避け、はっきり違う形だけにする
+    let mut rest: Vec<JigsawEdge> = (0..pool)
+        .filter(|&p| p != piece_a_edge.profile)
+        .filter(|p| difficulty != Difficulty::Beginner || !similar.contains(p))
+        .flat_map(|p| {
+            [
+                JigsawEdge::new(p, Knob::Tab),
+                JigsawEdge::new(p, Knob::Blank),
+            ]
+        })
+        .filter(|e| !decoys.contains(e))
+        .collect();
+    rest.shuffle(rng);
+    let needed = CHOICE_COUNT - 1 - decoys.len();
+    decoys.extend(rest.into_iter().take(needed));
+    decoys
+}
+
+fn generate_question(rng: &mut impl Rng, difficulty: Difficulty) -> Question {
+    let profile = rng.gen_range(0..profile_pool_size(difficulty));
+    let knob = if rng.gen_bool(0.5) {
+        Knob::Tab
+    } else {
+        Knob::Blank
+    };
+    let piece_a_edge = JigsawEdge::new(profile, knob);
+    // 正解: 同じ形で凹凸が逆の左辺
+    let correct = JigsawEdge::new(profile, knob.opposite());
+
+    let mut choices = pick_decoys(rng, difficulty, piece_a_edge);
+    choices.push(correct);
     choices.shuffle(rng);
+    // 正解の位置は噛み合わせ判定で決める(誤答はどれも噛み合わない)
     let correct_choice_position = choices
         .iter()
-        .position(|&idx| idx == piece_b_idx)
-        .expect("正解ピースBは必ずchoicesに含まれる");
+        .position(|&e| edges_interlock(piece_a_edge, e))
+        .expect("正解は必ずchoicesに含まれる");
 
     Question {
-        demo_piece_a,
-        demo_piece_b,
-        angle_b,
-        choices: choices.try_into().unwrap(),
+        piece_a_edge,
+        choices: choices
+            .try_into()
+            .expect("選択肢は必ずCHOICE_COUNT個そろう"),
         correct_choice_position,
     }
 }
 
-/// 図形群の外接矩形に余白を足した描画範囲
-fn content_bounds<'a>(shapes: impl IntoIterator<Item = &'a Shape>) -> ([f64; 2], [f64; 2]) {
-    let (mut x_min, mut x_max) = (f64::INFINITY, f64::NEG_INFINITY);
-    let (mut y_min, mut y_max) = (f64::INFINITY, f64::NEG_INFINITY);
-    for &(x, y) in shapes.into_iter().flat_map(|s| s.points.iter()) {
-        x_min = x_min.min(x);
-        x_max = x_max.max(x);
-        y_min = y_min.min(y);
-        y_max = y_max.max(y);
-    }
-    (
-        [x_min - BOUNDS_MARGIN, x_max + BOUNDS_MARGIN],
-        [y_min - BOUNDS_MARGIN, y_max + BOUNDS_MARGIN],
-    )
-}
-
-/// お手本と全選択肢の完成形をまとめて収める描画範囲。
+/// お手本と全選択肢のピースをまとめて収める描画範囲(原点中心で上下左右対称)。
 /// 全エリアで同じ範囲を使い、選択肢どうし・お手本との間で図形の縮尺をそろえる
 fn question_bounds(q: &Question) -> ([f64; 2], [f64; 2]) {
-    let choice_pieces: Vec<Shape> = (0..CHOICE_COUNT).map(|p| q.choice_piece_b(p)).collect();
-    content_bounds(
-        [&q.demo_piece_a, &q.demo_piece_b]
-            .into_iter()
-            .chain(choice_pieces.iter()),
-    )
+    let shapes: Vec<Shape> = std::iter::once(q.piece_a())
+        .chain((0..CHOICE_COUNT).map(|p| q.choice_piece(p)))
+        .collect();
+    let (mut x_extent, mut y_extent) = (0.0_f64, 0.0_f64);
+    for &(x, y) in shapes.iter().flat_map(|s| s.points.iter()) {
+        x_extent = x_extent.max(x.abs());
+        y_extent = y_extent.max(y.abs());
+    }
+    let (x, y) = (x_extent + BOUNDS_MARGIN, y_extent + BOUNDS_MARGIN);
+    ([-x, x], [-y, y])
 }
 
 /// 描画範囲を、描画先(inner、セル単位)の見た目の縦横比に合わせて中央基準で広げる。
@@ -199,6 +187,20 @@ fn fit_bounds_to_cells(bounds: ([f64; 2], [f64; 2]), inner: Rect) -> ([f64; 2], 
     (
         [cx - new_width / 2.0, cx + new_width / 2.0],
         [cy - new_height / 2.0, cy + new_height / 2.0],
+    )
+}
+
+/// 回答後に出す正解の説明(例: 「こたえ: 3番 (丸のくぼみ)」)
+fn answer_detail(q: &Question) -> String {
+    let edge = q.choices[q.correct_choice_position];
+    let knob = match edge.knob {
+        Knob::Tab => "出っ張り",
+        Knob::Blank => "くぼみ",
+    };
+    format!(
+        "こたえ: {}番 ({}の{knob})",
+        q.correct_choice_position + 1,
+        jigsaw_profile_name(edge.profile)
     )
 }
 
@@ -233,8 +235,8 @@ impl PuzzleConnectGame {
         let is_correct = answered_position == self.current.correct_choice_position;
         let latency_ms = self.question_started_at.elapsed().as_millis() as f64;
         self.tracker.record(is_correct, latency_ms);
-        let answer = SHAPE_NAMES[self.current.choices[self.current.correct_choice_position]];
-        self.feedback.record(is_correct, format!("こたえ: {answer}"));
+        self.feedback
+            .record(is_correct, answer_detail(&self.current));
         audio::play_se(if is_correct {
             SeKind::Correct
         } else {
@@ -297,7 +299,7 @@ impl Game for PuzzleConnectGame {
             frame,
             demo_area,
             &self.demo_canvas,
-            &self.current,
+            &self.current.piece_a(),
             bounds,
             self.feedback.current(),
         );
@@ -309,8 +311,7 @@ impl Game for PuzzleConnectGame {
                 panel,
                 &self.choice_canvases[position],
                 position + 1,
-                &self.current.demo_piece_a,
-                &self.current.choice_piece_b(position),
+                &self.current.choice_piece(position),
                 bounds,
             );
         }
@@ -318,7 +319,7 @@ impl Game for PuzzleConnectGame {
         theme::render_hint_footer(
             frame,
             footer_area,
-            &[("1〜4", "お手本と同じ組み合わせを回答"), ("q", "終了")],
+            &[("1〜4", "右辺にぴったりはまるピースを回答"), ("q", "終了")],
         );
     }
 
@@ -331,48 +332,30 @@ impl Game for PuzzleConnectGame {
     }
 }
 
-/// 1つ目のピースを描く色(お手本・選択肢共通)
+/// お手本のピースAを描く色
 const PIECE_A_COLOR: Color = theme::ACCENT_STRONG;
-/// 2つ目のピースを描く色(お手本・選択肢共通)
+/// 選択肢のピースBを描く色
 const PIECE_B_COLOR: Color = theme::HIGHLIGHT;
 
 fn draw_demo(
     frame: &mut Frame,
     area: Rect,
     canvas: &ShapeCanvas,
-    question: &Question,
+    piece_a: &Shape,
     bounds: ([f64; 2], [f64; 2]),
     flash: Option<&Flash>,
 ) {
-    // 色の凡例を枠の下辺に出す
-    let legend = Line::from(vec![
-        Span::styled(" ━ ", Style::default().fg(PIECE_A_COLOR)),
-        Span::styled("1つ目   ", Style::default().fg(theme::TEXT)),
-        Span::styled("━ ", Style::default().fg(PIECE_B_COLOR)),
-        Span::styled("2つ目 ", Style::default().fg(theme::TEXT)),
-    ]);
-    let block = theme::focus_panel(" お手本: この2つを組み合わせた完成形 ", flash)
-        .title_bottom(legend.centered());
+    let block = theme::focus_panel(" お手本: このピースの右辺にはまるのは? ", flash);
     let bounds = fit_bounds_to_cells(bounds, block.inner(area));
-    canvas.render_many(
-        frame,
-        area,
-        block,
-        &[
-            (&question.demo_piece_a, PIECE_A_COLOR),
-            (&question.demo_piece_b, PIECE_B_COLOR),
-        ],
-        bounds,
-    );
+    canvas.render_many(frame, area, block, &[(piece_a, PIECE_A_COLOR)], bounds);
 }
 
-/// 選択肢1つ分の完成形(ピースA+候補ピースB)を、お手本と同じ配色で描く
+/// 選択肢1つ分のピースB(左辺に接続部を持つ正方形)を描く
 fn draw_choice(
     frame: &mut Frame,
     area: Rect,
     canvas: &ShapeCanvas,
     number: usize,
-    piece_a: &Shape,
     piece_b: &Shape,
     bounds: ([f64; 2], [f64; 2]),
 ) {
@@ -387,13 +370,7 @@ fn draw_choice(
     .centered();
     let block = theme::sub_panel().title(title);
     let bounds = fit_bounds_to_cells(bounds, block.inner(area));
-    canvas.render_many(
-        frame,
-        area,
-        block,
-        &[(piece_a, PIECE_A_COLOR), (piece_b, PIECE_B_COLOR)],
-        bounds,
-    );
+    canvas.render_many(frame, area, block, &[(piece_b, PIECE_B_COLOR)], bounds);
 }
 
 #[cfg(test)]
@@ -401,149 +378,223 @@ mod tests {
     use super::*;
     use rand::rngs::StdRng;
     use rand::SeedableRng;
+    use std::collections::HashSet;
 
     const EPS: f64 = 1e-9;
 
-    fn assert_points_eq(actual: &Shape, expected: &Shape, context: &str) {
-        assert_eq!(actual.points.len(), expected.points.len(), "{context}: 頂点数");
-        for (a, e) in actual.points.iter().zip(&expected.points) {
+    const ALL_DIFFICULTIES: [Difficulty; 3] = [
+        Difficulty::Beginner,
+        Difficulty::Intermediate,
+        Difficulty::Advanced,
+    ];
+
+    /// 各難易度で多めに問題を生成する(乱数の偏りで条件を取りこぼさないように)
+    fn sample_questions(difficulty: Difficulty, seed: u64) -> Vec<Question> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        (0..300)
+            .map(|_| generate_question(&mut rng, difficulty))
+            .collect()
+    }
+
+    /// 誤答の選択肢(正解位置以外)
+    fn decoys(q: &Question) -> Vec<JigsawEdge> {
+        (0..CHOICE_COUNT)
+            .filter(|&p| p != q.correct_choice_position)
+            .map(|p| q.choices[p])
+            .collect()
+    }
+
+    /// 同じ形状番号で凹凸も同じ(タブ同士・ブランク同士)の誤答か
+    fn is_same_knob_decoy(q: &Question, e: JigsawEdge) -> bool {
+        e == q.piece_a_edge
+    }
+
+    /// ピースAの形状に似た形(サイズ違い等)の誤答か
+    fn is_similar_decoy(q: &Question, e: JigsawEdge) -> bool {
+        jigsaw_similar_profiles(q.piece_a_edge.profile).contains(&e.profile)
+    }
+
+    // --- 出題 ---
+
+    #[test]
+    fn every_question_has_exactly_one_interlocking_choice_at_the_correct_position() {
+        for difficulty in ALL_DIFFICULTIES {
+            for q in sample_questions(difficulty, 1) {
+                let fitting: Vec<usize> = (0..CHOICE_COUNT)
+                    .filter(|&p| edges_interlock(q.piece_a_edge, q.choices[p]))
+                    .collect();
+                assert_eq!(fitting, vec![q.correct_choice_position], "{difficulty:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn correct_choice_is_the_same_profile_with_the_opposite_knob() {
+        for difficulty in ALL_DIFFICULTIES {
+            for q in sample_questions(difficulty, 2) {
+                let correct = q.choices[q.correct_choice_position];
+                assert_eq!(correct.profile, q.piece_a_edge.profile);
+                assert_eq!(correct.knob, q.piece_a_edge.knob.opposite());
+            }
+        }
+    }
+
+    #[test]
+    fn choices_have_no_duplicates() {
+        for difficulty in ALL_DIFFICULTIES {
+            for q in sample_questions(difficulty, 3) {
+                let unique: HashSet<JigsawEdge> = q.choices.iter().copied().collect();
+                assert_eq!(
+                    unique.len(),
+                    CHOICE_COUNT,
+                    "{difficulty:?}: {:?}",
+                    q.choices
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn questions_only_use_profiles_within_the_difficulty_pool() {
+        for difficulty in ALL_DIFFICULTIES {
+            let pool = profile_pool_size(difficulty);
+            assert!(pool <= jigsaw_profile_count());
+            for q in sample_questions(difficulty, 4) {
+                assert!(q.piece_a_edge.profile < pool);
+                assert!(q.choices.iter().all(|e| e.profile < pool), "{difficulty:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn profile_variations_increase_with_difficulty() {
+        let beginner = profile_pool_size(Difficulty::Beginner);
+        let intermediate = profile_pool_size(Difficulty::Intermediate);
+        let advanced = profile_pool_size(Difficulty::Advanced);
+        assert!((2..=3).contains(&beginner), "初級は2〜3種");
+        assert!(beginner < intermediate && intermediate < advanced);
+        // 実際に出題される形状も、各難易度のプール全体に行き渡る
+        for difficulty in ALL_DIFFICULTIES {
+            let used: HashSet<usize> = sample_questions(difficulty, 5)
+                .iter()
+                .map(|q| q.piece_a_edge.profile)
+                .collect();
+            assert_eq!(used.len(), profile_pool_size(difficulty), "{difficulty:?}");
+        }
+    }
+
+    #[test]
+    fn piece_a_appears_with_both_tabs_and_blanks() {
+        for difficulty in ALL_DIFFICULTIES {
+            let knobs: HashSet<Knob> = sample_questions(difficulty, 6)
+                .iter()
+                .map(|q| q.piece_a_edge.knob)
+                .collect();
+            assert_eq!(knobs.len(), 2, "{difficulty:?}");
+        }
+    }
+
+    #[test]
+    fn correct_position_is_spread_over_all_choices() {
+        let positions: HashSet<usize> = sample_questions(Difficulty::Beginner, 7)
+            .iter()
+            .map(|q| q.correct_choice_position)
+            .collect();
+        assert_eq!(positions.len(), CHOICE_COUNT);
+    }
+
+    #[test]
+    fn beginner_decoys_are_clearly_different_shapes() {
+        // 初級: 誤答は形がはっきり違うものだけ(同じ形・似た形は出さない)
+        for q in sample_questions(Difficulty::Beginner, 8) {
+            for e in decoys(&q) {
+                assert_ne!(e.profile, q.piece_a_edge.profile, "{:?}", q.choices);
+                assert!(!is_similar_decoy(&q, e), "{:?}", q.choices);
+            }
+        }
+    }
+
+    #[test]
+    fn intermediate_always_mixes_in_a_similar_shape_decoy() {
+        // 中級: 似た形(サイズ違い等)の誤答を必ず混ぜる。同じ形で凹凸違いはまだ出さない
+        for q in sample_questions(Difficulty::Intermediate, 9) {
+            let d = decoys(&q);
             assert!(
-                (a.0 - e.0).abs() < EPS && (a.1 - e.1).abs() < EPS,
-                "{context}: {a:?} != {e:?}"
+                d.iter().any(|&e| is_similar_decoy(&q, e)),
+                "{:?}",
+                q.choices
+            );
+            assert!(
+                d.iter().all(|&e| e.profile != q.piece_a_edge.profile),
+                "{:?}",
+                q.choices
             );
         }
     }
 
     #[test]
-    fn translate_x_shifts_only_x_axis() {
-        let shape = Shape::new(vec![(0.0, 0.5), (1.0, -0.5)]);
-        let translated = translate_x(&shape, 2.0);
-        assert_eq!(translated.points, vec![(2.0, 0.5), (3.0, -0.5)]);
+    fn advanced_always_mixes_in_a_same_shape_same_knob_decoy() {
+        // 上級: 同じ形状番号で凹凸も同じ(タブ同士・ブランク同士で噛み合わない)誤答を必ず含める
+        for q in sample_questions(Difficulty::Advanced, 10) {
+            let d = decoys(&q);
+            assert!(
+                d.iter().any(|&e| is_same_knob_decoy(&q, e)),
+                "{:?}",
+                q.choices
+            );
+            assert!(
+                d.iter().any(|&e| is_similar_decoy(&q, e)),
+                "{:?}",
+                q.choices
+            );
+        }
     }
 
     #[test]
-    fn beginner_rotation_angle_is_always_zero() {
-        let mut rng = StdRng::seed_from_u64(1);
+    fn confusing_decoys_increase_with_difficulty() {
+        // 紛らわしい誤答(同じ形 or 似た形)の1問あたりの数は、難易度が上がるほど増える
+        let confusing = |difficulty| -> usize {
+            sample_questions(difficulty, 11)
+                .iter()
+                .map(|q| {
+                    decoys(q)
+                        .into_iter()
+                        .filter(|&e| is_same_knob_decoy(q, e) || is_similar_decoy(q, e))
+                        .count()
+                })
+                .sum()
+        };
+        let (b, i, a) = (
+            confusing(Difficulty::Beginner),
+            confusing(Difficulty::Intermediate),
+            confusing(Difficulty::Advanced),
+        );
+        assert!(b < i && i < a, "初級{b} 中級{i} 上級{a}");
+    }
+
+    #[test]
+    fn piece_a_has_the_knob_on_its_right_and_choices_on_their_left() {
+        let mut rng = StdRng::seed_from_u64(12);
         for _ in 0..20 {
-            assert_eq!(rotation_angle_rad(&mut rng, Difficulty::Beginner), 0.0);
-        }
-    }
-
-    #[test]
-    fn generate_question_places_piece_b_directly_after_piece_a_with_margin() {
-        let mut rng = StdRng::seed_from_u64(10);
-        for _ in 0..30 {
             let q = generate_question(&mut rng, Difficulty::Advanced);
-            let a_max_x = shape_max_x(&q.demo_piece_a);
-            let b_min_x = shape_min_x(&q.demo_piece_b);
-            assert!(
-                (b_min_x - (a_max_x + 0.1)).abs() < EPS,
-                "ピースBはピースAの右端+マージン0.1の位置から始まるべき"
-            );
-        }
-    }
-
-    #[test]
-    fn generate_question_choices_have_no_duplicates() {
-        let mut rng = StdRng::seed_from_u64(20);
-        for _ in 0..50 {
-            let q = generate_question(&mut rng, Difficulty::Intermediate);
-            let mut sorted = q.choices.to_vec();
-            sorted.sort();
-            sorted.dedup();
-            assert_eq!(sorted.len(), CHOICE_COUNT, "選択肢に重複がある");
-        }
-    }
-
-    #[test]
-    fn generate_question_correct_position_is_within_choices() {
-        let mut rng = StdRng::seed_from_u64(21);
-        for _ in 0..50 {
-            let q = generate_question(&mut rng, Difficulty::Beginner);
-            assert!(q.correct_choice_position < CHOICE_COUNT);
-            // correct_choice_positionの位置にある値は必ずchoices内に実在する図形インデックス
-            let idx = q.choices[q.correct_choice_position];
-            assert!(idx < base_shapes().len());
-        }
-    }
-
-    // --- 選択肢の完成形(ピースA+候補ピースB) ---
-
-    #[test]
-    fn correct_choice_forms_exactly_the_same_shape_as_the_demo() {
-        // 正解の選択肢はお手本と同じ点集合(=同じシルエット)になる
-        for difficulty in [
-            Difficulty::Beginner,
-            Difficulty::Intermediate,
-            Difficulty::Advanced,
-        ] {
-            let mut rng = StdRng::seed_from_u64(30);
-            for _ in 0..30 {
-                let q = generate_question(&mut rng, difficulty);
-                let piece_b = q.choice_piece_b(q.correct_choice_position);
-                assert_points_eq(&piece_b, &q.demo_piece_b, "正解の候補ピースB");
+            assert_eq!(q.piece_a(), jigsaw_piece_right(q.piece_a_edge));
+            for p in 0..CHOICE_COUNT {
+                assert_eq!(q.choice_piece(p), jigsaw_piece_left(q.choices[p]));
             }
         }
-    }
-
-    #[test]
-    fn wrong_choices_form_a_different_shape_from_the_demo() {
-        let mut rng = StdRng::seed_from_u64(31);
-        for _ in 0..30 {
-            let q = generate_question(&mut rng, Difficulty::Advanced);
-            for position in (0..CHOICE_COUNT).filter(|&p| p != q.correct_choice_position) {
-                assert_ne!(
-                    q.choice_piece_b(position).points,
-                    q.demo_piece_b.points,
-                    "不正解の選択肢{}がお手本と同じ形になっている",
-                    position + 1
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn every_choice_piece_b_is_rotated_by_the_same_angle_as_the_demo() {
-        // 全選択肢の候補ピースBは、お手本のピースBと同じ角度(angle_b)で回転し、
-        // ピースAの右端+0.1に接続されている(選択肢ごとに回転を変えない)
-        let shapes = base_shapes();
-        let mut rng = StdRng::seed_from_u64(32);
-        let mut saw_rotation = false;
-        for _ in 0..30 {
-            let q = generate_question(&mut rng, Difficulty::Advanced);
-            saw_rotation |= q.angle_b != 0.0;
-            // お手本のピースBがangle_bで回転したものであること(angle_bがお手本と一致する根拠)
-            let demo_expected = shapes[q.choices[q.correct_choice_position]].rotated(q.angle_b);
-            let dx = q.demo_piece_b.points[0].0 - demo_expected.points[0].0;
-            assert_points_eq(
-                &q.demo_piece_b,
-                &translate_x(&demo_expected, dx),
-                "お手本のピースB",
-            );
-            for position in 0..CHOICE_COUNT {
-                let rotated = shapes[q.choices[position]].rotated(q.angle_b);
-                let a_max_x = shape_max_x(&q.demo_piece_a);
-                let expected = translate_x(&rotated, a_max_x + 0.1 - shape_min_x(&rotated));
-                assert_points_eq(
-                    &q.choice_piece_b(position),
-                    &expected,
-                    &format!("選択肢{}", position + 1),
-                );
-            }
-        }
-        assert!(saw_rotation, "上級で一度も回転しなかった");
     }
 
     // --- 描画範囲 ---
 
     #[test]
-    fn question_bounds_contain_the_demo_and_every_choice() {
+    fn question_bounds_contain_the_demo_and_every_choice_and_are_centered() {
         let mut rng = StdRng::seed_from_u64(40);
         for _ in 0..20 {
             let q = generate_question(&mut rng, Difficulty::Advanced);
             let ([x_min, x_max], [y_min, y_max]) = question_bounds(&q);
-            let mut all: Vec<Shape> = vec![q.demo_piece_a.clone(), q.demo_piece_b.clone()];
-            all.extend((0..CHOICE_COUNT).map(|p| q.choice_piece_b(p)));
+            assert!((x_min + x_max).abs() < EPS && (y_min + y_max).abs() < EPS);
+            let mut all = vec![q.piece_a()];
+            all.extend((0..CHOICE_COUNT).map(|p| q.choice_piece(p)));
             for shape in &all {
                 for &(x, y) in &shape.points {
                     assert!(x > x_min && x < x_max && y > y_min && y < y_max);
@@ -557,13 +608,20 @@ mod tests {
         // 1セルは横1:縦2の比率とみなす。広げた後の範囲の縦横比がエリアの見た目の縦横比と一致し、
         // 元の範囲を中央に含む(図形が縦横に伸び縮みしない)
         let bounds = ([-1.0, 3.0], [-1.0, 1.0]);
-        for inner in [Rect::new(0, 0, 18, 7), Rect::new(0, 0, 78, 6), Rect::new(3, 2, 10, 10)] {
+        for inner in [
+            Rect::new(0, 0, 18, 7),
+            Rect::new(0, 0, 78, 6),
+            Rect::new(3, 2, 10, 10),
+        ] {
             let ([x_min, x_max], [y_min, y_max]) = fit_bounds_to_cells(bounds, inner);
             let world_ratio = (x_max - x_min) / (y_max - y_min);
             let cell_ratio = inner.width as f64 / (inner.height as f64 * 2.0);
             assert!((world_ratio - cell_ratio).abs() < EPS, "{inner:?}");
             assert!(x_min <= -1.0 && x_max >= 3.0 && y_min <= -1.0 && y_max >= 1.0);
-            assert!(((x_min + x_max) / 2.0 - 1.0).abs() < EPS, "横方向は中央そろえ");
+            assert!(
+                ((x_min + x_max) / 2.0 - 1.0).abs() < EPS,
+                "横方向は中央そろえ"
+            );
             assert!(((y_min + y_max) / 2.0).abs() < EPS, "縦方向は中央そろえ");
         }
     }
@@ -644,7 +702,11 @@ mod tests {
     #[test]
     fn clicking_anywhere_inside_a_drawn_choice_panel_selects_it() {
         // 選択肢パネルの描画位置(choice_areas)とクリック判定が一致すること(四隅で確認)
-        for area in [Rect::new(0, 0, 80, 24), Rect::new(0, 0, 43, 20), Rect::new(5, 3, 61, 30)] {
+        for area in [
+            Rect::new(0, 0, 80, 24),
+            Rect::new(0, 0, 43, 20),
+            Rect::new(5, 3, 61, 30),
+        ] {
             let (_, choices_area, _) = split_areas(area);
             for (i, panel) in choice_areas(choices_area).into_iter().enumerate() {
                 let corners = [
@@ -657,8 +719,18 @@ mod tests {
                     let mut game = PuzzleConnectGame::new(Difficulty::Beginner);
                     game.current.correct_choice_position = i;
                     game.handle_mouse(left_click(column, row), area);
-                    assert_eq!(game.tracker.total(), 1, "{area:?} 選択肢{} ({column},{row})", i + 1);
-                    assert_eq!(game.result().correct, 1, "{area:?} 選択肢{} ({column},{row})", i + 1);
+                    assert_eq!(
+                        game.tracker.total(),
+                        1,
+                        "{area:?} 選択肢{} ({column},{row})",
+                        i + 1
+                    );
+                    assert_eq!(
+                        game.result().correct,
+                        1,
+                        "{area:?} 選択肢{} ({column},{row})",
+                        i + 1
+                    );
                 }
             }
         }
@@ -669,8 +741,14 @@ mod tests {
         let choices_area = Rect::new(2, 10, 61, 9);
         let panels = choice_areas(choices_area);
         assert_eq!(panels.len(), CHOICE_COUNT);
-        let total: u32 = panels.iter().map(|r| r.width as u32 * r.height as u32).sum();
-        assert_eq!(total, choices_area.width as u32 * choices_area.height as u32);
+        let total: u32 = panels
+            .iter()
+            .map(|r| r.width as u32 * r.height as u32)
+            .sum();
+        assert_eq!(
+            total,
+            choices_area.width as u32 * choices_area.height as u32
+        );
         for pair in panels.windows(2) {
             assert!(pair[0].intersection(pair[1]).is_empty());
         }
@@ -687,16 +765,43 @@ mod tests {
     }
 
     #[test]
-    fn answering_shows_feedback_with_the_correct_shape_name() {
+    fn answering_shows_feedback_with_the_correct_choice_and_shape() {
         let mut game = PuzzleConnectGame::new(Difficulty::Beginner);
         let correct = game.current.correct_choice_position;
-        let answer = SHAPE_NAMES[game.current.choices[correct]];
+        let edge = game.current.choices[correct];
         game.advance_question((correct + 1) % CHOICE_COUNT);
         let flash = game.feedback.current().expect("回答直後は正誤を表示する");
         assert_eq!(flash.verdict, crate::game::feedback::Verdict::Incorrect);
-        assert_eq!(flash.detail, format!("こたえ: {answer}"));
+        assert!(
+            flash.detail.contains(&format!("{}番", correct + 1)),
+            "{}",
+            flash.detail
+        );
+        assert!(
+            flash.detail.contains(jigsaw_profile_name(edge.profile)),
+            "{}",
+            flash.detail
+        );
         game.update(crate::game::feedback::FEEDBACK_HOLD);
         assert!(game.feedback.current().is_none());
+    }
+
+    #[test]
+    fn answer_detail_names_the_knob_direction() {
+        let q = Question {
+            piece_a_edge: JigsawEdge::new(0, Knob::Tab),
+            choices: [
+                JigsawEdge::new(1, Knob::Blank),
+                JigsawEdge::new(0, Knob::Blank),
+                JigsawEdge::new(2, Knob::Tab),
+                JigsawEdge::new(1, Knob::Tab),
+            ],
+            correct_choice_position: 1,
+        };
+        assert_eq!(
+            answer_detail(&q),
+            format!("こたえ: 2番 ({}のくぼみ)", jigsaw_profile_name(0))
+        );
     }
 
     // --- 描画 ---
@@ -704,7 +809,9 @@ mod tests {
     fn rendered_text(game: &PuzzleConnectGame, width: u16, height: u16) -> String {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| game.render(frame, frame.area())).unwrap();
+        terminal
+            .draw(|frame| game.render(frame, frame.area()))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..height)
             .flat_map(|y| (0..width).map(move |x| (x, y)))
@@ -715,11 +822,12 @@ mod tests {
 
     #[test]
     fn choices_do_not_show_shape_names() {
-        // 選択肢は図形で描き、図形名のテキストは出さない(回答前はフィードバックも無い)
-        let game = PuzzleConnectGame::new(Difficulty::Beginner);
+        // 選択肢は図形で描き、形状名のテキストは出さない(回答前はフィードバックも無い)
+        let game = PuzzleConnectGame::new(Difficulty::Advanced);
         let text = rendered_text(&game, 80, 24);
-        for name in SHAPE_NAMES {
-            assert!(!text.contains(name), "図形名「{name}」が描かれている");
+        for profile in 0..jigsaw_profile_count() {
+            let name = jigsaw_profile_name(profile);
+            assert!(!text.contains(name), "形状名「{name}」が描かれている");
         }
     }
 
@@ -737,7 +845,11 @@ mod tests {
             let top: String = (panel.x..panel.x + panel.width)
                 .map(|x| buffer[(x, panel.y)].symbol().to_string())
                 .collect();
-            assert!(top.contains(&format!(" {} ", i + 1)), "選択肢{}の枠: {top}", i + 1);
+            assert!(
+                top.contains(&format!(" {} ", i + 1)),
+                "選択肢{}の枠: {top}",
+                i + 1
+            );
         }
     }
 
@@ -749,11 +861,6 @@ mod tests {
         game
     }
 
-    const ALL_DIFFICULTIES: [Difficulty; 3] = [
-        Difficulty::Beginner,
-        Difficulty::Intermediate,
-        Difficulty::Advanced,
-    ];
     const RENDER_SIZES: [(u16, u16); 5] = [(80, 24), (120, 40), (40, 15), (20, 8), (4, 3)];
 
     #[test]
@@ -783,8 +890,10 @@ mod tests {
         crate::image_backend::ImageDedupBackend<crate::image_backend::RecordingBackend>,
     > {
         use crate::image_backend::{ImageDedupBackend, RecordingBackend};
-        ratatui::Terminal::new(ImageDedupBackend::new(RecordingBackend::new(TERM_W, TERM_H)))
-            .unwrap()
+        ratatui::Terminal::new(ImageDedupBackend::new(RecordingBackend::new(
+            TERM_W, TERM_H,
+        )))
+        .unwrap()
     }
 
     #[test]
@@ -806,7 +915,11 @@ mod tests {
         for _ in 0..5 {
             terminal.draw(|f| game.render(f, f.area())).unwrap();
             assert!(
-                terminal.backend().inner().last_payload_positions().is_empty(),
+                terminal
+                    .backend()
+                    .inner()
+                    .last_payload_positions()
+                    .is_empty(),
                 "問題が変わらない間は画像を送り直さない"
             );
         }
@@ -818,21 +931,48 @@ mod tests {
         let mut game = game_with_image_canvases(Difficulty::Advanced);
         let mut terminal = dedup_terminal();
         terminal.draw(|f| game.render(f, f.area())).unwrap();
-        game.feedback.record(false, "こたえ: 三角形".to_string());
+        game.feedback.record(false, "こたえ: 1番".to_string());
         terminal.draw(|f| game.render(f, f.area())).unwrap();
-        assert!(terminal.backend().inner().last_payload_positions().is_empty());
+        assert!(terminal
+            .backend()
+            .inner()
+            .last_payload_positions()
+            .is_empty());
         game.update(crate::game::feedback::FEEDBACK_HOLD);
         terminal.draw(|f| game.render(f, f.area())).unwrap();
-        assert!(terminal.backend().inner().last_payload_positions().is_empty());
+        assert!(terminal
+            .backend()
+            .inner()
+            .last_payload_positions()
+            .is_empty());
     }
 
     #[test]
     fn all_images_are_sent_again_when_the_question_changes() {
+        // 前の問題と全ピースの形が異なる問題に切り替えると、5枚とも送り直す
         let mut game = game_with_image_canvases(Difficulty::Advanced);
         let mut terminal = dedup_terminal();
-        game.current = generate_question(&mut StdRng::seed_from_u64(50), Difficulty::Advanced);
+        game.current = Question {
+            piece_a_edge: JigsawEdge::new(0, Knob::Tab),
+            choices: [
+                JigsawEdge::new(0, Knob::Blank),
+                JigsawEdge::new(1, Knob::Blank),
+                JigsawEdge::new(2, Knob::Blank),
+                JigsawEdge::new(0, Knob::Tab),
+            ],
+            correct_choice_position: 0,
+        };
         terminal.draw(|f| game.render(f, f.area())).unwrap();
-        game.current = generate_question(&mut StdRng::seed_from_u64(51), Difficulty::Advanced);
+        game.current = Question {
+            piece_a_edge: JigsawEdge::new(1, Knob::Blank),
+            choices: [
+                JigsawEdge::new(2, Knob::Tab),
+                JigsawEdge::new(1, Knob::Tab),
+                JigsawEdge::new(0, Knob::Tab),
+                JigsawEdge::new(1, Knob::Blank),
+            ],
+            correct_choice_position: 1,
+        };
         terminal.draw(|f| game.render(f, f.area())).unwrap();
 
         let sent = terminal.backend().inner().last_payload_positions();
