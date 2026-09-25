@@ -280,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn bgm_tracks_in_playing_has_six_tracks() {
+    fn bgm_tracks_in_playing_has_seven_tracks() {
         let names = bgm_tracks_in(BgmCategory::Playing);
         assert!(names.iter().any(|n| n == "Method_of_Thought"));
         assert!(names.iter().any(|n| n == "The_Quiet_Calculation"));
@@ -288,7 +288,8 @@ mod tests {
         assert!(names.iter().any(|n| n == "Apex_Calculation"));
         assert!(names.iter().any(|n| n == "Kinetic_Ascent"));
         assert!(names.iter().any(|n| n == "Ten_Thousand_Strikes"));
-        assert_eq!(names.len(), 6);
+        assert!(names.iter().any(|n| n == "Beyond_the_Finish_Line"));
+        assert_eq!(names.len(), 7);
     }
 
     #[test]
@@ -338,6 +339,6 @@ mod tests {
                 seen.insert(name);
             }
         }
-        assert_eq!(seen.len(), 6, "100回試行して全曲が出現するはず: {seen:?}");
+        assert_eq!(seen.len(), 7, "100回試行して全曲が出現するはず: {seen:?}");
     }
 }
