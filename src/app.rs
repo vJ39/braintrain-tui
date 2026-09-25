@@ -8,6 +8,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 use crate::audio::{self, BgmCategory, SeKind};
+use crate::game::count_mania::CountManiaGame;
 use crate::game::memory::MemoryGame;
 use crate::game::mental_calc::MentalCalcGame;
 use crate::game::mirror_match::MirrorMatchGame;
@@ -22,7 +23,7 @@ use crate::game::theme;
 use crate::game::{Difficulty, Game, GameResult};
 use crate::stats::store;
 
-const MENU_ITEMS: [&str; 11] = [
+const MENU_ITEMS: [&str; 12] = [
     "図形回転判定",
     "鏡像判定",
     "反応速度(Stroop)",
@@ -31,13 +32,16 @@ const MENU_ITEMS: [&str; 11] = [
     "記憶(位置と色)",
     "数列予測",
     "組み合わせパズル",
+    "カウントマニア",
     "リズム(DDR風)",
     "ジュークボックス",
     "履歴",
 ];
 
+/// カウントマニア(マウス専用)
+const COUNT_MANIA_ITEM_INDEX: usize = 8;
 /// リズムゲームだけは難易度選択の前に曲選択を挟む
-const RHYTHM_ITEM_INDEX: usize = 8;
+const RHYTHM_ITEM_INDEX: usize = 9;
 const JUKEBOX_ITEM_INDEX: usize = MENU_ITEMS.len() - 2;
 const HISTORY_ITEM_INDEX: usize = MENU_ITEMS.len() - 1;
 
@@ -368,6 +372,7 @@ fn new_game(item: usize, difficulty: Difficulty) -> Box<dyn Game> {
         5 => Box::new(MemoryGame::new(difficulty)),
         6 => Box::new(SequenceGame::new(difficulty)),
         7 => Box::new(PuzzleConnectGame::new(difficulty)),
+        COUNT_MANIA_ITEM_INDEX => Box::new(CountManiaGame::new(difficulty)),
         RHYTHM_ITEM_INDEX => unreachable!("rhythm is started via start_rhythm with a song"),
         _ => unreachable!("history is handled without creating a game"),
     }
@@ -433,6 +438,7 @@ fn render_menu(frame: &mut Frame, area: Rect, state: &mut ListState) {
         "光ったパネルの順番を覚えて再現する",
         "数列の法則を見抜いて次の数を当てる",
         "完成形から2つ目のピースを当てる",
+        "数字の円を1から順にクリックする(マウス専用)",
         "矢印キーで曲に合わせてステップする",
         "BGMを選んで聴く",
         "ゲームごとの反応時間の推移を見る",
@@ -591,6 +597,7 @@ fn render_result(frame: &mut Frame, area: Rect, result: &GameResult) {
         (crate::game::memory::GAME_ID, 5),
         (crate::game::sequence::GAME_ID, 6),
         (crate::game::puzzle_connect::GAME_ID, 7),
+        (crate::game::count_mania::GAME_ID, COUNT_MANIA_ITEM_INDEX),
         (crate::game::rhythm::GAME_ID, RHYTHM_ITEM_INDEX),
     ];
     let game_name = game_names
@@ -785,6 +792,39 @@ mod tests {
             }
             let _game = new_game(item, Difficulty::Beginner);
         }
+    }
+
+    // --- カウントマニア ---
+
+    #[test]
+    fn count_mania_is_the_last_game_before_rhythm() {
+        assert_eq!(MENU_ITEMS[COUNT_MANIA_ITEM_INDEX], "カウントマニア");
+        assert_eq!(COUNT_MANIA_ITEM_INDEX + 1, RHYTHM_ITEM_INDEX);
+    }
+
+    #[test]
+    fn new_game_for_count_mania_item_creates_count_mania() {
+        let game = new_game(COUNT_MANIA_ITEM_INDEX, Difficulty::Advanced);
+        let result = game.result();
+        assert_eq!(result.game_id, crate::game::count_mania::GAME_ID);
+        assert_eq!(result.difficulty, Difficulty::Advanced);
+    }
+
+    #[test]
+    fn selecting_count_mania_goes_to_difficulty_and_starts_it() {
+        let mut app = App::new();
+        app.select_menu_item(COUNT_MANIA_ITEM_INDEX);
+        assert!(matches!(
+            app.screen,
+            Screen::SelectDifficulty(COUNT_MANIA_ITEM_INDEX, None)
+        ));
+        app.handle_key(KeyEvent::from(KeyCode::Char('1')));
+        let Screen::Playing(game) = &app.screen else {
+            panic!("Playing画面のはず");
+        };
+        assert_eq!(game.result().game_id, crate::game::count_mania::GAME_ID);
+        // 全角文字の2セル目は空白で埋まるため、空白を除いて比較する
+        assert!(rendered_text(&mut app).replace(' ', "").contains("マウス専用"));
     }
 
     #[test]

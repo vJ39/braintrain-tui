@@ -1,3 +1,4 @@
+pub mod count_mania;
 pub mod feedback;
 pub mod memory;
 pub mod mental_calc;
