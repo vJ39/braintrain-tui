@@ -62,6 +62,16 @@ const GOAL_BG: Color = Color::Rgb(40, 40, 40);
 const GOAL_FG: Color = Color::Yellow;
 const TOP_FG: Color = Color::Rgb(220, 240, 255);
 
+/// 平坦なマスの市松の2トーン。FLAT_BGを白・黒へこの割合だけ寄せる
+const CHECKER_MIX: f64 = 0.08;
+/// 凹凸の陰影の明・暗。BUMP_BG/HOLLOW_BGを白・黒へこの割合だけ寄せる
+const SHADE_MIX: f64 = 0.15;
+/// 陰影の帯の境界。d ≤ −SHADE_BANDで左上の帯、d ≥ SHADE_BANDで右下の帯、その間が中央の帯
+const SHADE_BAND: f64 = 0.2;
+/// 混色で明るく・暗くする時の寄せ先
+const WHITE: Color = Color::Rgb(255, 255, 255);
+const BLACK: Color = Color::Rgb(0, 0, 0);
+
 /// 盤面に描くベーゴマの状態
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TopView {
@@ -141,34 +151,106 @@ impl BoardArea {
         let y = raw_y.clamp(min_y, max_y.max(min_y));
         Rect::new(x as u16, y as u16, self.cell_width, self.cell_height)
     }
+}
 
-    /// rectをdx,dyだけずらす(panelの範囲内でクランプし、バッファ範囲外アクセスを防ぐ)
-    fn offset_rect(&self, rect: Rect, dx: i32, dy: i32) -> Rect {
-        let min_x = i32::from(self.panel.x);
-        let min_y = i32::from(self.panel.y);
-        let max_x = min_x + i32::from(self.panel.width) - i32::from(rect.width);
-        let max_y = min_y + i32::from(self.panel.height) - i32::from(rect.height);
-        let x = (i32::from(rect.x) + dx).clamp(min_x, max_x.max(min_x));
-        let y = (i32::from(rect.y) + dy).clamp(min_y, max_y.max(min_y));
-        Rect::new(x as u16, y as u16, rect.width, rect.height)
+/// 傾き最大(TILT_MAX)の時の盤の回転角(rad)。前後・左右とも同じ
+const TILT_ANGLE_MAX: f64 = std::f64::consts::PI / 12.0; // 15°
+/// カメラの高さ(マス単位)。盤の中心の真上
+const CAMERA_HEIGHT: f64 = 20.0;
+
+/// 盤の中心(マス座標)。変換は盤の中心を原点にして行う
+const HALF_WIDTH: f64 = BOARD_WIDTH as f64 / 2.0;
+const HALF_HEIGHT: f64 = BOARD_HEIGHT as f64 / 2.0;
+
+/// 傾きに応じた、盤のマス座標と端末のセル座標の間の変換(1フレームに1回作る)。
+/// 盤を3D空間でroll→pitchの順に回し、盤の中心の真上のカメラから透視投影する。
+/// 傾けた方向の遠い側(低くなった側)が縮んだ台形になり、近い側の辺は平らな時と同じ大きさに保つ
+struct BoardProjection {
+    /// 盤の左上のセル位置と1マスのセル数(BoardAreaから)
+    origin: (f64, f64),
+    cell: (f64, f64),
+    /// 正規化済みの回転係数と透視の係数
+    a: f64,
+    b: f64,
+    c: f64,
+    p: f64,
+    q: f64,
+}
+
+impl BoardProjection {
+    fn new(layout: &BoardArea, tilt: &Tilt) -> Self {
+        let theta_p = tilt.pitch() / TILT_MAX * TILT_ANGLE_MAX;
+        let theta_r = tilt.roll() / TILT_MAX * TILT_ANGLE_MAX;
+        let (sin_p, cos_p) = theta_p.sin_cos();
+        let (sin_r, cos_r) = theta_r.sin_cos();
+        // w = 1 + p·u + q·v(wが大きいほどカメラから遠く、小さく見える)
+        let p = sin_r * cos_p / CAMERA_HEIGHT;
+        let q = -sin_p / CAMERA_HEIGHT;
+        // 盤の4隅で最もカメラに近い(wが最小の)角に合わせて全体を拡大し、近い側の辺を平らな時と同じ大きさにする
+        let w_min = [
+            (-HALF_WIDTH, -HALF_HEIGHT),
+            (HALF_WIDTH, -HALF_HEIGHT),
+            (-HALF_WIDTH, HALF_HEIGHT),
+            (HALF_WIDTH, HALF_HEIGHT),
+        ]
+        .into_iter()
+        .map(|(u, v)| 1.0 + p * u + q * v)
+        .fold(f64::INFINITY, f64::min);
+        let s = 1.0 / w_min;
+        Self {
+            origin: (f64::from(layout.rect.x), f64::from(layout.rect.y)),
+            cell: (f64::from(layout.cell_width), f64::from(layout.cell_height)),
+            a: cos_r / s,
+            b: sin_r * sin_p / s,
+            c: cos_p / s,
+            p,
+            q,
+        }
+    }
+
+    /// マス座標(連続値)→セル座標(連続値)。盤外の座標もそのまま延長して変換する
+    fn project(&self, pos: (f64, f64)) -> (f64, f64) {
+        let u = pos.0 - HALF_WIDTH;
+        let v = pos.1 - HALF_HEIGHT;
+        let w = 1.0 + self.p * u + self.q * v;
+        let sx = self.a * u / w;
+        let sy = (self.b * u + self.c * v) / w;
+        (
+            self.origin.0 + (sx + HALF_WIDTH) * self.cell.0,
+            self.origin.1 + (sy + HALF_HEIGHT) * self.cell.1,
+        )
+    }
+
+    /// セル座標(連続値)→マス座標(連続値)。地平線の向こう側はNone
+    fn unproject(&self, screen: (f64, f64)) -> Option<(f64, f64)> {
+        let sx = (screen.0 - self.origin.0) / self.cell.0 - HALF_WIDTH;
+        let sy = (screen.1 - self.origin.1) / self.cell.1 - HALF_HEIGHT;
+        let den = 1.0 - self.p * sx / self.a - self.q * (sy - self.b * sx / self.a) / self.c;
+        if den <= 0.0 {
+            return None;
+        }
+        let w = 1.0 / den;
+        let u = sx * w / self.a;
+        let v = (sy - self.b * sx / self.a) * w / self.c;
+        Some((u + HALF_WIDTH, v + HALF_HEIGHT))
     }
 }
 
-/// 傾き1レベル・盤の中心から1マス分あたりの、疑似3D変形によるずれ量(セル単位)
-const TILT_SHIFT_PER_LEVEL: f64 = 0.12;
+/// 中心座標(セル、連続値)から記号を置くセルを決める。記号が2セル幅で表示されても隣のマスに
+/// 食い込まないよう、中心のすぐ左のセルに置く(傾き0では従来の記号の位置と同じになる)
+fn glyph_cell(center: (f64, f64)) -> (i32, i32) {
+    ((center.0 - 0.5).floor() as i32, center.1.floor() as i32)
+}
 
-/// 傾き(pitch/roll)に応じた、盤の行位置row(連続値)でのセルのずれ(x, y。セル単位の小数)。
-/// 盤の中心の行(row)からの距離に比例させ、板が回転しているように見せる。
-/// rollは左右に傾いて見えるようx方向、pitchは奥行きが傾いて見えるようy方向にずらす
-fn tilt_shift(row: f64, tilt: &Tilt) -> (f64, f64) {
-    let center = (BOARD_HEIGHT as f64 - 1.0) / 2.0;
-    let row_offset = row - center;
-    let roll = tilt.roll() / TILT_MAX;
-    let pitch = tilt.pitch() / TILT_MAX;
-    (
-        roll * row_offset * TILT_SHIFT_PER_LEVEL,
-        pitch * row_offset * TILT_SHIFT_PER_LEVEL,
-    )
+/// cellがclipの中なら記号を置く(範囲外は何もしない)。背景色はそのまま残す
+fn put_glyph_at(buffer: &mut Buffer, cell: (i32, i32), clip: Rect, glyph: &str, style: Style) {
+    let (Ok(x), Ok(y)) = (u16::try_from(cell.0), u16::try_from(cell.1)) else {
+        return;
+    };
+    let position = Position::new(x, y);
+    if clip.contains(position) {
+        buffer[position].set_symbol(glyph).set_style(style);
+    }
 }
 
 /// 直前に作った盤の画像(障害物・ゴールまで重ねたもの)
@@ -505,8 +587,93 @@ fn fill_circle(image: &mut RgbaImage, center: (f64, f64), radius: f64, color: Rg
     }
 }
 
-/// テキスト表示の盤面。マスごとに背景色で塗り、凸・凹・ゴール・ベーゴマは記号で示す
-/// (凸は明るい色の▲、凹は暗い色の▽)
+/// 凹凸のマスの中の陰影の帯。光源は左上
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShadeBand {
+    TopLeft,
+    Middle,
+    BottomRight,
+}
+
+/// マス内の位置frac = (fu, fv)から陰影の帯を決める。d = fu + fv − 1 で、d ≤ −SHADE_BANDなら左上、
+/// d ≥ SHADE_BANDなら右下、その間が中央。d == ∓SHADE_BANDちょうどが外側の帯に入るよう、
+/// 1を引かずに fu + fv と 1 ∓ SHADE_BAND を比べる(1を引くと丸め誤差で境界がずれる)
+fn shade_band(frac: (f64, f64)) -> ShadeBand {
+    let sum = frac.0 + frac.1;
+    if sum <= 1.0 - SHADE_BAND {
+        ShadeBand::TopLeft
+    } else if sum >= 1.0 + SHADE_BAND {
+        ShadeBand::BottomRight
+    } else {
+        ShadeBand::Middle
+    }
+}
+
+/// colorをtargetへ割合tだけ寄せた色(各チャンネルを四捨五入)。Color::Rgb以外はそのまま
+fn mix(color: Color, target: Color, t: f64) -> Color {
+    let (Color::Rgb(r, g, b), Color::Rgb(tr, tg, tb)) = (color, target) else {
+        return color;
+    };
+    let channel = |c: u8, tc: u8| {
+        let c = f64::from(c);
+        (c + (f64::from(tc) - c) * t).round().clamp(0.0, 255.0) as u8
+    };
+    Color::Rgb(channel(r, tr), channel(g, tg), channel(b, tb))
+}
+
+/// テキスト表示のマスの記号。平坦なマスは空白
+fn cell_glyph(cell: Cell) -> &'static str {
+    match cell {
+        Cell::Flat => " ",
+        Cell::Bump => BUMP_GLYPH,
+        Cell::Hollow => HOLLOW_GLYPH,
+        Cell::Goal => GOAL_GLYPH,
+    }
+}
+
+/// マスmass = (mx, my)のマス内位置fracにあるセルのスタイル。
+/// 背景色は市松(平坦)・陰影(凸凹)・一様(ゴール)、記号の色と太字はマスの種類で決まる
+fn cell_style(cell: Cell, mass: (usize, usize), frac: (f64, f64)) -> Style {
+    match cell {
+        Cell::Flat => {
+            // 市松: mx + myが偶数なら明るいトーン、奇数なら暗いトーン
+            let target = if (mass.0 + mass.1).is_multiple_of(2) {
+                WHITE
+            } else {
+                BLACK
+            };
+            Style::default().bg(mix(FLAT_BG, target, CHECKER_MIX))
+        }
+        Cell::Bump => {
+            // 盛り上がった面の左上に光が当たり、右下に影が落ちる
+            let bg = match shade_band(frac) {
+                ShadeBand::TopLeft => mix(BUMP_BG, WHITE, SHADE_MIX),
+                ShadeBand::Middle => BUMP_BG,
+                ShadeBand::BottomRight => mix(BUMP_BG, BLACK, SHADE_MIX),
+            };
+            Style::default()
+                .fg(BUMP_FG)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD)
+        }
+        Cell::Hollow => {
+            // くぼみの左上の内壁が影になり、右下の内壁に光が当たる
+            let bg = match shade_band(frac) {
+                ShadeBand::TopLeft => mix(HOLLOW_BG, BLACK, SHADE_MIX),
+                ShadeBand::Middle => HOLLOW_BG,
+                ShadeBand::BottomRight => mix(HOLLOW_BG, WHITE, SHADE_MIX),
+            };
+            Style::default().fg(HOLLOW_FG).bg(bg)
+        }
+        Cell::Goal => Style::default()
+            .fg(GOAL_FG)
+            .bg(GOAL_BG)
+            .add_modifier(Modifier::BOLD),
+    }
+}
+
+/// テキスト表示の盤面。マスごとに背景色で塗り(平坦なマスは市松、凹凸は左上から光を当てた陰影)、
+/// 凸・凹・ゴール・ベーゴマは記号で示す(凸は明るい色の▲、凹は暗い色の▽)。傾き(tilt)に応じて盤を疑似3Dで台形に変形して描く
 fn render_board_text(
     frame: &mut Frame,
     area: Rect,
@@ -515,39 +682,35 @@ fn render_board_text(
     top: &TopView,
     tilt: &Tilt,
 ) {
+    let projection = BoardProjection::new(&layout, tilt);
     let buffer = frame.buffer_mut();
+    // 背景: セルの中心を逆変換し、盤のマスに当たるセルをそのマスの色で塗る
+    // (逆変換で塗るので、変形しても隙間・重なりが出ない。盤の外のセルは触らない)
+    let (width, height) = (BOARD_WIDTH as f64, BOARD_HEIGHT as f64);
+    for position in area.positions() {
+        let center = (f64::from(position.x) + 0.5, f64::from(position.y) + 0.5);
+        let Some((u, v)) = projection.unproject(center) else {
+            continue;
+        };
+        if !((0.0..width).contains(&u) && (0.0..height).contains(&v)) {
+            continue;
+        }
+        // 属するマスとマス内位置で色を決める(平坦は市松、凹凸は陰影の帯)
+        let mass = (u as usize, v as usize);
+        let frac = (u - mass.0 as f64, v - mass.1 as f64);
+        let style = cell_style(board.cell(mass.0, mass.1), mass, frac);
+        buffer[position].set_symbol(" ").set_style(style);
+    }
+    // 凸・凹・ゴールの記号: マスの中心を順変換したセルに、記号だけ置く(背景色は塗ったまま)
     for y in 0..BOARD_HEIGHT {
-        let (shift_x, shift_y) = tilt_shift(y as f64, tilt);
-        let dx = (shift_x * f64::from(layout.cell_width)).round() as i32;
-        let dy = (shift_y * f64::from(layout.cell_height)).round() as i32;
         for x in 0..BOARD_WIDTH {
-            let (glyph, style) = match board.cell(x, y) {
-                Cell::Flat => (" ", Style::default().bg(FLAT_BG)),
-                Cell::Bump => (
-                    BUMP_GLYPH,
-                    Style::default()
-                        .fg(BUMP_FG)
-                        .bg(BUMP_BG)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Cell::Hollow => (HOLLOW_GLYPH, Style::default().fg(HOLLOW_FG).bg(HOLLOW_BG)),
-                Cell::Goal => (
-                    GOAL_GLYPH,
-                    Style::default()
-                        .fg(GOAL_FG)
-                        .bg(GOAL_BG)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            };
-            let rect = layout.offset_rect(layout.cell_rect(x, y), dx, dy);
-            // 幅0の範囲でもpositions()は1点返すので、見えないマスは飛ばす
-            let visible = rect.intersection(area);
-            if !visible.is_empty() {
-                for position in visible.positions() {
-                    buffer[position].set_symbol(" ").set_style(style);
-                }
+            let cell = board.cell(x, y);
+            if cell == Cell::Flat {
+                continue;
             }
-            put_glyph(buffer, rect, area, glyph, Style::default());
+            let glyph = cell_glyph(cell);
+            let center = projection.project((x as f64 + 0.5, y as f64 + 0.5));
+            put_glyph_at(buffer, glyph_cell(center), area, glyph, Style::default());
         }
     }
     let glyph = if let Some(frame) = top.star_frame {
@@ -559,22 +722,15 @@ fn render_board_text(
     };
     // 背景色はマスのものを残し、記号と文字色だけ変える
     let style = Style::default().fg(TOP_FG).add_modifier(Modifier::BOLD);
-    let (top_shift_x, top_shift_y) = tilt_shift(top.pos.1, tilt);
-    let top_dx = (top_shift_x * f64::from(layout.cell_width)).round() as i32;
-    let top_dy = (top_shift_y * f64::from(layout.cell_height)).round() as i32;
-    let top_rect = layout.offset_rect(layout.top_rect(top.pos), top_dx, top_dy);
-    put_glyph(buffer, top_rect, area, glyph, style);
-}
-
-/// マスの中央付近(横は左寄りの1セル)に記号を置く。記号の右のセルは空白のままにする
-fn put_glyph(buffer: &mut Buffer, rect: Rect, clip: Rect, glyph: &str, style: Style) {
-    let position = Position::new(
-        rect.x + rect.width.saturating_sub(2) / 2,
-        rect.y + rect.height / 2,
+    // 位置を含むマスの中心を順変換する。場外に出た時は盤の外側の位置になり、panelの範囲に収める
+    let center = projection.project((top.pos.0.floor() + 0.5, top.pos.1.floor() + 0.5));
+    let (x, y) = glyph_cell(center);
+    let panel = layout.panel;
+    let cell = (
+        x.clamp(i32::from(panel.left()), i32::from(panel.right()) - 1),
+        y.clamp(i32::from(panel.top()), i32::from(panel.bottom()) - 1),
     );
-    if clip.contains(position) && rect.contains(position) {
-        buffer[position].set_symbol(glyph).set_style(style);
-    }
+    put_glyph_at(buffer, cell, area, glyph, style);
 }
 
 impl Default for BoardRenderer {
@@ -739,8 +895,11 @@ impl TruckViewRenderer {
             header_style = header_style.add_modifier(Modifier::REVERSED);
         }
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(upcoming_text(info.upcoming), header_style)))
-                .alignment(Alignment::Center),
+            Paragraph::new(Line::from(Span::styled(
+                upcoming_text(info.upcoming),
+                header_style,
+            )))
+            .alignment(Alignment::Center),
             header,
         );
 
@@ -830,8 +989,8 @@ impl Default for TruckViewRenderer {
 
 #[cfg(test)]
 mod tests {
+    use super::super::board::{TiltKey, TILT_STEP};
     use super::*;
-    use super::super::board::TiltKey;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::Terminal;
@@ -961,15 +1120,7 @@ mod tests {
         assert!(layout.panel.contains(Position::new(rect.x, rect.y)));
     }
 
-    // --- 傾きによる疑似3D変形(tilt_shift) ---
-
-    #[test]
-    fn tilt_shift_is_zero_when_the_board_is_flat() {
-        let tilt = Tilt::default();
-        for row in [0.0, 3.0, (BOARD_HEIGHT - 1) as f64] {
-            assert_eq!(tilt_shift(row, &tilt), (0.0, 0.0));
-        }
-    }
+    // --- 傾きによる疑似3D変形(BoardProjection) ---
 
     /// テスト用: press()を繰り返して指定レベルまで傾ける
     fn tilted(pitch_presses: i32, roll_presses: i32) -> Tilt {
@@ -991,23 +1142,518 @@ mod tests {
         tilt
     }
 
-    #[test]
-    fn tilt_shift_is_zero_at_the_center_row_even_when_tilted() {
-        let tilt = tilted(3, 3);
-        let center = (BOARD_HEIGHT as f64 - 1.0) / 2.0;
-        let (x, y) = tilt_shift(center, &tilt);
-        assert!(x.abs() < 1e-9, "roll分の横ずれは中心の行では0: {x}");
-        assert!(y.abs() < 1e-9, "pitch分の縦ずれは中心の行では0: {y}");
+    /// テスト用: 各軸を最大(±TILT_MAX)まで傾ける。符号は+1で+側、-1で−側、0で傾けない
+    fn max_tilt(pitch_sign: i32, roll_sign: i32) -> Tilt {
+        let presses = (TILT_MAX / TILT_STEP).ceil() as i32 + 1;
+        let tilt = tilted(pitch_sign * presses, roll_sign * presses);
+        assert_eq!(tilt.pitch(), f64::from(pitch_sign) * TILT_MAX);
+        assert_eq!(tilt.roll(), f64::from(roll_sign) * TILT_MAX);
+        tilt
+    }
+
+    /// テスト用: 変換の性質を確かめる傾き(各軸最大・組み合わせ最大・途中の値)
+    fn tilts_to_check() -> Vec<Tilt> {
+        vec![
+            max_tilt(1, 0),
+            max_tilt(-1, 0),
+            max_tilt(0, 1),
+            max_tilt(0, -1),
+            max_tilt(1, 1),
+            max_tilt(1, -1),
+            max_tilt(-1, 1),
+            max_tilt(-1, -1),
+            tilted(2, -3),
+        ]
+    }
+
+    fn close(a: (f64, f64), b: (f64, f64)) -> bool {
+        (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9
+    }
+
+    /// 盤の描画範囲の中心(セル座標)
+    fn board_center(layout: &BoardArea) -> (f64, f64) {
+        (
+            f64::from(layout.rect.x) + f64::from(layout.rect.width) / 2.0,
+            f64::from(layout.rect.y) + f64::from(layout.rect.height) / 2.0,
+        )
+    }
+
+    /// セル座標を、盤の描画範囲の中心からのずれ(マス単位)にする
+    fn masses_from_center(layout: &BoardArea, screen: (f64, f64)) -> (f64, f64) {
+        let (cx, cy) = board_center(layout);
+        (
+            (screen.0 - cx) / f64::from(layout.cell_width),
+            (screen.1 - cy) / f64::from(layout.cell_height),
+        )
+    }
+
+    /// 盤の行row(マス座標のy)の、投影後の横幅(セル)
+    fn projected_width(projection: &BoardProjection, row: f64) -> f64 {
+        projection.project((BOARD_WIDTH as f64, row)).0 - projection.project((0.0, row)).0
+    }
+
+    /// 盤の列column(マス座標のx)の、投影後の高さ(セル)
+    fn projected_height(projection: &BoardProjection, column: f64) -> f64 {
+        projection.project((column, BOARD_HEIGHT as f64)).1 - projection.project((column, 0.0)).1
     }
 
     #[test]
-    fn tilt_shift_is_mirrored_across_the_top_and_bottom_rows() {
-        let tilt = tilted(2, 2);
-        let top = tilt_shift(0.0, &tilt);
-        let bottom = tilt_shift((BOARD_HEIGHT - 1) as f64, &tilt);
-        assert!((top.0 + bottom.0).abs() < 1e-9, "上端と下端で横ずれが逆向き");
-        assert!((top.1 + bottom.1).abs() < 1e-9, "上端と下端で縦ずれが逆向き");
-        assert!(top.0 != 0.0, "傾いていれば横ずれが出る");
+    fn flat_projection_matches_cell_rects_and_round_trips() {
+        let layouts = [
+            board_area(Rect::new(0, 0, 40, 12)).unwrap(),
+            board_area(Rect::new(3, 2, 90, 26)).unwrap(),
+            // 1マスの大きさが任意(縦横比も任意)でも同じ
+            BoardArea {
+                rect: Rect::new(5, 7, 60, 84),
+                cell_width: 3,
+                cell_height: 7,
+                panel: Rect::new(0, 0, 250, 120),
+            },
+        ];
+        for layout in layouts {
+            let projection = BoardProjection::new(&layout, &Tilt::default());
+            for y in 0..=BOARD_HEIGHT {
+                for x in 0..=BOARD_WIDTH {
+                    let rect = layout.cell_rect(x, y);
+                    assert_eq!(
+                        projection.project((x as f64, y as f64)),
+                        (f64::from(rect.x), f64::from(rect.y)),
+                        "傾き0ではマスの角がcell_rectの位置に一致する: ({x}, {y}) {layout:?}"
+                    );
+                }
+            }
+            for pos in [
+                (0.0, 0.0),
+                (3.5, 2.25),
+                (19.75, 11.5),
+                (10.0, 6.0),
+                (7.125, 9.875),
+            ] {
+                assert_eq!(
+                    projection.unproject(projection.project(pos)),
+                    Some(pos),
+                    "傾き0の往復は元に戻る: {pos:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn flat_glyph_cell_matches_the_previous_glyph_position() {
+        let mut widths = Vec::new();
+        for area in [
+            Rect::new(0, 0, 40, 12),
+            Rect::new(1, 1, 90, 26),
+            Rect::new(0, 0, 200, 60),
+        ] {
+            let layout = board_area(area).unwrap();
+            widths.push(layout.cell_width);
+            let projection = BoardProjection::new(&layout, &Tilt::default());
+            for y in 0..BOARD_HEIGHT {
+                for x in 0..BOARD_WIDTH {
+                    let rect = layout.cell_rect(x, y);
+                    let previous = (
+                        i32::from(rect.x + (rect.width - 2) / 2),
+                        i32::from(rect.y + rect.height / 2),
+                    );
+                    let center = projection.project((x as f64 + 0.5, y as f64 + 0.5));
+                    assert_eq!(glyph_cell(center), previous, "({x}, {y}) {layout:?}");
+                }
+            }
+        }
+        assert_eq!(
+            widths,
+            vec![2, 4, 10],
+            "1マスの横幅2・4・10の3通りを確かめる"
+        );
+    }
+
+    #[test]
+    fn the_board_center_stays_put_at_any_tilt() {
+        let layout = board_area(Rect::new(2, 1, 90, 26)).unwrap();
+        for tilt in tilts_to_check() {
+            let projection = BoardProjection::new(&layout, &tilt);
+            let center = projection.project((BOARD_WIDTH as f64 / 2.0, BOARD_HEIGHT as f64 / 2.0));
+            assert!(
+                close(center, board_center(&layout)),
+                "盤の中心は動かない: {center:?} {tilt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pitching_narrows_the_far_edge_and_keeps_the_near_edge() {
+        let layout = board_area(Rect::new(0, 0, 40, 12)).unwrap();
+        let flat = BoardProjection::new(&layout, &Tilt::default());
+        let (top_row, bottom_row) = (0.0, BOARD_HEIGHT as f64);
+        let (cx, _) = board_center(&layout);
+
+        let forward = BoardProjection::new(&layout, &max_tilt(1, 0));
+        let (top, bottom) = (
+            projected_width(&forward, top_row),
+            projected_width(&forward, bottom_row),
+        );
+        assert!(top < bottom, "前傾は奥(上の行)が狭い: {top} < {bottom}");
+        assert!(
+            (bottom - projected_width(&flat, bottom_row)).abs() < 1e-9,
+            "近い側(下の行)の横幅は平らな時と同じ"
+        );
+        for (bx, by) in [(0.0, 0.0), (3.0, 5.0), (7.5, 12.0), (1.25, 9.5)] {
+            let left = forward.project((bx, by));
+            let right = forward.project((BOARD_WIDTH as f64 - bx, by));
+            assert!(
+                (left.0 + right.0 - 2.0 * cx).abs() < 1e-9 && (left.1 - right.1).abs() < 1e-9,
+                "pitchだけなら左右対称: {left:?} {right:?}"
+            );
+        }
+
+        let back = BoardProjection::new(&layout, &max_tilt(-1, 0));
+        let (top, bottom) = (
+            projected_width(&back, top_row),
+            projected_width(&back, bottom_row),
+        );
+        assert!(bottom < top, "後傾は手前(下の行)が狭い: {bottom} < {top}");
+        assert!((top - projected_width(&flat, top_row)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rolling_shortens_the_far_edge_and_keeps_the_near_edge() {
+        let layout = board_area(Rect::new(0, 0, 40, 12)).unwrap();
+        let flat = BoardProjection::new(&layout, &Tilt::default());
+        let (left_column, right_column) = (0.0, BOARD_WIDTH as f64);
+        let (_, cy) = board_center(&layout);
+
+        let right_tilt = BoardProjection::new(&layout, &max_tilt(0, 1));
+        let (left, right) = (
+            projected_height(&right_tilt, left_column),
+            projected_height(&right_tilt, right_column),
+        );
+        assert!(right < left, "右傾は右の縁が低い: {right} < {left}");
+        assert!(
+            (left - projected_height(&flat, left_column)).abs() < 1e-9,
+            "近い側(左の縁)の高さは平らな時と同じ"
+        );
+        for (bx, by) in [(0.0, 0.0), (3.0, 5.0), (20.0, 1.5), (12.5, 2.25)] {
+            let upper = right_tilt.project((bx, by));
+            let lower = right_tilt.project((bx, BOARD_HEIGHT as f64 - by));
+            assert!(
+                (upper.1 + lower.1 - 2.0 * cy).abs() < 1e-9 && (upper.0 - lower.0).abs() < 1e-9,
+                "rollだけなら上下対称: {upper:?} {lower:?}"
+            );
+        }
+
+        let left_tilt = BoardProjection::new(&layout, &max_tilt(0, -1));
+        let (left, right) = (
+            projected_height(&left_tilt, left_column),
+            projected_height(&left_tilt, right_column),
+        );
+        assert!(left < right, "左傾は左の縁が低い: {left} < {right}");
+        assert!((right - projected_height(&flat, right_column)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_far_edge_shrinks_visibly_but_not_too_much_at_max_tilt() {
+        let layout = board_area(Rect::new(0, 0, 40, 12)).unwrap();
+        let pitch = BoardProjection::new(&layout, &max_tilt(1, 0));
+        let pitch_ratio =
+            projected_width(&pitch, 0.0) / projected_width(&pitch, BOARD_HEIGHT as f64);
+        assert!(
+            (0.80..=0.90).contains(&pitch_ratio),
+            "pitch最大の遠い辺/近い辺: {pitch_ratio}"
+        );
+        let roll = BoardProjection::new(&layout, &max_tilt(0, 1));
+        let roll_ratio = projected_height(&roll, BOARD_WIDTH as f64) / projected_height(&roll, 0.0);
+        assert!(
+            (0.70..=0.85).contains(&roll_ratio),
+            "roll最大の遠い辺/近い辺: {roll_ratio}"
+        );
+    }
+
+    #[test]
+    fn combined_tilt_makes_a_convex_quad_with_the_lowest_corner_nearest_the_center() {
+        let layout = board_area(Rect::new(0, 0, 40, 12)).unwrap();
+        let projection = BoardProjection::new(&layout, &max_tilt(1, 1));
+        let (w, h) = (BOARD_WIDTH as f64, BOARD_HEIGHT as f64);
+        // 左上・右上・右下・左下の順(一周)
+        let corners: Vec<(f64, f64)> = [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)]
+            .into_iter()
+            .map(|corner| projection.project(corner))
+            .collect();
+        // 一周する間の曲がる向き(外積の符号)がすべて同じなら、四角形は凸で自己交差しない
+        let turns: Vec<f64> = (0..4)
+            .map(|i| {
+                let (a, b, c) = (corners[i], corners[(i + 1) % 4], corners[(i + 2) % 4]);
+                (b.0 - a.0) * (c.1 - b.1) - (b.1 - a.1) * (c.0 - b.0)
+            })
+            .collect();
+        assert!(
+            turns.iter().all(|&t| t > 0.0) || turns.iter().all(|&t| t < 0.0),
+            "凸な四角形: {turns:?}"
+        );
+        let distance = |screen: (f64, f64)| {
+            let (dx, dy) = masses_from_center(&layout, screen);
+            dx.hypot(dy)
+        };
+        let top_right = distance(corners[1]);
+        for (i, &corner) in corners.iter().enumerate().filter(|&(i, _)| i != 1) {
+            assert!(
+                top_right < distance(corner),
+                "右上(最も低い角)が中心に最も近い: {top_right} < {} (角{i})",
+                distance(corner)
+            );
+        }
+        // 1本の横の走査線上では、右へ行くほど盤のxが増える
+        let (_, cy) = board_center(&layout);
+        let mut previous = f64::NEG_INFINITY;
+        let mut x = f64::from(layout.rect.x);
+        while x <= f64::from(layout.rect.right()) {
+            let (u, _) = projection.unproject((x, cy + 0.3)).unwrap();
+            assert!(u > previous, "走査線上でxが単調に増える: {u} > {previous}");
+            previous = u;
+            x += 0.5;
+        }
+    }
+
+    #[test]
+    fn projection_round_trips_at_max_tilt() {
+        let layout = board_area(Rect::new(1, 2, 90, 26)).unwrap();
+        for tilt in tilts_to_check() {
+            let projection = BoardProjection::new(&layout, &tilt);
+            for pos in [
+                (0.0, 0.0),
+                (20.0, 12.0),
+                (0.5, 0.5),
+                (19.5, 0.5),
+                (10.0, 6.0),
+                (3.3, 8.7),
+                (19.9, 11.9),
+            ] {
+                let back = projection.unproject(projection.project(pos));
+                assert!(
+                    back.is_some_and(|back| close(back, pos)),
+                    "往復で元に戻る: {pos:?} -> {back:?} {tilt:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn points_beyond_the_horizon_unproject_to_none() {
+        let layout = board_area(Rect::new(0, 0, 40, 12)).unwrap();
+        let projection = BoardProjection::new(&layout, &max_tilt(1, 0));
+        let (cx, cy) = board_center(&layout);
+        // 盤の中心から真上へmassesマス離れたセル座標
+        let above = |masses: f64| (cx, cy - masses * f64::from(layout.cell_height));
+        assert_eq!(projection.unproject(above(100.0)), None, "地平線の向こう側");
+        assert!(projection.unproject(above(60.0)).is_some(), "地平線の手前");
+    }
+
+    #[test]
+    fn the_camera_is_above_every_corner_at_max_tilt() {
+        let reach = (BOARD_WIDTH / 2 + BOARD_HEIGHT / 2) as f64;
+        assert!(
+            reach * TILT_ANGLE_MAX.sin() < CAMERA_HEIGHT,
+            "盤のどの角も地平線の手前にある"
+        );
+    }
+
+    // --- 傾けた時のテキスト表示の盤面 ---
+
+    /// 盤のマスの背景色か(市松2色・凸3色・凹3色・ゴールの9色)
+    fn is_board_bg(color: Color) -> bool {
+        board_bg_colors().contains(&color)
+    }
+
+    /// 盤のマスの背景色で塗られたセル
+    fn painted_positions(buffer: &Buffer, area: Rect) -> Vec<Position> {
+        area.positions()
+            .filter(|&position| is_board_bg(buffer[position].bg))
+            .collect()
+    }
+
+    #[test]
+    fn pitching_paints_fewer_cells_and_never_outside_the_board_rect() {
+        let board = Board::standard();
+        let area = Rect::new(0, 0, 60, 20);
+        let layout = board_area(area).unwrap();
+        assert!(layout.rect != area, "盤の周りに余白がある");
+        let renderer = BoardRenderer::from_parts(None, None, None);
+        let top = top_at(board.start_position());
+        let flat = painted_positions(
+            &draw_board_with_tilt(&renderer, &board, &top, area, &Tilt::default()),
+            area,
+        )
+        .len();
+        let pitched = painted_positions(
+            &draw_board_with_tilt(&renderer, &board, &top, area, &max_tilt(1, 0)),
+            area,
+        )
+        .len();
+        assert!(
+            pitched < flat,
+            "傾けると塗られる範囲が縮む: {pitched} < {flat}"
+        );
+        assert!(
+            pitched as f64 >= flat as f64 * 0.7,
+            "縮みすぎない: {pitched} >= {flat} × 0.7"
+        );
+        for tilt in tilts_to_check() {
+            let buffer = draw_board_with_tilt(&renderer, &board, &top, area, &tilt);
+            for position in painted_positions(&buffer, area) {
+                assert!(
+                    layout.rect.contains(position),
+                    "盤の描画範囲の外は塗らない: {position:?} {tilt:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tilted_text_board_is_a_trapezoid_on_a_large_area() {
+        let board = Board::standard();
+        let area = Rect::new(0, 0, 200, 60);
+        let layout = board_area(area).unwrap();
+        assert_eq!((layout.cell_width, layout.cell_height), (10, 5));
+        let renderer = BoardRenderer::from_parts(None, None, None);
+        let top = top_at(board.start_position());
+
+        let pitched = draw_board_with_tilt(&renderer, &board, &top, area, &max_tilt(1, 0));
+        let painted = painted_positions(&pitched, area);
+        let rows: Vec<usize> = (area.top()..area.bottom())
+            .map(|y| painted.iter().filter(|p| p.y == y).count())
+            .filter(|&count| count > 0)
+            .collect();
+        let (first_row, last_row) = (rows[0], rows[rows.len() - 1]);
+        assert!(
+            first_row < last_row,
+            "pitch最大で最上段の行は最下段より狭い: {first_row} < {last_row}"
+        );
+
+        let rolled = draw_board_with_tilt(&renderer, &board, &top, area, &max_tilt(0, 1));
+        let painted = painted_positions(&rolled, area);
+        let columns: Vec<usize> = (area.left()..area.right())
+            .map(|x| painted.iter().filter(|p| p.x == x).count())
+            .filter(|&count| count > 0)
+            .collect();
+        let (first_column, last_column) = (columns[0], columns[columns.len() - 1]);
+        assert!(
+            last_column < first_column,
+            "roll最大で最も右の列は最も左の列より低い: {last_column} < {first_column}"
+        );
+    }
+
+    #[test]
+    fn glyphs_stay_inside_their_own_cells_when_tilted() {
+        let board = Board::standard();
+        let area = Rect::new(0, 0, 200, 60);
+        let renderer = BoardRenderer::from_parts(None, None, None);
+        let top = top_at(board.start_position());
+        let count_of = |cell: Cell| {
+            (0..BOARD_HEIGHT)
+                .flat_map(|y| (0..BOARD_WIDTH).map(move |x| (x, y)))
+                .filter(|&(x, y)| board.cell(x, y) == cell)
+                .count()
+        };
+        for tilt in [
+            max_tilt(1, 1),
+            max_tilt(1, -1),
+            max_tilt(-1, 1),
+            max_tilt(-1, -1),
+        ] {
+            let buffer = draw_board_with_tilt(&renderer, &board, &top, area, &tilt);
+            for (glyph, bgs, cell) in [
+                (BUMP_GLYPH, BUMP_COLORS.to_vec(), Cell::Bump),
+                (HOLLOW_GLYPH, HOLLOW_COLORS.to_vec(), Cell::Hollow),
+                (GOAL_GLYPH, vec![GOAL_BG], Cell::Goal),
+            ] {
+                let positions: Vec<Position> = area
+                    .positions()
+                    .filter(|&position| buffer[position].symbol() == glyph)
+                    .collect();
+                assert_eq!(
+                    positions.len(),
+                    count_of(cell),
+                    "{glyph}は全部描く {tilt:?}"
+                );
+                for position in positions {
+                    assert!(
+                        bgs.contains(&buffer[position].bg),
+                        "{glyph}は自分のマスの中に置く: {position:?} {:?} {tilt:?}",
+                        buffer[position].bg
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tilted_top_is_drawn_at_the_projected_center_of_its_cell() {
+        let board = Board::standard();
+        let area = Rect::new(0, 0, 90, 26);
+        let layout = board_area(area).unwrap();
+        let renderer = BoardRenderer::from_parts(None, None, None);
+        for tilt in tilts_to_check() {
+            let projection = BoardProjection::new(&layout, &tilt);
+            for pos in [(5.5, 3.5), (12.3, 8.9), (0.2, 11.7), (19.8, 0.1)] {
+                let buffer = draw_board_with_tilt(&renderer, &board, &top_at(pos), area, &tilt);
+                let (x, y) =
+                    glyph_cell(projection.project((pos.0.floor() + 0.5, pos.1.floor() + 0.5)));
+                assert_eq!(
+                    buffer[(x as u16, y as u16)].symbol(),
+                    TOP_SPIN_GLYPHS[0],
+                    "ベーゴマは位置を含むマスの中心を順変換したセルに描く: {pos:?} {tilt:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tilted_top_far_off_the_board_stays_inside_the_panel() {
+        let board = Board::standard();
+        // 端末の左上に余白を取り、パネルの外にはみ出したら分かるようにする
+        let area = Rect::new(5, 3, 60, 20);
+        let renderer = BoardRenderer::from_parts(None, None, None);
+        let mut tilts = tilts_to_check();
+        tilts.push(Tilt::default());
+        for tilt in tilts {
+            for pos in [
+                (-1000.0, -1000.0),
+                (1000.0, 1000.0),
+                (-1000.0, 1000.0),
+                (1000.0, -1000.0),
+                (-1.0, 5.0),
+                (21.0, 13.0),
+            ] {
+                let buffer = draw_board_with_tilt(&renderer, &board, &top_at(pos), area, &tilt);
+                let tops: Vec<(u16, u16)> = buffer
+                    .content()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, cell)| cell.symbol() == TOP_SPIN_GLYPHS[0])
+                    .map(|(i, _)| buffer.pos_of(i))
+                    .collect();
+                assert_eq!(tops.len(), 1, "ベーゴマを1つ描く: {pos:?} {tilt:?}");
+                let (x, y) = tops[0];
+                assert!(
+                    area.contains(Position::new(x, y)),
+                    "パネルの中に収める: ({x}, {y}) {pos:?} {tilt:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn image_board_ignores_the_tilt() {
+        let board = Board::standard();
+        let area = Rect::new(0, 0, 40, 12);
+        let top = top_at(board.start_position());
+        // 画像のキャッシュの影響を受けないよう、描画器は別々に作る
+        let flat_renderer = BoardRenderer::with_images(test_picker(), plain_board_image(), None);
+        let tilted_renderer = BoardRenderer::with_images(test_picker(), plain_board_image(), None);
+        let flat = draw_board_with_tilt(&flat_renderer, &board, &top, area, &Tilt::default());
+        let tilted_board =
+            draw_board_with_tilt(&tilted_renderer, &board, &top, area, &max_tilt(1, 1));
+        assert_eq!(flat, tilted_board, "画像表示は傾きで描画内容が変わらない");
     }
 
     #[test]
@@ -1061,10 +1707,12 @@ mod tests {
             " ",
             "記号の右隣は空白"
         );
+        let mass = (top.pos.0.floor() as usize, top.pos.1.floor() as usize);
+        assert_eq!(board.cell(mass.0, mass.1), Cell::Flat);
         assert_eq!(
             buffer[(top_rect.x + 1, top_rect.y)].bg,
-            FLAT_BG,
-            "平坦なマスは木の色"
+            checker_of(mass),
+            "平坦なマスはマスの偶奇に対応する市松のトーン"
         );
     }
 
@@ -1112,18 +1760,27 @@ mod tests {
         assert_eq!(buffer[(hollow.x, hollow.y)].symbol(), HOLLOW_GLYPH);
         assert_eq!(buffer[(bump.x, bump.y)].symbol(), BUMP_GLYPH);
         let (hollow_bg, bump_bg) = (buffer[(hollow.x, hollow.y)].bg, buffer[(bump.x, bump.y)].bg);
-        assert_eq!(hollow_bg, HOLLOW_BG);
-        assert_eq!(bump_bg, BUMP_BG);
-        assert_eq!(
-            buffer[(hollow.x + 1, hollow.y)].bg,
-            HOLLOW_BG,
-            "マス全体を凹の色で塗る"
-        );
-        assert!(luma(HOLLOW_BG) < luma(FLAT_BG), "凹は平坦より暗く沈んだ色");
         assert!(
-            luma(BUMP_BG) > luma(FLAT_BG),
-            "凸は平坦より明るく盛り上がった色"
+            HOLLOW_COLORS.contains(&hollow_bg),
+            "凹の記号は凹の色の上: {hollow_bg:?}"
         );
+        assert!(
+            BUMP_COLORS.contains(&bump_bg),
+            "凸の記号は凸の色の上: {bump_bg:?}"
+        );
+        let hollow_right = buffer[(hollow.x + 1, hollow.y)].bg;
+        assert!(
+            HOLLOW_COLORS.contains(&hollow_right),
+            "マス全体を凹の色で塗る: {hollow_right:?}"
+        );
+        for flat in CHECKER_COLORS {
+            for hollow in HOLLOW_COLORS {
+                assert!(luma(hollow) < luma(flat), "凹は平坦より暗く沈んだ色");
+            }
+            for bump in BUMP_COLORS {
+                assert!(luma(bump) > luma(flat), "凸は平坦より明るく盛り上がった色");
+            }
+        }
     }
 
     #[test]
@@ -1171,7 +1828,7 @@ mod tests {
                 pos,
                 airborne: false,
                 spin_frame: frame,
-            star_frame: None,
+                star_frame: None,
             };
             let buffer = draw_board(&renderer, &board, &top, area);
             assert_eq!(buffer[(rect.x, rect.y)].symbol(), *glyph);
@@ -1215,11 +1872,418 @@ mod tests {
         let board = Board::standard();
         let renderer = BoardRenderer::new();
         let image_renderer = BoardRenderer::with_images(test_picker(), plain_board_image(), None);
-        for (w, h) in [(1, 1), (3, 2), (10, 4), (39, 11)] {
-            let area = Rect::new(0, 0, w, h);
-            draw_board(&renderer, &board, &top_at((19.9, 11.9)), area);
-            draw_board(&image_renderer, &board, &top_at((19.9, 11.9)), area);
+        // 傾き0・各軸最大・組み合わせ最大の3通り
+        let tilts = [
+            Tilt::default(),
+            max_tilt(1, 0),
+            max_tilt(-1, 0),
+            max_tilt(0, 1),
+            max_tilt(0, -1),
+            max_tilt(1, 1),
+            max_tilt(-1, -1),
+        ];
+        for tilt in &tilts {
+            for (w, h) in [(1, 1), (3, 2), (10, 4), (39, 11)] {
+                let area = Rect::new(0, 0, w, h);
+                for pos in [(19.9, 11.9), (0.0, 0.0), (-1000.0, -1000.0)] {
+                    draw_board_with_tilt(&renderer, &board, &top_at(pos), area, tilt);
+                    draw_board_with_tilt(&image_renderer, &board, &top_at(pos), area, tilt);
+                }
+            }
         }
+    }
+
+    // --- 盤の格子(平坦なマスの市松)と凹凸の陰影 ---
+
+    /// 設計書の参考値の色(基準色を白・黒へ寄せた結果)
+    const CHECKER_LIGHT: Color = Color::Rgb(158, 117, 76);
+    const CHECKER_DARK: Color = Color::Rgb(138, 97, 55);
+    const BUMP_LIGHT: Color = Color::Rgb(213, 174, 128);
+    const BUMP_DARK: Color = Color::Rgb(174, 136, 89);
+    const HOLLOW_DARK: Color = Color::Rgb(51, 32, 15);
+    const HOLLOW_LIGHT: Color = Color::Rgb(89, 71, 54);
+    const CHECKER_COLORS: [Color; 2] = [CHECKER_LIGHT, CHECKER_DARK];
+    /// 凸の3色(左上の帯・中央の帯・右下の帯の順)
+    const BUMP_COLORS: [Color; 3] = [BUMP_LIGHT, BUMP_BG, BUMP_DARK];
+    /// 凹の3色(左上の帯・中央の帯・右下の帯の順)
+    const HOLLOW_COLORS: [Color; 3] = [HOLLOW_DARK, HOLLOW_BG, HOLLOW_LIGHT];
+
+    /// 盤の背景色の9色
+    fn board_bg_colors() -> Vec<Color> {
+        CHECKER_COLORS
+            .into_iter()
+            .chain(BUMP_COLORS)
+            .chain(HOLLOW_COLORS)
+            .chain([GOAL_BG])
+            .collect()
+    }
+
+    /// 平坦なマスmassの市松のトーン(mx + myが偶数なら明るい方)
+    fn checker_of(mass: (usize, usize)) -> Color {
+        if (mass.0 + mass.1).is_multiple_of(2) {
+            CHECKER_LIGHT
+        } else {
+            CHECKER_DARK
+        }
+    }
+
+    const WHITE_RGB: Color = Color::Rgb(255, 255, 255);
+    const BLACK_RGB: Color = Color::Rgb(0, 0, 0);
+
+    /// 各帯に当たるマス内位置(1マス=2×1セルの左のセル・マスの中心・右のセル)
+    const TOP_LEFT_FRAC: (f64, f64) = (0.25, 0.5);
+    const MIDDLE_FRAC: (f64, f64) = (0.5, 0.5);
+    const BOTTOM_RIGHT_FRAC: (f64, f64) = (0.75, 0.5);
+    const BAND_FRACS: [(f64, f64); 3] = [TOP_LEFT_FRAC, MIDDLE_FRAC, BOTTOM_RIGHT_FRAC];
+
+    fn bg_of(cell: Cell, mass: (usize, usize), frac: (f64, f64)) -> Color {
+        cell_style(cell, mass, frac)
+            .bg
+            .unwrap_or_else(|| panic!("背景色がある: {cell:?} {mass:?} {frac:?}"))
+    }
+
+    #[test]
+    fn mix_moves_each_channel_toward_the_target_and_rounds() {
+        let base = FLAT_BG;
+        assert_eq!(mix(base, WHITE_RGB, 0.0), base);
+        assert_eq!(mix(base, BLACK_RGB, 0.0), base);
+        assert_eq!(mix(base, WHITE_RGB, 1.0), WHITE_RGB);
+        assert_eq!(mix(base, BLACK_RGB, 1.0), BLACK_RGB);
+        assert_eq!(
+            mix(Color::Rgb(150, 105, 60), WHITE_RGB, 0.08),
+            CHECKER_LIGHT
+        );
+        assert_eq!(mix(Color::Rgb(150, 105, 60), BLACK_RGB, 0.08), CHECKER_DARK);
+    }
+
+    #[test]
+    fn mix_leaves_non_rgb_colors_unchanged() {
+        for t in [0.0, 0.08, 0.5, 1.0] {
+            assert_eq!(mix(Color::Yellow, WHITE_RGB, t), Color::Yellow);
+            assert_eq!(mix(Color::Reset, BLACK_RGB, t), Color::Reset);
+        }
+    }
+
+    #[test]
+    fn shade_band_splits_a_mass_into_three_bands_lit_from_the_top_left() {
+        for (frac, band) in [
+            ((0.25, 0.5), ShadeBand::TopLeft),
+            ((0.75, 0.5), ShadeBand::BottomRight),
+            ((0.5, 0.5), ShadeBand::Middle),
+            ((0.125, 0.25), ShadeBand::TopLeft),
+            ((0.375, 0.75), ShadeBand::Middle),
+            ((0.875, 0.75), ShadeBand::BottomRight),
+        ] {
+            assert_eq!(shade_band(frac), band, "{frac:?}");
+        }
+    }
+
+    #[test]
+    fn shade_band_boundaries_belong_to_the_outer_bands() {
+        // d = fu + fv − 1 がちょうど −SHADE_BAND・+SHADE_BAND になる位置
+        let top_left_edge = (1.0 - SHADE_BAND) / 2.0;
+        let bottom_right_edge = (1.0 + SHADE_BAND) / 2.0;
+        assert_eq!(
+            shade_band((top_left_edge, top_left_edge)),
+            ShadeBand::TopLeft
+        );
+        assert_eq!(
+            shade_band((bottom_right_edge, bottom_right_edge)),
+            ShadeBand::BottomRight
+        );
+        // 境界のすぐ内側は中央の帯
+        assert_eq!(
+            shade_band((top_left_edge + 0.01, top_left_edge)),
+            ShadeBand::Middle
+        );
+        assert_eq!(
+            shade_band((bottom_right_edge - 0.01, bottom_right_edge)),
+            ShadeBand::Middle
+        );
+    }
+
+    #[test]
+    fn shade_band_is_symmetric_about_the_center_of_the_mass() {
+        // 1/32刻みの格子点(浮動小数で正確に表せる)で、マスの中心について点対称な位置の帯を比べる
+        for i in 0..16 {
+            for j in 0..16 {
+                let frac = (f64::from(2 * i + 1) / 32.0, f64::from(2 * j + 1) / 32.0);
+                let mirrored = (1.0 - frac.0, 1.0 - frac.1);
+                let expected = match shade_band(frac) {
+                    ShadeBand::TopLeft => ShadeBand::BottomRight,
+                    ShadeBand::Middle => ShadeBand::Middle,
+                    ShadeBand::BottomRight => ShadeBand::TopLeft,
+                };
+                assert_eq!(shade_band(mirrored), expected, "{frac:?} ↔ {mirrored:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn flat_masses_alternate_between_two_checker_tones() {
+        let fracs = [
+            TOP_LEFT_FRAC,
+            MIDDLE_FRAC,
+            BOTTOM_RIGHT_FRAC,
+            (0.0, 0.0),
+            (0.99, 0.99),
+        ];
+        for mass in [(0, 0), (1, 1), (2, 4), (19, 11)] {
+            for frac in fracs {
+                assert_eq!(
+                    bg_of(Cell::Flat, mass, frac),
+                    CHECKER_LIGHT,
+                    "{mass:?} {frac:?}"
+                );
+            }
+        }
+        for mass in [(1, 0), (0, 1), (3, 4), (19, 10)] {
+            for frac in fracs {
+                assert_eq!(
+                    bg_of(Cell::Flat, mass, frac),
+                    CHECKER_DARK,
+                    "{mass:?} {frac:?}"
+                );
+            }
+        }
+        assert!(luma(CHECKER_DARK) < luma(FLAT_BG));
+        assert!(luma(FLAT_BG) < luma(CHECKER_LIGHT));
+    }
+
+    #[test]
+    fn bumps_are_lit_on_the_top_left_and_shaded_on_the_bottom_right() {
+        let mass = (11, 1);
+        let [light, middle, dark] = BAND_FRACS.map(|frac| bg_of(Cell::Bump, mass, frac));
+        assert_eq!([light, middle, dark], BUMP_COLORS);
+        assert!(luma(light) > luma(middle), "左上は中央より明るい");
+        assert!(luma(middle) > luma(dark), "右下は中央より暗い");
+        for bg in [light, middle, dark] {
+            assert!(
+                luma(bg) > luma(CHECKER_LIGHT),
+                "凸は平坦の明るいトーンより明るい"
+            );
+        }
+        for frac in BAND_FRACS {
+            let style = cell_style(Cell::Bump, mass, frac);
+            assert_eq!(style.fg, Some(BUMP_FG));
+            assert!(style.add_modifier.contains(Modifier::BOLD));
+        }
+    }
+
+    #[test]
+    fn hollows_are_shaded_on_the_top_left_and_lit_on_the_bottom_right() {
+        let mass = (16, 2);
+        let [dark, middle, light] = BAND_FRACS.map(|frac| bg_of(Cell::Hollow, mass, frac));
+        assert_eq!([dark, middle, light], HOLLOW_COLORS);
+        assert!(luma(dark) < luma(middle), "左上は中央より暗い");
+        assert!(luma(middle) < luma(light), "右下は中央より明るい");
+        for bg in [dark, middle, light] {
+            assert!(
+                luma(bg) < luma(CHECKER_DARK),
+                "凹は平坦の暗いトーンより暗い"
+            );
+        }
+        for frac in BAND_FRACS {
+            assert_eq!(cell_style(Cell::Hollow, mass, frac).fg, Some(HOLLOW_FG));
+        }
+    }
+
+    #[test]
+    fn goal_is_a_single_color_regardless_of_position() {
+        for mass in [(17, 1), (0, 0), (3, 4)] {
+            for frac in BAND_FRACS.into_iter().chain([(0.0, 0.0), (0.99, 0.99)]) {
+                let style = cell_style(Cell::Goal, mass, frac);
+                assert_eq!(style.bg, Some(GOAL_BG), "{mass:?} {frac:?}");
+                assert_eq!(style.fg, Some(GOAL_FG));
+                assert!(style.add_modifier.contains(Modifier::BOLD));
+            }
+        }
+    }
+
+    #[test]
+    fn hollow_flat_and_bump_colors_are_ordered_and_nine_in_total() {
+        let mut colors: Vec<Color> = Vec::new();
+        for cell in [Cell::Flat, Cell::Bump, Cell::Hollow, Cell::Goal] {
+            for mass in [(0, 0), (1, 0), (4, 7)] {
+                for i in 0..16 {
+                    for j in 0..16 {
+                        let frac = (f64::from(2 * i + 1) / 32.0, f64::from(2 * j + 1) / 32.0);
+                        let bg = bg_of(cell, mass, frac);
+                        if !colors.contains(&bg) {
+                            colors.push(bg);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(colors.len(), 9, "背景色は9色: {colors:?}");
+        for color in board_bg_colors() {
+            assert!(colors.contains(&color), "{color:?}を使う");
+        }
+        let max = |set: &[Color]| set.iter().map(|&c| luma(c)).fold(f64::MIN, f64::max);
+        let min = |set: &[Color]| set.iter().map(|&c| luma(c)).fold(f64::MAX, f64::min);
+        assert!(max(&HOLLOW_COLORS) < min(&CHECKER_COLORS), "凹 < 平坦");
+        assert!(max(&CHECKER_COLORS) < min(&BUMP_COLORS), "平坦 < 凸");
+    }
+
+    /// テキスト表示の盤を描く(ベーゴマは投入位置)
+    fn draw_text_board(area: Rect, tilt: &Tilt) -> (Board, BoardArea, Buffer) {
+        let board = Board::standard();
+        let renderer = BoardRenderer::from_parts(None, None, None);
+        let top = top_at(board.start_position());
+        let buffer = draw_board_with_tilt(&renderer, &board, &top, area, tilt);
+        (board, board_area(area).unwrap(), buffer)
+    }
+
+    #[test]
+    fn two_by_one_masses_show_the_checker_and_two_shading_steps() {
+        let (board, layout, buffer) = draw_text_board(Rect::new(0, 0, 40, 12), &Tilt::default());
+        assert_eq!((layout.cell_width, layout.cell_height), (2, 1));
+        let bg_at = |mass: (usize, usize), dx: u16| {
+            let rect = layout.cell_rect(mass.0, mass.1);
+            buffer[(rect.x + dx, rect.y)].bg
+        };
+        // 平坦: マスの中は同じトーン、右隣・真下のマスとはトーンが違う
+        for mass in [(0, 0), (1, 0), (0, 1)] {
+            assert_eq!(board.cell(mass.0, mass.1), Cell::Flat);
+        }
+        assert_eq!(bg_at((0, 0), 0), bg_at((0, 0), 1));
+        assert_eq!(bg_at((0, 0), 0), CHECKER_LIGHT);
+        assert_ne!(
+            bg_at((0, 0), 0),
+            bg_at((1, 0), 0),
+            "右隣のマスとトーンが違う"
+        );
+        assert_ne!(
+            bg_at((0, 0), 0),
+            bg_at((0, 1), 0),
+            "真下のマスとトーンが違う"
+        );
+        // 凸: 左が明・右が暗
+        let bump = first_cell(&board, Cell::Bump);
+        assert_eq!((bg_at(bump, 0), bg_at(bump, 1)), (BUMP_LIGHT, BUMP_DARK));
+        // 凹: 左が暗・右が明
+        let hollow = first_cell(&board, Cell::Hollow);
+        assert_eq!(
+            (bg_at(hollow, 0), bg_at(hollow, 1)),
+            (HOLLOW_DARK, HOLLOW_LIGHT)
+        );
+        // ゴール: 2セルとも一様
+        let goal = board.goal();
+        assert_eq!((bg_at(goal, 0), bg_at(goal, 1)), (GOAL_BG, GOAL_BG));
+    }
+
+    #[test]
+    fn four_by_two_masses_show_three_shading_steps() {
+        let (board, layout, buffer) = draw_text_board(Rect::new(0, 0, 90, 26), &Tilt::default());
+        assert_eq!((layout.cell_width, layout.cell_height), (4, 2));
+        for (cell, glyph, [top_left, middle, bottom_right]) in [
+            (Cell::Bump, BUMP_GLYPH, BUMP_COLORS),
+            (Cell::Hollow, HOLLOW_GLYPH, HOLLOW_COLORS),
+        ] {
+            let (mx, my) = first_cell(&board, cell);
+            let rect = layout.cell_rect(mx, my);
+            assert_eq!(
+                buffer[(rect.x, rect.y)].bg,
+                top_left,
+                "{cell:?}の左上のセル"
+            );
+            assert_eq!(
+                buffer[(rect.x + 3, rect.y + 1)].bg,
+                bottom_right,
+                "{cell:?}の右下のセル"
+            );
+            let glyph_position = (rect.x + 1, rect.y + 1);
+            assert_eq!(buffer[glyph_position].symbol(), glyph);
+            assert_eq!(
+                buffer[glyph_position].bg, middle,
+                "{cell:?}の記号のセルは中央の帯"
+            );
+        }
+    }
+
+    #[test]
+    fn large_masses_have_as_many_lit_cells_as_shaded_cells() {
+        let (board, layout, buffer) = draw_text_board(Rect::new(0, 0, 200, 60), &Tilt::default());
+        assert_eq!((layout.cell_width, layout.cell_height), (10, 5));
+        for (cell, light, dark) in [
+            (Cell::Bump, BUMP_LIGHT, BUMP_DARK),
+            (Cell::Hollow, HOLLOW_LIGHT, HOLLOW_DARK),
+        ] {
+            let (mx, my) = first_cell(&board, cell);
+            let rect = layout.cell_rect(mx, my);
+            let count = |color: Color| rect.positions().filter(|&p| buffer[p].bg == color).count();
+            let (lit, shaded) = (count(light), count(dark));
+            assert!(lit > 0, "{cell:?}の明のセルがある");
+            assert_eq!(lit, shaded, "{cell:?}の明と暗のセル数は等しい");
+        }
+    }
+
+    #[test]
+    fn tilted_boards_use_only_the_board_colors() {
+        for area in [Rect::new(0, 0, 90, 26), Rect::new(0, 0, 200, 60)] {
+            for tilt in tilts_to_check() {
+                let (_, layout, buffer) = draw_text_board(area, &tilt);
+                for position in layout.rect.intersection(area).positions() {
+                    let bg = buffer[position].bg;
+                    assert!(
+                        bg == Color::Reset || is_board_bg(bg),
+                        "塗ったセルは9色のどれか: {position:?} {bg:?} {tilt:?}"
+                    );
+                }
+                for (glyph, colors) in [
+                    (BUMP_GLYPH, BUMP_COLORS.to_vec()),
+                    (HOLLOW_GLYPH, HOLLOW_COLORS.to_vec()),
+                    (GOAL_GLYPH, vec![GOAL_BG]),
+                ] {
+                    for position in area.positions().filter(|&p| buffer[p].symbol() == glyph) {
+                        assert!(
+                            colors.contains(&buffer[position].bg),
+                            "{glyph}の背景は自分の種類の色: {position:?} {tilt:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_checker_follows_the_projection_when_pitched() {
+        let area = Rect::new(0, 0, 90, 26);
+        // 行yで、隣り合う平坦なセルの市松のトーンが切り替わるx
+        let switches = |buffer: &Buffer, y: u16| -> Vec<u16> {
+            (area.left() + 1..area.right())
+                .filter(|&x| {
+                    let (left, right) = (buffer[(x - 1, y)].bg, buffer[(x, y)].bg);
+                    CHECKER_COLORS.contains(&left)
+                        && CHECKER_COLORS.contains(&right)
+                        && left != right
+                })
+                .collect()
+        };
+        // 市松のセルがある最上段・最下段の行の切り替わり位置
+        let edge_rows = |buffer: &Buffer| {
+            let rows: Vec<u16> = (area.top()..area.bottom())
+                .filter(|&y| {
+                    (area.left()..area.right()).any(|x| CHECKER_COLORS.contains(&buffer[(x, y)].bg))
+                })
+                .collect();
+            (
+                switches(buffer, rows[0]),
+                switches(buffer, rows[rows.len() - 1]),
+            )
+        };
+        let (_, _, flat) = draw_text_board(area, &Tilt::default());
+        let (flat_top, flat_bottom) = edge_rows(&flat);
+        assert!(!flat_top.is_empty());
+        assert_eq!(
+            flat_top, flat_bottom,
+            "傾き0では最上段と最下段で切り替わる位置が同じ"
+        );
+        let (_, _, pitched) = draw_text_board(area, &max_tilt(1, 0));
+        let (top, bottom) = edge_rows(&pitched);
+        assert!(!top.is_empty() && !bottom.is_empty());
+        assert_ne!(top, bottom, "pitch最大では投影に従って市松が変形する");
     }
 
     // --- 画像表示の盤面(盤は1回だけ合成し、ベーゴマのマスが変わった時だけパッチを作り直す) ---
@@ -1347,7 +2411,10 @@ mod tests {
 
     #[test]
     fn shake_offset_is_zero_with_no_g() {
-        assert_eq!(shake_offset(GForce::default(), Duration::from_millis(123)), (0.0, 0.0));
+        assert_eq!(
+            shake_offset(GForce::default(), Duration::from_millis(123)),
+            (0.0, 0.0)
+        );
     }
 
     #[test]
@@ -1375,7 +2442,10 @@ mod tests {
         };
         let first = shake_offset(g, Duration::from_millis(0));
         let later = shake_offset(g, Duration::from_millis(40));
-        assert_ne!(first, later, "経過時間が変われば揺れも変わる(固定値ではない)");
+        assert_ne!(
+            first, later,
+            "経過時間が変われば揺れも変わる(固定値ではない)"
+        );
     }
 
     #[test]
