@@ -122,11 +122,62 @@ pub const NORMAL_FEINT_RATE: f64 = 0.2;
 /// 通常時の顔がランダムに切り替わる間隔の範囲(ms)。この間隔でチラチラと表情を変える
 pub const NORMAL_FLICKER_MS: (u64, u64) = (400, 900);
 
+/// プレイヤー自身を映した絵。カウンター越しの親父とは別に、画面のもう半分に表示する
+pub const PLAYER_EATING_IMAGE: &str = "look_away/player_eating.png";
+pub const PLAYER_WATCHING_IMAGE: &str = "look_away/player_watching.png";
+pub const PLAYER_GUARD_LEFT_IMAGE: &str = "look_away/player_guard_left.png";
+pub const PLAYER_GUARD_RIGHT_IMAGE: &str = "look_away/player_guard_right.png";
+pub const PLAYER_YAHHO_REPLY_IMAGE: &str = "look_away/player_yahho_reply.png";
+pub const PLAYER_DAMAGED_EATING_IMAGE: &str = "look_away/player_damaged_eating.png";
+pub const PLAYER_DAMAGED_WATCHING_IMAGE: &str = "look_away/player_damaged_watching.png";
+
+/// プレイヤー自身の絵(画像プロトコル非対応環境のフォールバック表示)
+pub const PLAYER_EATING_TEXT: &str = "がつがつ食べる自分";
+pub const PLAYER_WATCHING_TEXT: &str = "身構える自分";
+pub const PLAYER_GUARD_LEFT_TEXT: &str = "左に防いだ";
+pub const PLAYER_GUARD_RIGHT_TEXT: &str = "右に防いだ";
+pub const PLAYER_YAHHO_REPLY_TEXT: &str = "やっほーと返す自分";
+pub const PLAYER_DAMAGED_EATING_TEXT: &str = "ごはんを吹く自分";
+pub const PLAYER_DAMAGED_WATCHING_TEXT: &str = "反応が間に合わない自分";
+
 /// 相手が指す向き
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Left,
     Right,
+}
+
+/// カウンター越しではなく、プレイヤー自身を映した絵の種類。待機中は食べているか
+/// どうか、結果表示中はその判定に応じた絵を見せる
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlayerStageKind {
+    /// がつがつ食べている
+    Eating,
+    /// 食べずに身構えている(待機中のデフォルト。フライング・やっほー失敗もこのまま)
+    Watching,
+    /// 「ヤー」を左方向に防いだ
+    GuardLeft,
+    /// 「ヤー」を右方向に防いだ
+    GuardRight,
+    /// 「やっほー」に「やっほー」で返した
+    YahhoReply,
+    /// 食事中に「ヤー」で襲われ、ごはんを吹いた
+    DamagedEating,
+    /// 食べていない時に「ヤー」への反応が間に合わなかった
+    DamagedWatching,
+}
+
+/// 画像プロトコル非対応環境で、プレイヤー自身の絵の代わりに出すテキスト
+fn player_fallback_text(kind: PlayerStageKind) -> &'static str {
+    match kind {
+        PlayerStageKind::Eating => PLAYER_EATING_TEXT,
+        PlayerStageKind::Watching => PLAYER_WATCHING_TEXT,
+        PlayerStageKind::GuardLeft => PLAYER_GUARD_LEFT_TEXT,
+        PlayerStageKind::GuardRight => PLAYER_GUARD_RIGHT_TEXT,
+        PlayerStageKind::YahhoReply => PLAYER_YAHHO_REPLY_TEXT,
+        PlayerStageKind::DamagedEating => PLAYER_DAMAGED_EATING_TEXT,
+        PlayerStageKind::DamagedWatching => PLAYER_DAMAGED_WATCHING_TEXT,
+    }
 }
 
 impl Side {
@@ -233,9 +284,13 @@ struct Verdict {
     message: Option<ResultMessage>,
     /// 「ヤー」の防御に成功したか(専用SEを鳴らす判断に使う)
     is_guard_success: bool,
+    /// 結果表示中に見せる、プレイヤー自身の絵
+    player_stage: PlayerStageKind,
 }
 
 impl Verdict {
+    /// 「やっほー」に成功した時。呼び出し元はYahho成功判定のみなので、
+    /// プレイヤー側の絵は常に「やっほー」で返した顔で固定する
     fn correct(elapsed: Duration) -> Self {
         let latency_ms = elapsed.as_millis() as f64;
         Self {
@@ -245,20 +300,27 @@ impl Verdict {
             penalty: 0,
             message: None,
             is_guard_success: false,
+            player_stage: PlayerStageKind::YahhoReply,
         }
     }
 
-    /// 「ヤー」の防御に成功した時。正解の判定内容に加え、専用SEを鳴らす対象にする
-    fn guard_success(elapsed: Duration) -> Self {
+    /// 「ヤー」の防御に成功した時。正解の判定内容に加え、専用SEを鳴らす対象にする。
+    /// sideに応じて左右どちらの防御顔を見せるか決める
+    fn guard_success(elapsed: Duration, side: Side) -> Self {
         Self {
             is_guard_success: true,
+            player_stage: match side {
+                Side::Left => PlayerStageKind::GuardLeft,
+                Side::Right => PlayerStageKind::GuardRight,
+            },
             ..Self::correct(elapsed)
         }
     }
 
     /// 不正解。elapsedはその判定が確定した時点での経過時間(誤入力ならその瞬間、
-    /// 無反応ならMAX_RESPONSE_WINDOW)で、これがそのままpenalty個数の計算に使われる
-    fn incorrect(detail: &str, elapsed: Duration) -> Self {
+    /// 無反応ならMAX_RESPONSE_WINDOW)で、これがそのままpenalty個数の計算に使われる。
+    /// player_stageは呼び出し元(フライングか、ヤーへの反応失敗か)ごとに指定する
+    fn incorrect(detail: &str, elapsed: Duration, player_stage: PlayerStageKind) -> Self {
         Self {
             is_correct: false,
             detail: detail.to_string(),
@@ -266,10 +328,12 @@ impl Verdict {
             penalty: penalty_for(elapsed),
             message: None,
             is_guard_success: false,
+            player_stage,
         }
     }
 
-    /// 「やっほー」に失敗した時。♥は減らさず、ごはんがおかわりされて満タンに戻る
+    /// 「やっほー」に失敗した時。♥は減らさず、ごはんがおかわりされて満タンに戻る。
+    /// プレイヤー側の絵は専用のものが無いため変化させない(様子を見ている顔のまま)
     fn yahho_failed(detail: &str, elapsed: Duration) -> Self {
         Self {
             is_correct: false,
@@ -278,6 +342,7 @@ impl Verdict {
             penalty: 0,
             message: Some(ResultMessage::RiceRefilled),
             is_guard_success: false,
+            player_stage: PlayerStageKind::Watching,
         }
     }
 
@@ -291,6 +356,7 @@ impl Verdict {
             penalty: 1,
             message: Some(ResultMessage::RiceRefilled),
             is_guard_success: false,
+            player_stage: PlayerStageKind::DamagedEating,
         }
     }
 }
@@ -301,22 +367,32 @@ fn judge(phase: &Phase, input: Input) -> Option<Verdict> {
     match (phase, input) {
         (_, Input::Eat) => None,
         (Phase::Countdown { .. } | Phase::Result { .. }, _) => None,
-        (Phase::Idle { .. }, _) => Some(Verdict::incorrect(FALSE_START_TEXT, Duration::ZERO)),
+        (Phase::Idle { .. }, _) => Some(Verdict::incorrect(
+            FALSE_START_TEXT,
+            Duration::ZERO,
+            PlayerStageKind::Watching,
+        )),
         (Phase::Shout { side, remaining, .. }, Input::Turn(turned)) if turned == *side => {
             let elapsed = MAX_RESPONSE_WINDOW.saturating_sub(*remaining);
             if elapsed <= RESPONSE_SAFE_WINDOW {
-                Some(Verdict::guard_success(elapsed))
+                Some(Verdict::guard_success(elapsed, *side))
             } else {
-                Some(Verdict::incorrect("反応が遅い", elapsed))
+                Some(Verdict::incorrect(
+                    "反応が遅い",
+                    elapsed,
+                    PlayerStageKind::DamagedWatching,
+                ))
             }
         }
         (Phase::Shout { remaining, .. }, Input::Turn(_)) => Some(Verdict::incorrect(
             "指された方を向く",
             MAX_RESPONSE_WINDOW.saturating_sub(*remaining),
+            PlayerStageKind::DamagedWatching,
         )),
         (Phase::Shout { remaining, .. }, Input::Yahho) => Some(Verdict::incorrect(
             "向きで答える",
             MAX_RESPONSE_WINDOW.saturating_sub(*remaining),
+            PlayerStageKind::DamagedWatching,
         )),
         (Phase::Yahho { remaining }, Input::Yahho) => {
             let elapsed = MAX_RESPONSE_WINDOW.saturating_sub(*remaining);
@@ -361,11 +437,13 @@ enum Phase {
     },
     /// 「やっほー」と言っている。残りの入力受付時間
     Yahho { remaining: Duration },
-    /// 正誤の結果表示。この表示が終わるまで次の問題へは進まず、入力も受け付けない
+    /// 正誤の結果表示。この表示が終わるまで次の問題へは進まず、入力も受け付けない。
+    /// player_stageはこの結果に応じてプレイヤー側に見せる絵
     Result {
         is_correct: bool,
         elapsed: Duration,
         message: Option<ResultMessage>,
+        player_stage: PlayerStageKind,
     },
 }
 
@@ -533,6 +611,7 @@ impl LookAwayGame {
             is_correct: verdict.is_correct,
             elapsed: Duration::ZERO,
             message,
+            player_stage: verdict.player_stage,
         };
     }
 
@@ -547,6 +626,7 @@ impl LookAwayGame {
                 is_correct: false,
                 elapsed: Duration::ZERO,
                 message: None,
+                player_stage: PlayerStageKind::Watching,
             };
             return;
         }
@@ -577,6 +657,7 @@ impl LookAwayGame {
                             is_correct: true,
                             elapsed: Duration::ZERO,
                             message: None,
+                            player_stage: PlayerStageKind::Eating,
                         };
                         return;
                     }
@@ -601,7 +682,11 @@ impl LookAwayGame {
             Phase::Shout { remaining, .. } => {
                 *remaining = remaining.saturating_sub(dt);
                 if remaining.is_zero() {
-                    self.finish_question(Verdict::incorrect(TIMEOUT_TEXT, MAX_RESPONSE_WINDOW));
+                    self.finish_question(Verdict::incorrect(
+                        TIMEOUT_TEXT,
+                        MAX_RESPONSE_WINDOW,
+                        PlayerStageKind::DamagedWatching,
+                    ));
                 }
             }
             Phase::Yahho { remaining } => {
@@ -625,8 +710,22 @@ impl LookAwayGame {
 
     /// 相手(と合図)を描くステージ
     fn render_stage(&self, frame: &mut Frame, area: Rect) {
+        if let Phase::Countdown { state } = &self.phase {
+            countdown::render(frame, area, state);
+            return;
+        }
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(area);
+        self.render_opponent_stage(frame, cols[0]);
+        self.render_player_stage(frame, cols[1]);
+    }
+
+    /// カウンター越しの親父を描く(Countdown以外の全フェーズ)
+    fn render_opponent_stage(&self, frame: &mut Frame, area: Rect) {
         match &self.phase {
-            Phase::Countdown { state } => countdown::render(frame, area, state),
+            Phase::Countdown { .. } => unreachable!("render_stageでCountdownは処理済み"),
             Phase::Result {
                 is_correct,
                 message,
@@ -683,6 +782,32 @@ impl LookAwayGame {
                 ],
             ),
         }
+    }
+
+    /// いまの局面でプレイヤー自身に見せる絵の種類
+    fn player_stage_kind(&self) -> PlayerStageKind {
+        match &self.phase {
+            Phase::Countdown { .. } => PlayerStageKind::Watching,
+            Phase::Idle { is_eating, .. } => {
+                if *is_eating {
+                    PlayerStageKind::Eating
+                } else {
+                    PlayerStageKind::Watching
+                }
+            }
+            Phase::Shout { .. } | Phase::Yahho { .. } => PlayerStageKind::Watching,
+            Phase::Result { player_stage, .. } => *player_stage,
+        }
+    }
+
+    /// プレイヤー自身を描く。画像が揃っていれば画像、無ければテキストの絵
+    fn render_player_stage(&self, frame: &mut Frame, area: Rect) {
+        let kind = self.player_stage_kind();
+        if self.stage_renderer.render_player(frame, area, kind) {
+            return;
+        }
+        let text = player_fallback_text(kind);
+        render_character(frame, area, IDLE_BG, theme::TEXT, vec![text.to_string()]);
     }
 
     /// カウンター越しの親父を描く。画像が揃っていれば画像、無ければテキストの絵
@@ -883,14 +1008,28 @@ struct StageImages {
     yahho: StatefulProtocol,
 }
 
-/// カウンター越しの親父の描画器。静止画が全て読めた時だけ画像で描く
+/// プレイヤー自身の静止画(食べている/身構え/防御左右/やっほー返答/被弾2種)
+struct PlayerImages {
+    eating: StatefulProtocol,
+    watching: StatefulProtocol,
+    guard_left: StatefulProtocol,
+    guard_right: StatefulProtocol,
+    yahho_reply: StatefulProtocol,
+    damaged_eating: StatefulProtocol,
+    damaged_watching: StatefulProtocol,
+}
+
+/// カウンター越しの親父とプレイヤー自身の描画器。それぞれ静止画が全て読めた
+/// グループだけ画像で描き、そうでなければテキストの絵にフォールバックする
 struct StageRenderer {
     images: Option<RefCell<StageImages>>,
+    player_images: Option<RefCell<PlayerImages>>,
 }
 
 impl StageRenderer {
     fn new() -> Self {
-        let images = detect_picker().and_then(|picker| {
+        let picker = detect_picker();
+        let images = picker.clone().and_then(|picker| {
             let normal: Option<Vec<_>> = STAGE_NORMAL_IMAGES
                 .iter()
                 .map(|path| splash::load_embedded_image(path))
@@ -923,13 +1062,40 @@ impl StageRenderer {
                 yahho: picker.new_resize_protocol(yahho),
             }))
         });
-        Self { images }
+        let player_images = picker.and_then(|picker| {
+            let eating = splash::load_embedded_image(PLAYER_EATING_IMAGE)?;
+            let watching = splash::load_embedded_image(PLAYER_WATCHING_IMAGE)?;
+            let guard_left = splash::load_embedded_image(PLAYER_GUARD_LEFT_IMAGE)?;
+            let guard_right = splash::load_embedded_image(PLAYER_GUARD_RIGHT_IMAGE)?;
+            let yahho_reply = splash::load_embedded_image(PLAYER_YAHHO_REPLY_IMAGE)?;
+            let damaged_eating = splash::load_embedded_image(PLAYER_DAMAGED_EATING_IMAGE)?;
+            let damaged_watching = splash::load_embedded_image(PLAYER_DAMAGED_WATCHING_IMAGE)?;
+            Some(RefCell::new(PlayerImages {
+                eating: picker.new_resize_protocol(eating),
+                watching: picker.new_resize_protocol(watching),
+                guard_left: picker.new_resize_protocol(guard_left),
+                guard_right: picker.new_resize_protocol(guard_right),
+                yahho_reply: picker.new_resize_protocol(yahho_reply),
+                damaged_eating: picker.new_resize_protocol(damaged_eating),
+                damaged_watching: picker.new_resize_protocol(damaged_watching),
+            }))
+        });
+        Self {
+            images,
+            player_images,
+        }
     }
 
     /// 画像で描くか(false=テキストの絵)。テストでの確認用
     #[cfg(test)]
     fn uses_image(&self) -> bool {
         self.images.is_some()
+    }
+
+    /// プレイヤー自身の絵を画像で描くか(false=テキストの絵)。テストでの確認用
+    #[cfg(test)]
+    fn uses_player_image(&self) -> bool {
+        self.player_images.is_some()
     }
 
     /// areaに画像を描いたか(true=描いた、false=画像が無いので呼び出し元がテキストで描く)
@@ -946,6 +1112,30 @@ impl StageRenderer {
             StageKind::ShoutLeft(i) => &mut images.shout_left[i],
             StageKind::ShoutRight(i) => &mut images.shout_right[i],
             StageKind::Yahho => &mut images.yahho,
+        };
+        let widget = StatefulImage::default().resize(Resize::Fit(Some(FilterType::Triangle)));
+        frame.render_stateful_widget(widget, area, protocol);
+        true
+    }
+
+    /// areaにプレイヤー自身の絵を描いたか(true=描いた、false=画像が無いので
+    /// 呼び出し元がテキストで描く)
+    fn render_player(&self, frame: &mut Frame, area: Rect, kind: PlayerStageKind) -> bool {
+        let Some(images) = &self.player_images else {
+            return false;
+        };
+        if area.is_empty() {
+            return true;
+        }
+        let mut images = images.borrow_mut();
+        let protocol = match kind {
+            PlayerStageKind::Eating => &mut images.eating,
+            PlayerStageKind::Watching => &mut images.watching,
+            PlayerStageKind::GuardLeft => &mut images.guard_left,
+            PlayerStageKind::GuardRight => &mut images.guard_right,
+            PlayerStageKind::YahhoReply => &mut images.yahho_reply,
+            PlayerStageKind::DamagedEating => &mut images.damaged_eating,
+            PlayerStageKind::DamagedWatching => &mut images.damaged_watching,
         };
         let widget = StatefulImage::default().resize(Resize::Fit(Some(FilterType::Triangle)));
         frame.render_stateful_widget(widget, area, protocol);
@@ -1057,6 +1247,14 @@ mod tests {
         matches!(game.phase, Phase::Result { is_correct, .. } if is_correct == correct)
     }
 
+    /// 結果表示中のプレイヤー自身の絵を取り出す(結果表示中でなければpanic)
+    fn result_player_stage(game: &LookAwayGame) -> PlayerStageKind {
+        match game.phase {
+            Phase::Result { player_stage, .. } => player_stage,
+            _ => panic!("結果表示中のはず"),
+        }
+    }
+
     /// 問題冒頭のカウントダウンを最後まで進め、待機にする。フェーズ(PHASE_DURATION)ごとに
     /// 分けて進める(実機のフレームループと同じく、一度に全部進めるとGO!!への遷移自体を
     /// 検出できずSEが鳴らないため)
@@ -1145,6 +1343,18 @@ mod tests {
     fn stage_bg(buffer: &Buffer) -> Color {
         let (_, body) = theme::split_hud(AREA);
         buffer[(body.x + 2, body.y + 2)].bg
+    }
+
+    /// HUDとフッターを除いた、プレイヤー自身を表示するステージ右半分だけの文字列
+    fn player_stage_text(buffer: &Buffer) -> String {
+        let (_, body) = theme::split_hud(AREA);
+        let stage_bottom = body.y + body.height.saturating_sub(3);
+        let mid_x = body.x + body.width / 2;
+        (body.y..stage_bottom)
+            .flat_map(|y| (mid_x..body.right()).map(move |x| (x, y)))
+            .map(|pos| buffer[pos].symbol().to_string())
+            .collect::<String>()
+            .replace(' ', "")
     }
 
     // --- 名称・定数 ---
@@ -1798,6 +2008,7 @@ mod tests {
         // テスト環境ではpickerを検出できないので、常にテキストのフォールバックになる
         let renderer = StageRenderer::new();
         assert!(!renderer.uses_image());
+        assert!(!renderer.uses_player_image());
     }
 
     #[test]
@@ -1806,6 +2017,25 @@ mod tests {
         paths.extend(STAGE_NORMAL_IMAGES);
         paths.extend(STAGE_SHOUT_RIGHT_IMAGES);
         paths.extend(STAGE_SHOUT_LEFT_IMAGES);
+        for path in paths {
+            assert!(
+                splash::load_embedded_image(path).is_some(),
+                "{path}が埋め込まれデコードできること"
+            );
+        }
+    }
+
+    #[test]
+    fn player_images_are_embedded_and_decodable() {
+        let paths = [
+            PLAYER_EATING_IMAGE,
+            PLAYER_WATCHING_IMAGE,
+            PLAYER_GUARD_LEFT_IMAGE,
+            PLAYER_GUARD_RIGHT_IMAGE,
+            PLAYER_YAHHO_REPLY_IMAGE,
+            PLAYER_DAMAGED_EATING_IMAGE,
+            PLAYER_DAMAGED_WATCHING_IMAGE,
+        ];
         for path in paths {
             assert!(
                 splash::load_embedded_image(path).is_some(),
@@ -1880,6 +2110,115 @@ mod tests {
         );
         assert!(!stage_text(&buffer).contains(&compact(WATCHING_TEXT)));
         assert_eq!(stage_bg(&buffer), EATING_BG, "食事中は背景色も変える");
+    }
+
+    // --- プレイヤー自身の絵 ---
+
+    #[test]
+    fn player_stage_matches_eating_state_while_idle() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        assert_eq!(game.player_stage_kind(), PlayerStageKind::Watching);
+        assert!(player_stage_text(&rendered(&game)).contains(&compact(PLAYER_WATCHING_TEXT)));
+        press(&mut game, KeyCode::Enter);
+        assert_eq!(game.player_stage_kind(), PlayerStageKind::Eating);
+        assert!(player_stage_text(&rendered(&game)).contains(&compact(PLAYER_EATING_TEXT)));
+    }
+
+    #[test]
+    fn player_stage_is_watching_while_waiting_for_shout_or_yahho_input() {
+        let mut game = LookAwayGame::new();
+        shout(&mut game, Side::Left);
+        assert_eq!(game.player_stage_kind(), PlayerStageKind::Watching);
+        yahho(&mut game);
+        assert_eq!(game.player_stage_kind(), PlayerStageKind::Watching);
+    }
+
+    #[test]
+    fn guard_success_shows_matching_side_player_stage() {
+        for side in SIDES {
+            let mut game = LookAwayGame::new();
+            finish_countdown(&mut game);
+            shout(&mut game, side);
+            press(&mut game, side.key());
+            assert!(is_result(&game, true));
+            let expected = match side {
+                Side::Left => PlayerStageKind::GuardLeft,
+                Side::Right => PlayerStageKind::GuardRight,
+            };
+            assert_eq!(result_player_stage(&game), expected);
+            let text = if side == Side::Left {
+                PLAYER_GUARD_LEFT_TEXT
+            } else {
+                PLAYER_GUARD_RIGHT_TEXT
+            };
+            assert!(player_stage_text(&rendered(&game)).contains(&compact(text)));
+        }
+    }
+
+    #[test]
+    fn yahho_success_shows_yahho_reply_player_stage() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        yahho(&mut game);
+        press(&mut game, KeyCode::Char(' '));
+        assert!(is_result(&game, true));
+        assert_eq!(result_player_stage(&game), PlayerStageKind::YahhoReply);
+        assert!(player_stage_text(&rendered(&game)).contains(&compact(PLAYER_YAHHO_REPLY_TEXT)));
+    }
+
+    #[test]
+    fn caught_eating_shows_damaged_eating_player_stage() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        game.begin_event(Event::Shout(Side::Left), true);
+        assert!(is_result(&game, false));
+        assert_eq!(result_player_stage(&game), PlayerStageKind::DamagedEating);
+        assert!(player_stage_text(&rendered(&game)).contains(&compact(PLAYER_DAMAGED_EATING_TEXT)));
+    }
+
+    #[test]
+    fn shout_failure_shows_damaged_watching_player_stage() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        shout(&mut game, Side::Left);
+        press(&mut game, KeyCode::Right); // 逆方向を押して不正解にする
+        assert!(is_result(&game, false));
+        assert_eq!(result_player_stage(&game), PlayerStageKind::DamagedWatching);
+        assert!(
+            player_stage_text(&rendered(&game)).contains(&compact(PLAYER_DAMAGED_WATCHING_TEXT))
+        );
+    }
+
+    #[test]
+    fn shout_timeout_shows_damaged_watching_player_stage() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        shout(&mut game, Side::Right);
+        game.update(MAX_RESPONSE_WINDOW);
+        assert!(is_result(&game, false));
+        assert_eq!(result_player_stage(&game), PlayerStageKind::DamagedWatching);
+    }
+
+    #[test]
+    fn false_start_keeps_watching_player_stage() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        press(&mut game, KeyCode::Left);
+        assert!(is_result(&game, false));
+        assert_eq!(result_player_stage(&game), PlayerStageKind::Watching);
+    }
+
+    #[test]
+    fn yahho_failure_keeps_watching_player_stage() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        game.rice = 0.3;
+        yahho(&mut game);
+        game.update(RESPONSE_SAFE_WINDOW + ms(1));
+        press(&mut game, KeyCode::Char(' '));
+        assert!(is_result(&game, false));
+        assert_eq!(result_player_stage(&game), PlayerStageKind::Watching);
     }
 
     #[test]
