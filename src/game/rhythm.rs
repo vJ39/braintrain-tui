@@ -282,21 +282,19 @@ enum StepPattern {
     Jump,
     /// このビート位置に同時押し+次のビートとの中間点に単押し
     JumpAndEighth,
-    /// このビート位置に同時押し+次のビートとの中間点にも同時押し(Extreme専用)
-    JumpAndEighthJump,
 }
 
 /// セクション密度・ビートインデックスから、そのビートの配置を決める純粋関数
 ///
-/// 方針:
+/// 方針: 同時押しは控えめにし、片足(単押し)の8分音符連打を主体にする
 /// - Lowは休符を残し、単押しのみ(「3拍踏んで1拍休む」)
 /// - Midは8分音符を混ぜる(2拍に1回)
-/// - Highは8分音符の連続+4拍ごとの同時押し
-/// - Extremeは最高難度。休符なしで全ビート同時押し+8分音符、4拍目は8分音符の位置も同時押しにする
+/// - Highは8分音符の連続。8拍フレーズの頭だけ同時押しで区切りを付ける
+/// - Extremeは最高難度。休符なしで全ビート8分音符の単押し連打。4拍目だけ同時押しで畳みかける
 /// - beat_indexは曲全体での通し番号(4拍・8拍周期の基準に使う)
 fn step_pattern_for(density: SectionDensity, beat_index: usize) -> StepPattern {
     use SectionDensity::{Extreme, High, Low, Mid};
-    use StepPattern::{Jump, JumpAndEighth, JumpAndEighthJump, Single, SingleAndEighth, Skip};
+    use StepPattern::{Jump, JumpAndEighth, Single, SingleAndEighth, Skip};
     match density {
         Low => {
             if beat_index % 4 == 3 {
@@ -312,18 +310,17 @@ fn step_pattern_for(density: SectionDensity, beat_index: usize) -> StepPattern {
                 Single
             }
         }
-        // 8拍フレーズの頭は同時押しだけで区切りを付け、4拍目は同時押し+8分音符で畳みかける
+        // 8拍フレーズの頭だけ同時押しで区切りを付け、残りは8分音符の単押し連打にする
         High => match beat_index % 8 {
             0 => Jump,
-            4 => JumpAndEighth,
             _ => SingleAndEighth,
         },
-        // 休符を作らず毎拍同時押し+8分音符。4拍目は8分音符も同時押しにして畳みかける
+        // 休符を作らず毎拍8分音符の単押し連打。4拍目だけ同時押しで畳みかける
         Extreme => {
             if beat_index % 4 == 3 {
-                JumpAndEighthJump
-            } else {
                 JumpAndEighth
+            } else {
+                SingleAndEighth
             }
         }
     }
@@ -429,9 +426,7 @@ fn generate_chart(song: &RhythmSong) -> Vec<Note> {
             StepPattern::Skip => {}
             StepPattern::Single => notes.push(Note::new(vec![cycler.next_single()], hit_at)),
             StepPattern::Jump => notes.push(Note::new(cycler.next_jump(), hit_at)),
-            StepPattern::SingleAndEighth
-            | StepPattern::JumpAndEighth
-            | StepPattern::JumpAndEighthJump => {
+            StepPattern::SingleAndEighth | StepPattern::JumpAndEighth => {
                 let lanes = if pattern == StepPattern::SingleAndEighth {
                     vec![cycler.next_single()]
                 } else {
@@ -440,12 +435,7 @@ fn generate_chart(song: &RhythmSong) -> Vec<Note> {
                 notes.push(Note::new(lanes, hit_at));
                 // 最後のビートには次のビートが無いので8分音符は付けない
                 if let Some(eighth_at) = eighth_at {
-                    let eighth_lanes = if pattern == StepPattern::JumpAndEighthJump {
-                        cycler.next_jump()
-                    } else {
-                        vec![cycler.next_single()]
-                    };
-                    notes.push(Note::new(eighth_lanes, eighth_at));
+                    notes.push(Note::new(vec![cycler.next_single()], eighth_at));
                 }
             }
         }
@@ -1386,19 +1376,19 @@ mod tests {
             StepPattern::SingleAndEighth => 2,
             StepPattern::Jump => 2,
             StepPattern::JumpAndEighth => 3,
-            StepPattern::JumpAndEighthJump => 4,
         }
     }
 
-    /// 8拍分の同時押しの回数(8分音符位置の同時押しも数える)
+    /// 8拍分の同時押しの回数
     fn jumps_per_8_beats(density: SectionDensity) -> usize {
         (0..8)
-            .map(|i| match step_pattern_for(density, i) {
-                StepPattern::Jump | StepPattern::JumpAndEighth => 1,
-                StepPattern::JumpAndEighthJump => 2,
-                _ => 0,
+            .filter(|&i| {
+                matches!(
+                    step_pattern_for(density, i),
+                    StepPattern::Jump | StepPattern::JumpAndEighth
+                )
             })
-            .sum()
+            .count()
     }
 
     /// 8拍分(フレーズ2小節分)の合計打鍵数
@@ -1407,14 +1397,12 @@ mod tests {
     }
 
     #[test]
-    fn step_pattern_jumps_every_four_beats_in_high() {
+    fn step_pattern_jumps_once_per_eight_beats_in_high() {
+        // 同時押しは8拍フレーズの頭だけ。残りは片足(単押し)の8分音符連打にする
         for i in 0..16 {
             let p = step_pattern_for(SectionDensity::High, i);
-            if i % 4 == 0 {
-                assert!(
-                    matches!(p, StepPattern::Jump | StepPattern::JumpAndEighth),
-                    "beat{i} => {p:?}"
-                );
+            if i % 8 == 0 {
+                assert_eq!(p, StepPattern::Jump, "beat{i}");
             } else {
                 assert_eq!(p, StepPattern::SingleAndEighth, "beat{i}");
             }
@@ -1423,29 +1411,20 @@ mod tests {
         for density in [SectionDensity::Low, SectionDensity::Mid] {
             for i in 0..16 {
                 let p = step_pattern_for(density, i);
-                assert!(!matches!(
-                    p,
-                    StepPattern::Jump | StepPattern::JumpAndEighth | StepPattern::JumpAndEighthJump
-                ));
+                assert!(!matches!(p, StepPattern::Jump | StepPattern::JumpAndEighth));
             }
         }
     }
 
     #[test]
-    fn step_pattern_extreme_jumps_on_every_beat_with_eighth_and_no_rests() {
+    fn step_pattern_extreme_fills_every_beat_with_eighth_singles_and_jumps_on_the_fourth() {
+        // 休符なし・片足の8分音符連打で埋め尽くす。4拍目だけ同時押しで畳みかける
         for i in 0..32 {
             let p = step_pattern_for(SectionDensity::Extreme, i);
-            // 休符なし・全ビートで同時押し・全ビートに8分音符
-            assert!(
-                matches!(
-                    p,
-                    StepPattern::JumpAndEighth | StepPattern::JumpAndEighthJump
-                ),
-                "beat{i} => {p:?}"
-            );
-            // 4拍目は8分音符の位置も同時押しにして畳みかける
             if i % 4 == 3 {
-                assert_eq!(p, StepPattern::JumpAndEighthJump, "beat{i}");
+                assert_eq!(p, StepPattern::JumpAndEighth, "beat{i}");
+            } else {
+                assert_eq!(p, StepPattern::SingleAndEighth, "beat{i}");
             }
         }
     }
@@ -1454,27 +1433,26 @@ mod tests {
     fn step_pattern_extreme_is_clearly_denser_than_high() {
         let high = presses_per_8_beats(SectionDensity::High);
         let extreme = presses_per_8_beats(SectionDensity::Extreme);
-        // 打鍵数で1.5倍以上(「Highよりはっきり難しい」)
-        assert!(extreme * 2 >= high * 3, "High {high} / Extreme {extreme}");
+        // 打鍵数はHigh以上(片足連打主体なので大きな倍率は求めない)
+        assert!(extreme >= high, "High {high} / Extreme {extreme}");
         let high_jumps = jumps_per_8_beats(SectionDensity::High);
         let extreme_jumps = jumps_per_8_beats(SectionDensity::Extreme);
+        // 同時押しの頻度ははっきりExtremeの方が多い(片足連打主体でも密度の違いは付ける)
         assert!(
-            extreme_jumps >= high_jumps * 4,
+            extreme_jumps > high_jumps,
             "同時押し High {high_jumps} / Extreme {extreme_jumps}"
         );
     }
 
     #[test]
-    fn step_pattern_double_jump_only_appears_in_extreme() {
-        for density in [
-            SectionDensity::Low,
-            SectionDensity::Mid,
-            SectionDensity::High,
-        ] {
+    fn step_pattern_jump_only_appears_in_high_and_extreme() {
+        for density in [SectionDensity::Low, SectionDensity::Mid] {
             for i in 0..32 {
-                assert_ne!(
-                    step_pattern_for(density, i),
-                    StepPattern::JumpAndEighthJump,
+                assert!(
+                    !matches!(
+                        step_pattern_for(density, i),
+                        StepPattern::Jump | StepPattern::JumpAndEighth
+                    ),
                     "{density:?} beat{i}"
                 );
             }
@@ -1767,7 +1745,8 @@ mod tests {
                 .filter(|n| n.lanes.len() == 2)
                 .map(|n| n.lanes)
                 .collect();
-            assert!(jumps.len() > 10, "{}", song.track_name);
+            // 片足連打主体になり同時押し数は減ったが、周期性チェックには十分な数がある
+            assert!(jumps.len() >= 5, "{}", song.track_name);
             for p in 1..=2 {
                 assert!(
                     !is_periodic(&jumps, p),
@@ -1786,68 +1765,44 @@ mod tests {
     }
 
     #[test]
-    fn generate_chart_extreme_jumps_on_every_beat_and_double_jumps_on_fourth() {
+    fn generate_chart_extreme_fills_every_beat_with_eighth_singles_and_jumps_on_the_fourth() {
         let notes = generate_chart(&TEST_SONG_EXTREME);
         // 全ビート+その8分音符(最後のビートは8分音符なし)
         assert_eq!(notes.len(), TEST_BEATS.len() * 2 - 1);
         for (i, &beat_ms) in TEST_BEATS.iter().enumerate() {
             let on_beat = &notes[i * 2];
             assert_eq!(on_beat.hit_at, Duration::from_millis(beat_ms as u64));
-            assert_eq!(on_beat.lanes.len(), 2, "beat{i}は同時押し");
-            assert_ne!(on_beat.lanes[0], on_beat.lanes[1]);
+            let expected_on_beat_lanes = if i % 4 == 3 { 2 } else { 1 };
+            assert_eq!(on_beat.lanes.len(), expected_on_beat_lanes, "beat{i}");
+            if expected_on_beat_lanes == 2 {
+                assert_ne!(on_beat.lanes[0], on_beat.lanes[1], "beat{i}");
+            }
             if let Some(next_ms) = TEST_BEATS.get(i + 1) {
                 let eighth = &notes[i * 2 + 1];
                 assert_eq!(eighth.hit_at, eighth_hit_at(beat_ms, *next_ms));
-                let expected_lanes = if i % 4 == 3 { 2 } else { 1 };
-                assert_eq!(eighth.lanes.len(), expected_lanes, "beat{i}の8分音符");
-                if expected_lanes == 2 {
-                    assert_ne!(eighth.lanes[0], eighth.lanes[1], "beat{i}");
-                }
+                assert_eq!(eighth.lanes.len(), 1, "beat{i}の8分音符は単押し");
             }
         }
     }
 
     #[test]
     fn generate_chart_extreme_is_clearly_busier_than_high() {
+        // 片足連打主体になったため、打鍵数の差は小さい。同時押しの頻度で密度の違いを付けている
+        // (jumps_per_8_beatsのテストを参照)ので、ここでは単純に上回ることだけ確認する
         let high = chart_press_count(&generate_chart(&TEST_SONG));
         let extreme = chart_press_count(&generate_chart(&TEST_SONG_EXTREME));
-        assert!(extreme * 2 >= high * 3, "High {high} / Extreme {extreme}");
-    }
-
-    /// 譜面中の任意の10秒間に踏むキー数の最大値(ピークの忙しさ)
-    fn peak_presses_in_10s(notes: &[Note]) -> usize {
-        const WINDOW: Duration = Duration::from_secs(10);
-        let mut best = 0;
-        let mut end = 0;
-        let mut sum = 0;
-        for start in 0..notes.len() {
-            while end < notes.len() && notes[end].hit_at < notes[start].hit_at + WINDOW {
-                sum += notes[end].lanes.len();
-                end += 1;
-            }
-            best = best.max(sum);
-            sum -= notes[start].lanes.len();
-        }
-        best
+        assert!(extreme > high, "High {high} / Extreme {extreme}");
     }
 
     #[test]
-    fn apex_movement_is_clearly_harder_than_existing_songs() {
+    fn apex_movement_has_more_total_presses_than_existing_songs() {
+        // 片足連打主体になり、Extreme区間のピークの忙しさは他曲のHigh区間と近くなったが、
+        // 総打鍵数(曲全体の忙しさ)ではApexが引き続き上回る
         let apex = generate_chart(song_by_track("Apex_Movement"));
-        let apex_peak = peak_presses_in_10s(&apex);
         let apex_total = chart_press_count(&apex);
         for track in ["Top_of_the_Leaderboard", "Redline_Response_Time"] {
             let other = generate_chart(song_by_track(track));
-            let other_peak = peak_presses_in_10s(&other);
             let other_total = chart_press_count(&other);
-            println!(
-                "10秒ピーク打鍵数 Apex {apex_peak} / {track} {other_peak}, 総打鍵数 Apex {apex_total} / {track} {other_total}"
-            );
-            // ピークの忙しさで1.2倍超、総打鍵数でも上回る
-            assert!(
-                apex_peak * 5 > other_peak * 6,
-                "{track}: Apex {apex_peak} vs {other_peak}"
-            );
             assert!(
                 apex_total > other_total,
                 "{track}: Apex {apex_total} vs {other_total}"
@@ -1857,11 +1812,12 @@ mod tests {
 
     #[test]
     fn existing_song_charts_are_unchanged_from_the_former_advanced_charts() {
-        // 難易度選択の廃止前に上級で生成していた譜面と同じ(ノーツ数, 打鍵数)になる
+        // 同時押しを減らし片足連打を増やした後の譜面が、意図せず変わっていないことを確認する
+        // (ノーツ数, 打鍵数)
         for (track, expected) in [
-            ("Top_of_the_Leaderboard", (593, 609)),
-            ("Redline_Response_Time", (668, 683)),
-            ("Apex_Movement", (645, 926)),
+            ("Top_of_the_Leaderboard", (593, 601)),
+            ("Redline_Response_Time", (668, 675)),
+            ("Apex_Movement", (645, 701)),
         ] {
             let notes = generate_chart(song_by_track(track));
             assert_eq!((notes.len(), chart_press_count(&notes)), expected, "{track}");
@@ -1869,18 +1825,12 @@ mod tests {
     }
 
     #[test]
-    fn overclocked_tempo_chart_has_jumps_and_double_jumps() {
-        // 最高潮(Extreme)区間では8分音符の位置の同時押しまで出る
+    fn overclocked_tempo_chart_has_jumps() {
+        // 片足連打主体になったが、最高潮(Extreme)区間の4拍目には引き続き同時押しが出る
         let notes = generate_chart(song_by_track("Overclocked_Tempo"));
         assert!(notes.len() > 100, "{}", notes.len());
         let jumps = notes.iter().filter(|n| n.lanes.len() == 2).count();
-        assert!(jumps > 100, "同時押し{jumps}個");
-        // 90秒からの最高潮(Extreme)区間の先頭ビートは同時押しになる
-        let song = song_by_track("Overclocked_Tempo");
-        let extreme_start = beat_index_at_or_after_secs(song.beat_times_ms, 90);
-        let extreme_ms = Duration::from_millis(song.beat_times_ms[extreme_start] as u64);
-        let on_extreme_beat = notes.iter().find(|n| n.hit_at == extreme_ms).unwrap();
-        assert_eq!(on_extreme_beat.lanes.len(), 2, "Extreme区間の頭は同時押し");
+        assert!(jumps > 20, "同時押し{jumps}個");
     }
 
     #[test]
