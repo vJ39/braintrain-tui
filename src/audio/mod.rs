@@ -65,6 +65,10 @@ pub enum SeKind {
     LookAwayShout,
     /// 「べー」で軽トラが障害物を避ける・停止する・発進する時のスキール音(複数候補からランダムに1つ)
     BeigomaSkid,
+    /// 「やっほー」で「ヤー」「やっほー」いずれかのイベントが始まった瞬間に鳴らす爆発音
+    LookAwayExplosion,
+    /// 「やっほー」で「ヤー」の防御に成功した時に鳴らす音
+    LookAwayGuardSuccess,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,11 +149,10 @@ pub fn random_bgm_track(category: BgmCategory) -> Option<String> {
 }
 
 /// 「やっほー」で相手が「やっほー」と言う時の音声の候補(1つをランダムに再生)
-const LOOK_AWAY_YAHHO_VOICES: [&str; 4] = [
+const LOOK_AWAY_YAHHO_VOICES: [&str; 3] = [
     "voice_look_away_yahho_1.mp3",
     "voice_look_away_yahho_2.mp3",
     "voice_look_away_yahho_3.mp3",
-    "voice_look_away_yahho_4.mp3",
 ];
 
 /// 「やっほー」で相手が「ヤー!」と叫ぶ時の音声の候補(1つをランダムに再生)
@@ -191,6 +194,8 @@ impl SeKind {
             SeKind::ColorStackClear => Some("se_color_stack_clear.mp3"),
             SeKind::ColorStackMiss => Some("se_color_stack_miss.mp3"),
             SeKind::LookAwayYahho | SeKind::LookAwayShout | SeKind::BeigomaSkid => None,
+            SeKind::LookAwayExplosion => Some("se_look_away_explosion.mp3"),
+            SeKind::LookAwayGuardSuccess => Some("se_look_away_guard_success.mp3"),
         }
     }
 
@@ -538,7 +543,7 @@ pub fn playing_typewriter_kind() -> Option<TypewriterSeKind> {
 mod tests {
     use super::*;
 
-    const ALL_SE_KINDS: [SeKind; 22] = [
+    const ALL_SE_KINDS: [SeKind; 24] = [
         SeKind::Correct,
         SeKind::Incorrect,
         SeKind::Transition,
@@ -561,6 +566,8 @@ mod tests {
         SeKind::LookAwayYahho,
         SeKind::LookAwayShout,
         SeKind::BeigomaSkid,
+        SeKind::LookAwayExplosion,
+        SeKind::LookAwayGuardSuccess,
     ];
 
     #[test]

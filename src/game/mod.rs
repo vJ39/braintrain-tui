@@ -103,13 +103,17 @@ pub struct GameResult {
     pub total: u32,
     pub avg_latency_ms: f64,
     pub played_at: DateTime<Utc>,
+    /// ライフ制等、途中で何問か正解していてもGAME OVERになるゲームがtrueにする。
+    /// 旧データにはこのフィールドが無いので、読み込み時はfalse扱いにする
+    #[serde(default)]
+    pub forced_game_over: bool,
 }
 
 impl GameResult {
-    /// GAME OVER(1問も正解できずに終わった)かどうか。プレイ前のダミー結果(total==0)は
-    /// GAME OVER扱いにしない
+    /// GAME OVER(1問も正解できずに終わった、またはforced_game_overで明示された)かどうか。
+    /// プレイ前のダミー結果(total==0)はGAME OVER扱いにしない
     pub fn is_game_over(&self) -> bool {
-        self.total > 0 && self.correct == 0
+        self.forced_game_over || (self.total > 0 && self.correct == 0)
     }
 }
 
@@ -178,6 +182,7 @@ impl ScoreTracker {
             total: self.total,
             avg_latency_ms,
             played_at: Utc::now(),
+            forced_game_over: false,
         }
     }
 }

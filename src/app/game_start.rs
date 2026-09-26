@@ -371,7 +371,7 @@ mod tests {
 
     // --- ヤッホー ---
 
-    /// ヤッホーが始まり、1問目(10問中)のゲーム内カウントダウンが表示されていることを確かめる。
+    /// ヤッホーが始まり、ごはんゲージ満タンでゲーム内カウントダウンが表示されていることを確かめる。
     /// 問題ごとに自前のカウントダウンを持つため、画面遷移側のカウントダウン(Screen::Countdown)は経由しない
     fn assert_look_away_round1_is_playing(app: &mut App) {
         let Screen::Playing(game) = &app.screen else {
@@ -385,7 +385,7 @@ mod tests {
             text.contains(crate::game::look_away::DISPLAY_NAME),
             "{text}"
         );
-        assert!(text.contains("Q1/10"), "10問制の1問目から始まる: {text}");
+        assert!(text.contains("ごはん"), "ごはんゲージが表示される: {text}");
         assert!(
             text.contains('█'),
             "ゲーム内のカウントダウンを大きな文字で出す"

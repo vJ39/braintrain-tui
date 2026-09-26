@@ -1,8 +1,10 @@
 //! ヤッホー(look_away): お茶漬け屋のカウンター越しに親父(白い割烹着)と対峙する。
-//! 親父が指さして「ヤー!!」と叫んだら、その方向と逆の矢印キーを押して防御する。
+//! 親父が指さして「ヤー!!」と叫んだら、指された方向と同じ矢印キーを押して防御する。
 //! 「やっほー」と言われたらSpaceで「やっほー」と返す。
-//! どちらもRESPONSE_SAFE_WINDOW(400ms)以内に正しく反応すれば正解。
-//! 400ms超過・誤入力・無反応(MAX_RESPONSE_WINDOWでタイムアウト確定)は不正解になり、
+//! 1問目は必ず「やっほー」から始まる。以降の待機はIDLE_WAIT_MS(最低5秒)で
+//! 「来るか来るか」という間を作ってから次のイベントが来る。
+//! どちらもRESPONSE_SAFE_WINDOW(800ms)以内に正しく反応すれば正解。
+//! 800ms超過・誤入力・無反応(MAX_RESPONSE_WINDOWでタイムアウト確定)は不正解になり、
 //! 遅れた分だけ複数個の♥を失う(penalty_for参照)。♥が0になったらGAME OVER。10問を終えたら勝利。
 //!
 //! 表示名(DISPLAY_NAME)は仮名称。改名はDISPLAY_NAMEを変えるだけで済むよう、
@@ -41,25 +43,28 @@ pub const GAME_ID: &str = "look_away";
 /// 結果に記録する難易度・HUDに出す難易度。難易度を選ばないので代表値にする
 pub const SESSION_DIFFICULTY: Difficulty = Difficulty::Advanced;
 
-/// 1セッションの問題数。正誤に関わらずこの数だけ出題する
-pub const ROUNDS_PER_SESSION: u32 = 10;
-
 /// セッション開始時の♥の数。0になったらGAME OVER
 pub const MAX_LIVES: u32 = 5;
 
-/// 待機(相手が何もしていない)の長さの範囲(最小, 最大)ms
-pub const IDLE_WAIT_MS: (u64, u64) = (700, 2500);
+/// ごはんゲージの初期値(満タン)。0になったらクリア
+pub const RICE_FULL: f32 = 1.0;
+/// 食事中、待機(Idle)フェーズで1秒あたりごはんゲージが減る量
+pub const RICE_DRAIN_PER_SEC: f32 = 0.1;
+
+/// 待機(相手が何もしていない)の長さの範囲(最小, 最大)ms。
+/// 最低でも5秒は待たせ、「来るか来るか」という緊張感を持続させる
+pub const IDLE_WAIT_MS: (u64, u64) = (5000, 9000);
 /// これ以内に正しい入力ができれば正解(♥は減らない)
-pub const RESPONSE_SAFE_WINDOW: Duration = Duration::from_millis(400);
+pub const RESPONSE_SAFE_WINDOW: Duration = Duration::from_millis(800);
 /// RESPONSE_SAFE_WINDOWを超えた経過時間をこの単位で区切り、超過1区分ごとに♥をもう1つ失う
 pub const PENALTY_STEP: Duration = Duration::from_millis(80);
 /// 入力を受け付ける最大時間。これを過ぎても入力が無ければ自動的に不正解確定(経過時間はこの値として計算する)
-pub const MAX_RESPONSE_WINDOW: Duration = Duration::from_millis(800);
+pub const MAX_RESPONSE_WINDOW: Duration = Duration::from_millis(1200);
 /// 正誤の結果(◯/✗)を表示し続ける時間。この間は次の問題へ進まず、入力も受け付けない
 pub const RESULT_HOLD: Duration = Duration::from_millis(1000);
 
-/// 待機の後に「やっほー」イベントになる確率
-pub const YAHHO_RATE: f64 = 0.25;
+/// 待機の後に「やっほー」イベントになる確率(やっほー5割・ヤー5割)
+pub const YAHHO_RATE: f64 = 0.5;
 
 /// 相手の決め台詞。指さしと一緒にこれを叫んだら、逆を向く合図
 pub const SHOUT_TEXT: &str = "ヤー!!";
@@ -77,8 +82,10 @@ pub const TIMEOUT_TEXT: &str = "時間切れ";
 pub const FALSE_START_TEXT: &str = "フライング";
 /// ライフが尽きた時の表示
 pub const GAME_OVER_TEXT: &str = "GAME OVER";
-/// 全問を終えてライフが残っていた時の表示
+/// ごはんを完食してライフが残っていた時の表示
 pub const CLEAR_TEXT: &str = "CLEAR!";
+/// 「やっほー」に失敗し、ごはんがおかわりされた時の表示
+pub const RICE_REFILLED_TEXT: &str = "ごはんをおかわりされた!";
 
 /// 待機中の背景(暗いグレー)
 pub const IDLE_BG: Color = Color::Rgb(48, 48, 48);
@@ -89,10 +96,18 @@ pub const YAHHO_BG: Color = Color::Rgb(0, 170, 230);
 
 /// 画像アセット(assets/image/からの相対パス)。無ければテキストで描く
 pub const STAGE_NORMAL_IMAGE: &str = "look_away/normal.png";
-/// 右を指して叫んでいる絵
-pub const STAGE_SHOUT_RIGHT_IMAGE: &str = "look_away/shout_right.png";
-/// 左を指して叫んでいる絵(shout_rightを左右反転したもの)
-pub const STAGE_SHOUT_LEFT_IMAGE: &str = "look_away/shout_left.png";
+/// 右を指して叫んでいる絵の候補(1問ごとにランダムに1枚選ぶ)
+pub const STAGE_SHOUT_RIGHT_IMAGES: [&str; 3] = [
+    "look_away/shout_right.png",
+    "look_away/shout_right_2.png",
+    "look_away/shout_right_3.png",
+];
+/// 左を指して叫んでいる絵の候補(各shout_rightを左右反転したもの)
+pub const STAGE_SHOUT_LEFT_IMAGES: [&str; 3] = [
+    "look_away/shout_left.png",
+    "look_away/shout_left_2.png",
+    "look_away/shout_left_3.png",
+];
 /// 「やっほー」と呼びかけている絵
 pub const STAGE_YAHHO_IMAGE: &str = "look_away/yahho.png";
 
@@ -104,14 +119,6 @@ pub enum Side {
 }
 
 impl Side {
-    /// 逆の向き
-    pub fn opposite(self) -> Side {
-        match self {
-            Side::Left => Side::Right,
-            Side::Right => Side::Left,
-        }
-    }
-
     /// この向きを向くキー
     pub fn key(self) -> KeyCode {
         match self {
@@ -153,17 +160,22 @@ fn choose_event(rng: &mut impl Rng) -> Event {
     }
 }
 
-/// ゲームで使うキー(←→Space)。それ以外のキーは無視する
+/// ゲームで使うキー(←→Space・Enter)。それ以外のキーは無視する
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Input {
     Turn(Side),
     Yahho,
+    /// 「食べる」のトグル(Enter)
+    Eat,
 }
 
 impl Input {
     fn from_key(code: KeyCode) -> Option<Input> {
         if code == KeyCode::Char(' ') {
             return Some(Input::Yahho);
+        }
+        if code == KeyCode::Enter {
+            return Some(Input::Eat);
         }
         [Side::Left, Side::Right]
             .into_iter()
@@ -179,13 +191,16 @@ fn penalty_for(elapsed: Duration) -> u32 {
     1 + (overage.as_millis() / PENALTY_STEP.as_millis()) as u32
 }
 
-/// 1問の判定結果(正誤・HUDに出す説明・記録する反応時間ms・失う♥の個数)
+/// 1問の判定結果(正誤・HUDに出す説明・記録する反応時間ms・失う♥の個数・添える一言)
 struct Verdict {
     is_correct: bool,
     detail: String,
     latency_ms: f64,
     /// 失う♥の個数。正解なら常に0
     penalty: u32,
+    message: Option<ResultMessage>,
+    /// 「ヤー」の防御に成功したか(専用SEを鳴らす判断に使う)
+    is_guard_success: bool,
 }
 
 impl Verdict {
@@ -196,6 +211,16 @@ impl Verdict {
             detail: format!("{latency_ms:.0}ms"),
             latency_ms,
             penalty: 0,
+            message: None,
+            is_guard_success: false,
+        }
+    }
+
+    /// 「ヤー」の防御に成功した時。正解の判定内容に加え、専用SEを鳴らす対象にする
+    fn guard_success(elapsed: Duration) -> Self {
+        Self {
+            is_guard_success: true,
+            ..Self::correct(elapsed)
         }
     }
 
@@ -207,25 +232,53 @@ impl Verdict {
             detail: detail.to_string(),
             latency_ms: elapsed.as_millis() as f64,
             penalty: penalty_for(elapsed),
+            message: None,
+            is_guard_success: false,
+        }
+    }
+
+    /// 「やっほー」に失敗した時。♥は減らさず、ごはんがおかわりされて満タンに戻る
+    fn yahho_failed(detail: &str, elapsed: Duration) -> Self {
+        Self {
+            is_correct: false,
+            detail: detail.to_string(),
+            latency_ms: elapsed.as_millis() as f64,
+            penalty: 0,
+            message: Some(ResultMessage::RiceRefilled),
+            is_guard_success: false,
+        }
+    }
+
+    /// 食事中に「ヤー」で襲われた時。防御操作を受け付けず、問答無用で♥を1つ失う
+    fn caught_eating() -> Self {
+        Self {
+            is_correct: false,
+            detail: "食事を邪魔された".to_string(),
+            latency_ms: 0.0,
+            penalty: 1,
+            message: None,
+            is_guard_success: false,
         }
     }
 }
 
-/// いまの状態で入力inputを受けた時の判定。判定しない状態(カウントダウン・結果表示)ならNone
+/// いまの状態で入力inputを受けた時の判定。判定しない状態(カウントダウン・結果表示)ならNone。
+/// Input::Eat(食べるトグル)は呼び出し元(handle_key)で先に処理するので常にNone
 fn judge(phase: &Phase, input: Input) -> Option<Verdict> {
     match (phase, input) {
+        (_, Input::Eat) => None,
         (Phase::Countdown { .. } | Phase::Result { .. }, _) => None,
         (Phase::Idle { .. }, _) => Some(Verdict::incorrect(FALSE_START_TEXT, Duration::ZERO)),
-        (Phase::Shout { side, remaining }, Input::Turn(turned)) if turned == side.opposite() => {
+        (Phase::Shout { side, remaining, .. }, Input::Turn(turned)) if turned == *side => {
             let elapsed = MAX_RESPONSE_WINDOW.saturating_sub(*remaining);
             if elapsed <= RESPONSE_SAFE_WINDOW {
-                Some(Verdict::correct(elapsed))
+                Some(Verdict::guard_success(elapsed))
             } else {
                 Some(Verdict::incorrect("反応が遅い", elapsed))
             }
         }
         (Phase::Shout { remaining, .. }, Input::Turn(_)) => Some(Verdict::incorrect(
-            "逆を向く",
+            "指された方を向く",
             MAX_RESPONSE_WINDOW.saturating_sub(*remaining),
         )),
         (Phase::Shout { remaining, .. }, Input::Yahho) => Some(Verdict::incorrect(
@@ -237,28 +290,44 @@ fn judge(phase: &Phase, input: Input) -> Option<Verdict> {
             if elapsed <= RESPONSE_SAFE_WINDOW {
                 Some(Verdict::correct(elapsed))
             } else {
-                Some(Verdict::incorrect("反応が遅い", elapsed))
+                Some(Verdict::yahho_failed("反応が遅い", elapsed))
             }
         }
-        (Phase::Yahho { remaining }, Input::Turn(_)) => Some(Verdict::incorrect(
+        (Phase::Yahho { remaining }, Input::Turn(_)) => Some(Verdict::yahho_failed(
             "Spaceで返す",
             MAX_RESPONSE_WINDOW.saturating_sub(*remaining),
         )),
     }
 }
 
+/// 正誤とは別に結果表示に添える一言(「おかわりされた」等)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResultMessage {
+    /// 「やっほー」に失敗し、ごはんがおかわりされて満タンに戻った
+    RiceRefilled,
+}
+
 /// 問題内の状態
 enum Phase {
     /// 問題冒頭の「3.2.1.GO!!」。この間の入力は受け付けない
     Countdown { state: CountdownState },
-    /// 相手が何もしていない待機。残りの待機時間
-    Idle { remaining: Duration },
-    /// 指さして「ヤー!!」と叫んでいる。残りの入力受付時間(MAX_RESPONSE_WINDOWから減っていく)
-    Shout { side: Side, remaining: Duration },
+    /// 相手が何もしていない待機。残りの待機時間と、食事中かどうか
+    Idle { remaining: Duration, is_eating: bool },
+    /// 指さして「ヤー!!」と叫んでいる。残りの入力受付時間(MAX_RESPONSE_WINDOWから減っていく)。
+    /// variantは叫び顔の絵のバリエーション番号(begin_event時にランダムに決め、以後は固定)
+    Shout {
+        side: Side,
+        remaining: Duration,
+        variant: usize,
+    },
     /// 「やっほー」と言っている。残りの入力受付時間
     Yahho { remaining: Duration },
     /// 正誤の結果表示。この表示が終わるまで次の問題へは進まず、入力も受け付けない
-    Result { is_correct: bool, elapsed: Duration },
+    Result {
+        is_correct: bool,
+        elapsed: Duration,
+        message: Option<ResultMessage>,
+    },
 }
 
 pub struct LookAwayGame {
@@ -266,6 +335,8 @@ pub struct LookAwayGame {
     phase: Phase,
     /// 残りの♥
     lives: u32,
+    /// ごはんゲージ。0以下になったらクリア
+    rice: f32,
     /// 最後の結果表示が終わってセッションを終えたか
     finished: bool,
     /// 直前の問題の結果表示(HUD用の小さい表示)
@@ -292,10 +363,13 @@ fn result_background(is_correct: bool, uses_image: bool) -> Color {
     }
 }
 
-/// ライフをハートで表す(残り=♥、失った分=♡)
+/// ライフをハートで表す(残り=♥、失った分=♡)。間隔を空けて1個ずつ見やすくする
 fn hearts(lives: u32) -> String {
     let lost = MAX_LIVES.saturating_sub(lives);
-    "♥".repeat(lives as usize) + &"♡".repeat(lost as usize)
+    let all: Vec<&str> = std::iter::repeat_n("♥", lives as usize)
+        .chain(std::iter::repeat_n("♡", lost as usize))
+        .collect();
+    all.join(" ")
 }
 
 /// 相手の顔と、指している腕の行
@@ -310,11 +384,12 @@ fn pointing_line(side: Option<Side>) -> String {
 impl LookAwayGame {
     pub fn new() -> Self {
         let mut game = Self {
-            tracker: ScoreTracker::with_session_length(ROUNDS_PER_SESSION),
+            tracker: ScoreTracker::new(),
             phase: Phase::Countdown {
                 state: CountdownState::new(),
             },
             lives: MAX_LIVES,
+            rice: RICE_FULL,
             finished: false,
             feedback: AnswerFeedback::new(),
             mark_renderer: MarkRenderer::new(),
@@ -331,14 +406,14 @@ impl LookAwayGame {
         self.lives == 0
     }
 
-    /// 全問を終えてライフが残っていたか(勝利)。最後の結果表示中からtrueになる
+    /// ごはんを完食したか(勝利)。ライフが尽きていた場合はGAME OVER優先でfalse
     pub fn is_cleared(&self) -> bool {
-        self.tracker.is_session_finished() && !self.is_game_over()
+        self.rice <= 0.0 && !self.is_game_over()
     }
 
-    /// 最後の結果表示が終わったらセッションを終えるか(ライフ切れ・全問終了)
+    /// 最後の結果表示が終わったらセッションを終えるか(ライフ切れ・完食)
     fn is_last_round(&self) -> bool {
-        self.is_game_over() || self.tracker.is_session_finished()
+        self.is_game_over() || self.rice <= 0.0
     }
 
     /// 新しい問題を始める。1問目だけ「3.2.1.GO!!」の
@@ -347,6 +422,7 @@ impl LookAwayGame {
         if self.shown_countdown_once {
             self.phase = Phase::Idle {
                 remaining: random_between(&mut rand::thread_rng(), IDLE_WAIT_MS),
+                is_eating: false,
             };
             return;
         }
@@ -360,38 +436,55 @@ impl LookAwayGame {
         self.phase = Phase::Countdown { state };
     }
 
-    /// 待機が終わった時に、次のイベントを始める
-    fn begin_event(&mut self, event: Event) {
-        self.phase = match event {
+    /// 待機が終わった時に、次のイベントを始める。was_eatingは待機中に食事していたか
+    /// (「ヤー」の場合、食事中なら防御操作を受け付けず問答無用で♥を失う)
+    fn begin_event(&mut self, event: Event, was_eating: bool) {
+        match event {
             Event::Yahho => {
                 audio::play_se(SeKind::LookAwayYahho);
-                Phase::Yahho {
+                audio::play_se(SeKind::LookAwayExplosion);
+                self.phase = Phase::Yahho {
                     remaining: MAX_RESPONSE_WINDOW,
-                }
+                };
             }
             Event::Shout(side) => {
                 audio::play_se(SeKind::LookAwayShout);
-                Phase::Shout {
+                audio::play_se(SeKind::LookAwayExplosion);
+                if was_eating {
+                    self.finish_question(Verdict::caught_eating());
+                    return;
+                }
+                let variant = rand::thread_rng().gen_range(0..STAGE_SHOUT_RIGHT_IMAGES.len());
+                self.phase = Phase::Shout {
                     side,
                     remaining: MAX_RESPONSE_WINDOW,
-                }
+                    variant,
+                };
             }
-        };
+        }
     }
 
-    /// 1問の正誤を記録して結果表示に入る。不正解ならverdict.penalty個ぶん♥を減らす
+    /// 1問の正誤を記録して結果表示に入る。不正解ならverdict.penalty個ぶん♥を減らす。
+    /// message==Some(RiceRefilled)ならごはんゲージを満タンに戻す(おかわり)
     fn finish_question(&mut self, verdict: Verdict) {
         self.tracker.record(verdict.is_correct, verdict.latency_ms);
         self.lives = self.lives.saturating_sub(verdict.penalty);
+        if verdict.message == Some(ResultMessage::RiceRefilled) {
+            self.rice = RICE_FULL;
+        }
         self.feedback.record(verdict.is_correct, verdict.detail);
         audio::play_se(if verdict.is_correct {
             SeKind::Correct
         } else {
             SeKind::Incorrect
         });
+        if verdict.is_guard_success {
+            audio::play_se(SeKind::LookAwayGuardSuccess);
+        }
         self.phase = Phase::Result {
             is_correct: verdict.is_correct,
             elapsed: Duration::ZERO,
+            message: verdict.message,
         };
     }
 
@@ -408,14 +501,35 @@ impl LookAwayGame {
                     self.shown_countdown_once = true;
                     self.phase = Phase::Idle {
                         remaining: random_between(&mut rand::thread_rng(), IDLE_WAIT_MS),
+                        is_eating: false,
                     };
                 }
             }
-            Phase::Idle { remaining } => {
+            Phase::Idle {
+                remaining,
+                is_eating,
+            } => {
+                if *is_eating {
+                    self.rice = (self.rice - RICE_DRAIN_PER_SEC * dt.as_secs_f32()).max(0.0);
+                    if self.rice <= 0.0 {
+                        audio::play_se(SeKind::Correct);
+                        self.phase = Phase::Result {
+                            is_correct: true,
+                            elapsed: Duration::ZERO,
+                            message: None,
+                        };
+                        return;
+                    }
+                }
                 *remaining = remaining.saturating_sub(dt);
                 if remaining.is_zero() {
-                    let event = choose_event(&mut rand::thread_rng());
-                    self.begin_event(event);
+                    let was_eating = *is_eating;
+                    let event = if self.tracker.total() == 0 {
+                        Event::Yahho
+                    } else {
+                        choose_event(&mut rand::thread_rng())
+                    };
+                    self.begin_event(event, was_eating);
                 }
             }
             Phase::Shout { remaining, .. } => {
@@ -427,7 +541,7 @@ impl LookAwayGame {
             Phase::Yahho { remaining } => {
                 *remaining = remaining.saturating_sub(dt);
                 if remaining.is_zero() {
-                    self.finish_question(Verdict::incorrect(TIMEOUT_TEXT, MAX_RESPONSE_WINDOW));
+                    self.finish_question(Verdict::yahho_failed(TIMEOUT_TEXT, MAX_RESPONSE_WINDOW));
                 }
             }
             Phase::Result { elapsed, .. } => {
@@ -447,7 +561,11 @@ impl LookAwayGame {
     fn render_stage(&self, frame: &mut Frame, area: Rect) {
         match &self.phase {
             Phase::Countdown { state } => countdown::render(frame, area, state),
-            Phase::Result { is_correct, .. } => self.render_result(frame, area, *is_correct),
+            Phase::Result {
+                is_correct,
+                message,
+                ..
+            } => self.render_result(frame, area, *is_correct, *message),
             Phase::Idle { .. } => self.render_scene(
                 frame,
                 area,
@@ -456,11 +574,11 @@ impl LookAwayGame {
                 StageKind::Normal,
                 vec![pointing_line(None)],
             ),
-            Phase::Shout { side, .. } => {
+            Phase::Shout { side, variant, .. } => {
                 let kind = if *side == Side::Left {
-                    StageKind::ShoutLeft
+                    StageKind::ShoutLeft(*variant)
                 } else {
-                    StageKind::ShoutRight
+                    StageKind::ShoutRight(*variant)
                 };
                 self.render_scene(
                     frame,
@@ -506,27 +624,33 @@ impl LookAwayGame {
         render_character(frame, area, background, text_color, texts);
     }
 
-    /// 結果表示。大きな◯/✗を出し、最後の問題ならGAME OVER/CLEAR!を添える
-    fn render_result(&self, frame: &mut Frame, area: Rect, is_correct: bool) {
+    /// 結果表示。大きな◯/✗を出し、GAME OVER/CLEAR!やおかわりされた一言を添える
+    fn render_result(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        is_correct: bool,
+        message: Option<ResultMessage>,
+    ) {
         let background = result_background(is_correct, self.mark_renderer.uses_image());
         let ending = if self.is_game_over() {
             Some(GAME_OVER_TEXT)
         } else if self.is_cleared() {
             Some(CLEAR_TEXT)
+        } else if message == Some(ResultMessage::RiceRefilled) {
+            Some(RICE_REFILLED_TEXT)
         } else {
             None
         };
         let Some(ending) = ending else {
-            self.mark_renderer
-                .render(frame, area, is_correct, background);
+            self.render_mark_or_background(frame, area, is_correct, background);
             return;
         };
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(3), Constraint::Length(3)])
             .split(area);
-        self.mark_renderer
-            .render(frame, rows[0], is_correct, background);
+        self.render_mark_or_background(frame, rows[0], is_correct, background);
         let footer = Block::default().style(Style::default().bg(background));
         let inner = footer.inner(rows[1]);
         frame.render_widget(footer, rows[1]);
@@ -542,26 +666,58 @@ impl LookAwayGame {
         );
     }
 
+    /// 正解時は緑の◯を出さず背景色だけ塗る。不正解時は従来通り✗を大きく出す
+    fn render_mark_or_background(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        is_correct: bool,
+        background: Color,
+    ) {
+        if is_correct {
+            frame.render_widget(Block::default().style(Style::default().bg(background)), area);
+            return;
+        }
+        self.mark_renderer.render(frame, area, is_correct, background);
+    }
+
     /// ライフと操作説明のフッター
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        let line = Line::from(vec![
-            Span::styled("ライフ ", Style::default().fg(theme::MUTED)),
+        let block = theme::sub_panel();
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(inner);
+        let hearts_bg = Color::Rgb(40, 0, 0);
+        let hearts_line = Line::from(vec![
             Span::styled(
-                hearts(self.lives),
+                " ライフ ",
                 Style::default()
-                    .fg(theme::INCORRECT)
+                    .fg(theme::TEXT)
+                    .bg(hearts_bg)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "   ← → で「ヤー!!」の逆を向く / Space で「やっほー」を返す",
-                Style::default().fg(theme::MUTED),
+                format!(" {} ", hearts(self.lives)),
+                Style::default()
+                    .fg(theme::INCORRECT)
+                    .bg(hearts_bg)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]);
         frame.render_widget(
-            Paragraph::new(line)
-                .alignment(Alignment::Center)
-                .block(theme::sub_panel()),
-            area,
+            Paragraph::new(hearts_line).alignment(Alignment::Center),
+            rows[0],
+        );
+        let help_line = Line::from(Span::styled(
+            "← → で「ヤー!!」の指された方を向く / Space で「やっほー」を返す / Enter で食べる",
+            Style::default().fg(theme::MUTED),
+        ));
+        frame.render_widget(
+            Paragraph::new(help_line).alignment(Alignment::Center),
+            rows[1],
         );
     }
 }
@@ -613,24 +769,24 @@ fn detect_picker() -> Option<Picker> {
         .cloned()
 }
 
-/// カウンター越しの親父の絵の種類
+/// カウンター越しの親父の絵の種類。ShoutLeft/ShoutRightの引数は叫び顔のバリエーション番号
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StageKind {
     Normal,
-    ShoutLeft,
-    ShoutRight,
+    ShoutLeft(usize),
+    ShoutRight(usize),
     Yahho,
 }
 
-/// 親父の静止画4種(通常/ヤー左/ヤー右/やっほー)
+/// 親父の静止画(通常/ヤー左右の複数バリエーション/やっほー)
 struct StageImages {
     normal: StatefulProtocol,
-    shout_left: StatefulProtocol,
-    shout_right: StatefulProtocol,
+    shout_left: Vec<StatefulProtocol>,
+    shout_right: Vec<StatefulProtocol>,
     yahho: StatefulProtocol,
 }
 
-/// カウンター越しの親父の描画器。4種の静止画が全て読めた時だけ画像で描く
+/// カウンター越しの親父の描画器。静止画が全て読めた時だけ画像で描く
 struct StageRenderer {
     images: Option<RefCell<StageImages>>,
 }
@@ -639,13 +795,27 @@ impl StageRenderer {
     fn new() -> Self {
         let images = detect_picker().and_then(|picker| {
             let normal = splash::load_embedded_image(STAGE_NORMAL_IMAGE)?;
-            let shout_right = splash::load_embedded_image(STAGE_SHOUT_RIGHT_IMAGE)?;
-            let shout_left = splash::load_embedded_image(STAGE_SHOUT_LEFT_IMAGE)?;
             let yahho = splash::load_embedded_image(STAGE_YAHHO_IMAGE)?;
+            let shout_right: Option<Vec<_>> = STAGE_SHOUT_RIGHT_IMAGES
+                .iter()
+                .map(|path| splash::load_embedded_image(path))
+                .collect();
+            let shout_left: Option<Vec<_>> = STAGE_SHOUT_LEFT_IMAGES
+                .iter()
+                .map(|path| splash::load_embedded_image(path))
+                .collect();
+            let shout_right = shout_right?;
+            let shout_left = shout_left?;
             Some(RefCell::new(StageImages {
                 normal: picker.new_resize_protocol(normal),
-                shout_left: picker.new_resize_protocol(shout_left),
-                shout_right: picker.new_resize_protocol(shout_right),
+                shout_left: shout_left
+                    .into_iter()
+                    .map(|img| picker.new_resize_protocol(img))
+                    .collect(),
+                shout_right: shout_right
+                    .into_iter()
+                    .map(|img| picker.new_resize_protocol(img))
+                    .collect(),
                 yahho: picker.new_resize_protocol(yahho),
             }))
         });
@@ -669,8 +839,8 @@ impl StageRenderer {
         let mut images = images.borrow_mut();
         let protocol = match kind {
             StageKind::Normal => &mut images.normal,
-            StageKind::ShoutLeft => &mut images.shout_left,
-            StageKind::ShoutRight => &mut images.shout_right,
+            StageKind::ShoutLeft(i) => &mut images.shout_left[i],
+            StageKind::ShoutRight(i) => &mut images.shout_right[i],
             StageKind::Yahho => &mut images.yahho,
         };
         let widget = StatefulImage::default().resize(Resize::Fit(Some(FilterType::Triangle)));
@@ -686,7 +856,7 @@ impl Default for LookAwayGame {
 }
 
 impl Game for LookAwayGame {
-    /// ←→Spaceだけを受け付ける。カウントダウン中・結果表示中の入力は無視する
+    /// ←→Space・Enterを受け付ける。カウントダウン中・結果表示中の入力は無視する
     fn handle_key(&mut self, key: KeyEvent) {
         if self.finished {
             return;
@@ -694,6 +864,12 @@ impl Game for LookAwayGame {
         let Some(input) = Input::from_key(key.code) else {
             return;
         };
+        if input == Input::Eat {
+            if let Phase::Idle { is_eating, .. } = &mut self.phase {
+                *is_eating = !*is_eating;
+            }
+            return;
+        }
         if let Some(verdict) = judge(&self.phase, input) {
             self.finish_question(verdict);
         }
@@ -709,18 +885,25 @@ impl Game for LookAwayGame {
 
     fn render(&self, frame: &mut Frame, area: Rect) {
         let (hud_area, body) = theme::split_hud(area);
-        theme::render_hud_with_session_length(
+        let rice_percent = (self.rice.clamp(0.0, 1.0) * 100.0).round() as u32;
+        let progress = Line::from(vec![
+            Span::styled(" ごはん ", theme::title_style()),
+            Span::styled(
+                theme::progress_bar(rice_percent, 100, 10),
+                Style::default().fg(theme::ACCENT),
+            ),
+        ]);
+        theme::render_hud_with_progress_line(
             frame,
             hud_area,
             DISPLAY_NAME,
             SESSION_DIFFICULTY,
-            self.tracker.total(),
-            self.tracker.session_length(),
             &self.feedback,
+            progress,
         );
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(3)])
+            .constraints([Constraint::Min(3), Constraint::Length(4)])
             .split(body);
         self.render_stage(frame, rows[0]);
         self.render_footer(frame, rows[1]);
@@ -731,7 +914,9 @@ impl Game for LookAwayGame {
     }
 
     fn result(&self) -> GameResult {
-        self.tracker.to_result(GAME_ID, SESSION_DIFFICULTY)
+        let mut result = self.tracker.to_result(GAME_ID, SESSION_DIFFICULTY);
+        result.forced_game_over = self.is_game_over();
+        result
     }
 }
 
@@ -795,6 +980,7 @@ mod tests {
         game.phase = Phase::Shout {
             side,
             remaining: MAX_RESPONSE_WINDOW,
+            variant: 0,
         };
     }
 
@@ -812,9 +998,9 @@ mod tests {
         }
         shout(game, Side::Left);
         let code = if correct {
-            KeyCode::Right
-        } else {
             KeyCode::Left
+        } else {
+            KeyCode::Right
         };
         press(game, code);
         assert!(is_result(game, correct));
@@ -868,18 +1054,15 @@ mod tests {
     }
 
     #[test]
-    fn session_has_ten_rounds_and_five_hearts() {
-        assert_eq!(ROUNDS_PER_SESSION, 10);
+    fn game_starts_with_five_hearts_and_full_rice() {
         assert_eq!(MAX_LIVES, 5);
         let game = LookAwayGame::new();
         assert_eq!(game.lives, MAX_LIVES);
-        assert_eq!(game.tracker.session_length(), ROUNDS_PER_SESSION);
+        assert_eq!(game.rice, RICE_FULL);
     }
 
     #[test]
-    fn side_opposite_and_key() {
-        assert_eq!(Side::Left.opposite(), Side::Right);
-        assert_eq!(Side::Right.opposite(), Side::Left);
+    fn side_key() {
         assert_eq!(Side::Left.key(), KeyCode::Left);
         assert_eq!(Side::Right.key(), KeyCode::Right);
     }
@@ -918,8 +1101,8 @@ mod tests {
         let events: Vec<Event> = (0..1000).map(|_| choose_event(&mut rng)).collect();
         let count = |f: &dyn Fn(&Event) -> bool| events.iter().filter(|e| f(e)).count();
         let yahho = count(&|e| *e == Event::Yahho);
-        // 1000回中の目安250回(25%)。乱数のゆれを見込んで幅を持たせる
-        assert!((180..=320).contains(&yahho), "やっほーの出現数: {yahho}");
+        // 1000回中の目安500回(50%)。乱数のゆれを見込んで幅を持たせる
+        assert!((430..=570).contains(&yahho), "やっほーの出現数: {yahho}");
         for side in SIDES {
             assert!(
                 count(&|e| *e == Event::Shout(side)) > 0,
@@ -952,7 +1135,7 @@ mod tests {
             assert!(is_countdown(&game), "GO!!が終わるまではカウントダウン");
             game.update(ms(1));
             match game.phase {
-                Phase::Idle { remaining } => {
+                Phase::Idle { remaining, .. } => {
                     assert!((ms(IDLE_WAIT_MS.0)..=ms(IDLE_WAIT_MS.1)).contains(&remaining))
                 }
                 _ => panic!("カウントダウンの後は待機"),
@@ -979,13 +1162,41 @@ mod tests {
     #[test]
     fn idle_elapses_into_an_event() {
         let mut game = LookAwayGame::new();
-        game.phase = Phase::Idle { remaining: ms(100) };
+        game.tracker.record(true, 0.0); // 1問目を消化済みにし、以降は両方あり得る状態にする
+        game.phase = Phase::Idle {
+            remaining: ms(100),
+            is_eating: false,
+        };
         game.update(ms(60));
-        assert!(matches!(game.phase, Phase::Idle { remaining } if remaining == ms(40)));
+        assert!(matches!(game.phase, Phase::Idle { remaining, .. } if remaining == ms(40)));
         game.update(ms(40));
         assert!(
             matches!(game.phase, Phase::Shout { .. } | Phase::Yahho { .. }),
             "待機が終わったら指さしかやっほー"
+        );
+    }
+
+    #[test]
+    fn first_round_after_countdown_is_always_yahho() {
+        for _ in 0..20 {
+            let mut game = LookAwayGame::new();
+            finish_countdown(&mut game);
+            match game.phase {
+                Phase::Idle { remaining, .. } => game.update(remaining),
+                _ => panic!("カウントダウンの後は待機のはず"),
+            }
+            assert!(
+                matches!(game.phase, Phase::Yahho { .. }),
+                "1問目は必ず「やっほー」から始まる"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_wait_is_at_least_five_seconds() {
+        assert!(
+            IDLE_WAIT_MS.0 >= 5000,
+            "「来るか来るか」の緊張感を作るため待機は最低5秒"
         );
     }
 
@@ -1009,14 +1220,17 @@ mod tests {
     // --- 指さし+「ヤー!!」 ---
 
     #[test]
-    fn pressing_the_opposite_within_the_safe_window_is_correct() {
+    fn pressing_the_same_side_within_the_safe_window_is_correct() {
         for side in SIDES {
             let mut game = LookAwayGame::new();
             finish_countdown(&mut game);
             shout(&mut game, side);
             game.update(ms(300));
-            press(&mut game, side.opposite().key());
-            assert!(is_result(&game, true), "{side:?}を指したら逆を向くのが正解");
+            press(&mut game, side.key());
+            assert!(
+                is_result(&game, true),
+                "{side:?}を指したら同じ方向を押すのが正解"
+            );
             let result = game.result();
             assert_eq!((result.correct, result.total), (1, 1));
             assert_eq!(result.avg_latency_ms, 300.0, "叫んでからの反応時間を記録");
@@ -1025,25 +1239,33 @@ mod tests {
     }
 
     #[test]
-    fn pressing_the_opposite_after_the_safe_window_is_incorrect_with_penalty() {
+    fn pressing_the_same_side_after_the_safe_window_is_incorrect_with_penalty() {
         let mut game = LookAwayGame::new();
         finish_countdown(&mut game);
         shout(&mut game, Side::Left);
         // 400ms(RESPONSE_SAFE_WINDOW)を160ms超えたところで正しい方向を押す→penalty=3
         game.update(RESPONSE_SAFE_WINDOW + ms(160));
-        press(&mut game, Side::Right.key());
+        press(&mut game, Side::Left.key());
         assert!(is_result(&game, false), "遅れれば正しい方向でも不正解");
         assert_eq!(game.lives, MAX_LIVES - 3);
     }
 
+    /// テストでの逆方向計算専用(本体コードは同方向のみを扱うのでopposite()を持たない)
+    fn opposite_side(side: Side) -> Side {
+        match side {
+            Side::Left => Side::Right,
+            Side::Right => Side::Left,
+        }
+    }
+
     #[test]
-    fn pressing_the_same_side_as_the_shout_is_incorrect() {
+    fn pressing_the_opposite_of_the_shouted_side_is_incorrect() {
         for side in SIDES {
             let mut game = LookAwayGame::new();
             finish_countdown(&mut game);
             shout(&mut game, side);
-            press(&mut game, side.key());
-            assert!(is_result(&game, false), "{side:?}: 指した方を向くと不正解");
+            press(&mut game, opposite_side(side).key());
+            assert!(is_result(&game, false), "{side:?}: 逆の方向を押すと不正解");
             assert_eq!(game.result().correct, 0);
             assert_eq!(game.lives, MAX_LIVES - 1, "即座の誤入力はペナルティ1個");
         }
@@ -1101,14 +1323,16 @@ mod tests {
     }
 
     #[test]
-    fn space_after_the_safe_window_is_incorrect_with_penalty() {
+    fn space_after_the_safe_window_is_incorrect_and_refills_rice() {
         let mut game = LookAwayGame::new();
         finish_countdown(&mut game);
+        game.rice = 0.3;
         yahho(&mut game);
         game.update(RESPONSE_SAFE_WINDOW + ms(1));
         press(&mut game, KeyCode::Char(' '));
-        assert!(is_result(&game, false), "400msを1msでも過ぎたら不正解");
-        assert_eq!(game.lives, MAX_LIVES - 1);
+        assert!(is_result(&game, false), "800msを1msでも過ぎたら不正解");
+        assert_eq!(game.lives, MAX_LIVES, "やっほー失敗では♥は減らない");
+        assert_eq!(game.rice, RICE_FULL, "やっほー失敗でごはんがおかわりされる");
     }
 
     #[test]
@@ -1116,13 +1340,15 @@ mod tests {
         for code in [KeyCode::Left, KeyCode::Right] {
             let mut game = LookAwayGame::new();
             finish_countdown(&mut game);
+            game.rice = 0.3;
             yahho(&mut game);
             press(&mut game, code);
             assert!(
                 is_result(&game, false),
                 "{code:?}: やっほーに向きで答えると不正解"
             );
-            assert_eq!(game.lives, MAX_LIVES - 1);
+            assert_eq!(game.lives, MAX_LIVES);
+            assert_eq!(game.rice, RICE_FULL);
         }
     }
 
@@ -1130,12 +1356,14 @@ mod tests {
     fn yahho_times_out_when_space_is_not_pressed() {
         let mut game = LookAwayGame::new();
         finish_countdown(&mut game);
+        game.rice = 0.3;
         yahho(&mut game);
         game.update(MAX_RESPONSE_WINDOW - ms(1));
         assert!(matches!(game.phase, Phase::Yahho { .. }));
         game.update(ms(1));
         assert!(is_result(&game, false));
-        assert_eq!(game.lives, 0, "無反応の最大ペナルティは♥5個を上回るので0になる");
+        assert_eq!(game.lives, MAX_LIVES, "やっほーの無反応では♥は減らない");
+        assert_eq!(game.rice, RICE_FULL, "やっほーの無反応でごはんがおかわりされる");
         assert!(game
             .feedback
             .current()
@@ -1148,15 +1376,15 @@ mod tests {
 
     #[test]
     fn other_keys_are_ignored_in_every_phase() {
-        let ignored = [
-            KeyCode::Up,
-            KeyCode::Down,
-            KeyCode::Enter,
-            KeyCode::Char('a'),
-        ];
+        let ignored = [KeyCode::Up, KeyCode::Down, KeyCode::Char('a')];
         let mut game = LookAwayGame::new();
         let setups: [fn(&mut LookAwayGame); 3] = [
-            |g| g.phase = Phase::Idle { remaining: ms(500) },
+            |g| {
+                g.phase = Phase::Idle {
+                    remaining: ms(500),
+                    is_eating: false,
+                }
+            },
             |g| shout(g, Side::Left),
             yahho,
         ];
@@ -1243,55 +1471,81 @@ mod tests {
 
     #[test]
     fn game_over_even_after_some_correct_answers() {
+        // 1問目は正解、2問目は無反応でタイムアウトさせ、大きいpenaltyで即GAME OVERにする
+        // (ROUNDS_PER_SESSION==MAX_LIVESのため、penalty=1の不正解を繰り返す形では
+        // セッションの残り問題数が先に尽きてしまい検証できない)
         let mut game = LookAwayGame::new();
         answer_round(&mut game, true);
         finish_result(&mut game);
-        for _ in 0..MAX_LIVES {
-            answer_round(&mut game, false);
-            finish_result(&mut game);
-        }
+        shout(&mut game, Side::Left);
+        game.update(MAX_RESPONSE_WINDOW);
+        assert!(is_result(&game, false));
+        finish_result(&mut game);
         assert!(game.is_finished());
         assert!(game.is_game_over());
         assert!(!game.is_cleared());
-        assert_eq!(game.result().total, MAX_LIVES + 1);
+        assert_eq!(game.result().total, 2);
         assert_eq!(game.result().correct, 1);
+        // 1問正解していてもGAME OVERならGameResult::is_game_over()もtrueにする
+        // (共通判定のcorrect==0前提だとここが取りこぼされるため、forced_game_overで補う)
+        assert!(
+            game.result().is_game_over(),
+            "1問正解していてもライフ切れならGameResultとしてもGAME OVER扱いにする"
+        );
     }
 
     #[test]
-    fn finishing_all_rounds_with_lives_left_is_a_clear() {
+    fn result_is_not_game_over_when_cleared_with_lives_left() {
         let mut game = LookAwayGame::new();
-        for round in 0..ROUNDS_PER_SESSION {
-            assert!(!game.is_finished(), "{round}問目の前は終わっていない");
-            assert!(!game.is_cleared(), "全問を終えるまでは勝利にしない");
-            // 間違いはライフの数より1つ少なく抑える
-            answer_round(&mut game, round >= MAX_LIVES - 1);
-            if round + 1 < ROUNDS_PER_SESSION {
-                finish_result(&mut game);
-            }
+        game.phase = Phase::Idle {
+            remaining: Duration::from_secs(3600),
+            is_eating: true,
+        };
+        assert!(!game.is_finished());
+        assert!(!game.is_cleared(), "完食するまでは勝利にしない");
+        game.update(Duration::from_secs_f32(RICE_FULL / RICE_DRAIN_PER_SEC) + ms(1));
+        finish_result(&mut game);
+        assert!(game.is_finished());
+        assert!(game.is_cleared());
+        assert!(!game.result().is_game_over(), "ライフが残っていればGAME OVER扱いにしない");
+    }
+
+    #[test]
+    fn finishing_the_meal_with_lives_left_is_a_clear() {
+        let mut game = LookAwayGame::new();
+        // 「ヤー」に3回失敗させ、ライフを1まで減らしてから完食する
+        for _ in 0..(MAX_LIVES - 1) {
+            shout(&mut game, Side::Left);
+            press(&mut game, KeyCode::Right); // 逆方向を押して不正解にする
+            finish_result(&mut game);
         }
-        assert!(
-            !game.is_finished(),
-            "最後の結果表示が終わるまでは終わらない"
-        );
+        assert_eq!(game.lives, 1);
+        game.phase = Phase::Idle {
+            remaining: Duration::from_secs(3600),
+            is_eating: true,
+        };
+        game.update(Duration::from_secs_f32(RICE_FULL / RICE_DRAIN_PER_SEC) + ms(1));
         finish_result(&mut game);
         assert!(game.is_finished());
         assert!(game.is_cleared());
         assert!(!game.is_game_over());
         assert_eq!(game.lives, 1);
-        let result = game.result();
-        assert_eq!(result.total, ROUNDS_PER_SESSION);
-        assert_eq!(result.correct, ROUNDS_PER_SESSION - (MAX_LIVES - 1));
     }
 
     #[test]
-    fn losing_the_last_life_on_the_final_round_is_game_over_not_clear() {
+    fn losing_the_last_life_while_eating_is_game_over_not_clear() {
         let mut game = LookAwayGame::new();
-        for round in 0..ROUNDS_PER_SESSION {
-            // 最後の問題で3つ目の間違いをする
-            let correct = round < ROUNDS_PER_SESSION - MAX_LIVES;
-            answer_round(&mut game, correct);
+        // 完食する直前まで食べ進め、そこでライフが尽きるように「ヤー」に何度も襲われる
+        for _ in 0..(MAX_LIVES - 1) {
+            shout(&mut game, Side::Left);
+            press(&mut game, KeyCode::Right);
             finish_result(&mut game);
         }
+        assert_eq!(game.lives, 1);
+        // 食事中に「ヤー」に襲われ、防御操作なしで問答無用でライフが尽きる
+        game.begin_event(Event::Shout(Side::Left), true);
+        assert!(is_result(&game, false));
+        finish_result(&mut game);
         assert!(game.is_finished());
         assert!(game.is_game_over());
         assert!(!game.is_cleared());
@@ -1316,10 +1570,10 @@ mod tests {
     // --- 描画 ---
 
     #[test]
-    fn hud_shows_display_name_and_round_count() {
+    fn hud_shows_display_name_and_rice_gauge() {
         let text = text_of(&rendered(&LookAwayGame::new()));
         assert!(text.contains(&compact(DISPLAY_NAME)), "{text}");
-        assert!(text.contains("Q1/10"), "{text}");
+        assert!(text.contains(&compact("ごはん")), "{text}");
     }
 
     #[test]
@@ -1345,6 +1599,19 @@ mod tests {
         // テスト環境ではpickerを検出できないので、常にテキストのフォールバックになる
         let renderer = StageRenderer::new();
         assert!(!renderer.uses_image());
+    }
+
+    #[test]
+    fn stage_images_are_embedded_and_decodable() {
+        let mut paths = vec![STAGE_NORMAL_IMAGE, STAGE_YAHHO_IMAGE];
+        paths.extend(STAGE_SHOUT_RIGHT_IMAGES);
+        paths.extend(STAGE_SHOUT_LEFT_IMAGES);
+        for path in paths {
+            assert!(
+                splash::load_embedded_image(path).is_some(),
+                "{path}が埋め込まれデコードできること"
+            );
+        }
     }
 
     #[test]
@@ -1387,10 +1654,13 @@ mod tests {
     }
 
     #[test]
-    fn result_shows_big_marks() {
+    fn result_shows_incorrect_mark_but_not_correct_mark() {
         let mut game = LookAwayGame::new();
         answer_round(&mut game, true);
-        assert!(text_of(&rendered(&game)).contains(CORRECT_MARK));
+        assert!(
+            !text_of(&rendered(&game)).contains(CORRECT_MARK),
+            "正解時は緑の◯を出さない"
+        );
         finish_result(&mut game);
         answer_round(&mut game, false);
         assert!(text_of(&rendered(&game)).contains(INCORRECT_MARK));
@@ -1409,13 +1679,12 @@ mod tests {
         assert!(text_of(&rendered(&game)).contains(&compact(GAME_OVER_TEXT)));
 
         let mut game = LookAwayGame::new();
-        for round in 0..ROUNDS_PER_SESSION {
-            answer_round(&mut game, true);
-            if round + 1 < ROUNDS_PER_SESSION {
-                assert!(!text_of(&rendered(&game)).contains(&compact(CLEAR_TEXT)));
-                finish_result(&mut game);
-            }
-        }
+        game.phase = Phase::Idle {
+            remaining: Duration::from_secs(3600),
+            is_eating: true,
+        };
+        assert!(!text_of(&rendered(&game)).contains(&compact(CLEAR_TEXT)));
+        game.update(Duration::from_secs_f32(RICE_FULL / RICE_DRAIN_PER_SEC) + ms(1));
         assert!(text_of(&rendered(&game)).contains(&compact(CLEAR_TEXT)));
     }
 
@@ -1424,7 +1693,12 @@ mod tests {
         let mut game = LookAwayGame::new();
         let setups: [fn(&mut LookAwayGame); 4] = [
             |_| {},
-            |g| g.phase = Phase::Idle { remaining: ms(500) },
+            |g| {
+                g.phase = Phase::Idle {
+                    remaining: ms(500),
+                    is_eating: false,
+                }
+            },
             |g| shout(g, Side::Right),
             yahho,
         ];

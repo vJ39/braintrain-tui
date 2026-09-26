@@ -285,6 +285,31 @@ pub fn render_hud_with_session_length(
     session_length: u32,
     feedback: &AnswerFeedback,
 ) {
+    // いま解いている問題の番号(全問解き終えたら最終問のまま)
+    let current_question = (answered + 1).min(session_length);
+    let progress = Line::from(vec![
+        Span::styled(
+            format!(" Q{current_question:>2}/{session_length} "),
+            title_style(),
+        ),
+        Span::styled(
+            progress_bar(answered, session_length, QUESTIONS_PER_SESSION as usize),
+            Style::default().fg(ACCENT),
+        ),
+    ]);
+    render_hud_with_progress_line(frame, area, game_name, difficulty, feedback, progress);
+}
+
+/// 問題数の進捗バーの代わりに、任意のLine(左欄)を出すHUD。
+/// 問題数固定のセッション制ではないゲーム(ゲージ制等)が使う
+pub fn render_hud_with_progress_line(
+    frame: &mut Frame,
+    area: Rect,
+    game_name: &str,
+    difficulty: Difficulty,
+    feedback: &AnswerFeedback,
+    progress: Line<'_>,
+) {
     let (difficulty_text, difficulty_color) = difficulty_label(difficulty);
     let block = panel(format!(" ◆ {game_name} "))
         .border_style(Style::default().fg(flash_border_color(feedback.current())))
@@ -309,18 +334,6 @@ pub fn render_hud_with_session_length(
         ])
         .split(inner);
 
-    // いま解いている問題の番号(全問解き終えたら最終問のまま)
-    let current_question = (answered + 1).min(session_length);
-    let progress = Line::from(vec![
-        Span::styled(
-            format!(" Q{current_question:>2}/{session_length} "),
-            title_style(),
-        ),
-        Span::styled(
-            progress_bar(answered, session_length, QUESTIONS_PER_SESSION as usize),
-            Style::default().fg(ACCENT),
-        ),
-    ]);
     frame.render_widget(Paragraph::new(progress), cols[0]);
 
     if let Some(flash) = feedback.current() {

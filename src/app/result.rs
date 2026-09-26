@@ -581,6 +581,38 @@ mod tests {
         assert_eq!(app.current_bgm.as_deref(), Some("Apex_Pursuit"));
     }
 
+    /// ライフ制ゲーム(ヤッホー等)は途中で何問か正解していてもライフ切れでGAME OVERになる。
+    /// GameResult::correct==0前提の共通判定を素通りしないよう、forced_game_overで明示する
+    fn forced_game_over_result_with_some_correct() -> GameResult {
+        let mut result = sample_result();
+        result.total = 2;
+        result.correct = 1;
+        result.forced_game_over = true;
+        result
+    }
+
+    #[test]
+    fn forced_game_over_does_not_draw_the_sprite() {
+        let (width, height) = (120u16, 40u16);
+        let mut app = App::new();
+        app.show_result(forced_game_over_result_with_some_correct(), None);
+        app.update(LONG_ENOUGH);
+        let without_sprite = rendered_buffer(&mut app, width, height);
+        app.result_sprite = halfblocks_sprite();
+        let with_sprite_configured = rendered_buffer(&mut app, width, height);
+        assert_eq!(
+            without_sprite, with_sprite_configured,
+            "1問正解していてもforced_game_overならキャラクターを描かない"
+        );
+    }
+
+    #[test]
+    fn forced_game_over_switches_bgm_to_result_failure_category() {
+        let mut app = App::new();
+        app.enter_result(forced_game_over_result_with_some_correct());
+        assert_eq!(app.current_bgm.as_deref(), Some("Apex_Pursuit"));
+    }
+
     #[test]
     fn non_game_over_result_still_uses_the_regular_result_bgm() {
         let mut app = App::new();

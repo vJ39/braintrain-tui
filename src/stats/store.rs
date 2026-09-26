@@ -56,6 +56,7 @@ mod tests {
             total: 10,
             avg_latency_ms: 123.4,
             played_at: Utc::now(),
+            forced_game_over: false,
         }
     }
 
