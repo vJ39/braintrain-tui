@@ -63,6 +63,8 @@ impl App {
             audio::play_se(SeKind::Transition);
             self.enter_jukebox();
         } else {
+            // ゲームの項目を選んだ瞬間の決定音(その後の遷移先ごとの音とは別に鳴らす)
+            audio::play_se(SeKind::GameSelect);
             self.start_game_item(selected);
         }
     }

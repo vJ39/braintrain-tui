@@ -45,6 +45,10 @@ pub enum SeKind {
     QuickDrawShoot,
     /// 「ハヤウチ」でフェイント(「撃つな」)にひっかかって撃ってしまった時の音
     QuickDrawMiss,
+    /// メニューでゲームの項目を選択(決定)した時の音
+    GameSelect,
+    /// TTRの曲選択画面で曲を決定した時の音
+    TtrSongSelect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +141,8 @@ impl SeKind {
             SeKind::QuickDrawReady => Some("se_hayauchi_ready.mp3"),
             SeKind::QuickDrawShoot => Some("se_hayauchi_shoot.mp3"),
             SeKind::QuickDrawMiss => Some("se_hayauchi_miss.mp3"),
+            SeKind::GameSelect => Some("se_game_select.mp3"),
+            SeKind::TtrSongSelect => Some("se_ttr_song_select.mp3"),
         }
     }
 }
@@ -463,7 +469,7 @@ pub fn playing_typewriter_kind() -> Option<TypewriterSeKind> {
 mod tests {
     use super::*;
 
-    const ALL_SE_KINDS: [SeKind; 12] = [
+    const ALL_SE_KINDS: [SeKind; 14] = [
         SeKind::Correct,
         SeKind::Incorrect,
         SeKind::Transition,
@@ -476,6 +482,8 @@ mod tests {
         SeKind::QuickDrawReady,
         SeKind::QuickDrawShoot,
         SeKind::QuickDrawMiss,
+        SeKind::GameSelect,
+        SeKind::TtrSongSelect,
     ];
 
     #[test]

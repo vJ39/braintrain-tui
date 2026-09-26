@@ -30,7 +30,7 @@ impl App {
 
     /// 曲選択画面での曲決定(キー/クリック共通)。難易度選択を挟まず、その曲のプレイを始める
     pub(super) fn select_song(&mut self, song: usize) {
-        audio::play_se(SeKind::Transition);
+        audio::play_se(SeKind::TtrSongSelect);
         self.start_rhythm(song);
     }
 
