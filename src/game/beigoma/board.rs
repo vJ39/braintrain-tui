@@ -4,8 +4,12 @@
 //! - 傾き: pitch(前後軸、+が前傾)・roll(左右軸、+が右傾)。-TILT_MAX〜+TILT_MAX
 //! - 軽トラのG(軽トラの加速度の向き)は、ベーゴマには慣性として逆向きにかかる
 //!   (ブレーキ=後方向のGで、ベーゴマは前(画面の上)へ押される)
-//! - 平坦な場所の摩擦はGによらず一定。障害物を踏むと一度飛び上がり、着地の瞬間の摩擦が
-//!   踏んだ時のGに応じて増える。その大きさで 軽い着地/弾かれる/吹っ飛ぶ の3段階になる
+//! - 平坦な場所の摩擦はGによらず一定。障害物は凸(でっぱり)と凹(くぼみ)の2種類で、
+//!   どちらも「マスに入った瞬間」に判定する
+//!   - 凸: 踏むと一度飛び上がり、着地の瞬間の摩擦が踏んだ時のGに応じて増える。
+//!     その大きさで 軽い着地/弾かれる/吹っ飛ぶ の3段階になる
+//!   - 凹: 正面から入るとハマり、強い摩擦で速さを奪われてマスの中に留まる(十分な速さで抜け出せる)。
+//!     斜めに入ると側面をこすり、凸の着地と同じ3段階(ただし摩擦が上乗せされる)で弾かれる
 //! - 盤の縁に壁は無い。ベーゴマの中心が縁を越えたら盤から落ちる(場外)
 
 use std::time::Duration;
@@ -16,19 +20,19 @@ use super::truck::GForce;
 pub const BOARD_WIDTH: usize = 20;
 pub const BOARD_HEIGHT: usize = 12;
 
-/// 盤の固定配置。'.'=平坦、'#'=障害物(凹凸)、'S'=投入位置、'G'=ゴール(唯一)。
+/// 盤の固定配置。'.'=平坦、'#'=凸(でっぱり)、'u'=凹(くぼみ)、'S'=投入位置、'G'=ゴール(唯一)。
 /// 毎回同じ配置なので、繰り返しプレイしてコースを覚えられる
 const LAYOUT: [&str; BOARD_HEIGHT] = [
     "....................",
     "...........#.....G..",
-    "....#...........#...",
-    "..........#.........",
-    ".......#.......#....",
-    "..#.........#.......",
-    ".........#.......#..",
-    "....#..........#....",
-    "...........#........",
-    ".......#.......#....",
+    "....#...........u...",
+    "..........u.........",
+    ".......#.......u....",
+    "..u.........#.......",
+    ".........u.......#..",
+    "....u..........#....",
+    "...........u........",
+    ".......#.......u....",
     ".S..#...............",
     "....................",
 ];
@@ -66,12 +70,24 @@ pub const BOUNCE_SPEED: f64 = 4.0;
 pub const BOUNCE_KICK: f64 = 0.5;
 /// ベーゴマの速さの上限(マス/秒)。1ステップでマスを飛び越さないようにする
 pub const MAX_SPEED: f64 = 15.0;
+/// 凹にハマっている間の摩擦(1秒あたりの速度の減衰率)。平坦の0.8に対して大きく、抜け出しにくい
+pub const HOLLOW_FRICTION: f64 = 3.0;
+/// 凹から抜け出すのに必要な速さ(マス/秒)。終端速度は 加速度/HOLLOW_FRICTION なので、
+/// 傾き最大(6マス/s^2)なら約2.0に届いて約0.5秒で抜け、それより弱い傾きだけでは届かない
+pub const HOLLOW_EXIT_SPEED: f64 = 1.5;
+/// 凹に入る向きと、跨いだ縁の法線のなす角のcos。これ未満(60°より浅い角度)なら側面をこすって弾かれる
+pub const HOLLOW_GRAZE_COS: f64 = 0.5;
+/// 凹の側面をこすった時に、着地の摩擦へ上乗せする分。G=0でも弾かれ、G>0.45で吹っ飛ぶ
+pub const HOLLOW_GRAZE_FRICTION: f64 = 0.7;
 
 /// 盤の1マス
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cell {
     Flat,
+    /// 凸(でっぱり)。踏むと飛び上がり、着地の摩擦が踏んだ時のGで増える
     Bump,
+    /// 凹(くぼみ)。正面から入るとハマって抜け出しにくい。斜めに入ると側面をこすって弾かれる
+    Hollow,
     Goal,
 }
 
@@ -91,6 +107,7 @@ impl Board {
             for (x, c) in row.chars().enumerate() {
                 cells.push(match c {
                     '#' => Cell::Bump,
+                    'u' => Cell::Hollow,
                     'G' => Cell::Goal,
                     'S' => {
                         start = (x, y);
@@ -212,12 +229,51 @@ fn decay_axis(value: &mut f64, idle: &mut Duration, dt: Duration) {
     };
 }
 
-/// 平坦な場所(ゴールも含む)の摩擦。Gの大小によらず一定
-pub fn surface_friction(cell: Cell, g: f64) -> f64 {
+/// 足元のマスとベーゴマの状態から決まる摩擦。凹にハマっている間は常にHOLLOW_FRICTION、
+/// それ以外の平坦な場所(ゴール・ハマらずに乗った凹も含む)はGの大小によらず一定
+pub fn surface_friction(cell: Cell, state: TopState, g: f64) -> f64 {
+    if state == TopState::Sunk {
+        return HOLLOW_FRICTION;
+    }
     match cell {
-        Cell::Flat | Cell::Goal => ROLLING_FRICTION,
-        // 障害物(凹凸)の上ではGがかかるほど引っかかる
+        Cell::Flat | Cell::Hollow | Cell::Goal => ROLLING_FRICTION,
+        // 凸の上ではGがかかるほど引っかかる
         Cell::Bump => landing_friction(g),
+    }
+}
+
+/// 凹への入り方
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HollowContact {
+    /// 正面から入った: ハマる
+    Sink,
+    /// 斜めに入った: 側面をこする
+    Graze,
+}
+
+/// 凹に入った向きの判定。prevからcurへ跨いだ縁の法線(curへ向かう向き)と速度のなす角で、
+/// 正面(Sink)か斜め(Graze)かを決める。角を斜めに跨いだ時は対角の向きを法線とみなす
+pub fn hollow_contact(vel: (f64, f64), prev: (usize, usize), cur: (usize, usize)) -> HollowContact {
+    let normal = (
+        (cur.0 as i64 - prev.0 as i64).signum() as f64,
+        (cur.1 as i64 - prev.1 as i64).signum() as f64,
+    );
+    let normal_len = normal.0.hypot(normal.1);
+    let speed = vel.0.hypot(vel.1);
+    if normal_len == 0.0 || speed < 1e-9 {
+        // 縁を跨いでいない・止まっている(通常は起きない)時は正面扱いにする
+        return HollowContact::Sink;
+    }
+    let cos = (vel.0 * normal.0 + vel.1 * normal.1) / (speed * normal_len);
+    hollow_contact_from_cos(cos)
+}
+
+/// 入る向きと縁の法線のなす角のcosから入り方を決める。HOLLOW_GRAZE_COSちょうどはハマる
+pub fn hollow_contact_from_cos(cos: f64) -> HollowContact {
+    if cos >= HOLLOW_GRAZE_COS {
+        HollowContact::Sink
+    } else {
+        HollowContact::Graze
     }
 }
 
@@ -253,21 +309,37 @@ pub fn classify_landing(friction: f64) -> Landing {
 pub enum TopState {
     /// 盤の上を転がっている
     Rolling,
-    /// 障害物を踏んで飛び上がっている。contact_gは踏んだ瞬間のG
+    /// 凸を踏んで飛び上がっている。contact_gは踏んだ瞬間のG
     Airborne { remaining: Duration, contact_g: f64 },
+    /// 凹にハマっている。凹のマスの縁で位置を留め、速さがHOLLOW_EXIT_SPEEDに届いたら抜ける
+    Sunk,
 }
 
 /// 1ステップの間に起きた出来事
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StepEvent {
-    /// 障害物を踏んで飛び上がった
+    /// 凸を踏んで飛び上がった
     Hopped { contact_g: f64 },
     /// 着地した
     Landed(Landing),
+    /// 凹に正面から入ってハマった
+    Sank,
+    /// 凹の側面をこすって弾かれた/吹っ飛んだ
+    Grazed(Landing),
+    /// 凹から抜け出した
+    Escaped,
     /// 盤から落ちた(場外)
     FellOff,
     /// ゴールに入った
     Goal,
+}
+
+/// 位置を含むマス(盤の範囲に収める)
+fn cell_index(pos: (f64, f64)) -> (usize, usize) {
+    (
+        (pos.0.max(0.0) as usize).min(BOARD_WIDTH - 1),
+        (pos.1.max(0.0) as usize).min(BOARD_HEIGHT - 1),
+    )
 }
 
 /// 盤の上のベーゴマ
@@ -276,18 +348,19 @@ pub struct Top {
     pub pos: (f64, f64),
     pub vel: (f64, f64),
     pub state: TopState,
-    /// 障害物のマスの上にいるか。障害物へ入った瞬間だけ飛び上がるために使う
-    on_bump: bool,
+    /// 直前のステップにいたマス。マスに入った瞬間(凸・凹の判定)の検出に使う。
+    /// ハマっている間は、ハマっている凹のマス
+    prev_cell: (usize, usize),
 }
 
 impl Top {
-    /// posに止まった状態で置く
+    /// posに止まった状態で置く(置いたマスには既に入っている扱い)
     pub fn new(pos: (f64, f64)) -> Self {
         Self {
             pos,
             vel: (0.0, 0.0),
             state: TopState::Rolling,
-            on_bump: false,
+            prev_cell: cell_index(pos),
         }
     }
 
@@ -305,32 +378,37 @@ impl Top {
         g: GForce,
     ) -> Option<StepEvent> {
         let secs = dt.as_secs_f64();
-        if let TopState::Airborne {
-            remaining,
-            contact_g,
-        } = self.state
-        {
-            return self.fly(board, dt, remaining, contact_g);
+        match self.state {
+            TopState::Airborne {
+                remaining,
+                contact_g,
+            } => self.fly(board, dt, remaining, contact_g),
+            TopState::Sunk => self.struggle(secs, tilt, g),
+            TopState::Rolling => self.roll(board, secs, tilt, g),
         }
-        // 傾きの向きへ転がり、Gは慣性として軽トラの加速度と逆向きにかかる
-        // (画面の上が前方なので、前傾(pitch +)・後方向のG(longitudinal -)はyを減らす向き)
-        let ax = tilt.roll() * TILT_ACCEL_PER_LEVEL - g.lateral * G_ACCEL_PER_G;
-        let ay = -tilt.pitch() * TILT_ACCEL_PER_LEVEL + g.longitudinal * G_ACCEL_PER_G;
-        self.vel.0 += ax * secs;
-        self.vel.1 += ay * secs;
-        let friction = surface_friction(board.cell_at(self.pos), g.magnitude());
-        let damping = (1.0 - friction * secs).max(0.0);
-        self.vel.0 *= damping;
-        self.vel.1 *= damping;
-        self.cap_speed();
-        self.advance(secs);
+    }
+
+    /// 転がっている間: 進んだ先のマスに入った瞬間だけ、凸・凹の判定をする
+    fn roll(&mut self, board: &Board, secs: f64, tilt: &Tilt, g: GForce) -> Option<StepEvent> {
+        let friction = surface_friction(board.cell_at(self.pos), self.state, g.magnitude());
+        self.drive(secs, tilt, g, friction);
         if !Board::contains(self.pos) {
             return Some(StepEvent::FellOff);
         }
-        match board.cell_at(self.pos) {
-            Cell::Bump if !self.on_bump => {
-                // 障害物を踏んだ瞬間: 一度飛び上がり、このときのGで着地の摩擦が決まる
-                self.on_bump = true;
+        let prev = self.prev_cell;
+        let cur = cell_index(self.pos);
+        self.prev_cell = cur;
+        let cell = board.cell(cur.0, cur.1);
+        if cell == Cell::Goal {
+            // ゴールは入った瞬間に限らず、ゴールのマスにいれば入ったとみなす(着地・脱出した先も含む)
+            return Some(StepEvent::Goal);
+        }
+        if cur == prev {
+            return None;
+        }
+        match cell {
+            Cell::Bump => {
+                // 凸を踏んだ瞬間: 一度飛び上がり、このときのGで着地の摩擦が決まる
                 let contact_g = g.magnitude();
                 self.state = TopState::Airborne {
                     remaining: HOP_DURATION,
@@ -338,20 +416,69 @@ impl Top {
                 };
                 Some(StepEvent::Hopped { contact_g })
             }
-            Cell::Bump => None,
-            Cell::Goal => {
-                self.on_bump = false;
-                Some(StepEvent::Goal)
+            Cell::Hollow => Some(self.enter_hollow(prev, cur, g.magnitude())),
+            Cell::Flat | Cell::Goal => None,
+        }
+    }
+
+    /// 凹のマスに入った瞬間。正面ならハマり、斜めなら側面をこすって凸の着地と同じ3段階で判定する
+    fn enter_hollow(&mut self, prev: (usize, usize), cur: (usize, usize), g: f64) -> StepEvent {
+        match hollow_contact(self.vel, prev, cur) {
+            HollowContact::Sink => {
+                self.state = TopState::Sunk;
+                StepEvent::Sank
             }
-            Cell::Flat => {
-                self.on_bump = false;
-                None
+            HollowContact::Graze => {
+                let landing = classify_landing(landing_friction(g) + HOLLOW_GRAZE_FRICTION);
+                if landing == Landing::Bounce {
+                    self.bounce();
+                    self.prev_cell = cell_index(self.pos);
+                }
+                StepEvent::Grazed(landing)
             }
         }
     }
 
+    /// 凹にハマっている間: 摩擦はHOLLOW_FRICTIONで、凹のマスから出る位置まで進んでも
+    /// 速さがHOLLOW_EXIT_SPEEDに届かなければ位置だけマスの内側に留める。
+    /// 速度は殺さないので、縁へ向かって傾け続けている間は速さが溜まっていく
+    fn struggle(&mut self, secs: f64, tilt: &Tilt, g: GForce) -> Option<StepEvent> {
+        let friction = surface_friction(Cell::Hollow, self.state, g.magnitude());
+        self.drive(secs, tilt, g, friction);
+        let hollow = self.prev_cell;
+        if Board::contains(self.pos) && cell_index(self.pos) == hollow {
+            return None;
+        }
+        if self.vel.0.hypot(self.vel.1) < HOLLOW_EXIT_SPEED {
+            self.pos = clamp_into_cell(self.pos, hollow);
+            return None;
+        }
+        if !Board::contains(self.pos) {
+            return Some(StepEvent::FellOff);
+        }
+        // prev_cellは凹のままにしておき、次のステップで抜けた先のマスに入った判定をする
+        self.state = TopState::Rolling;
+        Some(StepEvent::Escaped)
+    }
+
+    /// 傾きとGで加速し、摩擦で減速して、速度のぶん進める
+    fn drive(&mut self, secs: f64, tilt: &Tilt, g: GForce, friction: f64) {
+        // 傾きの向きへ転がり、Gは慣性として軽トラの加速度と逆向きにかかる
+        // (画面の上が前方なので、前傾(pitch +)・後方向のG(longitudinal -)はyを減らす向き)
+        let ax = tilt.roll() * TILT_ACCEL_PER_LEVEL - g.lateral * G_ACCEL_PER_G;
+        let ay = -tilt.pitch() * TILT_ACCEL_PER_LEVEL + g.longitudinal * G_ACCEL_PER_G;
+        self.vel.0 += ax * secs;
+        self.vel.1 += ay * secs;
+        let damping = (1.0 - friction * secs).max(0.0);
+        self.vel.0 *= damping;
+        self.vel.1 *= damping;
+        self.cap_speed();
+        self.advance(secs);
+    }
+
     /// 飛び上がっている間: 盤に触れていないので傾き・G・摩擦は効かず、そのままの速度で進む。
-    /// 着地したら、踏んだ時のGから決まる摩擦で結果を判定する。
+    /// 着地したら、踏んだ時のGから決まる摩擦で結果を判定する。凹の上に着地したら
+    /// (吹っ飛んだ時以外は)そのままハマる。出来事は着地(Landed)を返す。
     /// 飛び上がっている間に中心が縁を越えたら、着地を待たずに落ちる
     fn fly(
         &mut self,
@@ -377,7 +504,14 @@ impl Top {
         if landing == Landing::Bounce {
             self.bounce();
         }
-        self.on_bump = board.cell_at(self.pos) == Cell::Bump;
+        // 着地したマスには既に入っている扱い(同じ凸の上で飛び上がり直さない)
+        self.prev_cell = cell_index(self.pos);
+        if landing != Landing::Flown
+            && Board::contains(self.pos)
+            && board.cell(self.prev_cell.0, self.prev_cell.1) == Cell::Hollow
+        {
+            self.state = TopState::Sunk;
+        }
         Some(StepEvent::Landed(landing))
     }
 
@@ -411,6 +545,16 @@ impl Top {
         self.pos.0 += self.vel.0 * secs;
         self.pos.1 += self.vel.1 * secs;
     }
+}
+
+/// マスの内側に収めた位置(右端・下端はわずかに内側にして、次のマスに入らないようにする)
+fn clamp_into_cell(pos: (f64, f64), cell: (usize, usize)) -> (f64, f64) {
+    const INSET: f64 = 1e-9;
+    let (x, y) = (cell.0 as f64, cell.1 as f64);
+    (
+        pos.0.clamp(x, x + 1.0 - INSET),
+        pos.1.clamp(y, y + 1.0 - INSET),
+    )
 }
 
 #[cfg(test)]
@@ -500,6 +644,32 @@ mod tests {
         let again = Board::standard();
         assert_eq!(again.goal(), board.goal());
         assert_eq!(again.cells, board.cells);
+    }
+
+    #[test]
+    fn layout_chars_map_to_bump_and_hollow() {
+        let board = Board::standard();
+        let (mut bumps, mut hollows) = (0, 0);
+        for (y, row) in LAYOUT.iter().enumerate() {
+            for (x, c) in row.chars().enumerate() {
+                match c {
+                    '#' => {
+                        assert_eq!(board.cell(x, y), Cell::Bump, "({x},{y}): '#'は凸");
+                        bumps += 1;
+                    }
+                    'u' => {
+                        assert_eq!(board.cell(x, y), Cell::Hollow, "({x},{y}): 'u'は凹");
+                        hollows += 1;
+                    }
+                    _ => assert!(
+                        !matches!(board.cell(x, y), Cell::Bump | Cell::Hollow),
+                        "({x},{y}): '#'/'u'以外は凹凸にしない"
+                    ),
+                }
+            }
+        }
+        assert!(bumps >= 4, "凸を複数置く: {bumps}");
+        assert!(hollows >= 4, "凹を複数置く: {hollows}");
     }
 
     #[test]
@@ -631,10 +801,34 @@ mod tests {
 
     #[test]
     fn flat_friction_does_not_depend_on_g() {
+        let rolling = TopState::Rolling;
         for g in [0.0, 0.3, 0.8, 1.5, 3.0] {
-            assert_eq!(surface_friction(Cell::Flat, g), ROLLING_FRICTION, "g={g}");
-            assert_eq!(surface_friction(Cell::Goal, g), ROLLING_FRICTION, "g={g}");
+            assert_eq!(
+                surface_friction(Cell::Flat, rolling, g),
+                ROLLING_FRICTION,
+                "g={g}"
+            );
+            assert_eq!(
+                surface_friction(Cell::Goal, rolling, g),
+                ROLLING_FRICTION,
+                "g={g}"
+            );
         }
+    }
+
+    #[test]
+    fn sunk_top_always_uses_the_hollow_friction() {
+        for cell in [Cell::Flat, Cell::Bump, Cell::Hollow, Cell::Goal] {
+            for g in [0.0, 0.5, 3.0] {
+                assert_eq!(
+                    surface_friction(cell, TopState::Sunk, g),
+                    HOLLOW_FRICTION,
+                    "{cell:?} g={g}"
+                );
+            }
+        }
+        // 凹の中は平坦よりずっと転がりにくい
+        const { assert!(HOLLOW_FRICTION > ROLLING_FRICTION * 2.0) };
     }
 
     #[test]
@@ -1040,5 +1234,296 @@ mod tests {
             top.step(&board, STEP, &Tilt::new(), NO_G),
             Some(StepEvent::Goal)
         );
+    }
+
+    // --- 凹(Hollow) ---
+
+    /// 凹の物理のテストで使う凹のマス(盤の中央付近)
+    const HOLLOW_AT: (usize, usize) = (10, 6);
+
+    /// 全部平坦な盤に、指定したマスだけ置いた盤(凹のテストを固定配置に依存させないため)
+    fn board_with(cells: &[((usize, usize), Cell)]) -> Board {
+        let mut board = Board {
+            cells: vec![Cell::Flat; BOARD_WIDTH * BOARD_HEIGHT],
+            start: (1, 10),
+        };
+        for &((x, y), cell) in cells {
+            board.cells[y * BOARD_WIDTH + x] = cell;
+        }
+        board
+    }
+
+    fn hollow_board() -> Board {
+        board_with(&[(HOLLOW_AT, Cell::Hollow)])
+    }
+
+    /// posを含むマス
+    fn cell_containing(pos: (f64, f64)) -> (usize, usize) {
+        (pos.0 as usize, pos.1 as usize)
+    }
+
+    /// posで凹にハマって止まっているベーゴマ
+    fn sunk_top(pos: (f64, f64)) -> Top {
+        let mut top = Top::new(pos);
+        top.state = TopState::Sunk;
+        top
+    }
+
+    /// keyの向きへpresses回押した傾き
+    fn tilt_toward(key: TiltKey, presses: usize) -> Tilt {
+        let mut tilt = Tilt::new();
+        for _ in 0..presses {
+            tilt.press(key);
+        }
+        tilt
+    }
+
+    #[test]
+    fn entering_a_hollow_head_on_sinks_the_top() {
+        // 4辺とも、縁に垂直(正面)に入るとハマり、その後は凹のマスの中に留まる
+        let board = hollow_board();
+        let (hx, hy) = (HOLLOW_AT.0 as f64, HOLLOW_AT.1 as f64);
+        let cases = [
+            ((hx - 0.02, hy + 0.5), (3.0, 0.0)),
+            ((hx + 1.02, hy + 0.5), (-3.0, 0.0)),
+            ((hx + 0.5, hy - 0.02), (0.0, 3.0)),
+            ((hx + 0.5, hy + 1.02), (0.0, -3.0)),
+        ];
+        for (pos, vel) in cases {
+            let mut top = Top::new(pos);
+            top.vel = vel;
+            assert_eq!(
+                top.step(&board, STEP, &Tilt::new(), NO_G),
+                Some(StepEvent::Sank),
+                "{pos:?}: 正面から入るとハマる"
+            );
+            assert_eq!(top.state, TopState::Sunk);
+            for i in 0..300 {
+                assert_eq!(
+                    top.step(&board, STEP, &Tilt::new(), NO_G),
+                    None,
+                    "{pos:?} i={i}"
+                );
+                assert_eq!(
+                    cell_containing(top.pos),
+                    HOLLOW_AT,
+                    "{pos:?} i={i}: 凹の中に留まる"
+                );
+                assert_eq!(top.state, TopState::Sunk);
+            }
+        }
+    }
+
+    #[test]
+    fn entering_a_hollow_at_a_shallow_angle_grazes_and_bounces() {
+        // 上の縁(法線は下向き)に、横へ流れながら浅い角度(cos=1/√10≈0.32)で入る
+        let board = hollow_board();
+        let mut top = Top::new((HOLLOW_AT.0 as f64 + 0.5, HOLLOW_AT.1 as f64 - 0.005));
+        let incoming = (3.0, 1.0);
+        top.vel = incoming;
+        assert_eq!(
+            top.step(&board, STEP, &Tilt::new(), NO_G),
+            Some(StepEvent::Grazed(Landing::Bounce)),
+            "側面をこすって弾かれる(G=0でも弾かれる)"
+        );
+        assert_eq!(top.state, TopState::Rolling, "ハマらない");
+        assert!(approx(speed(&top), BOUNCE_SPEED), "勢いよく弾かれる");
+        assert!(
+            top.vel.0 < 0.0 && top.vel.1 < 0.0,
+            "来た方向へ速度が反転する: {:?}",
+            top.vel
+        );
+        let dot = top.vel.0 * incoming.0 + top.vel.1 * incoming.1;
+        assert!(
+            approx(dot, -BOUNCE_SPEED * incoming.0.hypot(incoming.1)),
+            "真逆の向き: {:?}",
+            top.vel
+        );
+        assert_ne!(cell_containing(top.pos), HOLLOW_AT, "凹の外へ弾き出される");
+        // 盤の中央付近で弾かれても場外へは出ない
+        for i in 0..1000 {
+            assert_eq!(top.step(&board, STEP, &Tilt::new(), NO_G), None, "i={i}");
+            assert!(Board::contains(top.pos), "i={i}: {:?}", top.pos);
+        }
+    }
+
+    #[test]
+    fn grazing_under_high_g_flies_the_top_off() {
+        let board = hollow_board();
+        let graze = |g: f64| {
+            let mut top = Top::new((HOLLOW_AT.0 as f64 + 0.5, HOLLOW_AT.1 as f64 - 0.005));
+            top.vel = (3.0, 1.0);
+            top.step(&board, STEP, &Tilt::new(), lateral(g))
+        };
+        assert_eq!(graze(0.6), Some(StepEvent::Grazed(Landing::Flown)));
+        assert_eq!(
+            graze(0.4),
+            Some(StepEvent::Grazed(Landing::Bounce)),
+            "G=0.45以下なら弾かれるだけ"
+        );
+    }
+
+    #[test]
+    fn hollow_contact_threshold_is_exact() {
+        assert_eq!(
+            hollow_contact_from_cos(HOLLOW_GRAZE_COS),
+            HollowContact::Sink,
+            "しきい値ちょうどはハマる"
+        );
+        assert_eq!(
+            hollow_contact_from_cos(HOLLOW_GRAZE_COS - 1e-6),
+            HollowContact::Graze
+        );
+        assert_eq!(hollow_contact_from_cos(1.0), HollowContact::Sink);
+        // 左の縁(法線は右向き)・上の縁(法線は下向き)とも、法線から60°の前後で分かれる
+        let edge_angle = HOLLOW_GRAZE_COS.acos();
+        let (left, right) = ((9, 6), (10, 6));
+        let (above, below) = ((10, 5), (10, 6));
+        for (delta, expected) in [
+            (-0.1_f64.to_radians(), HollowContact::Sink),
+            (0.1_f64.to_radians(), HollowContact::Graze),
+        ] {
+            let angle = edge_angle + delta;
+            let from_left = (2.0 * angle.cos(), 2.0 * angle.sin());
+            assert_eq!(hollow_contact(from_left, left, right), expected, "{delta}");
+            let from_above = (2.0 * angle.sin(), 2.0 * angle.cos());
+            assert_eq!(
+                hollow_contact(from_above, above, below),
+                expected,
+                "{delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn sunk_top_cannot_leave_below_the_exit_speed() {
+        // 最大より弱い傾きでは、60秒傾け続けても凹から出られない
+        let board = hollow_board();
+        let center = (HOLLOW_AT.0 as f64 + 0.5, HOLLOW_AT.1 as f64 + 0.5);
+        for presses in 1..=4 {
+            for key in [
+                TiltKey::Right,
+                TiltKey::Left,
+                TiltKey::Forward,
+                TiltKey::Back,
+            ] {
+                let tilt = tilt_toward(key, presses);
+                let mut top = sunk_top(center);
+                for i in 0..6000 {
+                    assert_eq!(
+                        top.step(&board, STEP, &tilt, NO_G),
+                        None,
+                        "{key:?}×{presses} i={i}"
+                    );
+                    assert_eq!(
+                        cell_containing(top.pos),
+                        HOLLOW_AT,
+                        "{key:?}×{presses} i={i}"
+                    );
+                }
+                assert_eq!(top.state, TopState::Sunk);
+                assert!(speed(&top) < HOLLOW_EXIT_SPEED);
+            }
+        }
+    }
+
+    #[test]
+    fn sunk_top_escapes_with_full_tilt() {
+        let board = hollow_board();
+        let center = (HOLLOW_AT.0 as f64 + 0.5, HOLLOW_AT.1 as f64 + 0.5);
+        for key in [
+            TiltKey::Right,
+            TiltKey::Left,
+            TiltKey::Forward,
+            TiltKey::Back,
+        ] {
+            let tilt = tilt_toward(key, 20);
+            let mut top = sunk_top(center);
+            let steps = (0..100)
+                .position(|_| top.step(&board, STEP, &tilt, NO_G) == Some(StepEvent::Escaped))
+                .unwrap_or_else(|| panic!("{key:?}: 1秒以内に抜け出せなかった: {:?}", top.pos));
+            assert!(steps > 10, "{key:?}: 一瞬では抜けない({steps}ステップ)");
+            assert_eq!(top.state, TopState::Rolling, "{key:?}: 抜けたら転がる");
+            assert_ne!(cell_containing(top.pos), HOLLOW_AT, "{key:?}");
+            assert!(speed(&top) >= HOLLOW_EXIT_SPEED);
+        }
+    }
+
+    #[test]
+    fn sunk_top_keeps_building_speed_while_clamped() {
+        // 縁の手前から、抜け出せない強さで縁へ向かって傾け続ける
+        let board = hollow_board();
+        let tilt = tilt_toward(TiltKey::Right, 3);
+        let mut top = sunk_top((HOLLOW_AT.0 as f64 + 0.9, HOLLOW_AT.1 as f64 + 0.5));
+        let mut previous = speed(&top);
+        let mut clamped_steps = 0;
+        for i in 0..100 {
+            assert_eq!(top.step(&board, STEP, &tilt, NO_G), None, "i={i}");
+            assert_eq!(cell_containing(top.pos), HOLLOW_AT, "i={i}: 縁で留まる");
+            assert!(
+                speed(&top) > previous,
+                "i={i}: 留められている間も速さは増え続ける: {} → {}",
+                previous,
+                speed(&top)
+            );
+            previous = speed(&top);
+            if top.pos.0 > HOLLOW_AT.0 as f64 + 0.999 {
+                clamped_steps += 1;
+            }
+        }
+        assert!(clamped_steps > 30, "縁で留められていた: {clamped_steps}");
+        assert!(top.vel.0 > 0.8, "速度は殺されていない: {:?}", top.vel);
+        assert_eq!(top.state, TopState::Sunk);
+    }
+
+    #[test]
+    fn sunk_top_escaping_over_the_rim_falls_off() {
+        // 縁にある凹から盤の外へ抜け出したら、そのまま落ちる
+        let board = board_with(&[((0, 6), Cell::Hollow)]);
+        let tilt = tilt_toward(TiltKey::Left, 20);
+        let mut top = sunk_top((0.5, 6.5));
+        let event = (0..100).find_map(|_| top.step(&board, STEP, &tilt, NO_G));
+        assert_eq!(event, Some(StepEvent::FellOff));
+        assert!(!Board::contains(top.pos));
+    }
+
+    #[test]
+    fn landing_on_a_hollow_sinks_after_landing() {
+        // 凸を踏んで飛び上がり、隣の凹に着地する
+        let (bump, hollow) = ((9, 6), (10, 6));
+        let board = board_with(&[(bump, Cell::Bump), (hollow, Cell::Hollow)]);
+        let mut top = Top::new((bump.0 as f64 - 0.02, bump.1 as f64 + 0.5));
+        top.vel = (5.0, 0.0);
+        let tilt = Tilt::new();
+        assert!(matches!(
+            top.step(&board, STEP, &tilt, NO_G),
+            Some(StepEvent::Hopped { .. })
+        ));
+        let event = (0..100).find_map(|_| top.step(&board, STEP, &tilt, NO_G));
+        assert_eq!(
+            event,
+            Some(StepEvent::Landed(Landing::Light)),
+            "着地の出来事を返す"
+        );
+        assert_eq!(cell_containing(top.pos), hollow, "凹の上に着地した");
+        assert_eq!(top.state, TopState::Sunk, "着地したらそのままハマる");
+    }
+
+    #[test]
+    fn moving_within_a_cell_triggers_nothing() {
+        // マスが変わらなければ、凸・凹とも何も起きない(入った瞬間だけ判定する)
+        for cell in [Cell::Bump, Cell::Hollow] {
+            let board = board_with(&[(HOLLOW_AT, cell)]);
+            let mut top = Top::new((HOLLOW_AT.0 as f64 + 0.1, HOLLOW_AT.1 as f64 + 0.5));
+            top.vel = (1.0, 0.0);
+            for i in 0..50 {
+                assert_eq!(
+                    top.step(&board, STEP, &Tilt::new(), NO_G),
+                    None,
+                    "{cell:?} i={i}"
+                );
+            }
+            assert_eq!(top.state, TopState::Rolling);
+        }
     }
 }

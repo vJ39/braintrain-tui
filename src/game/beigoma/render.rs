@@ -43,6 +43,7 @@ const MAX_CELL_SCALE: u16 = 3;
 /// テキスト表示の記号。記号は各マスの左端のセルに置き、残りは空白にする
 /// (端末によって記号が2セル幅で表示されても、隣のマスに食い込まないように)
 pub const BUMP_GLYPH: &str = "▲";
+pub const HOLLOW_GLYPH: &str = "▽";
 pub const GOAL_GLYPH: &str = "◎";
 /// 転がっている間の回転の見た目(順に切り替える)
 pub const TOP_SPIN_GLYPHS: [&str; 4] = ["◐", "◓", "◑", "◒"];
@@ -50,8 +51,11 @@ pub const TOP_SPIN_GLYPHS: [&str; 4] = ["◐", "◓", "◑", "◒"];
 pub const TOP_AIRBORNE_GLYPH: &str = "○";
 
 const FLAT_BG: Color = Color::Rgb(150, 105, 60);
-const BUMP_BG: Color = Color::Rgb(95, 60, 30);
-const BUMP_FG: Color = Color::Rgb(240, 200, 150);
+/// 凸は平坦より明るく(盛り上がり)、凹は暗く(穴)する
+const BUMP_BG: Color = Color::Rgb(205, 160, 105);
+const BUMP_FG: Color = Color::Rgb(95, 55, 20);
+const HOLLOW_BG: Color = Color::Rgb(60, 38, 18);
+const HOLLOW_FG: Color = Color::Rgb(120, 90, 60);
 const GOAL_BG: Color = Color::Rgb(40, 40, 40);
 const GOAL_FG: Color = Color::Yellow;
 const TOP_FG: Color = Color::Rgb(220, 240, 255);
@@ -367,7 +371,16 @@ fn compose_base(
             let radius = f64::from(pw.min(ph)) / 2.0;
             match board.cell(x, y) {
                 Cell::Flat => {}
-                Cell::Bump => fill_circle(&mut canvas, center, radius * 0.8, BUMP_PIXEL),
+                // 凸: 暗い縁(影)の上に明るい頂上を重ね、盛り上がって見せる
+                Cell::Bump => {
+                    fill_circle(&mut canvas, center, radius * 0.8, BUMP_EDGE_PIXEL);
+                    fill_circle(&mut canvas, center, radius * 0.55, BUMP_TOP_PIXEL);
+                }
+                // 凹: 暗い穴。中ほどをさらに暗くして沈んで見せる
+                Cell::Hollow => {
+                    fill_circle(&mut canvas, center, radius * 0.8, HOLLOW_PIXEL);
+                    fill_circle(&mut canvas, center, radius * 0.5, HOLLOW_DEEP_PIXEL);
+                }
                 Cell::Goal => {
                     fill_circle(&mut canvas, center, radius * 0.9, GOAL_RING_PIXEL);
                     fill_circle(&mut canvas, center, radius * 0.6, GOAL_HOLE_PIXEL);
@@ -378,8 +391,11 @@ fn compose_base(
     canvas
 }
 
-/// 画像表示の障害物・ゴール・ベーゴマ(top.pngが無い時)の色
-const BUMP_PIXEL: Rgba<u8> = Rgba([95, 60, 30, 255]);
+/// 画像表示の凹凸・ゴール・ベーゴマ(top.pngが無い時)の色
+const BUMP_EDGE_PIXEL: Rgba<u8> = Rgba([95, 60, 30, 255]);
+const BUMP_TOP_PIXEL: Rgba<u8> = Rgba([215, 170, 115, 255]);
+const HOLLOW_PIXEL: Rgba<u8> = Rgba([60, 38, 18, 255]);
+const HOLLOW_DEEP_PIXEL: Rgba<u8> = Rgba([35, 22, 10, 255]);
 const GOAL_RING_PIXEL: Rgba<u8> = Rgba([255, 215, 0, 255]);
 const GOAL_HOLE_PIXEL: Rgba<u8> = Rgba([30, 30, 30, 255]);
 const TOP_EDGE_PIXEL: Rgba<u8> = Rgba([90, 100, 115, 255]);
@@ -442,7 +458,8 @@ fn fill_circle(image: &mut RgbaImage, center: (f64, f64), radius: f64, color: Rg
     }
 }
 
-/// テキスト表示の盤面。マスごとに背景色で塗り、障害物・ゴール・ベーゴマは記号で示す
+/// テキスト表示の盤面。マスごとに背景色で塗り、凸・凹・ゴール・ベーゴマは記号で示す
+/// (凸は明るい色の▲、凹は暗い色の▽)
 fn render_board_text(
     frame: &mut Frame,
     area: Rect,
@@ -462,6 +479,7 @@ fn render_board_text(
                         .bg(BUMP_BG)
                         .add_modifier(Modifier::BOLD),
                 ),
+                Cell::Hollow => (HOLLOW_GLYPH, Style::default().fg(HOLLOW_FG).bg(HOLLOW_BG)),
                 Cell::Goal => (
                     GOAL_GLYPH,
                     Style::default()
@@ -852,6 +870,96 @@ mod tests {
             FLAT_BG,
             "平坦なマスは木の色"
         );
+    }
+
+    /// 色の明るさ(輝度)
+    fn luma(color: Color) -> f64 {
+        let Color::Rgb(r, g, b) = color else {
+            panic!("RGBの色: {color:?}");
+        };
+        0.299 * f64::from(r) + 0.587 * f64::from(g) + 0.114 * f64::from(b)
+    }
+
+    fn pixel_luma(pixel: &Rgba<u8>) -> f64 {
+        let [r, g, b, _] = pixel.0;
+        luma(Color::Rgb(r, g, b))
+    }
+
+    /// 盤の中で最初に見つかるcellのマス
+    fn first_cell(board: &Board, cell: Cell) -> (usize, usize) {
+        (0..BOARD_HEIGHT)
+            .flat_map(|y| (0..BOARD_WIDTH).map(move |x| (x, y)))
+            .find(|&(x, y)| board.cell(x, y) == cell)
+            .unwrap_or_else(|| panic!("{cell:?}のマスがある"))
+    }
+
+    #[test]
+    fn text_board_distinguishes_hollow_from_bump() {
+        let board = Board::standard();
+        let area = Rect::new(0, 0, 40, 12);
+        let renderer = BoardRenderer::new();
+        let top = top_at((0.5, 0.5));
+        let buffer = draw_board(&renderer, &board, &top, area);
+        let layout = board_area(area).unwrap();
+        let hollows = (0..BOARD_HEIGHT)
+            .flat_map(|y| (0..BOARD_WIDTH).map(move |x| (x, y)))
+            .filter(|&(x, y)| board.cell(x, y) == Cell::Hollow)
+            .count();
+        assert!(hollows > 0);
+        assert_eq!(count_symbol(&buffer, HOLLOW_GLYPH), hollows, "凹は全部描く");
+        assert_ne!(HOLLOW_GLYPH, BUMP_GLYPH, "凹と凸は記号が違う");
+
+        let (hx, hy) = first_cell(&board, Cell::Hollow);
+        let (bx, by) = first_cell(&board, Cell::Bump);
+        let hollow = layout.cell_rect(hx, hy);
+        let bump = layout.cell_rect(bx, by);
+        assert_eq!(buffer[(hollow.x, hollow.y)].symbol(), HOLLOW_GLYPH);
+        assert_eq!(buffer[(bump.x, bump.y)].symbol(), BUMP_GLYPH);
+        let (hollow_bg, bump_bg) = (buffer[(hollow.x, hollow.y)].bg, buffer[(bump.x, bump.y)].bg);
+        assert_eq!(hollow_bg, HOLLOW_BG);
+        assert_eq!(bump_bg, BUMP_BG);
+        assert_eq!(
+            buffer[(hollow.x + 1, hollow.y)].bg,
+            HOLLOW_BG,
+            "マス全体を凹の色で塗る"
+        );
+        assert!(luma(HOLLOW_BG) < luma(FLAT_BG), "凹は平坦より暗く沈んだ色");
+        assert!(
+            luma(BUMP_BG) > luma(FLAT_BG),
+            "凸は平坦より明るく盛り上がった色"
+        );
+    }
+
+    #[test]
+    fn compose_base_paints_hollow_darker_than_bump() {
+        let board = Board::standard();
+        let font_size = (10, 20);
+        let layout = board_area(Rect::new(0, 0, 40, 12)).unwrap();
+        let composed = compose_base(&plain_board_image(), &board, layout, font_size);
+        let origin = (layout.rect.x, layout.rect.y);
+        // マスの中心から横にoffset(ピクセル)ずれた点の明るさ
+        let luma_at = |(x, y): (usize, usize), offset: u32| {
+            let (px, py, pw, ph) = pixel_rect(layout.cell_rect(x, y), origin, font_size);
+            pixel_luma(composed.get_pixel(px + pw / 2 + offset, py + ph / 2))
+        };
+        let hollow = first_cell(&board, Cell::Hollow);
+        let bump = first_cell(&board, Cell::Bump);
+        let flat = (0, 0);
+        assert_eq!(board.cell(flat.0, flat.1), Cell::Flat);
+        assert!(
+            luma_at(hollow, 0) < luma_at(flat, 0),
+            "凹は暗い穴: {} < {}",
+            luma_at(hollow, 0),
+            luma_at(flat, 0)
+        );
+        assert!(
+            luma_at(bump, 0) > luma_at(flat, 0),
+            "凸の頂上は明るい: {} > {}",
+            luma_at(bump, 0),
+            luma_at(flat, 0)
+        );
+        // 凸は縁が暗く(盛り上がりの影)、頂上が明るい。1マスは20×20ピクセル
+        assert!(luma_at(bump, 7) < luma_at(bump, 0), "凸の縁は頂上より暗い");
     }
 
     #[test]

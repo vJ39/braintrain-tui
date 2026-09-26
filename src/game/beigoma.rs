@@ -3,7 +3,8 @@
 //!
 //! - 盤の傾きは前後・左右の2軸で、矢印キーを押すたびに一定量動く連打式(board.rs)
 //! - 軽トラは自動で走り、段差・信号・障害物回避のたびに運動方程式から求めたGが盤にかかる(truck.rs)
-//! - 障害物を踏んだ瞬間のGが大きいと弾かれ、さらに大きいと吹っ飛んで即GAME OVER
+//! - 凸を踏んだ瞬間のGが大きいと弾かれ、さらに大きいと吹っ飛んで即GAME OVER
+//! - 凹に正面から入るとハマり(強く傾けると抜け出せる)、斜めに入ると側面をこすって弾かれる・吹っ飛ぶ
 //! - 盤の縁に壁は無く、盤から落ちても(場外)即GAME OVER
 //! - 制限時間60秒。ゴールで成功、吹っ飛び・場外・時間切れで失敗。難易度選択は無い
 //! - 開始前の「3.2.1.GO!!」はapp.rsのカウントダウンで行い、終わってからゲームを作る(=ベーゴマを投入する)
@@ -139,19 +140,27 @@ impl BeigomaGame {
         }
     }
 
-    /// 盤上の出来事を反映する(弾かれたらSE、吹っ飛んだ・盤から落ちたら即GAME OVER、ゴールなら成功)
+    /// 盤上の出来事を反映する(弾かれたらSE、凹にハマった・抜けたら一言、
+    /// 吹っ飛んだ・盤から落ちたら即GAME OVER、ゴールなら成功)
     fn on_step_event(&mut self, event: StepEvent) {
         if self.status != Status::Playing {
             return;
         }
         match event {
             StepEvent::Hopped { .. } => self.message = Some(("ガタッ!", Duration::ZERO)),
-            StepEvent::Landed(Landing::Light) => self.message = Some(("セーフ", Duration::ZERO)),
-            StepEvent::Landed(Landing::Bounce) => {
+            StepEvent::Landed(Landing::Light) | StepEvent::Grazed(Landing::Light) => {
+                self.message = Some(("セーフ", Duration::ZERO));
+            }
+            // 凹の側面をこすって弾かれた時も、凸で弾かれた時と同じ演出
+            StepEvent::Landed(Landing::Bounce) | StepEvent::Grazed(Landing::Bounce) => {
                 audio::play_se(SeKind::Incorrect);
                 self.message = Some(("ピューン!", Duration::ZERO));
             }
-            StepEvent::Landed(Landing::Flown) | StepEvent::FellOff => self.finish(Outcome::Flown),
+            StepEvent::Sank => self.message = Some(("ズボッ", Duration::ZERO)),
+            StepEvent::Escaped => self.message = Some(("ぬけた!", Duration::ZERO)),
+            StepEvent::Landed(Landing::Flown)
+            | StepEvent::Grazed(Landing::Flown)
+            | StepEvent::FellOff => self.finish(Outcome::Flown),
             StepEvent::Goal => self.finish(Outcome::Cleared { time: self.elapsed }),
         }
     }
@@ -347,7 +356,7 @@ impl Game for BeigomaGame {
 
 #[cfg(test)]
 mod tests {
-    use super::board::{Cell, BOARD_HEIGHT, BOARD_WIDTH, HIGH_G_THRESHOLD, TILT_STEP};
+    use super::board::{Cell, TopState, BOARD_HEIGHT, BOARD_WIDTH, HIGH_G_THRESHOLD, TILT_STEP};
     use super::truck::RoadEvent;
     use super::*;
     use ratatui::backend::TestBackend;
@@ -589,6 +598,67 @@ mod tests {
         assert_eq!(game.outcome(), None);
     }
 
+    fn message_text(game: &BeigomaGame) -> Option<&'static str> {
+        game.message.map(|(text, _)| text)
+    }
+
+    #[test]
+    fn sinking_and_escaping_show_their_messages() {
+        let mut game = calm_game();
+        game.on_step_event(StepEvent::Sank);
+        assert_eq!(game.outcome(), None, "凹にハマっても続く");
+        assert_eq!(message_text(&game), Some("ズボッ"));
+        game.on_step_event(StepEvent::Escaped);
+        assert_eq!(game.outcome(), None);
+        assert_eq!(message_text(&game), Some("ぬけた!"));
+    }
+
+    #[test]
+    fn grazing_a_hollow_bounces_like_a_bump_or_ends_the_game() {
+        let mut game = calm_game();
+        game.on_step_event(StepEvent::Grazed(Landing::Bounce));
+        assert_eq!(game.outcome(), None, "側面をこすって弾かれても続く");
+        assert_eq!(
+            message_text(&game),
+            Some("ピューン!"),
+            "凸で弾かれた時と同じ一言"
+        );
+        game.on_step_event(StepEvent::Grazed(Landing::Light));
+        assert_eq!(game.outcome(), None);
+        game.on_step_event(StepEvent::Grazed(Landing::Flown));
+        assert_eq!(
+            game.outcome(),
+            Some(Outcome::Flown),
+            "側面で吹っ飛んだら即GAME OVER"
+        );
+        let result = game.result();
+        assert_eq!((result.correct, result.total), (0, 1));
+    }
+
+    #[test]
+    fn rolling_head_on_into_a_hollow_sinks_during_play() {
+        // 左隣が平坦な凹へ、右向きにまっすぐ転がり込む
+        let mut game = calm_game();
+        let (hx, hy) = (1..BOARD_HEIGHT)
+            .flat_map(|y| (1..BOARD_WIDTH).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                game.board.cell(x, y) == Cell::Hollow && game.board.cell(x - 1, y) == Cell::Flat
+            })
+            .expect("左隣が平坦な凹がある");
+        game.top = Top::new((hx as f64 - 0.02, hy as f64 + 0.5));
+        game.top.vel = (3.0, 0.0);
+        game.update(STEP);
+        assert_eq!(game.top.state, TopState::Sunk);
+        assert_eq!(message_text(&game), Some("ズボッ"));
+        game.update(Duration::from_secs(2));
+        assert_eq!(game.outcome(), None, "ハマっても続く");
+        assert_eq!(
+            (game.top.pos.0 as usize, game.top.pos.1 as usize),
+            (hx, hy),
+            "傾けなければ凹から出ない"
+        );
+    }
+
     #[test]
     fn the_session_finishes_after_the_end_display() {
         let mut game = calm_game();
@@ -636,6 +706,8 @@ mod tests {
         assert!(text.contains("軽トラ視点"), "{text}");
         assert!(text.contains("盤面"), "{text}");
         assert!(text.contains(render::GOAL_GLYPH));
+        assert!(text.contains(render::BUMP_GLYPH), "凸を描く");
+        assert!(text.contains(render::HOLLOW_GLYPH), "凹を描く");
         assert!(
             text.contains(render::TOP_SPIN_GLYPHS[0]),
             "投入されたベーゴマを描く"
