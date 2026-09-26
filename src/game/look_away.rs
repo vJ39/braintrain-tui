@@ -1,11 +1,14 @@
 //! ヤッホー(look_away): お茶漬け屋のカウンター越しに親父(白い割烹着)と対峙する。
+//! Enterで「食べる」をトグルし、TIME_LIMIT(60秒)以内にごはんゲージを完食すればクリア。
 //! 親父が指さして「ヤー!!」と叫んだら、指された方向と同じ矢印キーを押して防御する。
+//! 食事中に「ヤー」が来ると防御できず問答無用で♥を1つ失い、ごはんもおかわりになる。
 //! 「やっほー」と言われたらSpaceで「やっほー」と返す。
 //! 1問目は必ず「やっほー」から始まる。以降の待機はIDLE_WAIT_MS(最低5秒)で
 //! 「来るか来るか」という間を作ってから次のイベントが来る。
-//! どちらもRESPONSE_SAFE_WINDOW(800ms)以内に正しく反応すれば正解。
-//! 800ms超過・誤入力・無反応(MAX_RESPONSE_WINDOWでタイムアウト確定)は不正解になり、
-//! 遅れた分だけ複数個の♥を失う(penalty_for参照)。♥が0になったらGAME OVER。10問を終えたら勝利。
+//! どちらもRESPONSE_SAFE_WINDOW(500ms)以内に正しく反応すれば正解。
+//! 「ヤー」への反応が遅れた分だけ複数個の♥を失う(penalty_for参照)。
+//! 「やっほー」への反応が遅れるとごはんがおかわりされる(♥は減らない)。
+//! ♥が0になるか、60秒以内に完食できなければGAME OVER。
 //!
 //! 表示名(DISPLAY_NAME)は仮名称。改名はDISPLAY_NAMEを変えるだけで済むよう、
 //! メニュー・HUD・テストはすべてこの定数を参照する。GAME_ID・モジュール名は
@@ -49,7 +52,7 @@ pub const MAX_LIVES: u32 = 5;
 /// ごはんゲージの初期値(満タン)。0になったらクリア
 pub const RICE_FULL: f32 = 1.0;
 /// 食事中、待機(Idle)フェーズで1秒あたりごはんゲージが減る量
-pub const RICE_DRAIN_PER_SEC: f32 = 0.1;
+pub const RICE_DRAIN_PER_SEC: f32 = 0.1 / 3.0;
 
 /// 待機(相手が何もしていない)の長さの範囲(最小, 最大)ms。
 /// 最低でも5秒は待たせ、「来るか来るか」という緊張感を持続させる
@@ -103,21 +106,21 @@ pub const EATING_TEXT: &str = "むしゃむしゃ...";
 pub const WATCHING_TEXT: &str = "様子を見ている";
 
 /// 画像アセット(assets/image/からの相対パス)。無ければテキストで描く
-pub const STAGE_NORMAL_IMAGE: &str = "look_away/normal.png";
+/// 通常時(何もしていない)の顔の候補。待機中は一定間隔でランダムに切り替え、
+/// 目を開けたり閉じたりするフェイントを演出する(NORMAL_FEINT_RATEの確率で2枚目)
+pub const STAGE_NORMAL_IMAGES: [&str; 2] = ["look_away/normal.png", "look_away/normal_feint.png"];
 /// 右を指して叫んでいる絵の候補(1問ごとにランダムに1枚選ぶ)
-pub const STAGE_SHOUT_RIGHT_IMAGES: [&str; 3] = [
-    "look_away/shout_right.png",
-    "look_away/shout_right_2.png",
-    "look_away/shout_right_3.png",
-];
-/// 左を指して叫んでいる絵の候補(各shout_rightを左右反転したもの)
-pub const STAGE_SHOUT_LEFT_IMAGES: [&str; 3] = [
-    "look_away/shout_left.png",
-    "look_away/shout_left_2.png",
-    "look_away/shout_left_3.png",
-];
+pub const STAGE_SHOUT_RIGHT_IMAGES: [&str; 2] =
+    ["look_away/shout_right.png", "look_away/shout_right_2.png"];
+/// 左を指して叫んでいる絵の候補(右ヤーとは別ソースの独立した絵)
+pub const STAGE_SHOUT_LEFT_IMAGES: [&str; 2] =
+    ["look_away/shout_left.png", "look_away/shout_left_2.png"];
 /// 「やっほー」と呼びかけている絵
 pub const STAGE_YAHHO_IMAGE: &str = "look_away/yahho.png";
+/// 通常時の顔でフェイント(2枚目、目を閉じた顔)が選ばれる確率
+pub const NORMAL_FEINT_RATE: f64 = 0.2;
+/// 通常時の顔がランダムに切り替わる間隔の範囲(ms)。この間隔でチラチラと表情を変える
+pub const NORMAL_FLICKER_MS: (u64, u64) = (400, 900);
 
 /// 相手が指す向き
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,12 +162,33 @@ fn random_between(rng: &mut impl Rng, (min_ms, max_ms): (u64, u64)) -> Duration 
     Duration::from_millis(rng.gen_range(min_ms..=max_ms))
 }
 
+/// 待機(Idle)フェーズを新しく作る。通常顔のバリエーションとフェイントの
+/// 次回切り替えまでの間隔をここでランダムに決める
+fn new_idle_phase(remaining: Duration, is_eating: bool) -> Phase {
+    let mut rng = rand::thread_rng();
+    Phase::Idle {
+        remaining,
+        is_eating,
+        normal_variant: choose_normal_variant(&mut rng),
+        flicker_remaining: random_between(&mut rng, NORMAL_FLICKER_MS),
+    }
+}
+
 /// 待機の後に起こすイベントを選ぶ
 fn choose_event(rng: &mut impl Rng) -> Event {
     if rng.gen_bool(YAHHO_RATE) {
         Event::Yahho
     } else {
         Event::Shout(Side::random(rng))
+    }
+}
+
+/// 通常時の顔バリエーションをランダムに選ぶ(NORMAL_FEINT_RATEの確率でフェイント顔=1)
+fn choose_normal_variant(rng: &mut impl Rng) -> usize {
+    if rng.gen_bool(NORMAL_FEINT_RATE) {
+        1
+    } else {
+        0
     }
 }
 
@@ -320,8 +344,14 @@ enum ResultMessage {
 enum Phase {
     /// 問題冒頭の「3.2.1.GO!!」。この間の入力は受け付けない
     Countdown { state: CountdownState },
-    /// 相手が何もしていない待機。残りの待機時間と、食事中かどうか
-    Idle { remaining: Duration, is_eating: bool },
+    /// 相手が何もしていない待機。残りの待機時間と、食事中かどうか。
+    /// normal_variant/flicker_remainingは通常顔のフェイント(チラチラ切り替え)用
+    Idle {
+        remaining: Duration,
+        is_eating: bool,
+        normal_variant: usize,
+        flicker_remaining: Duration,
+    },
     /// 指さして「ヤー!!」と叫んでいる。残りの入力受付時間(MAX_RESPONSE_WINDOWから減っていく)。
     /// variantは叫び顔の絵のバリエーション番号(begin_event時にランダムに決め、以後は固定)
     Shout {
@@ -432,10 +462,7 @@ impl LookAwayGame {
     /// カウントダウンから始め、2問目以降は演出を挟まず直接待機から始める
     fn start_round(&mut self) {
         if self.shown_countdown_once {
-            self.phase = Phase::Idle {
-                remaining: random_between(&mut rand::thread_rng(), IDLE_WAIT_MS),
-                is_eating: false,
-            };
+            self.phase = new_idle_phase(random_between(&mut rand::thread_rng(), IDLE_WAIT_MS), false);
             return;
         }
         let state = CountdownState::new();
@@ -532,15 +559,15 @@ impl LookAwayGame {
                 }
                 if state.is_finished() {
                     self.shown_countdown_once = true;
-                    self.phase = Phase::Idle {
-                        remaining: random_between(&mut rand::thread_rng(), IDLE_WAIT_MS),
-                        is_eating: false,
-                    };
+                    self.phase =
+                        new_idle_phase(random_between(&mut rand::thread_rng(), IDLE_WAIT_MS), false);
                 }
             }
             Phase::Idle {
                 remaining,
                 is_eating,
+                normal_variant,
+                flicker_remaining,
             } => {
                 if *is_eating {
                     self.rice = (self.rice - RICE_DRAIN_PER_SEC * dt.as_secs_f32()).max(0.0);
@@ -553,6 +580,12 @@ impl LookAwayGame {
                         };
                         return;
                     }
+                }
+                *flicker_remaining = flicker_remaining.saturating_sub(dt);
+                if flicker_remaining.is_zero() {
+                    let mut rng = rand::thread_rng();
+                    *normal_variant = choose_normal_variant(&mut rng);
+                    *flicker_remaining = random_between(&mut rng, NORMAL_FLICKER_MS);
                 }
                 *remaining = remaining.saturating_sub(dt);
                 if remaining.is_zero() {
@@ -599,7 +632,11 @@ impl LookAwayGame {
                 message,
                 ..
             } => self.render_result(frame, area, *is_correct, *message),
-            Phase::Idle { is_eating, .. } => {
+            Phase::Idle {
+                is_eating,
+                normal_variant,
+                ..
+            } => {
                 let (background, status_text) = if *is_eating {
                     (EATING_BG, EATING_TEXT)
                 } else {
@@ -610,7 +647,7 @@ impl LookAwayGame {
                     area,
                     background,
                     theme::TEXT,
-                    StageKind::Normal,
+                    StageKind::Normal(*normal_variant),
                     vec![pointing_line(None), String::new(), status_text.to_string()],
                 )
             }
@@ -828,18 +865,19 @@ fn detect_picker() -> Option<Picker> {
         .cloned()
 }
 
-/// カウンター越しの親父の絵の種類。ShoutLeft/ShoutRightの引数は叫び顔のバリエーション番号
+/// カウンター越しの親父の絵の種類。Normalの引数は通常顔のバリエーション番号(フェイント用)、
+/// ShoutLeft/ShoutRightの引数は叫び顔のバリエーション番号
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StageKind {
-    Normal,
+    Normal(usize),
     ShoutLeft(usize),
     ShoutRight(usize),
     Yahho,
 }
 
-/// 親父の静止画(通常/ヤー左右の複数バリエーション/やっほー)
+/// 親父の静止画(通常の複数バリエーション/ヤー左右の複数バリエーション/やっほー)
 struct StageImages {
-    normal: StatefulProtocol,
+    normal: Vec<StatefulProtocol>,
     shout_left: Vec<StatefulProtocol>,
     shout_right: Vec<StatefulProtocol>,
     yahho: StatefulProtocol,
@@ -853,7 +891,10 @@ struct StageRenderer {
 impl StageRenderer {
     fn new() -> Self {
         let images = detect_picker().and_then(|picker| {
-            let normal = splash::load_embedded_image(STAGE_NORMAL_IMAGE)?;
+            let normal: Option<Vec<_>> = STAGE_NORMAL_IMAGES
+                .iter()
+                .map(|path| splash::load_embedded_image(path))
+                .collect();
             let yahho = splash::load_embedded_image(STAGE_YAHHO_IMAGE)?;
             let shout_right: Option<Vec<_>> = STAGE_SHOUT_RIGHT_IMAGES
                 .iter()
@@ -863,10 +904,14 @@ impl StageRenderer {
                 .iter()
                 .map(|path| splash::load_embedded_image(path))
                 .collect();
+            let normal = normal?;
             let shout_right = shout_right?;
             let shout_left = shout_left?;
             Some(RefCell::new(StageImages {
-                normal: picker.new_resize_protocol(normal),
+                normal: normal
+                    .into_iter()
+                    .map(|img| picker.new_resize_protocol(img))
+                    .collect(),
                 shout_left: shout_left
                     .into_iter()
                     .map(|img| picker.new_resize_protocol(img))
@@ -897,7 +942,7 @@ impl StageRenderer {
         }
         let mut images = images.borrow_mut();
         let protocol = match kind {
-            StageKind::Normal => &mut images.normal,
+            StageKind::Normal(i) => &mut images.normal[i],
             StageKind::ShoutLeft(i) => &mut images.shout_left[i],
             StageKind::ShoutRight(i) => &mut images.shout_right[i],
             StageKind::Yahho => &mut images.yahho,
@@ -1138,10 +1183,7 @@ mod tests {
     #[test]
     fn finishing_the_meal_before_time_limit_is_not_affected_by_it() {
         let mut game = LookAwayGame::new();
-        game.phase = Phase::Idle {
-            remaining: Duration::from_secs(3600),
-            is_eating: true,
-        };
+        game.phase = new_idle_phase(Duration::from_secs(3600), true);
         game.update(Duration::from_secs_f32(RICE_FULL / RICE_DRAIN_PER_SEC) + ms(1));
         finish_result(&mut game);
         assert!(game.is_finished());
@@ -1199,6 +1241,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn choose_normal_variant_is_mostly_the_default_face() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let variants: Vec<usize> = (0..1000).map(|_| choose_normal_variant(&mut rng)).collect();
+        let feint_count = variants.iter().filter(|&&v| v == 1).count();
+        // 1000回中の目安200回(20%)。乱数のゆれを見込んで幅を持たせる
+        assert!(
+            (140..=260).contains(&feint_count),
+            "フェイント顔の出現数: {feint_count}"
+        );
+        assert!(variants.contains(&0), "通常顔も出る");
+    }
+
+    #[test]
+    fn idle_flicker_remaining_resets_after_reaching_zero() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        let Phase::Idle {
+            flicker_remaining, ..
+        } = game.phase
+        else {
+            panic!("待機のはず")
+        };
+        game.update(flicker_remaining);
+        let Phase::Idle {
+            flicker_remaining: after,
+            ..
+        } = game.phase
+        else {
+            panic!("待機のはず")
+        };
+        assert!(after > Duration::ZERO, "0になったら即座に新しい間隔が設定される");
+    }
+
     // --- カウントダウン ---
 
     #[test]
@@ -1251,10 +1327,7 @@ mod tests {
     fn idle_elapses_into_an_event() {
         let mut game = LookAwayGame::new();
         game.tracker.record(true, 0.0); // 1問目を消化済みにし、以降は両方あり得る状態にする
-        game.phase = Phase::Idle {
-            remaining: ms(100),
-            is_eating: false,
-        };
+        game.phase = new_idle_phase(ms(100), false);
         game.update(ms(60));
         assert!(matches!(game.phase, Phase::Idle { remaining, .. } if remaining == ms(40)));
         game.update(ms(40));
@@ -1488,10 +1561,7 @@ mod tests {
         let mut game = LookAwayGame::new();
         let setups: [fn(&mut LookAwayGame); 3] = [
             |g| {
-                g.phase = Phase::Idle {
-                    remaining: ms(500),
-                    is_eating: false,
-                }
+                g.phase = new_idle_phase(ms(500), false)
             },
             |g| shout(g, Side::Left),
             yahho,
@@ -1605,10 +1675,7 @@ mod tests {
     #[test]
     fn result_is_not_game_over_when_cleared_with_lives_left() {
         let mut game = LookAwayGame::new();
-        game.phase = Phase::Idle {
-            remaining: Duration::from_secs(3600),
-            is_eating: true,
-        };
+        game.phase = new_idle_phase(Duration::from_secs(3600), true);
         assert!(!game.is_finished());
         assert!(!game.is_cleared(), "完食するまでは勝利にしない");
         game.update(Duration::from_secs_f32(RICE_FULL / RICE_DRAIN_PER_SEC) + ms(1));
@@ -1628,10 +1695,7 @@ mod tests {
             finish_result(&mut game);
         }
         assert_eq!(game.lives, 1);
-        game.phase = Phase::Idle {
-            remaining: Duration::from_secs(3600),
-            is_eating: true,
-        };
+        game.phase = new_idle_phase(Duration::from_secs(3600), true);
         game.update(Duration::from_secs_f32(RICE_FULL / RICE_DRAIN_PER_SEC) + ms(1));
         finish_result(&mut game);
         assert!(game.is_finished());
@@ -1738,7 +1802,8 @@ mod tests {
 
     #[test]
     fn stage_images_are_embedded_and_decodable() {
-        let mut paths = vec![STAGE_NORMAL_IMAGE, STAGE_YAHHO_IMAGE];
+        let mut paths = vec![STAGE_YAHHO_IMAGE];
+        paths.extend(STAGE_NORMAL_IMAGES);
         paths.extend(STAGE_SHOUT_RIGHT_IMAGES);
         paths.extend(STAGE_SHOUT_LEFT_IMAGES);
         for path in paths {
@@ -1870,10 +1935,7 @@ mod tests {
         assert!(text_of(&rendered(&game)).contains(&compact(GAME_OVER_TEXT)));
 
         let mut game = LookAwayGame::new();
-        game.phase = Phase::Idle {
-            remaining: Duration::from_secs(3600),
-            is_eating: true,
-        };
+        game.phase = new_idle_phase(Duration::from_secs(3600), true);
         assert!(!text_of(&rendered(&game)).contains(&compact(CLEAR_TEXT)));
         game.update(Duration::from_secs_f32(RICE_FULL / RICE_DRAIN_PER_SEC) + ms(1));
         assert!(text_of(&rendered(&game)).contains(&compact(CLEAR_TEXT)));
@@ -1885,10 +1947,7 @@ mod tests {
         let setups: [fn(&mut LookAwayGame); 4] = [
             |_| {},
             |g| {
-                g.phase = Phase::Idle {
-                    remaining: ms(500),
-                    is_eating: false,
-                }
+                g.phase = new_idle_phase(ms(500), false)
             },
             |g| shout(g, Side::Right),
             yahho,
