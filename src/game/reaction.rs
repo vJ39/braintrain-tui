@@ -34,17 +34,17 @@ fn split_areas(area: Rect) -> (Rect, Rect) {
 
 pub const GAME_ID: &str = "reaction";
 
-/// イロピッタンの1セッションの問題数。3問(初級相当)→4問(中級相当)→3問(上級相当)
-const SESSION_LENGTH: u32 = 10;
+/// イロピッタンの1セッションの問題数。6問(初級相当)→7問(中級相当)→7問(上級相当)
+const SESSION_LENGTH: u32 = 20;
 
 /// 結果・HUDに出す難易度。問題が進むと難易度が上がるため、最後の区間の上級を代表値にする
 pub const SESSION_DIFFICULTY: Difficulty = Difficulty::Advanced;
 
-/// 何問目(0始まり)の問題の難易度。1〜3問目=初級、4〜7問目=中級、8〜10問目=上級
+/// 何問目(0始まり)の問題の難易度。1〜6問目=初級、7〜13問目=中級、14〜20問目=上級
 fn question_difficulty(question_index: u32) -> Difficulty {
     match question_index {
-        0..=2 => Difficulty::Beginner,
-        3..=6 => Difficulty::Intermediate,
+        0..=5 => Difficulty::Beginner,
+        6..=12 => Difficulty::Intermediate,
         _ => Difficulty::Advanced,
     }
 }
@@ -883,13 +883,16 @@ mod tests {
     fn advanced_difficulty_auto_fails_after_time_limit() {
         let mut game = advanced_game();
         game.update(Duration::from_secs(4));
-        assert_eq!(game.tracker.total(), 8);
+        assert_eq!(game.tracker.total(), 14);
     }
 
-    // ---- 3問(初級相当)→4問(中級相当)→3問(上級相当)の固定10問構成 ----
+    // ---- 6問(初級相当)→7問(中級相当)→7問(上級相当)の固定20問構成 ----
 
     /// 何問目(0始まり)ごとの難易度
-    const EXPECTED_DIFFICULTIES: [Difficulty; 10] = [
+    const EXPECTED_DIFFICULTIES: [Difficulty; 20] = [
+        Difficulty::Beginner,
+        Difficulty::Beginner,
+        Difficulty::Beginner,
         Difficulty::Beginner,
         Difficulty::Beginner,
         Difficulty::Beginner,
@@ -897,6 +900,13 @@ mod tests {
         Difficulty::Intermediate,
         Difficulty::Intermediate,
         Difficulty::Intermediate,
+        Difficulty::Intermediate,
+        Difficulty::Intermediate,
+        Difficulty::Intermediate,
+        Difficulty::Advanced,
+        Difficulty::Advanced,
+        Difficulty::Advanced,
+        Difficulty::Advanced,
         Difficulty::Advanced,
         Difficulty::Advanced,
         Difficulty::Advanced,
@@ -910,10 +920,10 @@ mod tests {
         game.next_question();
     }
 
-    /// 上級相当の区間(8問目)を出題中のゲーム
+    /// 上級相当の区間(14問目)を出題中のゲーム
     fn advanced_game() -> ReactionGame {
         let mut game = ReactionGame::new();
-        advance_to_question(&mut game, 7);
+        advance_to_question(&mut game, 13);
         game
     }
 
@@ -924,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn question_difficulty_follows_three_four_three_questions() {
+    fn question_difficulty_follows_six_seven_seven_questions() {
         for (index, expected) in EXPECTED_DIFFICULTIES.iter().enumerate() {
             assert_eq!(
                 question_difficulty(index as u32),
@@ -947,11 +957,11 @@ mod tests {
     #[test]
     fn questions_use_parameters_of_their_position_in_session() {
         // 何セッションか通して遊び、何問目にどの色・表記が出たかを集める
-        let mut colors: Vec<Vec<Color>> = vec![Vec::new(); 10];
-        let mut katakana = [false; 10];
+        let mut colors: Vec<Vec<Color>> = vec![Vec::new(); 20];
+        let mut katakana = [false; 20];
         for _ in 0..40 {
             let mut game = ReactionGame::new();
-            for index in 0..10 {
+            for index in 0..20 {
                 assert_eq!(game.tracker.total(), index as u32);
                 let q = &game.current;
                 colors[index].push(q.display_color);
@@ -988,23 +998,23 @@ mod tests {
             }
             seen.len()
         };
-        assert_eq!(seen(0..3), 2);
-        assert_eq!(seen(3..7), 4);
-        assert_eq!(seen(7..10), 9);
+        assert_eq!(seen(0..6), 2);
+        assert_eq!(seen(6..13), 4);
+        assert_eq!(seen(13..20), 9);
     }
 
     #[test]
-    fn time_limit_applies_only_from_eighth_question() {
+    fn time_limit_applies_only_from_fourteenth_question() {
         let mut game = ReactionGame::new();
-        for index in 0..7 {
-            // 1〜7問目は時間制限が無く、待っても自動で不正解にならない
+        for index in 0..13 {
+            // 1〜13問目は時間制限が無く、待っても自動で不正解にならない
             game.update(Duration::from_secs(10));
             assert_eq!(game.tracker.total(), index, "{}問目は時間制限なし", index + 1);
             answer_and_wait(&mut game);
         }
-        // 8問目からは3秒で自動的に不正解になり次の問題へ進む
+        // 14問目からは3秒で自動的に不正解になり次の問題へ進む
         game.update(Duration::from_secs(3));
-        assert_eq!(game.tracker.total(), 8, "8問目は時間切れ");
+        assert_eq!(game.tracker.total(), 14, "14問目は時間切れ");
     }
 
     #[test]
@@ -1317,10 +1327,10 @@ mod tests {
         render_game(&game, 1, 1);
     }
 
-    // ---- 問題数(10問) ----
+    // ---- 問題数(20問) ----
 
     #[test]
-    fn session_finishes_after_ten_questions() {
+    fn session_finishes_after_twenty_questions() {
         let mut game = ReactionGame::new();
         for i in 0..SESSION_LENGTH - 1 {
             game.handle_key(KeyEvent::from(KeyCode::Left));
@@ -1328,22 +1338,22 @@ mod tests {
             assert!(!game.is_finished(), "{}問目では終わらない", i + 1);
         }
         game.handle_key(KeyEvent::from(KeyCode::Left));
-        assert!(game.is_finished(), "10問で終わる");
-        assert_eq!(game.result().total, 10);
+        assert!(game.is_finished(), "20問で終わる");
+        assert_eq!(game.result().total, 20);
         // 終わった後の入力は記録しない
         game.handle_key(KeyEvent::from(KeyCode::Left));
-        assert_eq!(game.result().total, 10);
+        assert_eq!(game.result().total, 20);
     }
 
     #[test]
-    fn session_length_is_ten() {
-        assert_eq!(SESSION_LENGTH, 10);
+    fn session_length_is_twenty() {
+        assert_eq!(SESSION_LENGTH, 20);
         let game = ReactionGame::new();
-        assert_eq!(game.tracker.session_length(), 10);
+        assert_eq!(game.tracker.session_length(), 20);
     }
 
     #[test]
-    fn hud_shows_progress_out_of_ten() {
+    fn hud_shows_progress_out_of_twenty() {
         let mut game = ReactionGame::new();
         for _ in 0..5 {
             game.handle_key(KeyEvent::from(KeyCode::Left));
@@ -1352,7 +1362,7 @@ mod tests {
         let (buffer, _) = render_game(&game, 60, 20);
         let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
         // 問題番号は2桁幅で右寄せする
-        assert!(text.contains("Q 6/10"), "HUDは10問中の番号を出す");
+        assert!(text.contains("Q 6/20"), "HUDは20問中の番号を出す");
     }
 
     // ---- 正誤の効果音 ----
