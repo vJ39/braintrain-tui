@@ -63,6 +63,8 @@ pub enum SeKind {
     LookAwayYahho,
     /// 「やっほー」で相手が「ヤー!」と叫ぶ時の音声(複数候補からランダムに1つ)
     LookAwayShout,
+    /// 「べー」で軽トラが障害物を避ける・停止する・発進する時のスキール音(複数候補からランダムに1つ)
+    BeigomaSkid,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,9 +155,17 @@ const LOOK_AWAY_SHOUT_VOICES: [&str; 2] = [
     "voice_look_away_shout_2.mp3",
 ];
 
+/// 「べー」で軽トラのスキール音の候補(1つをランダムに再生)
+const BEIGOMA_SKID_VOICES: [&str; 4] = [
+    "voice_beigoma_skid_1.mp3",
+    "voice_beigoma_skid_2.mp3",
+    "voice_beigoma_skid_3.mp3",
+    "voice_beigoma_skid_4.mp3",
+];
+
 impl SeKind {
     /// 音源ファイルのパス。合成音(Incorrect・Star)と、複数候補からランダムに選ぶ音声
-    /// (LookAwayYahho・LookAwayShout)はここでは決まらないのでNone
+    /// (LookAwayYahho・LookAwayShout・BeigomaSkid)はここでは決まらないのでNone
     fn asset_path(self) -> Option<&'static str> {
         match self {
             SeKind::Correct => Some("se_correct.wav"),
@@ -177,7 +187,7 @@ impl SeKind {
             SeKind::CursorMove => Some("se_cursor_move.mp3"),
             SeKind::ColorStackClear => Some("se_color_stack_clear.mp3"),
             SeKind::ColorStackMiss => Some("se_color_stack_miss.mp3"),
-            SeKind::LookAwayYahho | SeKind::LookAwayShout => None,
+            SeKind::LookAwayYahho | SeKind::LookAwayShout | SeKind::BeigomaSkid => None,
         }
     }
 
@@ -185,6 +195,7 @@ impl SeKind {
     fn voice_candidates(self) -> Option<&'static [&'static str]> {
         match self {
             SeKind::LookAwayYahho => Some(&LOOK_AWAY_YAHHO_VOICES),
+            SeKind::BeigomaSkid => Some(&BEIGOMA_SKID_VOICES),
             SeKind::LookAwayShout => Some(&LOOK_AWAY_SHOUT_VOICES),
             _ => None,
         }
@@ -524,7 +535,7 @@ pub fn playing_typewriter_kind() -> Option<TypewriterSeKind> {
 mod tests {
     use super::*;
 
-    const ALL_SE_KINDS: [SeKind; 21] = [
+    const ALL_SE_KINDS: [SeKind; 22] = [
         SeKind::Correct,
         SeKind::Incorrect,
         SeKind::Transition,
@@ -546,6 +557,7 @@ mod tests {
         SeKind::ColorStackMiss,
         SeKind::LookAwayYahho,
         SeKind::LookAwayShout,
+        SeKind::BeigomaSkid,
     ];
 
     #[test]
@@ -579,7 +591,11 @@ mod tests {
     #[test]
     fn every_voice_candidate_is_embedded_and_distinct() {
         let mut all_paths = Vec::new();
-        for se in [SeKind::LookAwayYahho, SeKind::LookAwayShout] {
+        for se in [
+            SeKind::LookAwayYahho,
+            SeKind::LookAwayShout,
+            SeKind::BeigomaSkid,
+        ] {
             let candidates = se.voice_candidates().expect("候補一覧を持つこと");
             assert!(candidates.len() >= 2, "{se:?}: ランダムに選ぶ意味がある数の候補");
             for &path in candidates {

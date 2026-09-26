@@ -40,7 +40,7 @@ use board::{
     round_params, Board, Landing, RoundParams, StepEvent, Tilt, TiltKey, Top, ROUNDS_PER_SESSION,
 };
 use render::{BoardRenderer, TopView, TruckViewInfo, TruckViewRenderer};
-use truck::Truck;
+use truck::{MotionKind, Truck};
 
 pub const GAME_ID: &str = "beigoma";
 
@@ -284,6 +284,9 @@ pub struct BeigomaGame {
     tops: Vec<TopSlot>,
     tilt: Tilt,
     truck: Truck,
+    /// 直前のstep()時点の軽トラの走り方。ブレーキ・発進・操舵が新しく始まった時に
+    /// スキール音を鳴らすため、変化を検知するのに使う
+    prev_truck_motion: truck::MotionKind,
     /// このROUNDでベーゴマを投入してからの経過時間
     elapsed: Duration,
     status: Status,
@@ -310,6 +313,7 @@ impl BeigomaGame {
         let params = round_params(0);
         let board = Board::generate(&params, &mut rand::thread_rng());
         let tops = Self::new_slots(&board, params.top_count);
+        let prev_truck_motion = truck.motion_kind();
         let mut game = Self {
             round_index: 0,
             params,
@@ -317,6 +321,7 @@ impl BeigomaGame {
             tops,
             tilt: Tilt::new(),
             truck,
+            prev_truck_motion,
             elapsed: Duration::ZERO,
             status: Status::Playing,
             tracker: ScoreTracker::with_session_length(ROUNDS_PER_SESSION),
@@ -400,6 +405,17 @@ impl BeigomaGame {
     fn step(&mut self, dt: Duration) {
         self.tilt.update(dt);
         self.truck.update(dt);
+        let motion = self.truck.motion_kind();
+        // ブレーキ・発進・操舵(障害物回避)が新しく始まった時だけスキール音を鳴らす
+        if motion != self.prev_truck_motion
+            && matches!(
+                motion,
+                MotionKind::Braking | MotionKind::Launching | MotionKind::Steering
+            )
+        {
+            self.play_se(SeKind::BeigomaSkid);
+        }
+        self.prev_truck_motion = motion;
         let g = self.truck.current_g();
         let mut events = Vec::new();
         for (i, slot) in self.tops.iter_mut().enumerate().filter(|(_, s)| !s.settled) {
@@ -1084,6 +1100,68 @@ mod tests {
         game.update(Duration::from_millis(500));
         assert_eq!(game.outcome(), Some(Outcome::Flown));
         assert_eq!(game.result().correct, 0);
+    }
+
+    #[test]
+    fn braking_launching_and_steering_each_play_the_skid_se_once() {
+        // ブレーキが始まった瞬間に1回だけスキール音(距離を近くして急ブレーキにし、早く止まるようにする)
+        let truck = Truck::with_course(
+            vec![super::truck::RoadEvent::Signal {
+                at: 12.0,
+                notice_delay: 0.1,
+            }],
+            1000.0,
+        );
+        let mut game = BeigomaGame::with_truck(truck);
+        finish_countdown(&mut game);
+        clear_se_log(&mut game);
+        let mut t = Duration::ZERO;
+        while game.truck.motion_kind() != MotionKind::Braking {
+            game.update(STEP);
+            t += STEP;
+            assert!(t < Duration::from_secs(15), "ブレーキが始まらなかった");
+        }
+        assert_eq!(
+            count_se(&game, SeKind::BeigomaSkid),
+            1,
+            "ブレーキが始まったらスキール音"
+        );
+        // ブレーキが続いている間は鳴り続けない
+        game.update(STEP);
+        assert_eq!(count_se(&game, SeKind::BeigomaSkid), 1);
+
+        // 発進が始まった瞬間にも1回だけ(赤信号で止まってから)
+        while game.truck.motion_kind() != MotionKind::Launching {
+            game.update(STEP);
+            t += STEP;
+            assert!(t < Duration::from_secs(15), "発進しなかった");
+        }
+        assert_eq!(count_se(&game, SeKind::BeigomaSkid), 2, "発進でもう1回鳴る");
+
+        // 操舵(障害物回避)が始まった瞬間にも1回だけ
+        let truck = Truck::with_course(
+            vec![super::truck::RoadEvent::Obstacle {
+                at: 50.0,
+                react_distance: 10.0,
+                lateral_distance: 1.5,
+                side: super::truck::Side::Right,
+            }],
+            1000.0,
+        );
+        let mut game = BeigomaGame::with_truck(truck);
+        finish_countdown(&mut game);
+        clear_se_log(&mut game);
+        let mut t = Duration::ZERO;
+        while game.truck.motion_kind() != MotionKind::Steering {
+            game.update(STEP);
+            t += STEP;
+            assert!(t < Duration::from_secs(10), "操舵が始まらなかった");
+        }
+        assert_eq!(
+            count_se(&game, SeKind::BeigomaSkid),
+            1,
+            "操舵が始まったらスキール音"
+        );
     }
 
     #[test]

@@ -168,6 +168,17 @@ pub const COURSE: [RoadEvent; 6] = [
     },
 ];
 
+/// 軽トラの走り方の種類(軽トラ視点のスキール音等、外部から走り方の変化を検知するのに使う)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionKind {
+    Cruise,
+    Noticing,
+    Braking,
+    Stopped,
+    Launching,
+    Steering,
+}
+
 /// 軽トラの走り方
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Motion {
@@ -224,6 +235,18 @@ impl Truck {
 
     pub fn speed(&self) -> f64 {
         self.speed
+    }
+
+    /// いまの走り方の種類。ブレーキ・発進・操舵が新しく始まったかを外部で検知するのに使う
+    pub fn motion_kind(&self) -> MotionKind {
+        match self.motion {
+            Motion::Cruise => MotionKind::Cruise,
+            Motion::Noticing { .. } => MotionKind::Noticing,
+            Motion::Braking { .. } => MotionKind::Braking,
+            Motion::Stopped { .. } => MotionKind::Stopped,
+            Motion::Launching => MotionKind::Launching,
+            Motion::Steering { .. } => MotionKind::Steering,
+        }
     }
 
     /// 経過時間を進める
@@ -445,6 +468,34 @@ mod tests {
 
     fn is_braking(truck: &Truck) -> bool {
         matches!(truck.motion, Motion::Braking { .. })
+    }
+
+    #[test]
+    fn motion_kind_reflects_braking_stopped_launching_and_steering() {
+        let mut truck = signal_course(0.5);
+        assert_eq!(truck.motion_kind(), MotionKind::Cruise);
+        run_until(&mut truck, 10.0, is_braking);
+        assert_eq!(truck.motion_kind(), MotionKind::Braking);
+        run_until(&mut truck, 10.0, |t| {
+            matches!(t.motion, Motion::Stopped { .. })
+        });
+        assert_eq!(truck.motion_kind(), MotionKind::Stopped);
+        run_until(&mut truck, 10.0, |t| matches!(t.motion, Motion::Launching));
+        assert_eq!(truck.motion_kind(), MotionKind::Launching);
+
+        let mut truck = Truck::with_course(
+            vec![RoadEvent::Obstacle {
+                at: 50.0,
+                react_distance: 10.0,
+                lateral_distance: 1.5,
+                side: Side::Right,
+            }],
+            1000.0,
+        );
+        run_until(&mut truck, 10.0, |t| {
+            matches!(t.motion, Motion::Steering { .. })
+        });
+        assert_eq!(truck.motion_kind(), MotionKind::Steering);
     }
 
     fn signal_course(notice_delay: f64) -> Truck {
