@@ -1081,8 +1081,8 @@ pub fn upcoming_text(upcoming: Option<Upcoming>) -> String {
     let label = match upcoming.kind {
         UpcomingKind::Bump => "段差".to_string(),
         UpcomingKind::Signal(light) => format!("信号({})", signal_label(light)),
-        UpcomingKind::Obstacle(Side::Right) => "障害物(右へよける)".to_string(),
-        UpcomingKind::Obstacle(Side::Left) => "障害物(左へよける)".to_string(),
+        UpcomingKind::Obstacle(Side::Right) => "障害物(右へドリフト)".to_string(),
+        UpcomingKind::Obstacle(Side::Left) => "障害物(左へドリフト)".to_string(),
     };
     format!("前方: {label} あと{:.0}m", upcoming.distance)
 }
@@ -3677,11 +3677,11 @@ mod tests {
         assert_eq!(at(UpcomingKind::Bump), "前方: 段差 あと18m");
         assert_eq!(
             at(UpcomingKind::Obstacle(Side::Right)),
-            "前方: 障害物(右へよける) あと18m"
+            "前方: 障害物(右へドリフト) あと18m"
         );
         assert_eq!(
             at(UpcomingKind::Obstacle(Side::Left)),
-            "前方: 障害物(左へよける) あと18m"
+            "前方: 障害物(左へドリフト) あと18m"
         );
         assert_eq!(upcoming_text(None), "前方: なし");
     }

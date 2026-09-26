@@ -4,10 +4,12 @@
 //! - 巡航: 一定速度。ただし路面のガタガタとして常時小さな揺れ(CRUISE_VIBRATION_G)がかかる
 //! - 信号のブレーキ: 気づいた時点の信号までの距離dと速度vから a = v^2 / (2d)
 //! - 信号の発進: 巡航速度に戻るまで一定の目標加速度
-//! - 障害物回避: t = d / v の間に横へlateral_distanceだけ動く a = 2 * lateral_distance / t^2
+//! - 障害物回避(ドリフト): t = d / v の間に横へlateral_distanceだけ動く平均加速度
+//!   a = 2 * lateral_distance / t^2 を基準に、実際のGは急激に立ち上がり・高い横Gを維持し・
+//!   急激に収束する台形の波形にする(ドリフトらしい荒々しさを出すため、ピークは平均のDRIFT_PEAK_MULTIPLIER倍)
 //! - 段差: 速度と段差の高さに比例した瞬間的な衝撃
 //!
-//! ここでのGは「軽トラの加速度」の向き(ブレーキ=後方向、発進=前方向、右へ避ける=右方向)で表す。
+//! ここでのGは「軽トラの加速度」の向き(ブレーキ=後方向、発進=前方向、右へドリフト=右方向)で表す。
 //! 盤上のベーゴマには慣性として逆向きの力がかかる(その換算は盤側が受け持つ)。
 
 use std::time::Duration;
@@ -38,6 +40,12 @@ pub const CRUISE_VIBRATION_G: f64 = 0.06;
 /// 巡航中の揺れの波長(m)。前後・左右で異なる値にして、単調な往復に見えないようにする
 const CRUISE_VIBRATION_WAVELENGTH_LONGITUDINAL: f64 = 2.6;
 const CRUISE_VIBRATION_WAVELENGTH_LATERAL: f64 = 1.7;
+/// ドリフトのG波形で、立ち上がり・収束にかける時間の割合(操舵全体の時間に対して)。
+/// 残りの(1 - 2*this)の間はピークGを維持する
+pub const DRIFT_RAMP_FRACTION: f64 = 0.2;
+/// ドリフトのピークG倍率。「距離をlateral_distanceだけ動くのに必要な平均加速度」に対する倍率。
+/// なめらかに避けるのでなく、急なハンドルで一気に振られるドリフトらしさを出す
+pub const DRIFT_PEAK_MULTIPLIER: f64 = 1.8;
 
 /// 加速度(m/s^2)をG単位にする
 pub fn to_g(accel: f64) -> f64 {
@@ -65,6 +73,20 @@ pub fn lateral_accel(speed: f64, distance: f64, lateral_distance: f64) -> f64 {
     match steer_time(speed, distance) {
         Some(t) => 2.0 * lateral_distance / (t * t),
         None => 0.0,
+    }
+}
+
+/// ドリフトのG波形。経過の割合(0.0〜1.0)から、ピークGに対する倍率(0.0〜1.0)を求める。
+/// 急激に立ち上がり(DRIFT_RAMP_FRACTIONの間)、中間はピークを維持し、終盤で急激に収束する台形波形
+pub fn drift_g_envelope(progress: f64) -> f64 {
+    let progress = progress.clamp(0.0, 1.0);
+    let ramp = DRIFT_RAMP_FRACTION;
+    if progress < ramp {
+        progress / ramp
+    } else if progress > 1.0 - ramp {
+        (1.0 - progress) / ramp
+    } else {
+        1.0
     }
 }
 
@@ -192,8 +214,13 @@ enum Motion {
     Stopped { signal_at: f64, remaining: f64 },
     /// 青信号で発進し、巡航速度へ加速中
     Launching,
-    /// 障害物を避けるため操舵中。accelは右方向が正の横加速度
-    Steering { accel: f64, remaining: f64 },
+    /// 障害物を避けてドリフト中。peak_accelは右方向が正のピーク横加速度、totalは操舵全体の時間。
+    /// 経過(total - remaining)の割合をdrift_g_envelopeに通した分だけpeak_accelがかかる
+    Steering {
+        peak_accel: f64,
+        total: f64,
+        remaining: f64,
+    },
 }
 
 /// 軽トラの走行シミュレーション
@@ -308,12 +335,20 @@ impl Truck {
                     Motion::Launching
                 }
             }
-            Motion::Steering { accel, remaining } => {
+            Motion::Steering {
+                peak_accel,
+                total,
+                remaining,
+            } => {
                 let remaining = remaining - secs;
                 if remaining <= 0.0 {
                     Motion::Cruise
                 } else {
-                    Motion::Steering { accel, remaining }
+                    Motion::Steering {
+                        peak_accel,
+                        total,
+                        remaining,
+                    }
                 }
             }
         };
@@ -364,7 +399,8 @@ impl Truck {
                             Side::Left => -1.0,
                         };
                         self.motion = Motion::Steering {
-                            accel: sign * accel,
+                            peak_accel: sign * accel * DRIFT_PEAK_MULTIPLIER,
+                            total: time,
                             remaining: time,
                         };
                     }
@@ -385,7 +421,14 @@ impl Truck {
         match self.motion {
             Motion::Braking { decel, .. } => g.longitudinal = -to_g(decel),
             Motion::Launching => g.longitudinal = to_g(LAUNCH_ACCEL),
-            Motion::Steering { accel, .. } => g.lateral = to_g(accel),
+            Motion::Steering {
+                peak_accel,
+                total,
+                remaining,
+            } => {
+                let progress = if total > 0.0 { 1.0 - remaining / total } else { 1.0 };
+                g.lateral = to_g(peak_accel * drift_g_envelope(progress));
+            }
             // 段差(bump)が起きている間は、その衝撃の方が支配的なので巡航の揺れは足さない
             Motion::Cruise if self.bump.is_none() => g = self.cruise_vibration(),
             Motion::Cruise | Motion::Noticing { .. } | Motion::Stopped { .. } => {}
@@ -727,7 +770,20 @@ mod tests {
     }
 
     #[test]
-    fn obstacle_avoidance_gives_lateral_g_from_distance_and_speed() {
+    fn drift_g_envelope_ramps_up_peaks_and_ramps_down() {
+        assert_eq!(drift_g_envelope(0.0), 0.0);
+        assert!((drift_g_envelope(DRIFT_RAMP_FRACTION) - 1.0).abs() < 1e-9);
+        assert_eq!(drift_g_envelope(0.5), 1.0, "中間はピークを維持する");
+        assert!((drift_g_envelope(1.0 - DRIFT_RAMP_FRACTION) - 1.0).abs() < 1e-9);
+        assert!((drift_g_envelope(1.0) - 0.0).abs() < 1e-9);
+        assert!(
+            (drift_g_envelope(DRIFT_RAMP_FRACTION / 2.0) - 0.5).abs() < 1e-9,
+            "立ち上がり区間は線形"
+        );
+    }
+
+    #[test]
+    fn obstacle_avoidance_gives_a_drift_shaped_lateral_g_from_distance_and_speed() {
         for (side, sign) in [(Side::Right, 1.0), (Side::Left, -1.0)] {
             let mut truck = Truck::with_course(
                 vec![RoadEvent::Obstacle {
@@ -741,14 +797,28 @@ mod tests {
             run_until(&mut truck, 10.0, |t| {
                 matches!(t.motion, Motion::Steering { .. })
             });
+            // 始まった直後は急激な立ち上がりの途中で、まだピークGに達していない
+            let just_started = truck.current_g();
             let distance = 50.0 - truck.position;
-            let expected = to_g(lateral_accel(CRUISE_SPEED, distance, 1.5));
-            let g = truck.current_g();
-            assert!((g.lateral - sign * expected).abs() < 1e-9, "{side:?}");
-            assert_eq!(g.longitudinal, 0.0);
-            // 避け終わったら巡航に戻る(t = d / v の間だけ続く)
+            let base = lateral_accel(CRUISE_SPEED, distance, 1.5);
+            let peak_expected = to_g(base * DRIFT_PEAK_MULTIPLIER);
+            assert!(
+                just_started.lateral.abs() < peak_expected.abs(),
+                "{side:?}: 立ち上がり中はまだピークGより小さい"
+            );
+            assert_eq!(just_started.longitudinal, 0.0);
+
+            // 半分ほど進めるとピークGを維持している
             let t = steer_time(CRUISE_SPEED, distance).unwrap();
-            let mut elapsed = 0.0;
+            truck.update(Duration::from_secs_f64(t * 0.5));
+            let g = truck.current_g();
+            assert!(
+                (g.lateral - sign * peak_expected).abs() < 1e-6,
+                "{side:?}: ピークGは避けるのに必要な平均加速度のDRIFT_PEAK_MULTIPLIER倍"
+            );
+
+            // 避け終わったら巡航に戻る(t = d / v の間だけ続く)
+            let mut elapsed = t * 0.5;
             run_until(&mut truck, 10.0, |t| {
                 elapsed += STEP.as_secs_f64();
                 matches!(t.motion, Motion::Cruise)
