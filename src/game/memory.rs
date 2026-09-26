@@ -102,7 +102,7 @@ fn generate_sequence(rng: &mut impl Rng, question_index: u32) -> Vec<usize> {
 /// 記号は黒なので、黒が読みやすい明るさの緑(正解)/赤(不正解)にする
 fn mark_background(is_correct: bool, uses_image: bool) -> Color {
     match (is_correct, uses_image) {
-        (true, true) => Color::Rgb(40, 190, 70),
+        (true, true) => Color::Rgb(0, 0, 0),
         (false, true) => Color::Rgb(230, 50, 50),
         (true, false) => Color::Green,
         (false, false) => Color::Red,
