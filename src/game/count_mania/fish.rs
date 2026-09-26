@@ -34,23 +34,28 @@ pub const FISH_HEIGHT: u16 = 1;
 const TEXT_RIGHT: &str = "><>";
 const TEXT_LEFT: &str = "<><";
 
-/// 画像表示の魚のドット絵(右向き)。AQUATERMのネオンテトラ成魚を参考にした、細身で尾の割れた形。
-/// W=体(白。recolorで魚の色になる)、F=ひれ(半透明の灰色。recolorで体より暗い色になる)、
-/// K=目(黒のまま)、.=透明。テキスト表示の魚と同じ3x1セルに収まるよう、横:縦=3:2にしている
+/// 画像表示の魚のドット絵(右向き)。AQUATERMのネオンテトラ成魚の構図を参考にした成魚の形。
+/// 頭側(右)の体高が最も高く、尾に向けて体高6→4→2と一続きの輪郭で絞り込む紡錘形にし、
+/// 尾の先は浅いフォークに割る。体側には横に通るアクセント帯を2行分の面で塗る。
+/// W=体(白。recolorで魚の色になる)、A=体側の帯(不透明な灰色。recolorで体より少し暗い色になる)、
+/// F=ひれ(半透明の灰色。recolorで体より暗い色になる)、K=目(黒のまま)、.=透明。
+/// テキスト表示の魚と同じ3x1セルに収まるよう、横:縦=3:2にしている
 const SPRITE: [&str; 8] = [
-    "....FF......",
-    "...FFFF.....",
-    "F.WWWWWWWW..",
-    "FFWWWWWWWWW.",
-    "FFWWWWWWWKWW",
-    "FFWWWWWWWWW.",
-    "F.WWWWWWWW..",
     "....FFF.....",
+    "F....FWWWW..",
+    "FF..WWWWWWW.",
+    ".FWWAAAAAWKW",
+    ".FWWAAAAAWWW",
+    "FF..WWWWWWW.",
+    "F....FWWWW..",
+    ".....FF.....",
 ];
 pub const SPRITE_WIDTH: u32 = 12;
 pub const SPRITE_HEIGHT: u32 = SPRITE.len() as u32;
 const SPRITE_BODY: Rgba<u8> = Rgba([255, 255, 255, 255]);
 const SPRITE_FIN: Rgba<u8> = Rgba([150, 150, 150, 190]);
+/// 体側の帯。不透明な明るい灰色で、recolorで魚の色の8割ほどの明るさ(体より少し暗い色)になる
+const SPRITE_BAND: Rgba<u8> = Rgba([170, 170, 170, 255]);
 const SPRITE_EYE: Rgba<u8> = Rgba([0, 0, 0, 255]);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -184,6 +189,7 @@ pub fn sprite(facing_right: bool) -> RgbaImage {
         for (x, dot) in row.chars().enumerate() {
             let color = match dot {
                 'W' => SPRITE_BODY,
+                'A' => SPRITE_BAND,
                 'F' => SPRITE_FIN,
                 'K' => SPRITE_EYE,
                 _ => continue,
@@ -229,6 +235,7 @@ pub fn render_text(buf: &mut Buffer, board: Rect, fish: &Fish, color: [u8; 3]) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::circle_image::recolor;
     use super::*;
     use rand::rngs::StdRng;
     use rand::SeedableRng;
@@ -463,12 +470,126 @@ mod tests {
             "体は白(recolorで魚の色になる)"
         );
         assert_eq!(count_rgb(&image, [0, 0, 0]), 1, "目は黒1ドット");
+        // ひれは半透明(不透明な体側の帯と区別する)
         let fins = image
             .pixels()
-            .filter(|p| p.0[3] > 0 && p.0[0] > 50 && p.0[0] < 200)
+            .filter(|p| p.0[3] > 0 && p.0[3] < 255 && p.0[0] > 50 && p.0[0] < 200)
             .count();
-        assert!(fins > 0, "ひれは白と黒の間の灰色(体より暗い色になる)");
+        assert!(
+            fins > 0,
+            "ひれは白と黒の間の半透明の灰色(体より暗い色になる)"
+        );
         assert!(image.pixels().any(|p| p.0[3] == 0), "周りは透明");
+    }
+
+    #[test]
+    fn sprite_rows_all_have_sprite_width() {
+        for (y, row) in SPRITE.iter().enumerate() {
+            assert_eq!(row.chars().count(), SPRITE_WIDTH as usize, "{y}行目: {row}");
+        }
+    }
+
+    /// 列xの胴体(不透明なピクセル。体・帯・目。半透明のひれは含めない)の行数
+    fn body_height(image: &RgbaImage, x: u32) -> u32 {
+        (0..image.height())
+            .filter(|&y| image.get_pixel(x, y).0[3] == 255)
+            .count() as u32
+    }
+
+    #[test]
+    fn sprite_has_opaque_accent_band_along_body_side() {
+        let image = sprite(true);
+        let band_rgb = [SPRITE_BAND.0[0], SPRITE_BAND.0[1], SPRITE_BAND.0[2]];
+        assert_eq!(SPRITE_BAND.0[3], 255, "帯は不透明(ひれと区別する)");
+        assert!(
+            band_rgb.iter().all(|&c| c > 50 && c < 200),
+            "帯は白と黒の間の灰色(recolorで体より少し暗い色になる)"
+        );
+        assert!(count_rgb(&image, band_rgb) >= 8, "帯は面で塗る");
+        // 帯は横に長く通す(1行の中で4ドット以上続く)
+        let longest_run = (0..SPRITE_HEIGHT)
+            .map(|y| {
+                let mut best = 0;
+                let mut run = 0;
+                for x in 0..SPRITE_WIDTH {
+                    if image.get_pixel(x, y).0 == SPRITE_BAND.0 {
+                        run += 1;
+                        best = best.max(run);
+                    } else {
+                        run = 0;
+                    }
+                }
+                best
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(longest_run >= 4, "帯は横に通す: {longest_run}");
+        // 帯は体側の内側にある(同じ列の上下に体の白がある)
+        for (x, y, p) in image.enumerate_pixels() {
+            if p.0 != SPRITE_BAND.0 {
+                continue;
+            }
+            let white_above = (0..y).any(|yy| image.get_pixel(x, yy).0 == SPRITE_BODY.0);
+            let white_below =
+                (y + 1..SPRITE_HEIGHT).any(|yy| image.get_pixel(x, yy).0 == SPRITE_BODY.0);
+            assert!(white_above && white_below, "帯({x},{y})は体の内側");
+        }
+    }
+
+    #[test]
+    fn recolored_band_is_slightly_darker_than_body_but_not_black() {
+        let color = [200, 120, 60];
+        let out = recolor(&sprite(true), color);
+        let body = count_rgb(&out, color);
+        assert!(body >= 25, "体は魚の色: {body}");
+        let band = out
+            .pixels()
+            .find(|p| p.0[3] == 255 && p.0[..3] != color && p.0[..3] != [0, 0, 0])
+            .expect("体の色とも目の黒とも違う不透明な帯がある");
+        for (channel, (&b, &c)) in band.0[..3].iter().zip(&color).enumerate() {
+            assert!(b < c, "帯は体より暗い(ch{channel}: {b} < {c})");
+            assert!(
+                f64::from(b) >= f64::from(c) * 0.6,
+                "帯は少し暗い程度で黒くならない(ch{channel}: {b} vs {c})"
+            );
+        }
+    }
+
+    #[test]
+    fn sprite_body_tapers_toward_tail() {
+        let image = sprite(true);
+        let heights: Vec<u32> = (0..SPRITE_WIDTH).map(|x| body_height(&image, x)).collect();
+        let max = *heights.iter().max().unwrap();
+        let widest = heights.iter().position(|&h| h == max).unwrap();
+        let tail_end = heights.iter().position(|&h| h > 0).unwrap();
+        assert!(
+            widest >= SPRITE_WIDTH as usize / 2,
+            "体高の最も高い所は頭側の半分にある: {heights:?}"
+        );
+        assert!(
+            heights[tail_end] * 2 <= max,
+            "尾の付け根は最大体高の半分以下まで絞り込む: {heights:?}"
+        );
+        assert!(
+            heights[tail_end..=widest].windows(2).all(|w| w[0] <= w[1]),
+            "尾から体の最も高い所まで途切れず太くなる: {heights:?}"
+        );
+    }
+
+    #[test]
+    fn sprite_tail_is_forked() {
+        let image = sprite(true);
+        // 尾びれの先(左端の列)は上下に分かれ、真ん中が空く
+        let tail: Vec<bool> = (0..SPRITE_HEIGHT)
+            .map(|y| image.get_pixel(0, y).0[3] > 0)
+            .collect();
+        let middle = SPRITE_HEIGHT / 2;
+        assert!(
+            !tail[middle as usize - 1] && !tail[middle as usize],
+            "尾の先の真ん中は切れ込み: {tail:?}"
+        );
+        assert!(tail[..middle as usize].iter().any(|&t| t), "上の尾びれ");
+        assert!(tail[middle as usize..].iter().any(|&t| t), "下の尾びれ");
     }
 
     #[test]

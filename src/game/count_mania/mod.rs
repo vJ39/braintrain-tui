@@ -4,6 +4,7 @@
 //! ROUND4・ROUND5は正解クリックのたびに近くの円が離れる方向へ散らばる(ROUND5はより広く・遠くへ)。
 //! ラウンドごとに「全部押せたか(クリア)/ライフが尽きたか(失敗)」を
 //! ScoreTrackerに1件として記録する。キー入力は受け付けない。
+//! 各ラウンドの冒頭には「3.2.1.GO!!」を自前で挟む(ROUND2以降はCLEAR!の待ち時間の後)。
 
 mod circle_image;
 mod fish;
@@ -27,6 +28,7 @@ use crate::audio::{self, SeKind};
 use crate::game::feedback::AnswerFeedback;
 use crate::game::theme;
 use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
+use crate::ui::countdown::{self, CountdownState};
 
 use circle_image::{BoardCircle, BoardFish, CircleRenderer};
 use fish::Fish;
@@ -477,8 +479,12 @@ pub struct CountManiaGame {
     /// 次のラウンドが始まった時だけ進むので、ラウンドの記録直後(待ち時間中・GAME OVER後)も
     /// 記録したラウンドを指したままになる
     round_serial: u32,
-    /// ラウンド間の待ち時間の残り。Noneならプレイ中
+    /// ラウンド間の待ち時間の残り。Noneならプレイ中(またはラウンド冒頭のカウントダウン中)
     interval: Option<Duration>,
+    /// ラウンド冒頭の「3.2.1.GO!!」(ハヤウチ・べーと同じく、ラウンドごとに自前で持つ)。
+    /// Someの間は円・魚を描かず、クリックも受け付けず、ラウンドの時間も数えない。
+    /// ROUND1はゲーム開始時、ROUND2以降は待ち時間(CLEAR!)が終わって次の盤面を作った時に始まる
+    countdown: Option<CountdownState>,
     feedback: AnswerFeedback,
     /// 正解クリックの位置から広がる波紋(見た目だけの演出)。Noneなら表示していない
     ripple: Option<Ripple>,
@@ -507,11 +513,12 @@ impl CountManiaGame {
         let mut rng = rand::thread_rng();
         let mut round = new_round(&mut rng, &params(ROUND_DIFFICULTIES[0]));
         round.motion = Motion::new(ROUND_MOTIONS[0]);
-        Self {
+        let mut game = Self {
             tracker: ScoreTracker::new(),
             round,
             round_serial: 0,
             interval: None,
+            countdown: None,
             feedback: AnswerFeedback::new(),
             ripple: None,
             wrong_mark: None,
@@ -521,7 +528,20 @@ impl CountManiaGame {
             fish: Vec::new(),
             fish_board: None,
             last_board: Cell::new(None),
+        };
+        // ROUND1もカウントダウンから始める
+        game.start_countdown();
+        game
+    }
+
+    /// ラウンド冒頭のカウントダウンを始める
+    fn start_countdown(&mut self) {
+        let state = CountdownState::new();
+        // 最初のフェーズ「3」の音
+        if let Some(phase) = state.phase() {
+            audio::play_se(phase.se());
         }
+        self.countdown = Some(state);
     }
 
     /// boardに魚を放す。すでにboardに放してあれば何もしない
@@ -788,7 +808,8 @@ impl CountManiaGame {
         }
     }
 
-    /// 次のラウンドを始める。ラウンドの番号を先に進め、そのラウンドの難易度で盤面を作る
+    /// 次のラウンドを始める。ラウンドの番号を先に進め、そのラウンドの難易度で盤面を作り、
+    /// カウントダウンに入る(GO!!が終わるまでは盤面を見せず、クリックも受け付けない)
     fn start_next_round(&mut self) {
         self.round_serial += 1;
         let mut rng = rand::thread_rng();
@@ -796,6 +817,7 @@ impl CountManiaGame {
         // ROUND4・ROUND5だけ円を動かす状態を持つ
         self.round.motion = Motion::new(self.round_motion());
         self.interval = None;
+        self.start_countdown();
     }
 
     fn render_hud(&self, frame: &mut Frame, area: Rect) {
@@ -843,9 +865,10 @@ impl CountManiaGame {
         frame.render_widget(Paragraph::new(progress), cols[0]);
 
         // 中央: 正誤表示中はそれを、そうでなければ次に押す数字を出す
+        // (待ち時間中・カウントダウン中は盤面に円が無いので出さない)
         let center = match self.feedback.current() {
             Some(flash) => theme::flash_line(flash),
-            None if self.interval.is_none() => Line::from(vec![
+            None if self.interval.is_none() && self.countdown.is_none() => Line::from(vec![
                 Span::styled("つぎ ", Style::default().fg(theme::MUTED)),
                 Span::styled(
                     format!(" {} ", self.round.next),
@@ -916,8 +939,12 @@ impl Game for CountManiaGame {
     fn handle_key(&mut self, _key: KeyEvent) {}
 
     fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
-        // 待ち時間中・セッション終了後・GAME OVER後のクリックは受け付けない
-        if self.is_finished() || self.interval.is_some() || self.game_over {
+        // 待ち時間中・カウントダウン中・セッション終了後・GAME OVER後のクリックは受け付けない
+        if self.is_finished()
+            || self.interval.is_some()
+            || self.countdown.is_some()
+            || self.game_over
+        {
             return;
         }
         if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
@@ -949,6 +976,16 @@ impl Game for CountManiaGame {
         self.ripple = self.ripple.and_then(|ripple| ripple.advanced(dt));
         // バツ印も同じく時間で消す
         self.wrong_mark = self.wrong_mark.and_then(|mark| mark.advanced(dt));
+        // カウントダウン中はラウンドの時間を数えない。GO!!が終わったらプレイに入る
+        if let Some(state) = self.countdown.as_mut() {
+            if let Some(phase) = state.tick(dt) {
+                audio::play_se(phase.se());
+            }
+            if state.is_finished() {
+                self.countdown = None;
+            }
+            return;
+        }
         if let Some(remaining) = self.interval {
             let remaining = remaining.saturating_sub(dt);
             if remaining.is_zero() {
@@ -983,6 +1020,11 @@ impl Game for CountManiaGame {
             return;
         }
         self.last_board.set(Some(board));
+        // カウントダウン中は円・魚を描かず、盤面に「3.2.1.GO!!」だけを大きく出す
+        if let Some(state) = &self.countdown {
+            countdown::render(frame, board, state);
+            return;
+        }
         self.render_fish(frame, board);
         if self.interval.is_some() {
             self.render_interval_message(frame, board);
@@ -1036,6 +1078,7 @@ impl Game for CountManiaGame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::countdown::{self as countdown_ui, PHASE_DURATION};
     use crossterm::event::{KeyCode, KeyModifiers};
     use rand::rngs::StdRng;
     use rand::SeedableRng;
@@ -1043,12 +1086,48 @@ mod tests {
 
     const AREA: Rect = Rect::new(0, 0, 100, 36);
 
+    /// ラウンド冒頭のカウントダウン全体の長さ(3/2/1/GO!!の4フェーズ)
+    const COUNTDOWN_TOTAL: Duration = Duration::from_millis(2400);
+
     fn left_click(column: u16, row: u16) -> MouseEvent {
         MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column,
             row,
             modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn is_countdown(game: &CountManiaGame) -> bool {
+        game.countdown.is_some()
+    }
+
+    fn countdown_phase(game: &CountManiaGame) -> Option<countdown_ui::Phase> {
+        game.countdown
+            .as_ref()
+            .expect("カウントダウン中のはず")
+            .phase()
+    }
+
+    /// ラウンド冒頭のカウントダウンを最後まで進め、プレイ中にする
+    fn finish_countdown(game: &mut CountManiaGame) {
+        assert!(is_countdown(game), "カウントダウン中のはず");
+        game.update(COUNTDOWN_TOTAL);
+        assert!(!is_countdown(game), "カウントダウンが終わったらプレイ中");
+    }
+
+    /// ROUND1冒頭のカウントダウンを終えて、すぐクリックできる状態のゲーム
+    fn playing_game() -> CountManiaGame {
+        let mut game = CountManiaGame::new();
+        finish_countdown(&mut game);
+        game
+    }
+
+    /// ラウンド間の待ち時間を終え、次のラウンドがあればその冒頭のカウントダウンも終える
+    fn pass_interval(game: &mut CountManiaGame) {
+        game.update(ROUND_INTERVAL);
+        if !game.is_finished() {
+            finish_countdown(game);
         }
     }
 
@@ -1149,7 +1228,7 @@ mod tests {
     fn advance_to_round(game: &mut CountManiaGame, index: u32) {
         for _ in 0..index {
             clear_round(game);
-            game.update(ROUND_INTERVAL);
+            pass_interval(game);
         }
         assert_eq!(
             game.round_serial,
@@ -1284,7 +1363,7 @@ mod tests {
     #[test]
     fn new_game_starts_with_full_lives_and_next_number_one() {
         // ROUND1は初級
-        let game = CountManiaGame::new();
+        let game = playing_game();
         assert_eq!(game.round.next, 1);
         assert_eq!(game.round.lives, 3);
         assert_eq!(game.round.circles.len(), 10);
@@ -1296,7 +1375,7 @@ mod tests {
 
     #[test]
     fn clicking_next_number_removes_it_and_advances() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         click_circle(&mut game, 1);
         assert_eq!(game.round.next, 2);
         assert!(!game.is_visible(1), "押した円は消える");
@@ -1307,7 +1386,7 @@ mod tests {
 
     #[test]
     fn clearing_all_numbers_records_success_with_elapsed_time() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         game.update(Duration::from_millis(1500));
         clear_round(&mut game);
         let result = game.result();
@@ -1320,7 +1399,7 @@ mod tests {
 
     #[test]
     fn clicking_wrong_number_loses_a_life_and_keeps_next() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let wrong = wrong_number(&game);
         click_circle(&mut game, wrong);
         assert_eq!(game.round.lives, 2);
@@ -1331,7 +1410,7 @@ mod tests {
 
     #[test]
     fn losing_all_lives_ends_round_as_failure_with_limit_latency() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         click_circle(&mut game, 1);
         lose_all_lives(&mut game);
         let result = game.result();
@@ -1348,7 +1427,7 @@ mod tests {
     fn game_over_ends_the_session_without_waiting_for_remaining_rounds() {
         // GAME OVER(ライフ0)は、5ラウンド構成の途中でも次のラウンドへ進まず、
         // フィードバック("ライフが尽きた")が消えたらセッション全体が終了する
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         click_circle(&mut game, 1);
         lose_all_lives(&mut game);
         assert_eq!(
@@ -1373,7 +1452,7 @@ mod tests {
 
     #[test]
     fn clicks_after_game_over_are_ignored() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         click_circle(&mut game, 1);
         lose_all_lives(&mut game);
         let next_before = game.round.next;
@@ -1385,7 +1464,7 @@ mod tests {
 
     #[test]
     fn clicks_are_ignored_during_interval_then_next_round_starts() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         clear_round(&mut game);
         assert!(game.interval.is_some(), "ラウンド終了後は待ち時間に入る");
         let before = game.round.next;
@@ -1393,7 +1472,7 @@ mod tests {
         assert_eq!(game.round.next, before, "待ち時間中のクリックは無視される");
         assert_eq!(game.tracker.total(), 1);
 
-        game.update(ROUND_INTERVAL);
+        pass_interval(&mut game);
         assert!(game.interval.is_none());
         assert_eq!(game.round.next, 1, "新しいラウンドは1から");
         assert_eq!(
@@ -1406,7 +1485,7 @@ mod tests {
 
     #[test]
     fn session_finishes_after_five_rounds() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         for round in 0..ROUNDS_PER_SESSION {
             assert!(
                 !game.is_finished(),
@@ -1414,7 +1493,7 @@ mod tests {
             );
             clear_round(&mut game);
             if round + 1 < ROUNDS_PER_SESSION {
-                game.update(ROUND_INTERVAL);
+                pass_interval(&mut game);
             }
         }
         assert!(game.is_finished());
@@ -1431,10 +1510,10 @@ mod tests {
 
     #[test]
     fn clicks_after_session_finished_are_ignored() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         for _ in 0..ROUNDS_PER_SESSION {
             clear_round(&mut game);
-            game.update(ROUND_INTERVAL);
+            pass_interval(&mut game);
         }
         assert!(game.is_finished());
         let (column, row) = center_of(&game, 1);
@@ -1442,11 +1521,269 @@ mod tests {
         assert_eq!(game.result().total, ROUNDS_PER_SESSION);
     }
 
+    // --- ラウンド冒頭のカウントダウン(3.2.1.GO!!) ---
+
+    #[test]
+    fn countdown_total_matches_four_phases() {
+        assert_eq!(PHASE_DURATION * 4, COUNTDOWN_TOTAL);
+    }
+
+    #[test]
+    fn new_game_starts_round1_with_countdown_from_three() {
+        let game = CountManiaGame::new();
+        assert!(is_countdown(&game), "ROUND1はカウントダウンから");
+        assert_eq!(countdown_phase(&game), Some(countdown_ui::Phase::Three));
+        assert_eq!(
+            game.round_serial, 0,
+            "カウントダウン中もROUND1の盤面を用意している"
+        );
+        assert!(game.interval.is_none());
+        assert!(!game.is_finished());
+    }
+
+    #[test]
+    fn countdown_advances_3_2_1_go_and_ends_after_total() {
+        let mut game = CountManiaGame::new();
+        game.update(PHASE_DURATION);
+        assert_eq!(countdown_phase(&game), Some(countdown_ui::Phase::Two));
+        game.update(PHASE_DURATION);
+        assert_eq!(countdown_phase(&game), Some(countdown_ui::Phase::One));
+        game.update(PHASE_DURATION);
+        assert_eq!(countdown_phase(&game), Some(countdown_ui::Phase::Go));
+        game.update(PHASE_DURATION - Duration::from_millis(1));
+        assert!(
+            is_countdown(&game),
+            "GO!!の表示時間が終わるまではカウントダウン中"
+        );
+        game.update(Duration::from_millis(1));
+        assert!(!is_countdown(&game), "GO!!が終わったらプレイ中");
+    }
+
+    #[test]
+    fn clicks_during_countdown_are_ignored() {
+        let mut game = CountManiaGame::new();
+        // 正解の円・押し間違いの円・円の無い所をどれもクリックする
+        click_circle(&mut game, 1);
+        let wrong = wrong_number(&game);
+        click_circle(&mut game, wrong);
+        let (column, row) = empty_cell(&game);
+        game.handle_mouse(left_click(column, row), AREA);
+        assert!(
+            is_countdown(&game),
+            "クリックでカウントダウンが飛ばされない"
+        );
+        assert_eq!(countdown_phase(&game), Some(countdown_ui::Phase::Three));
+        assert_eq!(game.round.next, 1, "円は消えない");
+        assert_eq!(game.round.lives, params(Difficulty::Beginner).lives);
+        assert_eq!(game.tracker.total(), 0);
+        assert!(game.ripple.is_none(), "波紋も出ない");
+        assert!(game.wrong_mark.is_none(), "バツ印も出ない");
+        assert!(game.feedback.current().is_none());
+    }
+
+    #[test]
+    fn countdown_finishes_into_playable_round1() {
+        let mut game = CountManiaGame::new();
+        finish_countdown(&mut game);
+        click_circle(&mut game, 1);
+        assert_eq!(game.round.next, 2, "カウントダウン後はクリックを受け付ける");
+    }
+
+    #[test]
+    fn round_time_does_not_advance_during_countdown() {
+        let mut game = CountManiaGame::new();
+        game.update(COUNTDOWN_TOTAL - Duration::from_millis(1));
+        assert!(
+            game.round.elapsed.is_zero(),
+            "カウントダウン中はラウンドの時間を数えない"
+        );
+        assert!(game.round.time_since_target.is_zero());
+        assert!(pressure_background(game.round.time_since_target).is_none());
+    }
+
+    #[test]
+    fn countdown_does_not_count_toward_time_out() {
+        // カウントダウン中に大きく時間が進んでも、時間切れにはならない
+        let mut game = CountManiaGame::new();
+        game.update(TIMEOUT_LIMIT);
+        assert!(!game.game_over);
+        assert!(!is_countdown(&game));
+        assert!(game.round.time_since_target.is_zero());
+    }
+
+    #[test]
+    fn recorded_round_time_excludes_countdown() {
+        let mut game = CountManiaGame::new();
+        game.update(COUNTDOWN_TOTAL);
+        game.update(Duration::from_millis(1500));
+        clear_round(&mut game);
+        let result = game.result();
+        assert!(
+            (result.avg_latency_ms - 1500.0).abs() < 1e-9,
+            "記録はGO!!の後から: {}",
+            result.avg_latency_ms
+        );
+    }
+
+    #[test]
+    fn next_round_countdown_starts_after_clear_interval() {
+        let mut game = playing_game();
+        clear_round(&mut game);
+        assert!(game.interval.is_some());
+        assert!(
+            !is_countdown(&game),
+            "CLEAR!の待ち時間中はまだカウントダウンしない"
+        );
+        let text = rendered_text(&game, AREA.width, AREA.height);
+        assert!(text.contains("CLEAR!"), "CLEAR!の表示は今まで通り");
+
+        game.update(ROUND_INTERVAL);
+        assert!(game.interval.is_none());
+        assert!(is_countdown(&game), "CLEAR!の後に3.2.1.GO!!が入る");
+        assert_eq!(countdown_phase(&game), Some(countdown_ui::Phase::Three));
+        assert_eq!(game.round_serial, 1, "ROUND2の盤面はカウントダウン前に作る");
+        assert_eq!(game.round_difficulty(), Difficulty::Intermediate);
+
+        click_circle(&mut game, 1);
+        assert_eq!(
+            game.round.next, 1,
+            "ROUND2のカウントダウン中もクリックは無視"
+        );
+        finish_countdown(&mut game);
+        click_circle(&mut game, 1);
+        assert_eq!(game.round.next, 2);
+    }
+
+    #[test]
+    fn every_round_from_1_to_5_starts_with_countdown() {
+        let mut game = CountManiaGame::new();
+        for round in 0..ROUNDS_PER_SESSION {
+            assert!(
+                is_countdown(&game),
+                "ROUND{}はカウントダウンから",
+                round + 1
+            );
+            assert_eq!(countdown_phase(&game), Some(countdown_ui::Phase::Three));
+            assert_eq!(game.round_serial, round);
+            let text = rendered_text(&game, AREA.width, AREA.height);
+            assert!(
+                text.contains(&format!("ROUND{}/{ROUNDS_PER_SESSION}", round + 1)),
+                "カウントダウン中もHUDは始まるラウンドの番号"
+            );
+            finish_countdown(&mut game);
+            clear_round(&mut game);
+            game.update(ROUND_INTERVAL);
+        }
+        assert!(game.is_finished());
+        assert!(
+            !is_countdown(&game),
+            "最終ラウンドの後にはカウントダウンしない"
+        );
+    }
+
+    #[test]
+    fn game_over_does_not_start_countdown() {
+        let mut game = playing_game();
+        lose_all_lives(&mut game);
+        assert!(game.game_over);
+        game.update(crate::game::feedback::FEEDBACK_HOLD);
+        assert!(game.is_finished());
+        assert!(!is_countdown(&game));
+    }
+
+    #[test]
+    fn countdown_renders_big_glyph_and_hides_circles() {
+        let game = CountManiaGame::new();
+        let text = rendered_text(&game, AREA.width, AREA.height);
+        assert!(text.contains('█'), "カウントダウンの大きな文字を描く");
+        for number in 1..=params(Difficulty::Beginner).max_number {
+            let digit = circle_image::circled_digit(number).unwrap();
+            assert!(
+                !text.contains(digit),
+                "カウントダウン中は円{digit}を描かない"
+            );
+        }
+        assert!(
+            !text.contains("つぎ"),
+            "カウントダウン中は次の数字の案内を出さない"
+        );
+        assert!(text.contains("ROUND1/5"));
+        assert!(text.contains("マウス専用"));
+    }
+
+    #[test]
+    fn countdown_hides_fish() {
+        let mut game = CountManiaGame::new();
+        let (column, row) = empty_cell(&game);
+        put_all_fish_at(&mut game, column, row);
+        for fish in &mut game.fish {
+            fish.facing_right = true;
+        }
+        let buffer = rendered_buffer(&game);
+        let fish_colors: Vec<Color> = FISH_COLORS
+            .iter()
+            .map(|&[r, g, b]| Color::Rgb(r, g, b))
+            .collect();
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .all(|cell| !fish_colors.contains(&cell.fg)),
+            "カウントダウン中は魚を描かない"
+        );
+
+        // カウントダウンが終わったら魚が見える
+        finish_countdown(&mut game);
+        put_all_fish_at(&mut game, column, row);
+        for fish in &mut game.fish {
+            fish.facing_right = true;
+        }
+        let buffer = rendered_buffer(&game);
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| fish_colors.contains(&cell.fg)),
+            "プレイ中は魚を描く"
+        );
+    }
+
+    #[test]
+    fn image_mode_countdown_does_not_build_board_image() {
+        use ratatui_image::picker::{Picker, ProtocolType};
+        let mut game = CountManiaGame::new();
+        let mut picker = Picker::from_fontsize((4, 8));
+        picker.set_protocol_type(ProtocolType::Halfblocks);
+        game.renderer = CircleRenderer::with_picker(picker);
+        let text = rendered_text(&game, AREA.width, AREA.height);
+        assert!(text.contains('█'));
+        assert_eq!(
+            game.renderer.board_encode_count(),
+            0,
+            "カウントダウン中は盤面の画像を作らない"
+        );
+        finish_countdown(&mut game);
+        rendered_text(&game, AREA.width, AREA.height);
+        assert!(
+            game.renderer.board_encode_count() > 0,
+            "プレイ中は盤面を描く"
+        );
+    }
+
+    #[test]
+    fn render_during_countdown_does_not_panic_on_tiny_areas() {
+        let mut game = CountManiaGame::new();
+        for (width, height) in [(1, 1), (5, 2), (20, 6), (AREA.width, AREA.height)] {
+            rendered_text(&game, width, height);
+            game.update(PHASE_DURATION);
+        }
+    }
+
     // --- マウス専用 ---
 
     #[test]
     fn handle_key_never_changes_state() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let keys = [
             KeyCode::Enter,
             KeyCode::Esc,
@@ -1473,7 +1810,7 @@ mod tests {
 
     #[test]
     fn clicking_empty_space_does_nothing() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let (column, row) = empty_cell(&game);
         game.handle_mouse(left_click(column, row), AREA);
         assert_eq!(game.round.next, 1);
@@ -1482,7 +1819,7 @@ mod tests {
 
     #[test]
     fn clicking_outside_board_or_non_left_button_does_nothing() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         // HUD(ボード外)のクリック
         game.handle_mouse(left_click(1, 1), AREA);
         // 1の円を右クリック
@@ -1503,7 +1840,7 @@ mod tests {
     #[test]
     fn clicking_overlap_hits_smaller_circle_then_circle_below_after_removal() {
         // 小さい円1が大きい円2の上に重なっている
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         set_overlap_layout(&game, 2, 1);
         let (x, y) = OVERLAP;
         click_board(&mut game, x, y);
@@ -1516,7 +1853,7 @@ mod tests {
     #[test]
     fn clicking_overlap_never_hits_larger_circle_below() {
         // 次に押すべき円1が大きい方で、その上に小さい円2が重なっている。重なった所は円2扱い
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         set_overlap_layout(&game, 1, 2);
         let (x, y) = OVERLAP;
         click_board(&mut game, x, y);
@@ -1526,7 +1863,7 @@ mod tests {
 
     #[test]
     fn render_draws_smaller_circle_on_top_of_larger() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         game.round.circles[0].color = [200, 50, 50];
         game.round.circles[1].color = [50, 50, 200];
         set_overlap_layout(&game, 2, 1);
@@ -1546,7 +1883,7 @@ mod tests {
 
     #[test]
     fn clicking_removed_circle_does_nothing() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         // 円1の下に他の円が無い配置にする(下に円があればそちらに当たるのが正しい動作のため)
         set_layout(&game, &[(1, 2, 2, 10, 5), (2, 40, 2, 10, 5)]);
         click_circle(&mut game, 1);
@@ -1560,7 +1897,7 @@ mod tests {
 
     #[test]
     fn layout_is_kept_between_clicks_and_regenerated_for_new_round() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let board = board_area(AREA);
         let first = game.placements(board);
         click_circle(&mut game, 1);
@@ -1572,7 +1909,7 @@ mod tests {
         for number in 2..=game.round_params().max_number {
             click_circle(&mut game, number);
         }
-        game.update(ROUND_INTERVAL);
+        pass_interval(&mut game);
         // 新しいラウンドでは色・サイズも振り直されるので、配置も作り直される
         assert_eq!(
             game.placements(board).len(),
@@ -1588,7 +1925,7 @@ mod tests {
 
     #[test]
     fn hud_shows_mouse_only_next_number_and_lives() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let text = rendered_text(&game, AREA.width, AREA.height);
         assert!(text.contains("マウス専用"), "マウス専用と明記すること");
         assert!(text.contains("つぎ"));
@@ -1604,7 +1941,7 @@ mod tests {
     #[test]
     fn board_shows_every_remaining_number_in_fallback_mode() {
         // ROUND3(上級)の20個の円
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         advance_to_round(&mut game, 2);
         click_circle(&mut game, 1);
         let text = rendered_text(&game, AREA.width, AREA.height);
@@ -1617,7 +1954,7 @@ mod tests {
 
     #[test]
     fn render_does_not_panic_in_tiny_or_interval_state() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         advance_to_round(&mut game, 1);
         rendered_text(&game, 20, 6);
         rendered_text(&game, 1, 1);
@@ -1631,7 +1968,7 @@ mod tests {
 
     #[test]
     fn interval_message_tells_clear_and_hides_circles() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         clear_round(&mut game);
         let text = rendered_text(&game, AREA.width, AREA.height);
         assert!(text.contains("CLEAR!"));
@@ -1641,11 +1978,12 @@ mod tests {
 
     #[test]
     fn elapsed_time_does_not_advance_during_interval() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         clear_round(&mut game);
         game.update(ROUND_INTERVAL / 2);
         assert!(game.interval.is_some());
         game.update(ROUND_INTERVAL / 2);
+        finish_countdown(&mut game);
         game.update(Duration::from_millis(700));
         clear_round(&mut game);
         let result = game.result();
@@ -1663,7 +2001,7 @@ mod tests {
 
     #[test]
     fn correct_click_starts_ripple_at_clicked_cell() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let (x, y) = set_separate_layout(&game);
         assert!(game.ripple.is_none(), "始めは波紋なし");
         click_board(&mut game, x, y);
@@ -1680,7 +2018,7 @@ mod tests {
 
     #[test]
     fn wrong_or_empty_click_does_not_start_ripple() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         set_separate_layout(&game);
         // 円2(次に押すべきでない円)をクリック
         click_board(&mut game, 44, 4);
@@ -1693,7 +2031,7 @@ mod tests {
 
     #[test]
     fn update_advances_ripple_and_removes_it_after_duration() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let (x, y) = set_separate_layout(&game);
         click_board(&mut game, x, y);
         game.update(ripple::RIPPLE_DURATION / 2);
@@ -1705,7 +2043,7 @@ mod tests {
 
     #[test]
     fn new_correct_click_replaces_previous_ripple() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let (x, y) = set_separate_layout(&game);
         click_board(&mut game, x, y);
         game.update(ripple::RIPPLE_DURATION / 2);
@@ -1723,7 +2061,7 @@ mod tests {
 
     #[test]
     fn ripple_expires_during_round_interval_without_affecting_score() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         clear_round(&mut game);
         assert!(game.ripple.is_some(), "最後の正解クリックでも波紋は始まる");
         assert!(game.interval.is_some());
@@ -1735,7 +2073,7 @@ mod tests {
 
     #[test]
     fn fallback_render_ignores_ripple() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let (x, y) = set_separate_layout(&game);
         click_board(&mut game, x, y);
         assert!(game.ripple.is_some());
@@ -1747,7 +2085,7 @@ mod tests {
     #[test]
     fn image_mode_render_with_ripple_does_not_panic() {
         use ratatui_image::picker::{Picker, ProtocolType};
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         advance_to_round(&mut game, 2);
         let mut picker = Picker::from_fontsize((4, 8));
         picker.set_protocol_type(ProtocolType::Halfblocks);
@@ -1769,7 +2107,7 @@ mod tests {
     fn ripple_animation_does_not_reencode_whole_board_every_tick() {
         // 実際のゲームループと同じく、tickごとにupdateして描く
         use ratatui_image::picker::{Picker, ProtocolType};
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         advance_to_round(&mut game, 2);
         let mut picker = Picker::from_fontsize((4, 8));
         picker.set_protocol_type(ProtocolType::Halfblocks);
@@ -1840,13 +2178,13 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(1);
         let round = new_round(&mut rng, &params(Difficulty::Beginner));
         assert!(round.time_since_target.is_zero());
-        let game = CountManiaGame::new();
+        let game = playing_game();
         assert!(game.round.time_since_target.is_zero());
     }
 
     #[test]
     fn update_advances_time_since_target_only_while_playing() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         game.update(Duration::from_millis(1500));
         game.update(Duration::from_millis(500));
         assert_eq!(game.round.time_since_target, Duration::from_secs(2));
@@ -1868,10 +2206,10 @@ mod tests {
 
     #[test]
     fn time_since_target_does_not_advance_after_session_finished() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         for _ in 0..ROUNDS_PER_SESSION {
             clear_round(&mut game);
-            game.update(ROUND_INTERVAL);
+            pass_interval(&mut game);
         }
         assert!(game.is_finished());
         game.update(PRESSURE_THRESHOLD * 2);
@@ -1880,7 +2218,7 @@ mod tests {
 
     #[test]
     fn correct_click_resets_time_since_target() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         game.update(Duration::from_secs(8));
         click_circle(&mut game, 1);
         assert_eq!(game.round.next, 2);
@@ -1894,7 +2232,7 @@ mod tests {
 
     #[test]
     fn wrong_click_keeps_time_since_target_while_lives_remain() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         game.update(Duration::from_secs(8));
         let wrong = wrong_number(&game);
         click_circle(&mut game, wrong);
@@ -1904,7 +2242,7 @@ mod tests {
 
     #[test]
     fn game_over_resets_time_since_target() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         game.update(Duration::from_secs(8));
         lose_all_lives(&mut game);
         assert_eq!(game.round.lives, 0);
@@ -1954,7 +2292,7 @@ mod tests {
 
     #[test]
     fn board_background_stays_normal_within_threshold() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let normal = board_background(&game);
         assert_eq!(normal, Color::Reset);
         game.update(Duration::from_millis(4_900));
@@ -1963,7 +2301,7 @@ mod tests {
 
     #[test]
     fn board_background_flashes_red_after_threshold_and_resets_on_correct_click() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         game.update(PRESSURE_THRESHOLD + PRESSURE_PERIOD / 2);
         let (r, g, b) = rgb(board_background(&game));
         assert!(r > g && r > b, "盤面の背景が赤系になる: {r},{g},{b}");
@@ -1989,7 +2327,7 @@ mod tests {
 
     #[test]
     fn board_background_resets_on_game_over() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         game.update(PRESSURE_THRESHOLD * 2);
         lose_all_lives(&mut game);
         assert!(game.game_over, "ライフ切れでGAME OVERになる");
@@ -2021,7 +2359,7 @@ mod tests {
 
     #[test]
     fn wrong_click_shows_mark_at_clicked_cell() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         set_separate_layout(&game);
         assert!(game.wrong_mark.is_none(), "始めはバツ印なし");
         // 円2(次に押すべきでない円)をクリック
@@ -2038,7 +2376,7 @@ mod tests {
 
     #[test]
     fn wrong_mark_disappears_after_duration() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         set_separate_layout(&game);
         click_board(&mut game, 44, 4);
         game.update(wrong_mark::WRONG_MARK_DURATION - Duration::from_millis(1));
@@ -2049,7 +2387,7 @@ mod tests {
 
     #[test]
     fn empty_or_correct_click_does_not_show_mark() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let (x, y) = set_separate_layout(&game);
         click_board(&mut game, 25, 4);
         assert!(
@@ -2063,7 +2401,7 @@ mod tests {
 
     #[test]
     fn new_wrong_click_moves_mark_and_restarts_it() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         set_layout(
             &game,
             &[(1, 2, 2, 10, 5), (2, 40, 2, 10, 5), (3, 60, 10, 10, 5)],
@@ -2084,7 +2422,7 @@ mod tests {
 
     #[test]
     fn correct_click_after_wrong_click_keeps_ripple_and_feedback_unaffected() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let (x, y) = set_separate_layout(&game);
         click_board(&mut game, 44, 4);
         assert!(game.wrong_mark.is_some());
@@ -2104,7 +2442,7 @@ mod tests {
 
     #[test]
     fn game_over_click_shows_mark_with_life_feedback() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         click_circle(&mut game, 1);
         lose_all_lives(&mut game);
         assert!(game.game_over);
@@ -2120,7 +2458,7 @@ mod tests {
 
     #[test]
     fn fallback_render_draws_red_cross_at_wrong_click() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         set_separate_layout(&game);
         let board = board_area(AREA);
         let cell = (board.x + 42, board.y + 3);
@@ -2143,7 +2481,7 @@ mod tests {
 
     #[test]
     fn time_out_is_game_over_with_time_out_message() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         click_circle(&mut game, 1);
         game.update(TIMEOUT_LIMIT - Duration::from_millis(1));
         assert!(!game.game_over, "上限の直前はまだGAME OVERではない");
@@ -2175,7 +2513,7 @@ mod tests {
 
     #[test]
     fn time_out_accumulates_over_many_ticks() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let mut elapsed = Duration::ZERO;
         while !game.game_over {
             game.update(crate::TICK_RATE);
@@ -2190,7 +2528,7 @@ mod tests {
 
     #[test]
     fn time_out_ends_session_after_feedback_like_life_game_over() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         game.update(TIMEOUT_LIMIT);
         assert!(game.game_over);
         assert!(!game.is_finished(), "フィードバック表示中はまだ終了しない");
@@ -2205,7 +2543,7 @@ mod tests {
 
     #[test]
     fn time_out_is_recorded_only_once() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         game.update(TIMEOUT_LIMIT);
         game.update(TIMEOUT_LIMIT);
         game.update(TIMEOUT_LIMIT);
@@ -2214,7 +2552,7 @@ mod tests {
 
     #[test]
     fn clicks_after_time_out_are_ignored() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         game.update(TIMEOUT_LIMIT);
         click_circle(&mut game, 1);
         assert_eq!(game.round.next, 1, "GAME OVER後のクリックは無視される");
@@ -2223,7 +2561,7 @@ mod tests {
 
     #[test]
     fn time_out_resets_pressure_background() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         game.update(TIMEOUT_LIMIT);
         assert!(game.round.time_since_target.is_zero());
         let buffer = rendered_buffer(&game);
@@ -2233,7 +2571,7 @@ mod tests {
 
     #[test]
     fn correct_click_resets_time_out_countdown() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         game.update(TIMEOUT_LIMIT - Duration::from_secs(1));
         click_circle(&mut game, 1);
         game.update(TIMEOUT_LIMIT - Duration::from_secs(1));
@@ -2244,7 +2582,7 @@ mod tests {
 
     #[test]
     fn wrong_click_does_not_reset_time_out_countdown() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         game.update(TIMEOUT_LIMIT - Duration::from_secs(1));
         let wrong = wrong_number(&game);
         click_circle(&mut game, wrong);
@@ -2255,7 +2593,7 @@ mod tests {
 
     #[test]
     fn time_out_does_not_happen_during_round_interval() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         clear_round(&mut game);
         assert!(game.interval.is_some());
         game.update(TIMEOUT_LIMIT);
@@ -2314,7 +2652,7 @@ mod tests {
 
     #[test]
     fn target_circle_blinks_before_time_out_and_other_circles_do_not() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         set_separate_layout(&game);
         let [r, g, b] = game.round.circles[0].color;
         let own = Color::Rgb(r, g, b);
@@ -2365,7 +2703,7 @@ mod tests {
 
     #[test]
     fn each_round_uses_params_of_its_difficulty() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let board = board_area(AREA);
         for (index, difficulty) in ROUND_DIFFICULTIES.into_iter().enumerate() {
             let expected = params(difficulty);
@@ -2379,7 +2717,7 @@ mod tests {
             assert_eq!(game.placements(board).len(), expected.max_number as usize);
             clear_round(&mut game);
             if index + 1 < ROUND_DIFFICULTIES.len() {
-                game.update(ROUND_INTERVAL);
+                pass_interval(&mut game);
             }
         }
         assert!(game.is_finished());
@@ -2392,7 +2730,7 @@ mod tests {
 
     #[test]
     fn difficulty_switches_only_when_next_round_starts() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         clear_round(&mut game);
         assert!(game.interval.is_some());
         assert_eq!(
@@ -2410,7 +2748,7 @@ mod tests {
 
     #[test]
     fn game_over_in_round2_records_intermediate_fail_latency() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         // ROUND1は経過時間0でクリア(記録0ms)
         advance_to_round(&mut game, 1);
         lose_all_lives(&mut game);
@@ -2428,7 +2766,7 @@ mod tests {
 
     #[test]
     fn round3_uses_advanced_dense_layout_and_two_lives() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         advance_to_round(&mut game, 2);
         assert_eq!(game.round_difficulty(), Difficulty::Advanced);
         assert!(game.round_params().dense);
@@ -2440,7 +2778,7 @@ mod tests {
 
     #[test]
     fn hud_shows_difficulty_label_of_current_round() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let labels: Vec<String> = ROUND_DIFFICULTIES
             .iter()
             .map(|&d| theme::difficulty_label(d).0.replace(' ', ""))
@@ -2452,7 +2790,7 @@ mod tests {
                 let text = rendered_text(&game, AREA.width, AREA.height);
                 assert!(text.contains(&format!("ROUND{index}/{ROUNDS_PER_SESSION}")));
                 assert!(text.contains(labels[index - 1].as_str()));
-                game.update(ROUND_INTERVAL);
+                pass_interval(&mut game);
             }
             let text = rendered_text(&game, AREA.width, AREA.height);
             assert!(
@@ -2476,7 +2814,7 @@ mod tests {
 
     #[test]
     fn result_difficulty_is_session_difficulty_from_the_start() {
-        let game = CountManiaGame::new();
+        let game = playing_game();
         assert_eq!(game.result().difficulty, SESSION_DIFFICULTY);
     }
 
@@ -2484,7 +2822,7 @@ mod tests {
 
     #[test]
     fn ripple_size_follows_clicked_circle_size() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let (x, y) = set_separate_layout(&game);
         game.round.circles[0].size = CircleSize::Huge;
         game.round.circles[1].size = CircleSize::Small;
@@ -2510,12 +2848,14 @@ mod tests {
     // --- ROUND4・ROUND5: 動く円 ---
 
     /// 前のラウンドを遊ばずに、0始まりでindex番目のラウンドを直接始める
-    /// (動くラウンドを、前のラウンドの配置の乱数に左右されずに確かめるため)
+    /// (動くラウンドを、前のラウンドの配置の乱数に左右されずに確かめるため)。
+    /// ラウンド冒頭のカウントダウンも終えて、すぐクリックできる状態にする
     fn start_round(game: &mut CountManiaGame, index: u32) {
         assert!(index >= 1, "ROUND1はnew()で始まる");
         game.round_serial = index - 1;
         game.start_next_round();
         assert_eq!(game.round_serial, index);
+        finish_countdown(game);
     }
 
     /// 番号numberの円の、盤面左上からの相対位置の矩形
@@ -2543,7 +2883,7 @@ mod tests {
 
     #[test]
     fn round4_and_round5_use_advanced_params() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         for index in [3, 4] {
             start_round(&mut game, index);
             let advanced = params(Difficulty::Advanced);
@@ -2566,7 +2906,7 @@ mod tests {
                 MotionKind::Scatter
             ]
         );
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         assert!(game.round.motion.is_none(), "ROUND1は円が動かない");
         for index in 1..ROUNDS_PER_SESSION {
             start_round(&mut game, index);
@@ -2588,7 +2928,7 @@ mod tests {
 
     #[test]
     fn round5_scatters_stronger_than_round4() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         start_round(&mut game, 3);
         let round4 = game.round_scatter();
         assert_eq!(round4, SCATTER_NORMAL, "ROUND4は今までの強さのまま");
@@ -2613,7 +2953,7 @@ mod tests {
     /// 0始まりでindex番目のラウンドを始め、set_scatter_layoutの配置で円1を押した後の
     /// 円2(真右)の位置
     fn pushed_right_circle_after_first_click(index: u32) -> Rect {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         start_round(&mut game, index);
         let (x, y) = set_scatter_layout(&game);
         click_board(&mut game, x, y);
@@ -2638,7 +2978,7 @@ mod tests {
         // 円1の中心(45.5,12.5)から円2の中心(75,12.5)までは見た目の距離29.5。
         // ROUND4の範囲(24)の外で、ROUND5の範囲の内側
         let layout = [(1, 40, 10, 10, 5), (2, 70, 10, 10, 5)];
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         start_round(&mut game, 3);
         set_layout(&game, &layout);
         click_board(&mut game, 45, 12);
@@ -2660,7 +3000,7 @@ mod tests {
     #[test]
     fn rounds_1_to_3_keep_positions_over_time_and_clicks() {
         let board = board_area(AREA);
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         for index in 0..3 {
             if index > 0 {
                 start_round(&mut game, index);
@@ -2700,7 +3040,7 @@ mod tests {
 
     #[test]
     fn round4_correct_click_pushes_nearby_circles_away_and_keeps_far_ones() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         start_round(&mut game, 3);
         let (x, y) = set_scatter_layout(&game);
         click_board(&mut game, x, y);
@@ -2730,7 +3070,7 @@ mod tests {
     #[test]
     fn round4_and_round5_scatter_keeps_circles_inside_board() {
         for index in [3, 4] {
-            let mut game = CountManiaGame::new();
+            let mut game = playing_game();
             start_round(&mut game, index);
             // 盤面は98x31なので、幅10・高さ5の円の左上が取れる範囲は x=0〜88, y=0〜26
             set_layout(
@@ -2747,7 +3087,7 @@ mod tests {
 
     #[test]
     fn round4_wrong_or_empty_click_does_not_move_circles() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         start_round(&mut game, 3);
         set_scatter_layout(&game);
         let board = board_area(AREA);
@@ -2764,7 +3104,7 @@ mod tests {
     #[test]
     fn round4_and_round5_circles_stay_still_between_clicks() {
         for index in [3, 4] {
-            let mut game = CountManiaGame::new();
+            let mut game = playing_game();
             start_round(&mut game, index);
             let board = board_area(AREA);
             let first = game.placements(board);
@@ -2802,7 +3142,7 @@ mod tests {
     fn round5_image_mode_does_not_reencode_board_while_idle() {
         // ROUND5も放っておく間は盤面を作り直さない(円が動き続けて盤面全体がちらつかない)
         use ratatui_image::picker::{Picker, ProtocolType};
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         start_round(&mut game, 4);
         let mut picker = Picker::from_fontsize((4, 8));
         picker.set_protocol_type(ProtocolType::Halfblocks);
@@ -2824,7 +3164,7 @@ mod tests {
 
     #[test]
     fn round4_next_click_is_judged_at_moved_position() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         start_round(&mut game, 3);
         let (x, y) = set_scatter_layout(&game);
         click_board(&mut game, x, y);
@@ -2853,7 +3193,7 @@ mod tests {
 
     #[test]
     fn round5_resized_board_restarts_positions_from_new_layout() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         start_round(&mut game, 4);
         let (x, y) = set_scatter_layout(&game);
         click_board(&mut game, x, y);
@@ -2879,12 +3219,12 @@ mod tests {
 
     #[test]
     fn full_session_of_five_rounds_can_be_cleared_with_moving_rounds() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         for round in 0..ROUNDS_PER_SESSION {
             // ROUND4・ROUND5は円が散らばっても、今の位置をクリックすれば進める
             clear_round(&mut game);
             if round + 1 < ROUNDS_PER_SESSION {
-                game.update(ROUND_INTERVAL);
+                pass_interval(&mut game);
             }
         }
         assert!(game.is_finished());
@@ -2903,7 +3243,7 @@ mod tests {
         let board = board_area(AREA);
         for index in [3, 4] {
             for trial in 0..40 {
-                let mut game = CountManiaGame::new();
+                let mut game = playing_game();
                 start_round(&mut game, index);
                 for number in 1..=game.round_params().max_number {
                     let placements = game.placements(board);
@@ -2939,7 +3279,7 @@ mod tests {
         let (mut moved, mut total) = (0.0, 0usize);
         let mut strength = SCATTER_NORMAL;
         for _ in 0..20 {
-            let mut game = CountManiaGame::new();
+            let mut game = playing_game();
             start_round(&mut game, index);
             strength = game.round_scatter();
             for number in 1..game.round_params().max_number {
@@ -2988,7 +3328,7 @@ mod tests {
 
     #[test]
     fn round4_scatter_avoids_hiding_number_of_crowded_neighbor() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         start_round(&mut game, 3);
         // 円2をそのまま右へ押すと、同じ大きさで手前(並びの後ろ)の円3にぴったり重なって隠れる
         set_layout(
@@ -3032,7 +3372,7 @@ mod tests {
 
     #[test]
     fn fish_are_released_into_board_after_render_and_update() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         rendered_text(&game, AREA.width, AREA.height);
         game.update(FISH_TICK);
         let board = board_area(AREA);
@@ -3046,7 +3386,7 @@ mod tests {
 
     #[test]
     fn fish_keep_swimming_during_round_interval_and_after_game_over() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         rendered_text(&game, AREA.width, AREA.height);
         game.update(FISH_TICK);
         clear_round(&mut game);
@@ -3057,7 +3397,7 @@ mod tests {
         }
         assert_ne!(game.fish, before, "待ち時間中も泳ぐ");
 
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         rendered_text(&game, AREA.width, AREA.height);
         game.update(FISH_TICK);
         lose_all_lives(&mut game);
@@ -3071,7 +3411,7 @@ mod tests {
 
     #[test]
     fn empty_click_spooks_only_nearby_fish() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let (column, row) = empty_cell(&game);
         put_all_fish_at(&mut game, column, row);
         let board = board_area(AREA);
@@ -3099,7 +3439,7 @@ mod tests {
 
     #[test]
     fn circle_clicks_do_not_spook_fish() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let (column, row) = clickable_cell(&game, 1);
         put_all_fish_at(&mut game, column, row);
         click_circle(&mut game, 1);
@@ -3123,7 +3463,7 @@ mod tests {
 
     #[test]
     fn text_mode_draws_fish_behind_circles() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let (column, row) = empty_cell(&game);
         put_all_fish_at(&mut game, column, row);
         for fish in &mut game.fish {
@@ -3140,7 +3480,7 @@ mod tests {
 
     #[test]
     fn text_mode_render_with_fish_does_not_panic_on_tiny_areas() {
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         rendered_text(&game, AREA.width, AREA.height);
         game.update(FISH_TICK);
         for (width, height) in [(20, 6), (5, 5), (1, 1), (AREA.width, AREA.height)] {
@@ -3154,7 +3494,7 @@ mod tests {
     #[test]
     fn image_mode_render_with_fish_does_not_panic() {
         use ratatui_image::picker::{Picker, ProtocolType};
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let mut picker = Picker::from_fontsize((4, 8));
         picker.set_protocol_type(ProtocolType::Halfblocks);
         game.renderer = CircleRenderer::with_picker(picker);
@@ -3172,7 +3512,7 @@ mod tests {
     #[test]
     fn image_mode_draws_moving_fish_as_patches_without_rebuilding_board() {
         use ratatui_image::picker::{Picker, ProtocolType};
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let mut picker = Picker::from_fontsize((4, 8));
         picker.set_protocol_type(ProtocolType::Halfblocks);
         game.renderer = CircleRenderer::with_picker(picker);
@@ -3197,7 +3537,7 @@ mod tests {
     #[test]
     fn text_mode_does_not_pass_fish_to_image_patches() {
         // テキスト表示では魚を文字で描き、画像のパッチは作らない
-        let mut game = CountManiaGame::new();
+        let mut game = playing_game();
         let (column, row) = empty_cell(&game);
         put_all_fish_at(&mut game, column, row);
         rendered_text(&game, AREA.width, AREA.height);

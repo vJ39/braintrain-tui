@@ -402,11 +402,10 @@ impl App {
             return;
         }
         if selected == COUNT_MANIA_ITEM_INDEX {
-            // カウントメニアもROUND1〜5で難易度・動きが自動で変わるため、難易度選択を挟まない
-            self.start_playing(
-                COUNT_MANIA_ITEM_INDEX,
-                crate::game::count_mania::SESSION_DIFFICULTY,
-            );
+            // カウントメニアもROUND1〜5で難易度・動きが自動で変わるため、難易度選択を挟まない。
+            // ラウンドごとに自前の「3.2.1.GO!!」を持つため、画面遷移側のカウントダウンも挟まない
+            // (挟むと演出が2回連続してしまう)
+            self.start_count_mania();
             return;
         }
         if selected == QUICK_DRAW_ITEM_INDEX {
@@ -474,6 +473,16 @@ impl App {
             difficulty,
             state,
         };
+    }
+
+    /// カウントメニアを開始する。ラウンドごとの「3.2.1.GO!!」を自前で持つため、
+    /// 画面遷移側のカウントダウン(start_playing)は経由しない
+    fn start_count_mania(&mut self) {
+        if let Some(name) = audio::random_bgm_track(BgmCategory::Playing) {
+            audio::play_bgm_track(&name);
+            self.current_bgm = Some(name);
+        }
+        self.screen = Screen::Playing(Box::new(CountManiaGame::new()));
     }
 
     /// ハヤウチを開始する。ラウンドごとの「3.2.1.GO!!」を自前で持つため、
@@ -1556,11 +1565,12 @@ mod tests {
         }
     }
 
-    /// カウントメニアが始まり、ROUND1(初級)が表示されていることを確かめる
-    fn assert_count_mania_round1_is_playing(app: &mut App) {
-        finish_countdown(app);
+    /// カウントメニアが始まり、ゲーム内のROUND1(初級)の「3.2.1.GO!!」から始まっていることを確かめる。
+    /// カウントメニアはラウンドごとに自前のカウントダウンを持つため、
+    /// 画面遷移側のカウントダウン(Screen::Countdown)は経由しない
+    fn assert_count_mania_round1_countdown_in_game(app: &mut App) {
         let Screen::Playing(game) = &app.screen else {
-            panic!("Playing画面のはず");
+            panic!("外側のカウントダウンを挟まず直接Playing画面になるはず");
         };
         assert_eq!(game.result().game_id, crate::game::count_mania::GAME_ID);
         assert!(!game.is_finished());
@@ -1569,40 +1579,38 @@ mod tests {
         assert!(text.contains("マウス専用"));
         assert!(text.contains("ROUND1/5"), "ROUND1から始まる");
         assert!(text.contains("初級"), "ROUND1は初級");
+        assert!(
+            text.contains('█'),
+            "ゲーム内のカウントダウンを大きな文字で出す"
+        );
+        assert!(
+            !text.contains("つぎ"),
+            "カウントダウン中は次の数字の案内を出さない"
+        );
+        // ゲーム内のカウントダウン(GO!!まで)が終わるとROUND1のプレイに入る
+        app.update(COUNTDOWN_TOTAL);
+        assert!(
+            matches!(app.screen, Screen::Playing(_)),
+            "Playing画面のまま"
+        );
+        let text = rendered_text(app).replace(' ', "");
+        assert!(text.contains("つぎ"), "GO!!の後はプレイ中: {text}");
     }
 
     #[test]
-    fn selecting_count_mania_skips_difficulty_and_starts_round1_after_countdown() {
+    fn selecting_count_mania_skips_difficulty_and_the_outer_countdown() {
         let mut app = App::new();
         app.select_menu_item(COUNT_MANIA_ITEM_INDEX);
-        let Screen::Countdown {
-            item,
-            difficulty,
-            state,
-        } = &app.screen
-        else {
-            panic!("難易度選択を挟まずカウントダウンになるはず");
-        };
-        assert_eq!(*item, COUNT_MANIA_ITEM_INDEX);
-        assert_eq!(*difficulty, crate::game::count_mania::SESSION_DIFFICULTY);
-        assert_eq!(state.phase(), Some(Phase::Three), "3から始まる");
-        assert_count_mania_round1_is_playing(&mut app);
+        assert_count_mania_round1_countdown_in_game(&mut app);
     }
 
     #[test]
-    fn enter_on_count_mania_in_menu_goes_straight_to_countdown() {
+    fn enter_on_count_mania_in_menu_goes_straight_to_playing() {
         let mut app = App::new();
         app.screen = Screen::Menu;
         app.menu_state.select(COUNT_MANIA_ITEM_INDEX);
         app.handle_key(KeyEvent::from(KeyCode::Enter));
-        assert!(matches!(
-            app.screen,
-            Screen::Countdown {
-                item: COUNT_MANIA_ITEM_INDEX,
-                ..
-            }
-        ));
-        assert_count_mania_round1_is_playing(&mut app);
+        assert_count_mania_round1_countdown_in_game(&mut app);
     }
 
     // --- シタケシ ---
@@ -3181,8 +3189,8 @@ mod tests {
     #[test]
     fn mouse_clicks_during_countdown_are_ignored() {
         let mut app = App::new();
-        // マウス専用ゲーム(難易度選択を挟まずカウントダウンに入る)
-        app.select_menu_item(COUNT_MANIA_ITEM_INDEX);
+        // 難易度選択を挟まず画面遷移側のカウントダウンに入るゲーム
+        app.select_menu_item(COLOR_STACK_ITEM_INDEX);
         app.last_area = rect(0, 0, 80, 24);
         for row in 0..24 {
             app.handle_mouse(left_click(row));
@@ -3196,7 +3204,7 @@ mod tests {
         let Screen::Playing(game) = &app.screen else {
             unreachable!();
         };
-        assert_eq!(game.result().game_id, crate::game::count_mania::GAME_ID);
+        assert_eq!(game.result().game_id, crate::game::color_stack::GAME_ID);
         assert!(!game.is_finished());
     }
 
