@@ -304,36 +304,10 @@ pub fn clamp_position(board: Rect, width: u16, height: u16, x: f64, y: f64) -> (
     (x.clamp(min_x, max_x), y.clamp(min_y, max_y))
 }
 
-/// 進めた後の左上の位置(x, y)が盤面からはみ出していたら、盤面の端で跳ね返す。
-/// はみ出した軸だけ、はみ出した分を押し戻して速度(vx, vy)のその成分を反転する。
-/// 1回で盤面の幅以上に進んでも、最後は盤面の範囲内に収める
-pub fn reflect_position(
-    board: Rect,
-    width: u16,
-    height: u16,
-    (x, y): (f64, f64),
-    (vx, vy): (f64, f64),
-) -> ((f64, f64), (f64, f64)) {
-    let (x, vx) = reflect_axis(x, vx, position_range(board.x, board.width, width));
-    let (y, vy) = reflect_axis(y, vy, position_range(board.y, board.height, height));
-    ((x, y), (vx, vy))
-}
-
 /// 盤面の1つの軸(start から len セル)に長さsizeの円を置く時、左上が取れる範囲(最小, 最大)
 fn position_range(start: u16, len: u16, size: u16) -> (f64, f64) {
     let min = f64::from(start);
     (min, min + f64::from(len.saturating_sub(size)))
-}
-
-/// 1つの軸の位置posが範囲(min, max)を出ていたら跳ね返す。戻り値は(位置, 速度)
-fn reflect_axis(pos: f64, velocity: f64, (min, max): (f64, f64)) -> (f64, f64) {
-    if pos < min {
-        ((min + (min - pos)).min(max), -velocity)
-    } else if pos > max {
-        ((max - (pos - max)).max(min), -velocity)
-    } else {
-        (pos, velocity)
-    }
 }
 
 /// クリック位置clickから見て、中心がcenterの円を離す移動量(横のセル数, 縦の行数)。
@@ -975,40 +949,6 @@ mod tests {
             (20.5, 10.25),
             "範囲内ならそのまま"
         );
-    }
-
-    #[test]
-    fn reflect_position_bounces_only_the_axis_that_went_out() {
-        // 盤面40x20に幅10・高さ4の円。左上が取れる範囲は x=0〜30, y=0〜16
-        let board = Rect::new(0, 0, 40, 20);
-        assert_eq!(
-            reflect_position(board, 10, 4, (32.0, 5.0), (3.0, 1.0)),
-            ((28.0, 5.0), (-3.0, 1.0)),
-            "右端をはみ出したらx成分だけ反転し、はみ出した分だけ押し戻す"
-        );
-        assert_eq!(
-            reflect_position(board, 10, 4, (5.0, -1.5), (1.0, -2.0)),
-            ((5.0, 1.5), (1.0, 2.0)),
-            "上端をはみ出したらy成分だけ反転する"
-        );
-        assert_eq!(
-            reflect_position(board, 10, 4, (-2.0, 17.0), (-1.0, 0.5)),
-            ((2.0, 15.0), (1.0, -0.5)),
-            "角では両方反転する"
-        );
-        assert_eq!(
-            reflect_position(board, 10, 4, (12.0, 8.0), (-1.0, 0.5)),
-            ((12.0, 8.0), (-1.0, 0.5)),
-            "範囲内なら何も変えない"
-        );
-    }
-
-    #[test]
-    fn reflect_position_stays_inside_even_when_overshooting_far() {
-        let board = Rect::new(0, 0, 40, 20);
-        let ((x, y), _) = reflect_position(board, 10, 4, (95.0, -60.0), (5.0, -5.0));
-        assert!((0.0..=30.0).contains(&x), "x={x}");
-        assert!((0.0..=16.0).contains(&y), "y={y}");
     }
 
     #[test]
