@@ -48,7 +48,8 @@ const MAX_CELL_SCALE: u16 = 5;
 /// (端末によって記号が2セル幅で表示されても、隣のマスに食い込まないように)
 pub const BUMP_GLYPH: &str = "▲";
 pub const HOLLOW_GLYPH: &str = "▽";
-pub const GOAL_GLYPH: &str = "◎";
+/// ゴールは緑のマスに赤い旗。絵文字なので2セル幅で、1マスの横幅(2セル以上)にちょうど収まる
+pub const GOAL_GLYPH: &str = "🚩";
 /// 転がっている間の回転の見た目(順に切り替える)。
 /// 点字の2×4の点の外周8つのうち1つを欠けさせ、欠けた点を時計回りに1つずつ進める(8等分の回転)。
 /// どのコマも1セル幅で、欠けた点の位置だけが変わる
@@ -62,8 +63,10 @@ const BUMP_BG: Color = Color::Rgb(205, 160, 105);
 const BUMP_FG: Color = Color::Rgb(95, 55, 20);
 const HOLLOW_BG: Color = Color::Rgb(60, 38, 18);
 const HOLLOW_FG: Color = Color::Rgb(120, 90, 60);
-const GOAL_BG: Color = Color::Rgb(40, 40, 40);
-const GOAL_FG: Color = Color::Yellow;
+/// ゴールのマスは盤の茶色の中で見つけやすい緑(ゴルフのグリーン)にする。
+/// 記号の色は、旗の絵文字を色付きで出せない端末でも赤い旗に見えるように赤
+const GOAL_BG: Color = Color::Rgb(40, 140, 60);
+const GOAL_FG: Color = Color::Rgb(230, 30, 30);
 /// テキスト表示のベーゴマの円盤の色(画像表示のTOP_FACE_PIXELと同じ)
 const TOP_BG: Color = Color::Rgb(200, 210, 225);
 /// 円盤の上に置く回転・飛び上がりの記号の色
@@ -92,12 +95,16 @@ pub struct TopView {
     pub spin_frame: usize,
     /// 場外・吹っ飛びGAME OVERの星の演出のコマ(Noneなら通常のベーゴマを描く)
     pub star_frame: Option<usize>,
+    /// 吹っ飛び・場外のGAME OVERで、盤の外へ飛んでいる途中(星になる前)。
+    /// 宙に浮いた小さな円盤の上に回転の記号を描く(飛び上がり中の○にはしない)
+    pub flying: bool,
 }
 
 /// 星の演出のコマ(だんだん暗く・小さくなり、最後は消える)
 pub const STAR_ANIM_GLYPHS: [&str; 8] = ["★", "☆", "✦", "✧", "∗", "⋆", "‥", "･"];
-/// 星の演出の1コマの表示時間。最後のコマに達するまで(7コマ分)を従来(4コマ×180ms)の540ms並みにする
-pub const STAR_ANIM_FRAME: Duration = Duration::from_millis(77);
+/// 星の演出の1コマの表示時間。盤の外へ吹っ飛んでから画面の端でキラーンと光る時間を長く見せるため、
+/// 最後のコマに達するまで(7コマ分)を770ms(従来は540ms)にする
+pub const STAR_ANIM_FRAME: Duration = Duration::from_millis(110);
 
 /// 盤を描く範囲とマスの大きさ(セル)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,9 +429,11 @@ impl BoardRenderer {
         let Some(layout) = board_area(area) else {
             return;
         };
-        // 星の演出中は画像のパッチ更新に乗せず、テキストで星を描く
-        let starring = tops.iter().any(|top| top.star_frame.is_some());
-        if !starring && self.render_image(frame, area, layout, board, tops) {
+        // 吹っ飛んでいる途中・星の演出中は画像のパッチ更新に乗せず、テキストで描く
+        let blasting = tops
+            .iter()
+            .any(|top| top.flying || top.star_frame.is_some());
+        if !blasting && self.render_image(frame, area, layout, board, tops) {
             return;
         }
         render_board_text(frame, area, layout, board, tops, tilt);
@@ -834,7 +843,7 @@ fn render_board_text(
     }
     // ベーゴマの円盤: 中心が盤の上の間だけ塗る(星の演出中は描かない)。重なった範囲は後のものが上
     for top in tops {
-        if top.star_frame.is_none() && Board::contains(top.pos) {
+        if has_disc(top) {
             paint_disc(buffer, &projection, area, top.pos, disc_radius(top));
         }
     }
@@ -856,20 +865,35 @@ fn render_board_text(
     for ((top, &(x, y)), lane) in tops.iter().zip(&cells).zip(lanes) {
         let first = x.min(right - (lane.count as i32 - 1)).max(left);
         let cell = ((first + lane.index as i32).min(right), y);
-        // 背景色(円盤・マス)はそのまま残し、記号と文字色だけ変える
-        let fg = if top.star_frame.is_some() {
-            STAR_FG
-        } else {
-            TOP_FG
-        };
+        // 背景色(円盤・マス)はそのまま残し、記号と文字色だけ変える。
+        // 円盤の上は暗い色、円盤の無い所(星・盤の外)は明るい色
+        let fg = if has_disc(top) { TOP_FG } else { STAR_FG };
         let style = Style::default().fg(fg).add_modifier(Modifier::BOLD);
+        clear_wide_glyph_on_left(buffer, cell, area);
         put_glyph_at(buffer, cell, area, top_glyph(top), style);
     }
 }
 
-/// ベーゴマの円盤の半径(マス)。飛び上がっている間は小さくする
+/// ベーゴマの円盤を描くか。中心が盤の上にある間だけで、星の演出中は描かない
+fn has_disc(top: &TopView) -> bool {
+    top.star_frame.is_none() && Board::contains(top.pos)
+}
+
+/// cellの左隣のセルに2セル幅の記号(ゴールの旗)があれば空白にする。2セル幅の記号は右隣のセルまで覆うので、
+/// そのままでは右隣に置いたベーゴマの記号・円盤が端末に表示されない(ベーゴマを見せる方を優先する)
+fn clear_wide_glyph_on_left(buffer: &mut Buffer, cell: (i32, i32), clip: Rect) {
+    let (Ok(x), Ok(y)) = (u16::try_from(cell.0 - 1), u16::try_from(cell.1)) else {
+        return;
+    };
+    let position = Position::new(x, y);
+    if clip.contains(position) && Span::raw(buffer[position].symbol()).width() > 1 {
+        buffer[position].set_symbol(" ");
+    }
+}
+
+/// ベーゴマの円盤の半径(マス)。飛び上がっている間・吹っ飛んで飛んでいる間は小さくする
 fn disc_radius(top: &TopView) -> f64 {
-    if top.airborne {
+    if top.airborne || top.flying {
         TOP_RADIUS * AIRBORNE_DISC_SCALE
     } else {
         TOP_RADIUS
@@ -913,6 +937,7 @@ fn paint_disc(
                 continue;
             };
             if rect_distance(pos, bounds) < radius {
+                clear_wide_glyph_on_left(buffer, (i32::from(x), i32::from(y)), area);
                 buffer[(x, y)].set_symbol(" ").set_bg(TOP_BG);
             }
         }
@@ -947,11 +972,12 @@ fn rect_distance(pos: (f64, f64), bounds: ((f64, f64), (f64, f64))) -> f64 {
     dx.hypot(dy)
 }
 
-/// ベーゴマの記号。星の演出中はそのコマ、飛び上がっている間は専用の記号、それ以外は回転のコマ
+/// ベーゴマの記号。星の演出中はそのコマ、飛び上がっている間は専用の記号、それ以外
+/// (吹っ飛んで飛んでいる間も含む)は回転のコマ
 fn top_glyph(top: &TopView) -> &'static str {
     if let Some(frame) = top.star_frame {
         STAR_ANIM_GLYPHS[frame.min(STAR_ANIM_GLYPHS.len() - 1)]
-    } else if top.airborne {
+    } else if top.airborne && !top.flying {
         TOP_AIRBORNE_GLYPH
     } else {
         TOP_SPIN_GLYPHS[top.spin_frame % TOP_SPIN_GLYPHS.len()]
@@ -1236,6 +1262,7 @@ mod tests {
             airborne: false,
             spin_frame: 0,
             star_frame: None,
+            flying: false,
         }
     }
 
@@ -2097,6 +2124,7 @@ mod tests {
                 airborne: false,
                 spin_frame: frame,
                 star_frame: None,
+                flying: false,
             };
             let buffer = draw_board(&renderer, &board, &top, area);
             assert_eq!(buffer[(rect.x, rect.y)].symbol(), *glyph);
@@ -2106,6 +2134,7 @@ mod tests {
             airborne: true,
             spin_frame: 1,
             star_frame: None,
+            flying: false,
         };
         let buffer = draw_board(&renderer, &board, &top, area);
         assert_eq!(buffer[(rect.x, rect.y)].symbol(), TOP_AIRBORNE_GLYPH);
@@ -2125,6 +2154,7 @@ mod tests {
                 airborne: false,
                 spin_frame: 0,
                 star_frame: Some(frame),
+                flying: false,
             };
             let buffer = draw_board(&renderer, &board, &top, area);
             assert_eq!(
@@ -2182,13 +2212,167 @@ mod tests {
     }
 
     #[test]
-    fn star_animation_takes_as_long_as_before_to_fade_out() {
-        // コマ数を増やしても、最後のコマに達するまでの長さは従来(4コマ×180ms → 540ms)並みにする
+    fn star_animation_twinkles_longer_than_before() {
+        // 盤の外へ吹っ飛んでから画面の端でキラーンと光る時間を、従来(540ms)より長くする
         let to_last = STAR_ANIM_FRAME * (STAR_ANIM_GLYPHS.len() as u32 - 1);
         assert!(
-            (Duration::from_millis(530)..=Duration::from_millis(550)).contains(&to_last),
+            (Duration::from_millis(700)..=Duration::from_millis(800)).contains(&to_last),
             "最後のコマまで{to_last:?}"
         );
+    }
+
+    // --- 吹っ飛んで飛んでいる途中のベーゴマ ---
+
+    fn flying_at(pos: (f64, f64), spin_frame: usize) -> TopView {
+        TopView {
+            flying: true,
+            spin_frame,
+            ..top_at(pos)
+        }
+    }
+
+    #[test]
+    fn a_flying_top_over_the_board_spins_on_a_small_disc() {
+        let board = Board::standard();
+        // 円盤の大きさの違いがセル数に出る広さ(1マス10×5セル)で描く
+        let area = Rect::new(0, 0, 200, 60);
+        let renderer = BoardRenderer::from_parts(None, None, None);
+        let pos = (5.5, 5.5);
+        let rolling = draw_board(&renderer, &board, &top_at(pos), area);
+        for (frame, glyph) in TOP_SPIN_GLYPHS.iter().enumerate() {
+            let buffer = draw_board(&renderer, &board, &flying_at(pos, frame), area);
+            let positions = positions_of(&buffer, glyph);
+            assert_eq!(positions.len(), 1, "回転の記号で描く(○にしない): {glyph}");
+            assert_eq!(count_symbol(&buffer, TOP_AIRBORNE_GLYPH), 0);
+            let cell = &buffer[positions[0]];
+            assert_eq!(cell.bg, TOP_BG, "円盤の上");
+            assert_eq!(cell.fg, TOP_FG, "円盤の上では読める暗い色");
+            let (flying_disc, rolling_disc) =
+                (count_bg(&buffer, TOP_BG), count_bg(&rolling, TOP_BG));
+            assert!(
+                flying_disc > 0 && flying_disc < rolling_disc,
+                "宙に浮いているので円盤は小さい: {flying_disc} < {rolling_disc}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flying_top_off_the_board_is_a_bright_glyph_inside_the_panel() {
+        let board = Board::standard();
+        let area = Rect::new(5, 3, 60, 20);
+        let renderer = BoardRenderer::from_parts(None, None, None);
+        for pos in [
+            (-3.0, 5.0),
+            (25.0, 5.0),
+            (-1000.0, -1000.0),
+            (1000.0, 1000.0),
+        ] {
+            let buffer = draw_board(&renderer, &board, &flying_at(pos, 3), area);
+            let positions = positions_of(&buffer, TOP_SPIN_GLYPHS[3]);
+            assert_eq!(positions.len(), 1, "{pos:?}");
+            let (x, y) = positions[0];
+            assert!(area.contains(Position::new(x, y)), "パネルの中: {pos:?}");
+            assert_eq!(buffer[(x, y)].fg, STAR_FG, "盤の外では明るい色: {pos:?}");
+            assert_eq!(count_bg(&buffer, TOP_BG), 0, "盤の外では円盤を描かない");
+        }
+    }
+
+    #[test]
+    fn a_flying_top_switches_the_image_board_to_text() {
+        let board = Board::standard();
+        let area = Rect::new(0, 0, 40, 12);
+        let renderer = BoardRenderer::with_images(test_picker(), plain_board_image(), None);
+        let buffer = draw_tops(&renderer, &board, &[flying_at((5.5, 5.5), 2)], area);
+        assert_eq!(count_symbol(&buffer, TOP_SPIN_GLYPHS[2]), 1);
+        assert_eq!(renderer.base_encode_count(), 0, "画像は使わない");
+    }
+
+    // --- ゴール(赤い旗) ---
+
+    #[test]
+    fn the_goal_is_a_red_flag_two_cells_wide() {
+        assert_eq!(GOAL_GLYPH, "🚩");
+        assert_eq!(Span::raw(GOAL_GLYPH).width(), 2, "絵文字なので2セル幅");
+        assert_eq!(cell_glyph(Cell::Goal), GOAL_GLYPH);
+    }
+
+    #[test]
+    fn the_goal_mass_is_a_green_that_stands_out_from_the_board() {
+        // ゴルフのグリーンに赤い旗: 盤の茶色の中で見つけやすい色にする
+        let Color::Rgb(r, g, b) = GOAL_BG else {
+            panic!("RGBの色");
+        };
+        assert!(g > r && g > b, "緑: {GOAL_BG:?}");
+        let Color::Rgb(r, g, b) = GOAL_FG else {
+            panic!("RGBの色");
+        };
+        assert!(
+            r > g && r > b,
+            "赤い旗(絵文字を出せない端末でも赤): {GOAL_FG:?}"
+        );
+        for color in board_bg_colors().into_iter().filter(|&c| c != GOAL_BG) {
+            let Color::Rgb(cr, cg, _) = color else {
+                panic!("RGBの色");
+            };
+            assert!(cg <= cr, "盤の他の色は緑でない(ゴールだけが緑): {color:?}");
+        }
+    }
+
+    #[test]
+    fn the_goal_flag_fits_inside_the_goal_mass() {
+        // 旗は2セル幅なので、記号を置いたセルとその右隣(旗が覆うセル)がどちらもゴールのマスの中にあること
+        // (隣のマスに食い込まない)。右隣のセルは旗に覆われて端末へは送られない
+        for area in [
+            Rect::new(0, 0, 40, 12),
+            Rect::new(0, 0, 90, 26),
+            Rect::new(0, 0, 200, 60),
+        ] {
+            let (board, layout, buffer) = draw_text_board(area, &Tilt::default());
+            let flags = positions_of(&buffer, GOAL_GLYPH);
+            assert_eq!(flags.len(), 1, "{area:?}");
+            let (x, y) = flags[0];
+            assert_eq!(buffer[(x, y)].bg, GOAL_BG, "{area:?}");
+            let (gx, gy) = board.goal();
+            let goal = layout.cell_rect(gx, gy);
+            for covered in [x, x + 1] {
+                assert!(
+                    goal.contains(Position::new(covered, y)),
+                    "旗が覆うセルはゴールのマスの中: ({covered}, {y}) {goal:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_top_just_right_of_the_flag_is_not_hidden_by_it() {
+        // 旗(2セル幅)の右半分のセルにベーゴマの記号が来た時は、旗を消してベーゴマを見せる
+        let board = Board::standard();
+        let area = Rect::new(0, 0, 40, 12);
+        let renderer = BoardRenderer::from_parts(None, None, None);
+        let (_, _, plain) = draw_text_board(area, &Tilt::default());
+        let flag = positions_of(&plain, GOAL_GLYPH)[0];
+        // 記号のセルが旗の右隣になり、円盤は旗のセルに掛からない位置(ゴールの右隣のマス)
+        let (gx, gy) = board.goal();
+        let top = top_at((gx as f64 + 1.1, gy as f64 + 0.5));
+        let buffer = draw_board(&renderer, &board, &top, area);
+        assert_eq!(
+            buffer[(flag.0 + 1, flag.1)].symbol(),
+            TOP_SPIN_GLYPHS[0],
+            "ベーゴマの記号は旗の右隣"
+        );
+        assert_eq!(
+            count_symbol(&buffer, GOAL_GLYPH),
+            0,
+            "旗は右隣を覆って隠すので消す"
+        );
+        // 離れていれば旗はそのまま
+        let far = draw_board(
+            &renderer,
+            &board,
+            &top_at((gx as f64 - 2.5, gy as f64 + 0.5)),
+            area,
+        );
+        assert_eq!(count_symbol(&far, GOAL_GLYPH), 1);
     }
 
     #[test]
@@ -2499,9 +2683,11 @@ mod tests {
             (bg_at(hollow, 0), bg_at(hollow, 1)),
             (HOLLOW_DARK, HOLLOW_LIGHT)
         );
-        // ゴール: 2セルとも一様
+        // ゴール: 左のセルはゴールの色で、右のセルは2セル幅の旗に覆われる(端末へは送られない)
         let goal = board.goal();
-        assert_eq!((bg_at(goal, 0), bg_at(goal, 1)), (GOAL_BG, GOAL_BG));
+        assert_eq!(bg_at(goal, 0), GOAL_BG);
+        let rect = layout.cell_rect(goal.0, goal.1);
+        assert_eq!(buffer[(rect.x, rect.y)].symbol(), GOAL_GLYPH);
     }
 
     #[test]
@@ -2650,6 +2836,7 @@ mod tests {
             airborne: false,
             spin_frame: 3,
             star_frame: None,
+            flying: false,
         };
         draw_board(&renderer, &board, &spun, area);
         assert_eq!(renderer.patch_encode_count(), 1);
@@ -2665,6 +2852,7 @@ mod tests {
             airborne: true,
             spin_frame: 0,
             star_frame: None,
+            flying: false,
         };
         draw_board(&renderer, &board, &airborne, area);
         assert_eq!(renderer.patch_encode_count(), 4);

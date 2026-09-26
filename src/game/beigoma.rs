@@ -6,6 +6,9 @@
 //! - 凸を踏んだ瞬間のGが大きいと弾かれ、さらに大きいと吹っ飛んで即GAME OVER
 //! - 凹に正面から入るとハマり(強く傾けると抜け出せる)、斜めに入ると側面をこすって弾かれる・吹っ飛ぶ
 //! - 盤の縁に壁は無く、盤から落ちても(場外)即GAME OVER
+//! - 吹っ飛び・場外のGAME OVERでは、ゴールで待機中のもの以外の全ベーゴマが盤の外へ加速しながら吹っ飛んでいき
+//!   (速く回りながら左右に振れる)、盤の外へ出たところから星の演出(キラーン)になる。
+//!   音は「ふいっ」(SeKind::Star)の少し後にブブー(SeKind::Incorrect)を鳴らす
 //! - 1セッションは2ROUND(ROUND1=やさしい、ROUND2=むずかしい)。盤の配置は共通で、
 //!   ROUND1のゴールは投入位置から最も遠い位置に固定、ROUND2のゴールはランダム
 //! - ROUND2はベーゴマ2個を共通の傾きで同時に操作する。どちらか1個でも吹っ飛び・場外になったら即GAME OVER、
@@ -63,6 +66,17 @@ const MAX_STEP: Duration = Duration::from_millis(10);
 /// ベーゴマの回転の見た目が1コマ進む間隔。8コマで1周280ms(従来の4コマ×70msと同じ速さ)
 const SPIN_FRAME_INTERVAL: Duration = Duration::from_millis(35);
 
+/// 吹っ飛んで飛んでいる間の回転の見た目が1コマ進む間隔。転がっている時の2倍以上の速さで回す
+const FLY_SPIN_FRAME_INTERVAL: Duration = Duration::from_millis(15);
+
+/// 吹っ飛んで飛んでいる間、描く位置を進む向きの左右へ振る幅(マス)と、1往復の周期
+const FLY_WOBBLE: f64 = 0.8;
+const FLY_WOBBLE_PERIOD: Duration = Duration::from_millis(120);
+
+/// 吹っ飛び・場外のGAME OVERで「ふいっ」(SeKind::Star、約110ms)を鳴らしてから、
+/// ブブー(SeKind::Incorrect)を鳴らすまでの間。2つの音が重なって濁らないようにずらす
+const OFF_BOARD_BUZZ_DELAY: Duration = Duration::from_millis(150);
+
 /// 画面左の軽トラ視点の幅(%)。残りを盤面に使う
 const TRUCK_VIEW_PERCENT: u16 = 40;
 
@@ -77,11 +91,46 @@ pub enum Outcome {
     TimeUp,
 }
 
+/// 吹っ飛び・場外のGAME OVERで、盤の外へ飛んでいく途中の経過
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Flight {
+    /// 飛び始めてからの時間
+    elapsed: Duration,
+    /// 盤の外へ出た時のelapsed(まだ盤の上ならNone)。星の演出はここから始める
+    off_board_at: Option<Duration>,
+}
+
+impl Flight {
+    /// 星の演出のコマ(盤の外へ出るまではNone)。最後のコマで止める
+    fn star_frame(&self) -> Option<usize> {
+        self.off_board_at.map(|at| {
+            let frame = (self.elapsed.saturating_sub(at).as_millis()
+                / render::STAR_ANIM_FRAME.as_millis()) as usize;
+            frame.min(render::STAR_ANIM_GLYPHS.len() - 1)
+        })
+    }
+
+    /// 飛んでいる間の回転の見た目のコマ(転がっている時より速く回す)
+    fn spin_frame(&self) -> usize {
+        (self.elapsed.as_nanos() / FLY_SPIN_FRAME_INTERVAL.as_nanos()) as usize
+            % render::TOP_SPIN_GLYPHS.len()
+    }
+
+    /// 描く位置の、進む向き(dir、単位ベクトル)の左右への振れ(マス)。飛び始めは振れていない
+    fn wobble(&self, dir: (f64, f64)) -> (f64, f64) {
+        let phase = self.elapsed.as_secs_f64() / FLY_WOBBLE_PERIOD.as_secs_f64();
+        let across = FLY_WOBBLE * (std::f64::consts::TAU * phase).sin();
+        (-dir.1 * across, dir.0 * across)
+    }
+}
+
 /// 1個のベーゴマの進行状態
 struct TopSlot {
     top: Top,
     /// 個別にゴールへ達し、以後の物理更新を止めているか(他のベーゴマが揃うのを待つ)
     settled: bool,
+    /// 吹っ飛び・場外のGAME OVERで盤の外へ飛んでいる途中(それ以外はNone)
+    flight: Option<Flight>,
 }
 
 impl TopSlot {
@@ -90,7 +139,44 @@ impl TopSlot {
         Self {
             top: Top::new(board, pos),
             settled: false,
+            flight: None,
         }
+    }
+
+    /// 盤の外へ向けて飛ばし始める。既に盤の外にいれば、すぐに星の演出を始める
+    fn launch(&mut self) {
+        self.top.launch();
+        self.flight = Some(Flight {
+            elapsed: Duration::ZERO,
+            off_board_at: (!Board::contains(self.top.pos)).then_some(Duration::ZERO),
+        });
+    }
+
+    /// 飛んでいる途中ならdtだけ飛ばす。盤の外へ出た時刻を覚える
+    fn fly(&mut self, dt: Duration) {
+        let Some(flight) = self.flight.as_mut() else {
+            return;
+        };
+        self.top.fly_away(dt);
+        flight.elapsed += dt;
+        if flight.off_board_at.is_none() && !Board::contains(self.top.pos) {
+            flight.off_board_at = Some(flight.elapsed);
+        }
+    }
+
+    /// 描く位置。飛んでいる途中は進む向きの左右へ振る
+    fn view_pos(&self) -> (f64, f64) {
+        let pos = self.top.pos;
+        let Some(flight) = self.flight else {
+            return pos;
+        };
+        let (vx, vy) = self.top.vel;
+        let speed = vx.hypot(vy);
+        if speed < 1e-9 {
+            return pos;
+        }
+        let (dx, dy) = flight.wobble((vx / speed, vy / speed));
+        (pos.0 + dx, pos.1 + dy)
     }
 }
 
@@ -200,6 +286,9 @@ pub struct BeigomaGame {
     message: Option<(&'static str, Duration)>,
     board_renderer: BoardRenderer,
     truck_view: TruckViewRenderer,
+    /// テスト用: 鳴らしたSEの記録(音は端末で確かめられないため)
+    #[cfg(test)]
+    se_log: Vec<SeKind>,
 }
 
 impl BeigomaGame {
@@ -226,9 +315,18 @@ impl BeigomaGame {
             message: None,
             board_renderer: BoardRenderer::new(),
             truck_view: TruckViewRenderer::new(),
+            #[cfg(test)]
+            se_log: Vec::new(),
         };
         game.start_round(0);
         game
+    }
+
+    /// SEを鳴らす(テストでは鳴らしたSEを記録する)
+    fn play_se(&mut self, se: SeKind) {
+        #[cfg(test)]
+        self.se_log.push(se);
+        audio::play_se(se);
     }
 
     /// 盤の投入位置に並べたcount個のベーゴマ
@@ -253,7 +351,7 @@ impl BeigomaGame {
         let state = CountdownState::new();
         // 最初のフェーズ「3」の音
         if let Some(phase) = state.phase() {
-            audio::play_se(phase.se());
+            self.play_se(phase.se());
         }
         self.status = Status::Countdown { state };
     }
@@ -337,7 +435,7 @@ impl BeigomaGame {
         let step_events: Vec<StepEvent> = events.iter().map(|&(_, event)| event).collect();
         if let Some(reaction) = strongest_reaction(&step_events) {
             if reaction.plays_se() {
-                audio::play_se(SeKind::Incorrect);
+                self.play_se(SeKind::Incorrect);
             }
             self.message = Some((reaction.text(), Duration::ZERO));
         }
@@ -353,16 +451,43 @@ impl BeigomaGame {
             Outcome::Flown | Outcome::TimeUp => (false, TIME_LIMIT),
         };
         self.tracker.record(success, latency.as_millis() as f64);
-        // 場外・吹っ飛びは専用の「ふいっ」という音、時間切れは従来のブザー音のまま
-        audio::play_se(match outcome {
+        // 場外・吹っ飛びは専用の「ふいっ」という音(ブブーはOFF_BOARD_BUZZ_DELAY後に鳴らす)、
+        // 時間切れは従来のブザー音のまま
+        self.play_se(match outcome {
             Outcome::Cleared { .. } => SeKind::Correct,
             Outcome::Flown => SeKind::Star,
             Outcome::TimeUp => SeKind::Incorrect,
         });
+        if outcome == Outcome::Flown {
+            // 共通の傾きで一蓮托生のため、原因になった1個だけでなく、ゴールで待機中のもの以外を全部吹っ飛ばす
+            for slot in self.tops.iter_mut().filter(|slot| !slot.settled) {
+                slot.launch();
+            }
+        }
         self.status = Status::Ended {
             outcome,
             shown: Duration::ZERO,
         };
+    }
+
+    /// 終了表示の間に時間がdt進み、表示してからの時間がbeforeからafterになった。
+    /// 吹っ飛び・場外なら、ベーゴマを盤の外へ飛ばし続け(小さなステップに分けて、盤の外へ出た時刻を正しく取る)、
+    /// OFF_BOARD_BUZZ_DELAYを過ぎた時に1回だけブブーを鳴らす
+    fn update_ended(&mut self, outcome: Outcome, before: Duration, after: Duration, dt: Duration) {
+        if outcome != Outcome::Flown {
+            return;
+        }
+        let mut remaining = dt;
+        while !remaining.is_zero() {
+            let step = remaining.min(MAX_STEP);
+            for slot in &mut self.tops {
+                slot.fly(step);
+            }
+            remaining -= step;
+        }
+        if before < OFF_BOARD_BUZZ_DELAY && after >= OFF_BOARD_BUZZ_DELAY {
+            self.play_se(SeKind::Incorrect);
+        }
     }
 
     /// 回転の見た目のコマ
@@ -371,33 +496,23 @@ impl BeigomaGame {
             % render::TOP_SPIN_GLYPHS.len()
     }
 
-    /// 盤面に描く各ベーゴマの見た目。GAME OVERの星の演出は、ゴールで待機中のもの以外の全ベーゴマに出す
-    /// (共通の傾きで一蓮托生のため、原因になった1個だけにしない)
+    /// 盤面に描く各ベーゴマの見た目。吹っ飛び・場外のGAME OVERでは、ゴールで待機中のもの以外の全ベーゴマが
+    /// 盤の外へ吹っ飛んでいき(速く回りながら左右に振れる)、盤の外へ出たところから星の演出になる
     fn top_views(&self) -> Vec<TopView> {
         let spin_frame = self.spin_frame();
-        let star_frame = self.star_frame();
         self.tops
             .iter()
-            .map(|slot| TopView {
-                pos: slot.top.pos,
-                airborne: slot.top.is_airborne(),
-                spin_frame,
-                star_frame: if slot.settled { None } else { star_frame },
+            .map(|slot| {
+                let star_frame = slot.flight.and_then(|flight| flight.star_frame());
+                TopView {
+                    pos: slot.view_pos(),
+                    airborne: slot.top.is_airborne(),
+                    spin_frame: slot.flight.map_or(spin_frame, |flight| flight.spin_frame()),
+                    star_frame,
+                    flying: slot.flight.is_some() && star_frame.is_none(),
+                }
             })
             .collect()
-    }
-
-    /// 場外・吹っ飛びGAME OVERの星の演出のコマ(それ以外はNone)
-    fn star_frame(&self) -> Option<usize> {
-        let Status::Ended {
-            outcome: Outcome::Flown,
-            shown,
-        } = self.status
-        else {
-            return None;
-        };
-        let frame = (shown.as_millis() / render::STAR_ANIM_FRAME.as_millis()) as usize;
-        Some(frame.min(render::STAR_ANIM_GLYPHS.len() - 1))
     }
 
     /// 上段: 残り時間・一言(終わったら結果)・傾き。枠のタイトルにROUNDの名前を出す
@@ -493,18 +608,23 @@ impl Game for BeigomaGame {
     fn update(&mut self, dt: Duration) {
         match &mut self.status {
             Status::Countdown { state } => {
-                if let Some(phase) = state.tick(dt) {
-                    audio::play_se(phase.se());
+                let phase = state.tick(dt);
+                let finished = state.is_finished();
+                if let Some(phase) = phase {
+                    self.play_se(phase.se());
                 }
-                if state.is_finished() {
+                if finished {
                     self.drop_top();
                 }
                 return;
             }
-            Status::Ended { shown, .. } => {
+            Status::Ended { outcome, shown } => {
+                let (outcome, before) = (*outcome, *shown);
                 *shown = shown.saturating_add(dt);
+                let after = *shown;
+                self.update_ended(outcome, before, after, dt);
                 // 結果の表示を出し終えたら、クリアしていて次のROUNDがあれば進む
-                if *shown >= END_HOLD && !self.is_last_round_ended() {
+                if after >= END_HOLD && !self.is_last_round_ended() {
                     self.start_round(self.round_index + 1);
                 }
                 return;
@@ -584,8 +704,8 @@ impl Game for BeigomaGame {
 #[cfg(test)]
 mod tests {
     use super::board::{
-        round_params, Cell, TopState, BOARD_HEIGHT, BOARD_WIDTH, HIGH_G_THRESHOLD, MAX_SPEED,
-        ROUNDS_PER_SESSION, TILT_STEP, TOP_PAIR_OFFSET_X, TOP_RADIUS,
+        round_params, Cell, TopState, BOARD_HEIGHT, BOARD_WIDTH, FLOWN_KICK, FLY_AWAY_EXIT_LIMIT,
+        HIGH_G_THRESHOLD, MAX_SPEED, ROUNDS_PER_SESSION, TILT_STEP, TOP_PAIR_OFFSET_X, TOP_RADIUS,
     };
     use super::truck::RoadEvent;
     use super::*;
@@ -1271,14 +1391,35 @@ mod tests {
 
     #[test]
     fn input_and_physics_stop_after_the_end() {
+        // 時間切れ・クリアの後は転がらない(吹っ飛びGAME OVERだけは盤の外へ飛んでいく演出を続ける)
+        for outcome in [
+            Outcome::TimeUp,
+            Outcome::Cleared {
+                time: Duration::from_secs(1),
+            },
+        ] {
+            let mut game = calm_game();
+            game.handle_key(key(KeyCode::Right));
+            game.finish(outcome);
+            let (pos, roll) = (game.tops[0].top.pos, game.tilt.roll());
+            game.handle_key(key(KeyCode::Right));
+            game.update(Duration::from_millis(500));
+            assert_eq!(
+                game.tops[0].top.pos, pos,
+                "{outcome:?}: 終わった後は転がらない"
+            );
+            assert_eq!(
+                game.tilt.roll(),
+                roll,
+                "{outcome:?}: 終わった後のキーは無視する"
+            );
+        }
         let mut game = calm_game();
-        game.handle_key(key(KeyCode::Right));
         game.finish(Outcome::Flown);
-        let (pos, roll) = (game.tops[0].top.pos, game.tilt.roll());
+        let roll = game.tilt.roll();
         game.handle_key(key(KeyCode::Right));
         game.update(Duration::from_millis(500));
-        assert_eq!(game.tops[0].top.pos, pos, "終わった後は転がらない");
-        assert_eq!(game.tilt.roll(), roll, "終わった後のキーは無視する");
+        assert_eq!(game.tilt.roll(), roll, "吹っ飛んだ後のキーも無視する");
     }
 
     // --- ROUND2: ベーゴマ2個 ---
@@ -1357,11 +1498,16 @@ mod tests {
         let mut game = calm_round2();
         game.tops[1].top = Top::new(&game.board, (0.6, 5.5));
         game.tops[1].top.vel = (-3.0, 0.0);
-        game.update(Duration::from_millis(500));
+        for _ in 0..50 {
+            game.update(STEP);
+            if game.outcome().is_some() {
+                break;
+            }
+        }
         assert_eq!(game.outcome(), Some(Outcome::Flown));
         assert!(
             Board::contains(game.tops[0].top.pos),
-            "もう片方は盤の上に残っている"
+            "GAME OVERになった時点では、もう片方は盤の上に残っている"
         );
     }
 
@@ -1529,22 +1675,34 @@ mod tests {
     }
 
     #[test]
-    fn the_star_animation_is_shown_on_every_top_still_on_the_board() {
+    fn the_star_animation_is_shown_on_every_unsettled_top_after_it_flies_off() {
         let mut game = calm_round2();
         game.on_step_events(vec![(1, StepEvent::FellOff)]);
         let views = game.top_views();
         assert_eq!(views.len(), 2);
         assert!(
-            views.iter().all(|view| view.star_frame == Some(0)),
-            "原因でない方にも星を出す: {views:?}"
+            views
+                .iter()
+                .all(|view| view.flying && view.star_frame.is_none()),
+            "盤の上にいる間は星にせず、吹っ飛んでいく: {views:?}"
         );
-        // ゴールで待機していた方は通常の見た目のまま
+        game.update(FLY_AWAY_EXIT_LIMIT);
+        let views = game.top_views();
+        assert!(
+            views.iter().all(|view| view.star_frame.is_some()),
+            "原因でない方も盤の外へ飛んで星になる: {views:?}"
+        );
+        // ゴールで待機していた方は通常の見た目のまま、その場に残る
         let mut game = calm_round2();
         game.on_step_events(vec![(0, StepEvent::Goal)]);
+        let settled_pos = game.tops[0].top.pos;
         game.on_step_events(vec![(1, StepEvent::FellOff)]);
+        game.update(FLY_AWAY_EXIT_LIMIT);
         let views = game.top_views();
         assert_eq!(views[0].star_frame, None);
-        assert_eq!(views[1].star_frame, Some(0));
+        assert!(!views[0].flying);
+        assert_eq!(views[0].pos, settled_pos);
+        assert!(views[1].star_frame.is_some());
     }
 
     #[test]
@@ -1647,26 +1805,36 @@ mod tests {
         assert_eq!(flown_text, fell_text, "吹っ飛び・場外で同じ表示");
     }
 
+    /// i番目のベーゴマの星の演出のコマ
+    fn star_frame(game: &BeigomaGame, i: usize) -> Option<usize> {
+        game.top_views()[i].star_frame
+    }
+
+    /// 1個目のベーゴマを盤の左の縁のすぐ外に、左へ転がり出ていく状態で置く(場外に出た瞬間)
+    fn place_just_off_the_left_rim(game: &mut BeigomaGame) {
+        game.tops[0].top = Top::new(&game.board, (-0.01, 5.5));
+        game.tops[0].top.vel = (-2.0, 0.0);
+    }
+
     #[test]
-    fn falling_off_starts_the_star_animation() {
+    fn falling_off_starts_the_star_animation_at_once() {
+        // 既に盤の外にいる(場外に落ちた)ベーゴマは、GAME OVER直後から星の1コマ目
         let mut game = calm_game();
+        place_just_off_the_left_rim(&mut game);
         game.on_step_event(StepEvent::FellOff);
-        assert_eq!(
-            game.star_frame(),
-            Some(0),
-            "GAME OVER直後は星の1コマ目"
-        );
+        assert_eq!(star_frame(&game, 0), Some(0), "GAME OVER直後は星の1コマ目");
     }
 
     #[test]
     fn star_animation_advances_and_stays_on_the_last_frame() {
         let mut game = calm_game();
+        place_just_off_the_left_rim(&mut game);
         game.on_step_event(StepEvent::FellOff);
         game.update(render::STAR_ANIM_FRAME);
-        assert_eq!(game.star_frame(), Some(1), "時間が経つとコマが進む");
+        assert_eq!(star_frame(&game, 0), Some(1), "時間が経つとコマが進む");
         game.update(render::STAR_ANIM_FRAME * render::STAR_ANIM_GLYPHS.len() as u32 * 2);
         assert_eq!(
-            game.star_frame(),
+            star_frame(&game, 0),
             Some(render::STAR_ANIM_GLYPHS.len() - 1),
             "最後のコマで止まる(範囲外にならない)"
         );
@@ -1676,12 +1844,289 @@ mod tests {
     fn timeup_and_cleared_do_not_show_the_star_animation() {
         let mut timeup = calm_game();
         timeup.finish(Outcome::TimeUp);
-        assert_eq!(timeup.star_frame(), None, "時間切れは星の演出を出さない");
+        timeup.update(Duration::from_millis(500));
+        assert_eq!(star_frame(&timeup, 0), None, "時間切れは星の演出を出さない");
+        assert!(!timeup.top_views()[0].flying, "時間切れは吹っ飛ばない");
 
         let mut cleared = calm_game();
         place_just_before_goal(&mut cleared);
         cleared.update(STEP);
-        assert_eq!(cleared.star_frame(), None, "クリア時は星の演出を出さない");
+        cleared.update(Duration::from_millis(500));
+        assert_eq!(
+            star_frame(&cleared, 0),
+            None,
+            "クリア時は星の演出を出さない"
+        );
+        assert!(!cleared.top_views()[0].flying, "クリア時は吹っ飛ばない");
+    }
+
+    // --- 吹っ飛び・場外のGAME OVERで盤の外へ飛んでいく演出 ---
+
+    /// GAME OVER(吹っ飛び・場外)になる出来事
+    const GAME_OVER_EVENTS: [StepEvent; 3] = [
+        StepEvent::FellOff,
+        StepEvent::Landed(Landing::Flown),
+        StepEvent::Grazed(Landing::Flown),
+    ];
+
+    /// 盤の中心からの距離
+    fn distance_from_center(pos: (f64, f64)) -> f64 {
+        (pos.0 - BOARD_WIDTH as f64 / 2.0).hypot(pos.1 - BOARD_HEIGHT as f64 / 2.0)
+    }
+
+    #[test]
+    fn a_game_over_on_the_board_blasts_the_top_off_the_board() {
+        // 盤の上でGAME OVERになっても、その場で小さくなって消えずに盤の外まで吹っ飛ぶ
+        for event in GAME_OVER_EVENTS {
+            let mut game = calm_game();
+            let start = game.tops[0].top.pos;
+            assert!(Board::contains(start));
+            game.on_step_event(event);
+            assert_eq!(game.outcome(), Some(Outcome::Flown), "{event:?}");
+            let views = game.top_views();
+            assert!(views[0].flying, "{event:?}: 吹っ飛んでいく");
+            assert_eq!(
+                views[0].star_frame, None,
+                "{event:?}: 盤の上ではまだ星にしない"
+            );
+            game.update(FLY_AWAY_EXIT_LIMIT);
+            assert!(
+                !Board::contains(game.tops[0].top.pos),
+                "{event:?}: 盤の外へ出る: {:?}",
+                game.tops[0].top.pos
+            );
+            assert!(!game.is_finished(), "{event:?}: 演出の途中");
+        }
+    }
+
+    #[test]
+    fn a_hard_hit_during_play_really_moves_the_top_off_the_board() {
+        // 実際の物理で吹っ飛んだ時(凸を大きなGで踏んだ): 位置が動かないまま終わらない
+        let truck = Truck::with_course(
+            vec![RoadEvent::Signal {
+                at: 35.0,
+                notice_delay: 5.0,
+            }],
+            1000.0,
+        );
+        let mut game = BeigomaGame::with_truck(truck);
+        finish_countdown(&mut game);
+        while game.truck.current_g().magnitude() <= HIGH_G_THRESHOLD {
+            game.update(STEP);
+        }
+        let (x, y) = flat_below_a_bump(&game.board);
+        game.tops[0].top = Top::new(&game.board, (x as f64 + 0.5, y as f64 + TOP_RADIUS + 0.1));
+        let mut last = game.tops[0].top.pos;
+        for _ in 0..100 {
+            last = game.tops[0].top.pos;
+            game.update(STEP);
+            if game.outcome().is_some() {
+                break;
+            }
+        }
+        assert_eq!(game.outcome(), Some(Outcome::Flown));
+        let at_game_over = game.tops[0].top.pos;
+        assert!(
+            (at_game_over.0 - last.0).hypot(at_game_over.1 - last.1) > FLOWN_KICK / 2.0,
+            "吹っ飛んだ瞬間に弾き飛ばされる: {last:?} → {at_game_over:?}"
+        );
+        game.update(FLY_AWAY_EXIT_LIMIT);
+        assert!(!Board::contains(game.tops[0].top.pos), "盤の外まで飛ぶ");
+        assert!(star_frame(&game, 0).is_some(), "盤の外へ出たら星になる");
+    }
+
+    #[test]
+    fn the_star_starts_when_the_flying_top_leaves_the_board() {
+        let mut game = calm_game();
+        game.on_step_event(StepEvent::Landed(Landing::Flown));
+        let mut t = Duration::ZERO;
+        while Board::contains(game.tops[0].top.pos) {
+            assert_eq!(star_frame(&game, 0), None, "盤の上にいる間は星にしない");
+            game.update(STEP);
+            t += STEP;
+            assert!(t <= FLY_AWAY_EXIT_LIMIT);
+        }
+        assert_eq!(
+            star_frame(&game, 0),
+            Some(0),
+            "盤の外へ出た瞬間に星の1コマ目"
+        );
+        assert!(
+            !game.top_views()[0].flying,
+            "星になったら飛んでいる見た目は終わり"
+        );
+    }
+
+    #[test]
+    fn flying_tops_keep_getting_farther_until_the_end_display_finishes() {
+        for event in GAME_OVER_EVENTS {
+            let mut game = calm_round2();
+            game.on_step_events(vec![(0, event)]);
+            let mut distances: Vec<f64> = game
+                .tops
+                .iter()
+                .map(|s| distance_from_center(s.top.pos))
+                .collect();
+            let mut shown = Duration::ZERO;
+            while shown + STEP < END_HOLD {
+                game.update(STEP);
+                shown += STEP;
+                for (i, slot) in game.tops.iter().enumerate() {
+                    let now = distance_from_center(slot.top.pos);
+                    assert!(now > distances[i], "{event:?} slot{i}: 遠ざかり続ける");
+                    distances[i] = now;
+                }
+            }
+            for (i, d) in distances.iter().enumerate() {
+                assert!(*d >= 40.0, "{event:?} slot{i}: 画面の外まで飛ぶ: {d}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_flying_top_spins_faster_than_a_rolling_top() {
+        const { assert!(FLY_SPIN_FRAME_INTERVAL.as_nanos() * 2 <= SPIN_FRAME_INTERVAL.as_nanos()) };
+        let mut game = calm_game();
+        game.on_step_event(StepEvent::Landed(Landing::Flown));
+        let mut frames = vec![game.top_views()[0].spin_frame];
+        for _ in 1..render::TOP_SPIN_GLYPHS.len() {
+            game.update(FLY_SPIN_FRAME_INTERVAL);
+            frames.push(game.top_views()[0].spin_frame);
+        }
+        let expected: Vec<usize> = (0..render::TOP_SPIN_GLYPHS.len()).collect();
+        assert_eq!(frames, expected, "1間隔ごとに1コマずつ回る");
+    }
+
+    #[test]
+    fn a_flying_top_zigzags_across_its_path() {
+        // 描く位置(TopView.pos)は、実際の軌道(Top.pos)から進む向きの左右へ振れる
+        let mut game = calm_game();
+        game.tops[0].top.vel = (0.0, -1.0);
+        game.on_step_event(StepEvent::Landed(Landing::Flown));
+        let (mut left, mut right) = (false, false);
+        for _ in 0..30 {
+            game.update(STEP);
+            let (view, top) = (game.top_views()[0], &game.tops[0].top);
+            let dir = {
+                let speed = top.vel.0.hypot(top.vel.1);
+                (top.vel.0 / speed, top.vel.1 / speed)
+            };
+            let offset = (view.pos.0 - top.pos.0, view.pos.1 - top.pos.1);
+            let along = offset.0 * dir.0 + offset.1 * dir.1;
+            let across = offset.0 * -dir.1 + offset.1 * dir.0;
+            assert!(along.abs() < 1e-9, "進む向きにはずらさない: {offset:?}");
+            assert!(across.abs() <= FLY_WOBBLE + 1e-9, "振れ幅の範囲: {across}");
+            left |= across < -FLY_WOBBLE / 2.0;
+            right |= across > FLY_WOBBLE / 2.0;
+        }
+        assert!(left && right, "左右両方へ大きく振れる");
+    }
+
+    #[test]
+    fn the_star_fades_out_before_the_end_display_finishes_even_from_the_far_corner() {
+        // 最も盤の外へ出るのが遅い場合(盤の角から対角の角へ向かって吹っ飛ぶ)でも、
+        // 結果の表示が終わるまでに星は最後のコマまで消えていく
+        let mut game = calm_game();
+        // 遅い速度で向きだけ与え、吹っ飛ぶ速さを最小(FLOWN_SPEED)にする
+        game.tops[0].top = Top::new(&game.board, (0.01, 0.01));
+        game.tops[0].top.vel = (BOARD_WIDTH as f64 / 100.0, BOARD_HEIGHT as f64 / 100.0);
+        game.on_step_event(StepEvent::Grazed(Landing::Flown));
+        game.update(END_HOLD - STEP);
+        assert!(!game.is_finished());
+        assert_eq!(
+            star_frame(&game, 0),
+            Some(render::STAR_ANIM_GLYPHS.len() - 1),
+            "最後のコマまで進んでいる"
+        );
+    }
+
+    // --- 場外・吹っ飛びのSE ---
+
+    /// 鳴らしたSEの記録を空にする
+    fn clear_se_log(game: &mut BeigomaGame) {
+        game.se_log.clear();
+    }
+
+    fn count_se(game: &BeigomaGame, se: SeKind) -> usize {
+        game.se_log.iter().filter(|&&s| s == se).count()
+    }
+
+    #[test]
+    fn game_over_plays_the_star_sound_then_the_buzzer() {
+        const {
+            assert!(OFF_BOARD_BUZZ_DELAY.as_millis() >= 100);
+            assert!(OFF_BOARD_BUZZ_DELAY.as_millis() <= 300);
+        };
+        for event in GAME_OVER_EVENTS {
+            let mut game = calm_game();
+            clear_se_log(&mut game);
+            game.on_step_event(event);
+            assert_eq!(game.se_log, vec![SeKind::Star], "{event:?}: まず「ふいっ」");
+            game.update(OFF_BOARD_BUZZ_DELAY - Duration::from_millis(1));
+            assert_eq!(game.se_log, vec![SeKind::Star], "{event:?}: ブブーはまだ");
+            game.update(Duration::from_millis(1));
+            assert_eq!(
+                game.se_log,
+                vec![SeKind::Star, SeKind::Incorrect],
+                "{event:?}: 少し遅れてブブー"
+            );
+            game.update(END_HOLD);
+            assert_eq!(
+                count_se(&game, SeKind::Incorrect),
+                1,
+                "{event:?}: ブブーは1回だけ"
+            );
+            assert_eq!(count_se(&game, SeKind::Star), 1, "{event:?}");
+        }
+    }
+
+    #[test]
+    fn the_buzzer_rings_once_even_if_the_end_display_passes_in_one_update() {
+        let mut game = calm_game();
+        clear_se_log(&mut game);
+        game.on_step_event(StepEvent::FellOff);
+        game.update(END_HOLD * 2);
+        assert_eq!(game.se_log, vec![SeKind::Star, SeKind::Incorrect]);
+    }
+
+    #[test]
+    fn one_top_failing_in_round2_plays_the_buzzer_once() {
+        let mut game = calm_round2();
+        clear_se_log(&mut game);
+        game.on_step_events(vec![
+            (0, StepEvent::FellOff),
+            (1, StepEvent::Landed(Landing::Flown)),
+        ]);
+        game.update(END_HOLD);
+        assert_eq!(game.se_log, vec![SeKind::Star, SeKind::Incorrect]);
+    }
+
+    #[test]
+    fn time_up_and_clear_do_not_add_the_delayed_buzzer() {
+        let mut timeup = calm_game();
+        clear_se_log(&mut timeup);
+        timeup.update(TIME_LIMIT + STEP);
+        timeup.update(END_HOLD);
+        assert_eq!(
+            timeup.se_log,
+            vec![SeKind::Incorrect],
+            "時間切れはブザー1回のまま"
+        );
+
+        let mut cleared = calm_game();
+        clear_se_log(&mut cleared);
+        clear_round(&mut cleared);
+        cleared.update(OFF_BOARD_BUZZ_DELAY * 2);
+        assert_eq!(cleared.se_log, vec![SeKind::Correct]);
+    }
+
+    #[test]
+    fn a_bounce_still_plays_the_buzzer_immediately() {
+        let mut game = calm_game();
+        clear_se_log(&mut game);
+        game.on_step_event(StepEvent::Landed(Landing::Bounce));
+        assert_eq!(game.se_log, vec![SeKind::Incorrect]);
+        assert_eq!(game.outcome(), None);
     }
 
     #[test]

@@ -149,6 +149,16 @@ pub const HOP_DURATION: Duration = Duration::from_millis(250);
 /// (平坦な場所での減速距離 BOUNCE_SPEED/ROLLING_FRICTION + BOUNCE_KICK ≒ 5.5マス、中央から縦の縁まで6マス)
 pub const BOUNCE_SPEED: f64 = 4.0;
 pub const BOUNCE_KICK: f64 = 0.5;
+/// 吹っ飛んだ(Landing::Flown)時の速さ(マス/秒)と、吹っ飛んだ瞬間に位置が飛ぶ量(マス)。
+/// 弾かれ(BOUNCE_SPEED/BOUNCE_KICK)よりずっと強くし、その場に留まったままGAME OVERにしない
+pub const FLOWN_SPEED: f64 = 12.0;
+pub const FLOWN_KICK: f64 = 1.0;
+/// 吹っ飛んだ後、盤に触れずに飛んでいく間の加速度(マス/秒²)。進む向きへ加速し続けて画面の外まで飛ぶ
+pub const FLY_AWAY_ACCEL: f64 = 80.0;
+/// 吹っ飛んでから盤の外へ出るまでにかかる時間の上限。最も遠いのは盤の角から対角の角へ向かう場合で、
+/// 約23.3マスを FLOWN_SPEED·t + FLY_AWAY_ACCEL·t²/2 で進む(約0.63秒)。演出の長さを確かめるテストで使う
+#[cfg_attr(not(test), allow(dead_code))]
+pub const FLY_AWAY_EXIT_LIMIT: Duration = Duration::from_millis(650);
 /// ベーゴマの速さの上限(マス/秒)。1ステップでマスを飛び越さないようにする
 pub const MAX_SPEED: f64 = 15.0;
 /// 凹にハマっている間の摩擦(1秒あたりの速度の減衰率)。平坦の0.8に対して大きく、抜け出しにくい
@@ -718,12 +728,16 @@ impl Top {
         }
     }
 
-    /// 側面をこすった(凸・凹共通)。frictionから弾かれ/吹っ飛びを決め、弾かれるならbounce()して
-    /// 弾かれた先で触れている凹凸を持ち直す。Grazed(landing)を返す
+    /// 側面をこすった(凸・凹共通)。frictionから弾かれ/吹っ飛びを決め、弾かれるならbounce()、
+    /// 吹っ飛ぶならblast()して、飛ばされた先で触れている凹凸を持ち直す。Grazed(landing)を返す
     fn graze(&mut self, board: &Board, friction: f64) -> StepEvent {
         let landing = classify_landing(friction);
-        if landing == Landing::Bounce {
-            self.bounce();
+        match landing {
+            Landing::Light => {}
+            Landing::Bounce => self.bounce(),
+            Landing::Flown => self.blast(),
+        }
+        if landing != Landing::Light {
             self.settle_contacts(board);
         }
         StepEvent::Grazed(landing)
@@ -810,8 +824,10 @@ impl Top {
         }
         self.state = TopState::Rolling;
         let landing = classify_landing(landing_friction(contact_g));
-        if landing == Landing::Bounce {
-            self.bounce();
+        match landing {
+            Landing::Light => {}
+            Landing::Bounce => self.bounce(),
+            Landing::Flown => self.blast(),
         }
         let hollow = if landing != Landing::Flown && Board::contains(self.pos) {
             board
@@ -832,18 +848,60 @@ impl Top {
     /// 弾かれる: 来た方向へ勢いよく弾き返し、位置も一気に戻す(盤の外へ出てもよい。
     /// その場合は次のステップでFellOffになる)
     fn bounce(&mut self) {
-        let speed = self.vel.0.hypot(self.vel.1);
-        let dir = if speed > 1e-9 {
-            (-self.vel.0 / speed, -self.vel.1 / speed)
+        self.kick_back(BOUNCE_SPEED, BOUNCE_KICK);
+    }
+
+    /// 吹っ飛ぶ: 弾かれよりずっと強く来た方向へ弾き返し、位置も大きく飛ばす。
+    /// この後はGAME OVERになり、ゲーム側がlaunch()・fly_away()で盤の外まで飛ばし続ける
+    fn blast(&mut self) {
+        self.kick_back(FLOWN_SPEED, FLOWN_KICK);
+    }
+
+    /// 来た方向(速度の逆向き)へ速さspeedで弾き返し、位置をkickマスだけその向きへ動かす
+    fn kick_back(&mut self, speed: f64, kick: f64) {
+        let current = self.vel.0.hypot(self.vel.1);
+        let dir = if current > 1e-9 {
+            (-self.vel.0 / current, -self.vel.1 / current)
         } else {
             // 止まったまま踏むことは無いが、念のため手前(画面の下)へ弾く
             (0.0, 1.0)
         };
-        self.vel = (dir.0 * BOUNCE_SPEED, dir.1 * BOUNCE_SPEED);
-        self.pos = (
-            self.pos.0 + dir.0 * BOUNCE_KICK,
-            self.pos.1 + dir.1 * BOUNCE_KICK,
-        );
+        self.vel = (dir.0 * speed, dir.1 * speed);
+        self.pos = (self.pos.0 + dir.0 * kick, self.pos.1 + dir.1 * kick);
+    }
+
+    /// 吹っ飛び・場外のGAME OVERで、盤の外へ飛んでいき始める。動いていればその向きのまま
+    /// 少なくともFLOWN_SPEEDの速さにし、止まっていれば盤の中心から離れる向き(ちょうど中心なら上)へ飛ばす
+    pub fn launch(&mut self) {
+        let speed = self.speed();
+        let dir = if speed > 1e-9 {
+            (self.vel.0 / speed, self.vel.1 / speed)
+        } else {
+            let outward = (
+                self.pos.0 - BOARD_WIDTH as f64 / 2.0,
+                self.pos.1 - BOARD_HEIGHT as f64 / 2.0,
+            );
+            let length = outward.0.hypot(outward.1);
+            if length > 1e-9 {
+                (outward.0 / length, outward.1 / length)
+            } else {
+                (0.0, -1.0)
+            }
+        };
+        let speed = speed.max(FLOWN_SPEED);
+        self.vel = (dir.0 * speed, dir.1 * speed);
+    }
+
+    /// 吹っ飛んで飛んでいる間: 盤には触れず(凹凸・ゴール・摩擦・速さの上限は効かない)、
+    /// 進む向きへFLY_AWAY_ACCELで加速しながら進む
+    pub fn fly_away(&mut self, dt: Duration) {
+        let secs = dt.as_secs_f64();
+        let speed = self.speed();
+        if speed > 1e-9 {
+            let scale = (speed + FLY_AWAY_ACCEL * secs) / speed;
+            self.vel = (self.vel.0 * scale, self.vel.1 * scale);
+        }
+        self.advance(secs);
     }
 
     fn cap_speed(&mut self) {
@@ -2944,5 +3002,176 @@ mod tests {
         // 盤の上の何もない所で弾かれたら、何にも触れていない
         let top = bounce_at(&board, (13.5, 6.0), (0.0, 3.0));
         assert!(top.touching.is_empty());
+    }
+
+    // --- 吹っ飛び(Flown)で盤の外へ飛ばす ---
+
+    #[test]
+    fn flown_blast_is_much_stronger_than_a_bounce() {
+        // 吹っ飛びは弾かれよりずっと強く弾き返す(その場で小さくなって消えるだけにしない)
+        const { assert!(FLOWN_SPEED >= BOUNCE_SPEED * 2.0) };
+        const { assert!(FLOWN_KICK > BOUNCE_KICK) };
+        const { assert!(FLY_AWAY_ACCEL > 0.0) };
+    }
+
+    #[test]
+    fn flying_off_on_landing_blasts_the_top_back_hard() {
+        let (top, landing) = land_after_contact(lateral(-1.0), NO_G);
+        assert_eq!(landing, Landing::Flown);
+        assert!(approx(speed(&top), FLOWN_SPEED), "勢いよく吹っ飛ぶ");
+        assert!(top.vel.0 < 0.0, "来た方向へ弾き返される: {:?}", top.vel);
+        // 着地の直前の位置から、FLOWN_KICKだけ来た方向へ一気に飛ばされる
+        let board = round1_board();
+        let mut before_landing = top_just_left_of_bump(&board);
+        let tilt = Tilt::new();
+        let previous = loop {
+            let pos = before_landing.pos;
+            if let Some(StepEvent::Landed(_)) =
+                before_landing.step(&board, STEP, &tilt, lateral(-1.0))
+            {
+                break pos;
+            }
+        };
+        assert_eq!(before_landing.pos, top.pos);
+        assert!(
+            top.pos.0 < previous.0 - FLOWN_KICK / 2.0,
+            "位置も一気に飛ばされる: {previous:?} → {:?}",
+            top.pos
+        );
+    }
+
+    #[test]
+    fn grazing_and_flying_off_blasts_the_top_back_hard() {
+        // 凹の側面(凸も同じgraze)で吹っ飛んだ時も、その場に留まらず来た方向へ強く弾き返す
+        let board = hollow_board();
+        let start = (
+            HOLLOW_AT.0 as f64 + 0.5,
+            HOLLOW_AT.1 as f64 - TOP_RADIUS - 0.005,
+        );
+        let mut top = Top::new(&board, start);
+        let incoming = (3.0, 1.0);
+        top.vel = incoming;
+        assert_eq!(
+            top.step(&board, STEP, &Tilt::new(), lateral(0.6)),
+            Some(StepEvent::Grazed(Landing::Flown))
+        );
+        assert!(approx(speed(&top), FLOWN_SPEED), "勢いよく吹っ飛ぶ");
+        // 接触までの間にGで速度が少し変わるので、来た向きとほぼ逆(なす角のcosが-0.9未満)を確かめる
+        let cos = (top.vel.0 * incoming.0 + top.vel.1 * incoming.1)
+            / (FLOWN_SPEED * incoming.0.hypot(incoming.1));
+        assert!(cos < -0.9, "来た方向へ弾き返される: {:?}", top.vel);
+        let moved = (top.pos.0 - start.0).hypot(top.pos.1 - start.1);
+        assert!(moved > FLOWN_KICK / 2.0, "位置も一気に飛ばされる: {moved}");
+        // 凸の側面で吹っ飛んだ時も同じ
+        let board = bump_board();
+        let (top, event) = first_event(&board, above_bump(), (7.0, 2.0), NO_G);
+        assert_eq!(event, StepEvent::Grazed(Landing::Flown));
+        assert!(approx(speed(&top), FLOWN_SPEED));
+        assert!(top.vel.0 < 0.0 && top.vel.1 < 0.0, "{:?}", top.vel);
+    }
+
+    #[test]
+    fn launch_keeps_the_moving_direction_at_least_at_the_flown_speed() {
+        let board = board_with(&[]);
+        let mut top = Top::new(&board, (5.5, 5.5));
+        top.vel = (0.0, -1.0);
+        top.launch();
+        assert!(approx(top.vel.0, 0.0) && approx(top.vel.1, -FLOWN_SPEED));
+        // 既にFLOWN_SPEEDより速ければその速さのまま
+        let mut fast = Top::new(&board, (5.5, 5.5));
+        fast.vel = (30.0, 40.0);
+        fast.launch();
+        assert!(approx(fast.vel.0, 30.0) && approx(fast.vel.1, 40.0));
+    }
+
+    #[test]
+    fn launching_a_resting_top_sends_it_away_from_the_center() {
+        let board = board_with(&[]);
+        let (cx, cy) = (BOARD_WIDTH as f64 / 2.0, BOARD_HEIGHT as f64 / 2.0);
+        for pos in [(15.5, cy), (2.5, cy), (cx, 1.5), (cx, 10.5), (1.5, 10.5)] {
+            let mut top = Top::new(&board, pos);
+            top.launch();
+            assert!(approx(speed(&top), FLOWN_SPEED), "{pos:?}");
+            let outward = (pos.0 - cx, pos.1 - cy);
+            let dot = top.vel.0 * outward.0 + top.vel.1 * outward.1;
+            assert!(
+                approx(dot, FLOWN_SPEED * outward.0.hypot(outward.1)),
+                "中心から離れる向き: {pos:?} {:?}",
+                top.vel
+            );
+        }
+        // ちょうど中心で止まっていたら上(画面の奥)へ
+        let mut top = Top::new(&board, (cx, cy));
+        top.launch();
+        assert!(approx(top.vel.0, 0.0) && approx(top.vel.1, -FLOWN_SPEED));
+    }
+
+    #[test]
+    fn fly_away_accelerates_along_the_direction_without_touching_the_board() {
+        // 凸の上を通っても飛び上がり・判定は起きず、向きを保ったまま加速していく
+        let board = round1_board();
+        let mut top = Top::new(&board, (0.5, 0.5));
+        top.vel = (3.0, 0.0);
+        top.launch();
+        let mut previous_speed = speed(&top);
+        let mut previous_x = top.pos.0;
+        for i in 0..50 {
+            top.fly_away(STEP);
+            assert!(speed(&top) > previous_speed, "i={i}: 加速する");
+            assert!(top.pos.0 > previous_x, "i={i}: 進む");
+            assert!(
+                approx(top.vel.1, 0.0) && approx(top.pos.1, 0.5),
+                "向きを保つ"
+            );
+            previous_speed = speed(&top);
+            previous_x = top.pos.0;
+        }
+    }
+
+    #[test]
+    fn a_launched_top_always_leaves_the_board_quickly_and_keeps_going() {
+        // 盤のどこからどの向きへ吹っ飛んでも、FLY_AWAY_EXIT_LIMITまでに盤の外へ出て、その後は盤に戻らない
+        // (最悪は盤の角から対角の向き)。1.2秒後には盤の中心から40マス以上離れる(広い画面でも画面の外)
+        let board = board_with(&[]);
+        let directions = [
+            (1.0, 0.0),
+            (-1.0, 0.0),
+            (0.0, 1.0),
+            (0.0, -1.0),
+            (20.0, 12.0),
+            (-20.0, -12.0),
+            (20.0, -12.0),
+            (-20.0, 12.0),
+            (0.0, 0.0),
+        ];
+        let (cx, cy) = (BOARD_WIDTH as f64 / 2.0, BOARD_HEIGHT as f64 / 2.0);
+        for x in [0.01, 5.5, 10.0, 19.99] {
+            for y in [0.01, 6.0, 11.99] {
+                for vel in directions {
+                    let mut top = Top::new(&board, (x, y));
+                    top.vel = vel;
+                    top.launch();
+                    let mut t = Duration::ZERO;
+                    while Board::contains(top.pos) {
+                        top.fly_away(STEP);
+                        t += STEP;
+                        assert!(
+                            t <= FLY_AWAY_EXIT_LIMIT,
+                            "({x}, {y}) {vel:?}: 盤の外へ出るのが遅い"
+                        );
+                    }
+                    while t < Duration::from_millis(1200) {
+                        top.fly_away(STEP);
+                        t += STEP;
+                        assert!(
+                            !Board::contains(top.pos),
+                            "({x}, {y}) {vel:?}: 戻ってこない"
+                        );
+                    }
+                    let distance = (top.pos.0 - cx).hypot(top.pos.1 - cy);
+                    assert!(distance >= 40.0, "({x}, {y}) {vel:?}: {distance}");
+                }
+            }
+        }
     }
 }
