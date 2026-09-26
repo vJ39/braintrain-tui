@@ -3569,8 +3569,9 @@ mod tests {
     // --- 軽トラ視点 ---
 
     #[test]
-    fn truck_drift_and_hard_brake_images_are_embedded_and_decodable() {
+    fn truck_normal_drift_and_hard_brake_images_are_embedded_and_decodable() {
         for path in [
+            TRUCK_NORMAL_IMAGE,
             TRUCK_DRIFT_RIGHT_IMAGE,
             TRUCK_DRIFT_LEFT_IMAGE,
             TRUCK_HARD_BRAKE_IMAGE,
