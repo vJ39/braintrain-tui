@@ -1778,7 +1778,7 @@ mod tests {
     }
 
     /// 画像がまだ生成されていないアイコン(読めない間はカードのアイコン部分が空白になる)
-    const PENDING_MENU_ICONS: [&str; 1] = ["menu_icons/beigoma.png"];
+    const PENDING_MENU_ICONS: [&str; 0] = [];
 
     #[test]
     fn every_menu_icon_is_embedded_and_decodes() {
