@@ -40,7 +40,7 @@ const MENU_ITEMS: [&str; 15] = [
     "オイカケ",
     "数列予測",
     "組み合わせパズル",
-    "カウントマニア",
+    "カウントメニア",
     "ソコヌキ",
     "TTR",
     "ハヤウチ",
@@ -53,7 +53,7 @@ const MENU_ITEMS: [&str; 15] = [
 const REACTION_ITEM_INDEX: usize = 2;
 /// オイカケ(3問→4問→3問で手数が増える固定10問)
 const MEMORY_ITEM_INDEX: usize = 5;
-/// カウントマニア(マウス専用)
+/// カウントメニア(マウス専用)
 const COUNT_MANIA_ITEM_INDEX: usize = 8;
 /// ソコヌキ
 const COLOR_STACK_ITEM_INDEX: usize = 9;
@@ -377,7 +377,7 @@ impl App {
             return;
         }
         if selected == COUNT_MANIA_ITEM_INDEX {
-            // カウントマニアもROUND1〜5で難易度・動きが自動で変わるため、難易度選択を挟まない
+            // カウントメニアもROUND1〜5で難易度・動きが自動で変わるため、難易度選択を挟まない
             self.start_playing(
                 COUNT_MANIA_ITEM_INDEX,
                 crate::game::count_mania::SESSION_DIFFICULTY,
@@ -779,7 +779,7 @@ fn new_game(item: usize, difficulty: Difficulty) -> Box<dyn Game> {
         MEMORY_ITEM_INDEX => Box::new(MemoryGame::new()),
         6 => Box::new(SequenceGame::new(difficulty)),
         7 => Box::new(PuzzleConnectGame::new(difficulty)),
-        // カウントマニアは難易度を選ばず、ROUND1=初級・ROUND2=中級・ROUND3=上級と進む
+        // カウントメニアは難易度を選ばず、ROUND1=初級・ROUND2=中級・ROUND3=上級と進む
         COUNT_MANIA_ITEM_INDEX => Box::new(CountManiaGame::new()),
         // ソコヌキは難易度を持たず、ROUND1〜3が固定の内容で進む
         COLOR_STACK_ITEM_INDEX => Box::new(ColorStackGame::new()),
@@ -1480,17 +1480,17 @@ mod tests {
         }
     }
 
-    // --- カウントマニア ---
+    // --- カウントメニア ---
 
     #[test]
     fn count_mania_comes_right_before_color_stack() {
-        assert_eq!(MENU_ITEMS[COUNT_MANIA_ITEM_INDEX], "カウントマニア");
+        assert_eq!(MENU_ITEMS[COUNT_MANIA_ITEM_INDEX], "カウントメニア");
         assert_eq!(COUNT_MANIA_ITEM_INDEX + 1, COLOR_STACK_ITEM_INDEX);
     }
 
     #[test]
     fn new_game_for_count_mania_item_creates_count_mania() {
-        // カウントマニアはROUND1〜5で難易度・動きが変わる固定進行なので、渡した難易度によらず
+        // カウントメニアはROUND1〜5で難易度・動きが変わる固定進行なので、渡した難易度によらず
         // 代表値の難易度で記録する
         for difficulty in [
             Difficulty::Beginner,
@@ -1507,7 +1507,7 @@ mod tests {
         }
     }
 
-    /// カウントマニアが始まり、ROUND1(初級)が表示されていることを確かめる
+    /// カウントメニアが始まり、ROUND1(初級)が表示されていることを確かめる
     fn assert_count_mania_round1_is_playing(app: &mut App) {
         finish_countdown(app);
         let Screen::Playing(game) = &app.screen else {
@@ -1988,7 +1988,7 @@ mod tests {
         assert_eq!(RHYTHM_ITEM_INDEX + 1, QUICK_DRAW_ITEM_INDEX);
         assert_eq!(QUICK_DRAW_ITEM_INDEX + 1, BEIGOMA_ITEM_INDEX);
         // 先頭側の既存インデックスはずれない
-        assert_eq!(MENU_ITEMS[COUNT_MANIA_ITEM_INDEX], "カウントマニア");
+        assert_eq!(MENU_ITEMS[COUNT_MANIA_ITEM_INDEX], "カウントメニア");
         assert_eq!(MENU_ITEMS[COLOR_STACK_ITEM_INDEX], "ソコヌキ");
     }
 
@@ -2965,7 +2965,7 @@ mod tests {
     }
 
     /// 難易度選択画面を経由するゲームのメニュー項目一覧
-    /// (DDR・ソコヌキ・カウントマニア・ハヤウチ・べー・記憶・イロピッタン以外)
+    /// (DDR・ソコヌキ・カウントメニア・ハヤウチ・べー・記憶・イロピッタン以外)
     fn difficulty_select_game_items() -> impl Iterator<Item = usize> {
         non_rhythm_game_items().filter(|&item| {
             item != COLOR_STACK_ITEM_INDEX
@@ -2993,7 +2993,7 @@ mod tests {
 
     #[test]
     fn starting_any_non_rhythm_game_goes_through_countdown() {
-        // ソコヌキ・カウントマニア・ハヤウチは難易度選択を経由しないので別のテストで確認する
+        // ソコヌキ・カウントメニア・ハヤウチは難易度選択を経由しないので別のテストで確認する
         for item in difficulty_select_game_items() {
             let mut app = App::new();
             app.screen = Screen::SelectDifficulty(item, None);
@@ -3070,7 +3070,7 @@ mod tests {
 
     #[test]
     fn countdown_finishes_into_the_selected_game_for_every_item() {
-        // ソコヌキ・カウントマニア・ハヤウチは難易度選択を経由しないので別のテストで確認する
+        // ソコヌキ・カウントメニア・ハヤウチは難易度選択を経由しないので別のテストで確認する
         for item in difficulty_select_game_items() {
             let mut app = App::new();
             app.screen = Screen::SelectDifficulty(item, None);

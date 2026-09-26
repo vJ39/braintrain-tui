@@ -1,4 +1,4 @@
-//! カウントマニア: ランダムに並んだ1〜Nの数字付き円を、1から順にクリックしていくマウス専用ゲーム。
+//! カウントメニア: ランダムに並んだ1〜Nの数字付き円を、1から順にクリックしていくマウス専用ゲーム。
 //!
 //! 1セッション=5ラウンド。難易度は選ばせず、ROUND1=初級・ROUND2=中級・ROUND3〜5=上級と上がっていく。
 //! ROUND4・ROUND5は正解クリックのたびに近くの円が離れる方向へ散らばる(ROUND5はより広く・遠くへ)。
@@ -713,7 +713,7 @@ impl CountManiaGame {
 
     fn render_hud(&self, frame: &mut Frame, area: Rect) {
         let (difficulty_text, difficulty_color) = theme::difficulty_label(self.round_difficulty());
-        let block = theme::panel(" ◆ カウントマニア ")
+        let block = theme::panel(" ◆ カウントメニア ")
             .border_style(Style::default().fg(theme::flash_border_color(self.feedback.current())))
             .title(
                 Line::from(Span::styled(

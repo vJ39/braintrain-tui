@@ -143,7 +143,7 @@ mod tests {
         assert!(GAME_IDS.contains(&QUICK_DRAW_ID), "反射神経も履歴に出す");
         assert!(
             GAME_IDS.contains(&COUNT_MANIA_ID),
-            "カウントマニアも履歴に出す"
+            "カウントメニアも履歴に出す"
         );
         assert!(
             GAME_IDS.contains(&COLOR_STACK_ID),
