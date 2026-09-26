@@ -691,6 +691,8 @@ impl LookAwayGame {
                     self.rice = (self.rice - RICE_DRAIN_PER_SEC * dt.as_secs_f32()).max(0.0);
                     if self.rice <= 0.0 {
                         audio::play_se(SeKind::Correct);
+                        audio::play_se(SeKind::Cheer);
+                        audio::play_se(SeKind::VictoryJingle);
                         self.phase = Phase::Result {
                             is_correct: true,
                             elapsed: Duration::ZERO,
