@@ -10,6 +10,7 @@
 //!   画像が無ければ同じ2通りのテキストの絵で描く
 
 use std::cell::RefCell;
+use std::time::Duration;
 
 use image::imageops::{self, FilterType};
 use image::{DynamicImage, Rgba, RgbaImage};
@@ -68,7 +69,14 @@ pub struct TopView {
     pub airborne: bool,
     /// 回転の見た目のコマ(テキスト表示のみ。画像では再エンコードを避けるため使わない)
     pub spin_frame: usize,
+    /// 場外・吹っ飛びGAME OVERの「キラーン」演出のコマ(Noneなら通常のベーゴマを描く)
+    pub star_frame: Option<usize>,
 }
+
+/// 「キラーン」演出のコマ(だんだん小さくなり、最後は消える)
+pub const STAR_ANIM_GLYPHS: [&str; 4] = ["★", "☆", "✦", "･"];
+/// 「キラーン」演出の1コマの表示時間
+pub const STAR_ANIM_FRAME: Duration = Duration::from_millis(180);
 
 /// 盤を描く範囲とマスの大きさ(セル)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,7 +230,8 @@ impl BoardRenderer {
         let Some(layout) = board_area(area) else {
             return;
         };
-        if self.render_image(frame, area, layout, board, top) {
+        // 「キラーン」演出中は画像のパッチ更新に乗せず、テキストで星を描く
+        if top.star_frame.is_none() && self.render_image(frame, area, layout, board, top) {
             return;
         }
         render_board_text(frame, area, layout, board, top);
@@ -501,7 +510,9 @@ fn render_board_text(
             put_glyph(buffer, rect, area, glyph, Style::default());
         }
     }
-    let glyph = if top.airborne {
+    let glyph = if let Some(frame) = top.star_frame {
+        STAR_ANIM_GLYPHS[frame.min(STAR_ANIM_GLYPHS.len() - 1)]
+    } else if top.airborne {
         TOP_AIRBORNE_GLYPH
     } else {
         TOP_SPIN_GLYPHS[top.spin_frame % TOP_SPIN_GLYPHS.len()]
@@ -751,6 +762,7 @@ mod tests {
             pos,
             airborne: false,
             spin_frame: 0,
+            star_frame: None,
         }
     }
 
@@ -977,6 +989,7 @@ mod tests {
                 pos,
                 airborne: false,
                 spin_frame: frame,
+            star_frame: None,
             };
             let buffer = draw_board(&renderer, &board, &top, area);
             assert_eq!(buffer[(rect.x, rect.y)].symbol(), *glyph);
@@ -985,9 +998,34 @@ mod tests {
             pos,
             airborne: true,
             spin_frame: 1,
+            star_frame: None,
         };
         let buffer = draw_board(&renderer, &board, &top, area);
         assert_eq!(buffer[(rect.x, rect.y)].symbol(), TOP_AIRBORNE_GLYPH);
+    }
+
+    #[test]
+    fn text_top_shows_the_star_animation_glyph_when_present() {
+        let board = Board::standard();
+        let area = Rect::new(0, 0, 40, 12);
+        let renderer = BoardRenderer::new();
+        let layout = board_area(area).unwrap();
+        let pos = board.start_position();
+        let rect = layout.top_rect(pos);
+        for (frame, glyph) in STAR_ANIM_GLYPHS.iter().enumerate() {
+            let top = TopView {
+                pos,
+                airborne: false,
+                spin_frame: 0,
+                star_frame: Some(frame),
+            };
+            let buffer = draw_board(&renderer, &board, &top, area);
+            assert_eq!(
+                buffer[(rect.x, rect.y)].symbol(),
+                *glyph,
+                "star_frame={frame}では通常の回転記号ではなく星の演出を描く"
+            );
+        }
     }
 
     #[test]
@@ -1034,6 +1072,7 @@ mod tests {
             pos: (1.5, 10.5),
             airborne: false,
             spin_frame: 3,
+            star_frame: None,
         };
         draw_board(&renderer, &board, &spun, area);
         assert_eq!(renderer.patch_encode_count(), 1);
@@ -1048,6 +1087,7 @@ mod tests {
             pos: (3.5, 9.5),
             airborne: true,
             spin_frame: 0,
+            star_frame: None,
         };
         draw_board(&renderer, &board, &airborne, area);
         assert_eq!(renderer.patch_encode_count(), 4);

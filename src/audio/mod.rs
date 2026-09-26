@@ -28,6 +28,8 @@ pub enum SeKind {
     Transition,
     /// タイトル画面(Splash)でEnter/クリックした時の決定音
     Confirm,
+    /// 「べー」でベーゴマが盤外に吹っ飛んだ時の「キラーン」という星の音
+    Star,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,12 +98,14 @@ pub fn random_bgm_track(category: BgmCategory) -> Option<String> {
 }
 
 impl SeKind {
-    fn asset_path(self) -> &'static str {
+    /// 音源ファイルのパス。合成音(Incorrect・Star)はファイルを使わないのでNone
+    fn asset_path(self) -> Option<&'static str> {
         match self {
-            SeKind::Correct => "se_correct.wav",
-            SeKind::Incorrect => "se_incorrect.wav",
-            SeKind::Transition => "se_transition.wav",
-            SeKind::Confirm => "se_confirm.wav",
+            SeKind::Correct => Some("se_correct.wav"),
+            SeKind::Incorrect => None,
+            SeKind::Transition => Some("se_transition.wav"),
+            SeKind::Confirm => Some("se_confirm.wav"),
+            SeKind::Star => None,
         }
     }
 }
@@ -145,6 +149,75 @@ fn buzz_source() -> impl Source<Item = f32> {
     rodio::buffer::SamplesBuffer::new(1, BUZZ_SAMPLE_RATE, samples)
 }
 
+/// 「キラーン」音のサンプリングレート
+const KIRAN_SAMPLE_RATE: u32 = 44100;
+/// 立ち上がり(アタック)の時間。定常音にならないよう、すぐに減衰へ移る
+const KIRAN_ATTACK_SECS: f32 = 0.003;
+/// 「キラーン」の各音(start_freq, end_freq, duration_ms, decay, volume, delay_ms)。
+/// AQUATERM(vJ39/aquaterm)のスター取得音(SfxEvent::StarPickup)の質感を参考にした、
+/// 周波数スイープ+指数減衰による、明るく上昇する2音のキラキラしたアルペジオ
+const KIRAN_TONES: [(f32, f32, u64, f32, f32, u64); 2] = [
+    (900.0, 1300.0, 70, 20.0, 0.20, 0),
+    (1300.0, 1700.0, 90, 16.0, 0.18, 60),
+];
+
+/// 1音ぶんの波形をbufferのdelay_ms位置から加算する(周波数は指数補間でスイープさせ、
+/// アタック→指数減衰のエンベロープをかける)
+fn add_kiran_tone(
+    buffer: &mut [f32],
+    start_freq: f32,
+    end_freq: f32,
+    duration_ms: u64,
+    decay: f32,
+    volume: f32,
+    delay_ms: u64,
+) {
+    let delay_samples = (KIRAN_SAMPLE_RATE as u64 * delay_ms / 1000) as usize;
+    let tone_samples = (KIRAN_SAMPLE_RATE as u64 * duration_ms / 1000).max(1) as usize;
+    let ratio = (end_freq / start_freq).max(1e-6);
+    let mut phase = 0.0f32;
+    for i in 0..tone_samples {
+        let t = i as f32 / KIRAN_SAMPLE_RATE as f32;
+        let progress = (i as f32 / tone_samples as f32).clamp(0.0, 1.0);
+        let freq_now = start_freq * ratio.powf(progress);
+        phase += 2.0 * std::f32::consts::PI * freq_now / KIRAN_SAMPLE_RATE as f32;
+        if phase > 2.0 * std::f32::consts::PI {
+            phase -= 2.0 * std::f32::consts::PI;
+        }
+        let envelope = if t < KIRAN_ATTACK_SECS {
+            t / KIRAN_ATTACK_SECS
+        } else {
+            (-decay * (t - KIRAN_ATTACK_SECS)).exp()
+        };
+        if let Some(sample) = buffer.get_mut(delay_samples + i) {
+            *sample += phase.sin() * envelope * volume;
+        }
+    }
+}
+
+/// 「キラーン」という星のキラキラ音。「べー」でベーゴマが盤外に吹っ飛んだ時に鳴らす
+fn kiran_source() -> impl Source<Item = f32> {
+    let total_ms = KIRAN_TONES
+        .iter()
+        .map(|&(_, _, duration_ms, _, _, delay_ms)| duration_ms + delay_ms)
+        .max()
+        .unwrap_or(0);
+    let total_samples = (KIRAN_SAMPLE_RATE as u64 * total_ms / 1000).max(1) as usize;
+    let mut samples = vec![0.0f32; total_samples];
+    for &(start_freq, end_freq, duration_ms, decay, volume, delay_ms) in &KIRAN_TONES {
+        add_kiran_tone(
+            &mut samples,
+            start_freq,
+            end_freq,
+            duration_ms,
+            decay,
+            volume,
+            delay_ms,
+        );
+    }
+    rodio::buffer::SamplesBuffer::new(1, KIRAN_SAMPLE_RATE, samples)
+}
+
 /// 実際にrodioで音声デバイスへ再生するプレイヤー。
 /// 音声デバイスが無い/取得できない環境では初期化時にNoneとなり、以後は何もしない。
 pub struct RodioPlayer {
@@ -169,13 +242,17 @@ impl RodioPlayer {
         let Ok(sink) = Sink::try_new(stream_handle) else {
             return;
         };
-        // 不正解音は音源ファイルを使わず、耳障りな矩形波のブザー音を生成して鳴らす
-        if se == SeKind::Incorrect {
-            sink.append(buzz_source());
+        // 合成音(音源ファイルを使わない)は種類ごとの生成関数で鳴らす
+        let Some(path) = se.asset_path() else {
+            match se {
+                SeKind::Incorrect => sink.append(buzz_source()),
+                SeKind::Star => sink.append(kiran_source()),
+                _ => return,
+            }
             sink.detach();
             return;
-        }
-        let Some(file) = Assets::get(se.asset_path()) else {
+        };
+        let Some(file) = Assets::get(path) else {
             return;
         };
         if let Ok(source) = rodio::Decoder::new(Cursor::new(file.data.into_owned())) {
@@ -253,16 +330,22 @@ pub fn stop_bgm() {
 mod tests {
     use super::*;
 
-    const ALL_SE_KINDS: [SeKind; 4] = [
+    const ALL_SE_KINDS: [SeKind; 5] = [
         SeKind::Correct,
         SeKind::Incorrect,
         SeKind::Transition,
         SeKind::Confirm,
+        SeKind::Star,
     ];
 
     #[test]
     fn asset_paths_are_distinct_per_se_kind() {
-        let paths = ALL_SE_KINDS.map(SeKind::asset_path);
+        // 合成音(Incorrect・Star)はファイルを持たない(None)ので、
+        // 音源ファイルを持つ(Some)もの同士だけ重複が無いことを確認する
+        let paths: Vec<&str> = ALL_SE_KINDS
+            .iter()
+            .filter_map(|se| se.asset_path())
+            .collect();
         for i in 0..paths.len() {
             for j in (i + 1)..paths.len() {
                 assert_ne!(paths[i], paths[j]);
@@ -273,11 +356,12 @@ mod tests {
     #[test]
     fn every_se_asset_is_embedded() {
         for se in ALL_SE_KINDS {
+            let Some(path) = se.asset_path() else {
+                continue; // 合成音はファイルを持たない
+            };
             assert!(
-                Assets::get(se.asset_path()).is_some(),
-                "{:?}のasset({})が埋め込まれていること",
-                se,
-                se.asset_path()
+                Assets::get(path).is_some(),
+                "{se:?}のasset({path})が埋め込まれていること"
             );
         }
     }
@@ -370,6 +454,59 @@ mod tests {
             bgm_sink: RefCell::new(None),
         };
         player.play_se(SeKind::Incorrect);
+    }
+
+    // --- 生成音(「キラーン」音) ---
+
+    #[test]
+    fn kiran_tones_are_defined_as_rising_pitches() {
+        for &(start_freq, end_freq, ..) in &KIRAN_TONES {
+            assert!(
+                end_freq > start_freq,
+                "「キラーン」の各音は上昇するアルペジオ"
+            );
+        }
+    }
+
+    #[test]
+    fn kiran_source_is_mono_at_expected_sample_rate() {
+        let source = kiran_source();
+        assert_eq!(source.channels(), 1);
+        assert_eq!(source.sample_rate(), KIRAN_SAMPLE_RATE);
+    }
+
+    #[test]
+    fn kiran_source_is_not_silent_but_quieter_than_full_volume_se() {
+        let peak = kiran_source().map(f32::abs).fold(0.0_f32, f32::max);
+        assert!(peak > 0.0, "無音ではないこと");
+        assert!(peak < 1.0, "振幅{peak}が元の振幅(1.0)より小さいこと");
+    }
+
+    #[test]
+    fn kiran_source_length_matches_the_last_tone_ending() {
+        // 総サンプル数は、最後に終わる音(delay_ms + duration_ms)に一致する
+        let expected_ms = KIRAN_TONES
+            .iter()
+            .map(|&(_, _, duration_ms, _, _, delay_ms)| duration_ms + delay_ms)
+            .max()
+            .unwrap();
+        let source = kiran_source();
+        let rate = source.sample_rate() as u128;
+        let expected = rate * expected_ms as u128 / 1000;
+        let count = source.count() as u128;
+        assert!(
+            count + 1 >= expected && count <= expected + 1,
+            "サンプル数{count}(期待値{expected})"
+        );
+    }
+
+    #[test]
+    fn play_se_star_without_audio_device_does_not_panic() {
+        let player = RodioPlayer {
+            handle: None,
+            bgm_sink: RefCell::new(None),
+        };
+        player.play_se(SeKind::Star);
     }
 
     #[test]

@@ -232,10 +232,11 @@ impl BeigomaGame {
             Outcome::Flown | Outcome::TimeUp => (false, TIME_LIMIT),
         };
         self.tracker.record(success, latency.as_millis() as f64);
-        audio::play_se(if success {
-            SeKind::Correct
-        } else {
-            SeKind::Incorrect
+        // 場外・吹っ飛びは専用の「キラーン」音、時間切れは従来のブザー音のまま
+        audio::play_se(match outcome {
+            Outcome::Cleared { .. } => SeKind::Correct,
+            Outcome::Flown => SeKind::Star,
+            Outcome::TimeUp => SeKind::Incorrect,
         });
         self.status = Status::Ended {
             outcome,
@@ -247,6 +248,19 @@ impl BeigomaGame {
     fn spin_frame(&self) -> usize {
         (self.elapsed.as_millis() / SPIN_FRAME_INTERVAL.as_millis()) as usize
             % render::TOP_SPIN_GLYPHS.len()
+    }
+
+    /// 場外・吹っ飛びGAME OVERの「キラーン」演出のコマ(それ以外はNone)
+    fn star_frame(&self) -> Option<usize> {
+        let Status::Ended {
+            outcome: Outcome::Flown,
+            shown,
+        } = self.status
+        else {
+            return None;
+        };
+        let frame = (shown.as_millis() / render::STAR_ANIM_FRAME.as_millis()) as usize;
+        Some(frame.min(render::STAR_ANIM_GLYPHS.len() - 1))
     }
 
     /// 上段: 残り時間・一言(終わったら結果)・傾き。枠のタイトルにROUNDの名前を出す
@@ -410,6 +424,7 @@ impl Game for BeigomaGame {
             pos: self.top.pos,
             airborne: self.top.is_airborne(),
             spin_frame: self.spin_frame(),
+            star_frame: self.star_frame(),
         };
         self.board_renderer
             .render(frame, board_inner, &self.board, &top);
@@ -1106,6 +1121,43 @@ mod tests {
             );
         }
         assert_eq!(flown_text, fell_text, "吹っ飛び・場外で同じ表示");
+    }
+
+    #[test]
+    fn falling_off_starts_the_star_animation() {
+        let mut game = calm_game();
+        game.on_step_event(StepEvent::FellOff);
+        assert_eq!(
+            game.star_frame(),
+            Some(0),
+            "GAME OVER直後は星の1コマ目"
+        );
+    }
+
+    #[test]
+    fn star_animation_advances_and_stays_on_the_last_frame() {
+        let mut game = calm_game();
+        game.on_step_event(StepEvent::FellOff);
+        game.update(render::STAR_ANIM_FRAME);
+        assert_eq!(game.star_frame(), Some(1), "時間が経つとコマが進む");
+        game.update(render::STAR_ANIM_FRAME * 10);
+        assert_eq!(
+            game.star_frame(),
+            Some(render::STAR_ANIM_GLYPHS.len() - 1),
+            "最後のコマで止まる(範囲外にならない)"
+        );
+    }
+
+    #[test]
+    fn timeup_and_cleared_do_not_show_the_star_animation() {
+        let mut timeup = calm_game();
+        timeup.finish(Outcome::TimeUp);
+        assert_eq!(timeup.star_frame(), None, "時間切れは星の演出を出さない");
+
+        let mut cleared = calm_game();
+        place_just_before_goal(&mut cleared);
+        cleared.update(STEP);
+        assert_eq!(cleared.star_frame(), None, "クリア時は星の演出を出さない");
     }
 
     #[test]
