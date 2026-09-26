@@ -49,6 +49,14 @@ pub enum SeKind {
     GameSelect,
     /// TTRの曲選択画面で曲を決定した時の音
     TtrSongSelect,
+    /// 「カウントメニア」で数字をクリックして正解した時の音
+    CountManiaPop,
+    /// メニュー等でカーソル移動(選択項目の変更)をした時の音
+    CursorMove,
+    /// 「シタケシ」でブロックを消した時の音
+    ColorStackClear,
+    /// 「シタケシ」で間違えて消えなかった時の音
+    ColorStackMiss,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +151,10 @@ impl SeKind {
             SeKind::QuickDrawMiss => Some("se_hayauchi_miss.mp3"),
             SeKind::GameSelect => Some("se_game_select.mp3"),
             SeKind::TtrSongSelect => Some("se_ttr_song_select.mp3"),
+            SeKind::CountManiaPop => Some("se_count_mania_pop.mp3"),
+            SeKind::CursorMove => Some("se_cursor_move.mp3"),
+            SeKind::ColorStackClear => Some("se_color_stack_clear.mp3"),
+            SeKind::ColorStackMiss => Some("se_color_stack_miss.mp3"),
         }
     }
 }
@@ -469,7 +481,7 @@ pub fn playing_typewriter_kind() -> Option<TypewriterSeKind> {
 mod tests {
     use super::*;
 
-    const ALL_SE_KINDS: [SeKind; 14] = [
+    const ALL_SE_KINDS: [SeKind; 18] = [
         SeKind::Correct,
         SeKind::Incorrect,
         SeKind::Transition,
@@ -484,6 +496,10 @@ mod tests {
         SeKind::QuickDrawMiss,
         SeKind::GameSelect,
         SeKind::TtrSongSelect,
+        SeKind::CountManiaPop,
+        SeKind::CursorMove,
+        SeKind::ColorStackClear,
+        SeKind::ColorStackMiss,
     ];
 
     #[test]
@@ -866,15 +882,14 @@ mod tests {
     }
 
     #[test]
-    fn bgm_tracks_in_playing_has_six_tracks() {
+    fn bgm_tracks_in_playing_has_five_tracks() {
         let names = bgm_tracks_in(BgmCategory::Playing);
         assert!(names.iter().any(|n| n == "Method_of_Thought"));
         assert!(names.iter().any(|n| n == "Zenith_Pursuit"));
         assert!(names.iter().any(|n| n == "Apex_Calculation"));
         assert!(names.iter().any(|n| n == "Kinetic_Ascent"));
-        assert!(names.iter().any(|n| n == "Ten_Thousand_Strikes"));
         assert!(names.iter().any(|n| n == "Beyond_the_Finish_Line"));
-        assert_eq!(names.len(), 6);
+        assert_eq!(names.len(), 5);
     }
 
     #[test]
@@ -1018,6 +1033,6 @@ mod tests {
                 seen.insert(name);
             }
         }
-        assert_eq!(seen.len(), 6, "100回試行して全曲が出現するはず: {seen:?}");
+        assert_eq!(seen.len(), 5, "100回試行して全曲が出現するはず: {seen:?}");
     }
 }

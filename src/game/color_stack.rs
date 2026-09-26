@@ -434,11 +434,11 @@ impl ColorStackGame {
         };
         if outcome == PressOutcome::Added {
             // ミス: 一番上に1個積まれた(ラウンドは続き、スコアには記録しない)
-            audio::play_se(SeKind::Incorrect);
+            audio::play_se(SeKind::ColorStackMiss);
             self.feedback.record(false, "+1段");
             return;
         }
-        audio::play_se(SeKind::Correct);
+        audio::play_se(SeKind::ColorStackClear);
         if self.round.board.is_cleared() {
             let seconds = self.round.elapsed.as_secs_f64();
             self.tracker.record(true, seconds * 1000.0);

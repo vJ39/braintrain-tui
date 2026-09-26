@@ -746,7 +746,7 @@ impl CountManiaGame {
 
     /// 正解の円をクリックした。(column, row)はクリックしたセルで、そこから波紋を広げる
     fn click_correct(&mut self, column: u16, row: u16) {
-        audio::play_se(SeKind::Correct);
+        audio::play_se(SeKind::CountManiaPop);
         // 押した円(次に押すべき数字の円)の大きさに応じて、波紋の広がる大きさを変える
         let size = self
             .round

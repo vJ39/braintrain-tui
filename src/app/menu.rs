@@ -91,8 +91,11 @@ impl App {
             _ => return,
         };
         let columns = menu_grid(screen_rect(self.last_area)).columns;
-        self.menu_state
-            .select(grid_move(selected, direction, columns, MENU_ITEMS.len()));
+        let moved = grid_move(selected, direction, columns, MENU_ITEMS.len());
+        if moved != selected {
+            audio::play_se(SeKind::CursorMove);
+        }
+        self.menu_state.select(moved);
     }
 
     /// Menu画面でのクリック。描画(render)と同じく余白を除いた中央の範囲(screen_rect)を基準に、
