@@ -726,6 +726,7 @@ mod tests {
     use super::*;
     use crate::ui::countdown::{Phase, PHASE_DURATION};
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
     use ratatui::Terminal;
 
     const AREA: Rect = Rect::new(0, 0, 100, 24);
@@ -780,6 +781,12 @@ mod tests {
         let mut game = calm_game_before_go();
         finish_countdown(&mut game);
         game
+    }
+
+    fn rendered(game: &BeigomaGame, area: Rect) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(area.right(), area.bottom())).unwrap();
+        terminal.draw(|frame| game.render(frame, area)).unwrap();
+        terminal.backend().buffer().clone()
     }
 
     fn rendered_text(game: &BeigomaGame, area: Rect) -> String {
@@ -1741,19 +1748,25 @@ mod tests {
             .all(|view| view.spin_frame == game.spin_frame()));
     }
 
-    /// 描画した盤面の中のベーゴマ記号の数
-    fn count_top_glyphs(game: &BeigomaGame) -> usize {
-        let glyph = render::TOP_SPIN_GLYPHS[game.spin_frame()];
-        rendered_text(game, AREA).matches(glyph).count()
+    /// 描画した盤面の中の円盤(塗り分けのどちらか)のセル数。回転は円盤の塗り分けで
+    /// 表すため記号では数えられないので、円盤の色のセル数で「何個描かれているか」を確かめる
+    fn count_top_disc_cells(game: &BeigomaGame) -> usize {
+        rendered(game, AREA)
+            .content()
+            .iter()
+            .filter(|c| render::is_disc_bg(c.bg))
+            .count()
     }
 
     #[test]
     fn round2_draws_two_tops_and_round1_draws_one() {
-        assert_eq!(count_top_glyphs(&calm_game()), 1, "ROUND1は1個");
+        let round1 = count_top_disc_cells(&calm_game());
+        assert!(round1 > 0, "ROUND1は円盤を描く");
+        let round2 = count_top_disc_cells(&calm_round2());
         assert_eq!(
-            count_top_glyphs(&calm_round2()),
-            2,
-            "ROUND2は同じマスにいても2個とも描く"
+            round2,
+            round1 * 2,
+            "ROUND2は同じマスにいても2個とも描く(円盤のセル数が2倍)"
         );
     }
 
@@ -1781,10 +1794,7 @@ mod tests {
         assert!(text.contains(render::GOAL_GLYPH));
         assert!(text.contains(render::BUMP_GLYPH), "凸を描く");
         assert!(text.contains(render::HOLLOW_GLYPH), "凹を描く");
-        assert!(
-            text.contains(render::TOP_SPIN_GLYPHS[0]),
-            "投入されたベーゴマを描く"
-        );
+        assert!(count_top_disc_cells(&game) > 0, "投入されたベーゴマの円盤を描く");
     }
 
     #[test]

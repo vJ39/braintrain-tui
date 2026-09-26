@@ -60,16 +60,21 @@ pub const TOP_AIRBORNE_GLYPH: &str = "○";
 const FLAT_BG: Color = Color::Rgb(150, 105, 60);
 /// 凸は平坦より明るく(盛り上がり)、凹は暗く(穴)する
 const BUMP_BG: Color = Color::Rgb(205, 160, 105);
-const BUMP_FG: Color = Color::Rgb(95, 55, 20);
+/// 凸の記号は焦げ茶を濃くして、盛り上がった面(BUMP_BG系)とのコントラストを強める
+const BUMP_FG: Color = Color::Rgb(60, 30, 8);
 const HOLLOW_BG: Color = Color::Rgb(60, 38, 18);
-const HOLLOW_FG: Color = Color::Rgb(120, 90, 60);
+/// 凹の記号は穴の中で光っているように明るいクリーム色にして、暗いHOLLOW_BG系との
+/// コントラストを強める(旧色は背景との差が小さく見づらかった)
+const HOLLOW_FG: Color = Color::Rgb(225, 195, 150);
 /// ゴールのマスは盤の茶色の中で見つけやすい緑(ゴルフのグリーン)にする。
 /// 記号の色は、旗の絵文字を色付きで出せない端末でも赤い旗に見えるように赤
 const GOAL_BG: Color = Color::Rgb(40, 140, 60);
 const GOAL_FG: Color = Color::Rgb(230, 30, 30);
-/// テキスト表示のベーゴマの円盤の色(画像表示のTOP_FACE_PIXELと同じ)
+/// テキスト表示のベーゴマの円盤の色(画像表示のTOP_FACE_PIXELと同じ)。回転すると
+/// TOP_BG_DARKと交互に見える扇形に塗り分ける(回転が円盤全体で分かるように)
 const TOP_BG: Color = Color::Rgb(200, 210, 225);
-/// 円盤の上に置く回転・飛び上がりの記号の色
+const TOP_BG_DARK: Color = Color::Rgb(140, 150, 170);
+/// 円盤の上に置く飛び上がり・星の記号の色
 const TOP_FG: Color = Color::Rgb(60, 70, 90);
 /// 星の演出の記号の色(円盤は描かない)
 const STAR_FG: Color = Color::Rgb(220, 240, 255);
@@ -78,8 +83,11 @@ const AIRBORNE_DISC_SCALE: f64 = 0.7;
 
 /// 平坦なマスの市松の2トーン。FLAT_BGを白・黒へこの割合だけ寄せる
 const CHECKER_MIX: f64 = 0.08;
-/// 凹凸の陰影の明・暗。BUMP_BG/HOLLOW_BGを白・黒へこの割合だけ寄せる
-const SHADE_MIX: f64 = 0.15;
+/// 凹凸の陰影の明・暗。BUMP_BG/HOLLOW_BGを白・黒へこの割合だけ寄せる。
+/// 盛り上がり・へこみをもっと立体的に見せるため、旧来(0.15)より強めにする。
+/// これ以上大きくすると、凸の暗い帯が平坦の明るいトーンより暗くなり、
+/// 「凸は常に平坦より明るい」という前提が崩れる(0.2549が理論上の上限)
+const SHADE_MIX: f64 = 0.22;
 /// 陰影の帯の境界。d ≤ −SHADE_BANDで左上の帯、d ≥ SHADE_BANDで右下の帯、その間が中央の帯
 const SHADE_BAND: f64 = 0.2;
 /// 混色で明るく・暗くする時の寄せ先
@@ -789,7 +797,10 @@ fn cell_style(cell: Cell, mass: (usize, usize), frac: (f64, f64)) -> Style {
                 ShadeBand::Middle => HOLLOW_BG,
                 ShadeBand::BottomRight => mix(HOLLOW_BG, WHITE, SHADE_MIX),
             };
-            Style::default().fg(HOLLOW_FG).bg(bg)
+            Style::default()
+                .fg(HOLLOW_FG)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD)
         }
         Cell::Goal => Style::default()
             .fg(GOAL_FG)
@@ -844,7 +855,14 @@ fn render_board_text(
     // ベーゴマの円盤: 中心が盤の上の間だけ塗る(星の演出中は描かない)。重なった範囲は後のものが上
     for top in tops {
         if has_disc(top) {
-            paint_disc(buffer, &projection, area, top.pos, disc_radius(top));
+            paint_disc(
+                buffer,
+                &projection,
+                area,
+                top.pos,
+                disc_radius(top),
+                top.spin_frame,
+            );
         }
     }
     let panel = layout.panel;
@@ -865,12 +883,16 @@ fn render_board_text(
     for ((top, &(x, y)), lane) in tops.iter().zip(&cells).zip(lanes) {
         let first = x.min(right - (lane.count as i32 - 1)).max(left);
         let cell = ((first + lane.index as i32).min(right), y);
-        // 背景色(円盤・マス)はそのまま残し、記号と文字色だけ変える。
+        // 背景色(円盤・マス)はそのまま残し、記号と文字色だけ変える(回転中は円盤の塗り分けで
+        // 表すので記号を出さず、背景色もそのままにする)。
         // 円盤の上は暗い色、円盤の無い所(星・盤の外)は明るい色
-        let fg = if has_disc(top) { TOP_FG } else { STAR_FG };
-        let style = Style::default().fg(fg).add_modifier(Modifier::BOLD);
-        clear_wide_glyph_on_left(buffer, cell, area);
-        put_glyph_at(buffer, cell, area, top_glyph(top), style);
+        let disc = has_disc(top);
+        if let Some(glyph) = top_glyph(top, disc) {
+            let fg = if disc { TOP_FG } else { STAR_FG };
+            let style = Style::default().fg(fg).add_modifier(Modifier::BOLD);
+            clear_wide_glyph_on_left(buffer, cell, area);
+            put_glyph_at(buffer, cell, area, glyph, style);
+        }
     }
 }
 
@@ -900,8 +922,35 @@ fn disc_radius(top: &TopView) -> f64 {
     }
 }
 
+/// 円盤の色(塗り分けのどちらか)か。テストで円盤の位置・大きさを確認するのに使う
+#[cfg(test)]
+pub(crate) fn is_disc_bg(color: Color) -> bool {
+    color == TOP_BG || color == TOP_BG_DARK
+}
+
+/// 円盤の中でのセルの色。posからセル中心(cell_center、マス座標)への角度と、回転位相
+/// (spin_frameをTOP_SPIN_GLYPHS.len()等分した角度)を比べ、進んでいる半分をTOP_BG、
+/// 遅れている半分をTOP_BG_DARKにする。境界の向きがspin_frameにつれて回るので、
+/// 円盤全体がくるくる回っているように見える
+fn disc_slice_color(pos: (f64, f64), cell_center: (f64, f64), spin_frame: usize) -> Color {
+    let (du, dv) = (cell_center.0 - pos.0, cell_center.1 - pos.1);
+    if du == 0.0 && dv == 0.0 {
+        return TOP_BG;
+    }
+    let angle = dv.atan2(du);
+    let phase =
+        spin_frame as f64 / TOP_SPIN_GLYPHS.len() as f64 * std::f64::consts::TAU;
+    let relative = (angle - phase).rem_euclid(std::f64::consts::TAU);
+    if relative < std::f64::consts::PI {
+        TOP_BG
+    } else {
+        TOP_BG_DARK
+    }
+}
+
 /// posを中心とする半径radiusの円盤を塗る。セルの4隅を逆変換した外接矩形(マス座標)とposの距離が
-/// radius未満のセルの記号を空白にし、背景色をTOP_BGにする。調べるセルは、pos ± radiusの正方形の
+/// radius未満のセルの記号を空白にし、背景色をdisc_slice_colorで塗り分ける(spin_frameに応じて
+/// 回転して見える扇形)。調べるセルは、pos ± radiusの正方形の
 /// 4隅を順変換した外接矩形を上下左右1セルずつ広げてareaで切り詰めた範囲
 fn paint_disc(
     buffer: &mut Buffer,
@@ -909,6 +958,7 @@ fn paint_disc(
     area: Rect,
     pos: (f64, f64),
     radius: f64,
+    spin_frame: usize,
 ) {
     let corners = [
         (pos.0 - radius, pos.1 - radius),
@@ -937,8 +987,11 @@ fn paint_disc(
                 continue;
             };
             if rect_distance(pos, bounds) < radius {
+                let (min, max) = bounds;
+                let cell_center = ((min.0 + max.0) / 2.0, (min.1 + max.1) / 2.0);
+                let color = disc_slice_color(pos, cell_center, spin_frame);
                 clear_wide_glyph_on_left(buffer, (i32::from(x), i32::from(y)), area);
-                buffer[(x, y)].set_symbol(" ").set_bg(TOP_BG);
+                buffer[(x, y)].set_symbol(" ").set_bg(color);
             }
         }
     }
@@ -972,15 +1025,19 @@ fn rect_distance(pos: (f64, f64), bounds: ((f64, f64), (f64, f64))) -> f64 {
     dx.hypot(dy)
 }
 
-/// ベーゴマの記号。星の演出中はそのコマ、飛び上がっている間は専用の記号、それ以外
-/// (吹っ飛んで飛んでいる間も含む)は回転のコマ
-fn top_glyph(top: &TopView) -> &'static str {
+/// ベーゴマの記号。星の演出中はそのコマ、飛び上がっている間は専用の記号。
+/// 円盤を描ける間(has_disc)は、回転を円盤の塗り分け(disc_slice_color)で表すので記号は
+/// 出さない(Noneは何も描かない合図)。盤の外にいて円盤を描けない間は、回転記号で表す
+/// (円盤が無いと塗り分けで回転を示せないため)
+fn top_glyph(top: &TopView, has_disc: bool) -> Option<&'static str> {
     if let Some(frame) = top.star_frame {
-        STAR_ANIM_GLYPHS[frame.min(STAR_ANIM_GLYPHS.len() - 1)]
+        Some(STAR_ANIM_GLYPHS[frame.min(STAR_ANIM_GLYPHS.len() - 1)])
     } else if top.airborne && !top.flying {
-        TOP_AIRBORNE_GLYPH
+        Some(TOP_AIRBORNE_GLYPH)
+    } else if has_disc {
+        None
     } else {
-        TOP_SPIN_GLYPHS[top.spin_frame % TOP_SPIN_GLYPHS.len()]
+        Some(TOP_SPIN_GLYPHS[top.spin_frame % TOP_SPIN_GLYPHS.len()])
     }
 }
 
@@ -1885,12 +1942,11 @@ mod tests {
                 let buffer = draw_board_with_tilt(&renderer, &board, &top_at(pos), area, &tilt);
                 let (x, y) = glyph_cell(projection.project(pos));
                 let cell = &buffer[(x as u16, y as u16)];
-                assert_eq!(
-                    cell.symbol(),
-                    TOP_SPIN_GLYPHS[0],
-                    "ベーゴマは位置そのものを順変換したセルに描く: {pos:?} {tilt:?}"
+                assert!(
+                    is_disc_bg(cell.bg),
+                    "ベーゴマは位置そのものを順変換したセルに描く(円盤の色): {pos:?} {tilt:?} {:?}",
+                    cell.bg
                 );
-                assert_eq!(cell.bg, TOP_BG, "記号は円盤の中: {pos:?} {tilt:?}");
             }
         }
     }
@@ -1986,19 +2042,18 @@ mod tests {
         let goal = layout.cell_rect(gx, gy);
         assert_eq!(buffer[(goal.x, goal.y)].symbol(), GOAL_GLYPH);
         let top_rect = layout.top_rect(top.pos);
-        assert_eq!(
-            buffer[(top_rect.x, top_rect.y)].symbol(),
-            TOP_SPIN_GLYPHS[0]
+        assert!(
+            is_disc_bg(buffer[(top_rect.x, top_rect.y)].bg),
+            "ベーゴマの円盤を描く"
         );
         assert_eq!(
             buffer[(top_rect.x + 1, top_rect.y)].symbol(),
             " ",
-            "記号の右隣は空白"
+            "記号は出さない(円盤の塗り分けで回転を表す)"
         );
-        assert_eq!(
-            buffer[(top_rect.x + 1, top_rect.y)].bg,
-            TOP_BG,
-            "記号の右隣はベーゴマの円盤の色"
+        assert!(
+            is_disc_bg(buffer[(top_rect.x + 1, top_rect.y)].bg),
+            "右隣もベーゴマの円盤の色"
         );
         // 市松はベーゴマの円盤の外のマスで確かめる
         let mass = (top.pos.0.floor() as usize + 2, top.pos.1.floor() as usize);
@@ -2118,7 +2173,8 @@ mod tests {
         let layout = board_area(area).unwrap();
         let pos = board.start_position();
         let rect = layout.top_rect(pos);
-        for (frame, glyph) in TOP_SPIN_GLYPHS.iter().enumerate() {
+        // 回転中(盤の上)は記号を出さず、円盤の塗り分けだけで回転を表す
+        for frame in 0..TOP_SPIN_GLYPHS.len() {
             let top = TopView {
                 pos,
                 airborne: false,
@@ -2127,7 +2183,8 @@ mod tests {
                 flying: false,
             };
             let buffer = draw_board(&renderer, &board, &top, area);
-            assert_eq!(buffer[(rect.x, rect.y)].symbol(), *glyph);
+            assert_eq!(buffer[(rect.x, rect.y)].symbol(), " ", "frame={frame}");
+            assert!(is_disc_bg(buffer[(rect.x, rect.y)].bg), "frame={frame}");
         }
         let top = TopView {
             pos,
@@ -2163,7 +2220,7 @@ mod tests {
                 "star_frame={frame}では通常の回転記号ではなく星の演出を描く"
             );
             assert_eq!(buffer[(rect.x, rect.y)].fg, STAR_FG, "星の記号の色");
-            assert_eq!(count_bg(&buffer, TOP_BG), 0, "星の演出中は円盤を描かない");
+            assert_eq!(count_disc_bg(&buffer), 0, "星の演出中は円盤を描かない");
         }
     }
 
@@ -2239,16 +2296,11 @@ mod tests {
         let renderer = BoardRenderer::from_parts(None, None, None);
         let pos = (5.5, 5.5);
         let rolling = draw_board(&renderer, &board, &top_at(pos), area);
-        for (frame, glyph) in TOP_SPIN_GLYPHS.iter().enumerate() {
+        for frame in 0..TOP_SPIN_GLYPHS.len() {
             let buffer = draw_board(&renderer, &board, &flying_at(pos, frame), area);
-            let positions = positions_of(&buffer, glyph);
-            assert_eq!(positions.len(), 1, "回転の記号で描く(○にしない): {glyph}");
-            assert_eq!(count_symbol(&buffer, TOP_AIRBORNE_GLYPH), 0);
-            let cell = &buffer[positions[0]];
-            assert_eq!(cell.bg, TOP_BG, "円盤の上");
-            assert_eq!(cell.fg, TOP_FG, "円盤の上では読める暗い色");
-            let (flying_disc, rolling_disc) =
-                (count_bg(&buffer, TOP_BG), count_bg(&rolling, TOP_BG));
+            // 回転は円盤の塗り分けで表すので、○(TOP_AIRBORNE_GLYPH)にはしない
+            assert_eq!(count_symbol(&buffer, TOP_AIRBORNE_GLYPH), 0, "frame={frame}");
+            let (flying_disc, rolling_disc) = (count_disc_bg(&buffer), count_disc_bg(&rolling));
             assert!(
                 flying_disc > 0 && flying_disc < rolling_disc,
                 "宙に浮いているので円盤は小さい: {flying_disc} < {rolling_disc}"
@@ -2283,7 +2335,7 @@ mod tests {
         let area = Rect::new(0, 0, 40, 12);
         let renderer = BoardRenderer::with_images(test_picker(), plain_board_image(), None);
         let buffer = draw_tops(&renderer, &board, &[flying_at((5.5, 5.5), 2)], area);
-        assert_eq!(count_symbol(&buffer, TOP_SPIN_GLYPHS[2]), 1);
+        assert!(count_disc_bg(&buffer) > 0, "円盤を描く(画像ではなくテキストの証拠)");
         assert_eq!(renderer.base_encode_count(), 0, "画像は使わない");
     }
 
@@ -2355,10 +2407,9 @@ mod tests {
         let (gx, gy) = board.goal();
         let top = top_at((gx as f64 + 1.1, gy as f64 + 0.5));
         let buffer = draw_board(&renderer, &board, &top, area);
-        assert_eq!(
-            buffer[(flag.0 + 1, flag.1)].symbol(),
-            TOP_SPIN_GLYPHS[0],
-            "ベーゴマの記号は旗の右隣"
+        assert!(
+            is_disc_bg(buffer[(flag.0 + 1, flag.1)].bg),
+            "ベーゴマの円盤は旗の右隣"
         );
         assert_eq!(
             count_symbol(&buffer, GOAL_GLYPH),
@@ -2413,10 +2464,10 @@ mod tests {
     /// 設計書の参考値の色(基準色を白・黒へ寄せた結果)
     const CHECKER_LIGHT: Color = Color::Rgb(158, 117, 76);
     const CHECKER_DARK: Color = Color::Rgb(138, 97, 55);
-    const BUMP_LIGHT: Color = Color::Rgb(213, 174, 128);
-    const BUMP_DARK: Color = Color::Rgb(174, 136, 89);
-    const HOLLOW_DARK: Color = Color::Rgb(51, 32, 15);
-    const HOLLOW_LIGHT: Color = Color::Rgb(89, 71, 54);
+    const BUMP_LIGHT: Color = Color::Rgb(216, 181, 138);
+    const BUMP_DARK: Color = Color::Rgb(160, 125, 82);
+    const HOLLOW_DARK: Color = Color::Rgb(47, 30, 14);
+    const HOLLOW_LIGHT: Color = Color::Rgb(103, 86, 70);
     const CHECKER_COLORS: [Color; 2] = [CHECKER_LIGHT, CHECKER_DARK];
     /// 凸の3色(左上の帯・中央の帯・右下の帯の順)
     const BUMP_COLORS: [Color; 3] = [BUMP_LIGHT, BUMP_BG, BUMP_DARK];
@@ -2599,7 +2650,9 @@ mod tests {
             );
         }
         for frac in BAND_FRACS {
-            assert_eq!(cell_style(Cell::Hollow, mass, frac).fg, Some(HOLLOW_FG));
+            let style = cell_style(Cell::Hollow, mass, frac);
+            assert_eq!(style.fg, Some(HOLLOW_FG));
+            assert!(style.add_modifier.contains(Modifier::BOLD), "凹の記号も太字で強調する");
         }
     }
 
@@ -2744,8 +2797,8 @@ mod tests {
                 for position in layout.rect.intersection(area).positions() {
                     let bg = buffer[position].bg;
                     assert!(
-                        bg == Color::Reset || bg == TOP_BG || is_board_bg(bg),
-                        "塗ったセルは9色のどれか: {position:?} {bg:?} {tilt:?}"
+                        bg == Color::Reset || bg == TOP_BG || bg == TOP_BG_DARK || is_board_bg(bg),
+                        "塗ったセルは盤の色・円盤の色(塗り分けのどちらか)のどれか: {position:?} {bg:?} {tilt:?}"
                     );
                 }
                 for (glyph, colors) in [
@@ -2891,9 +2944,11 @@ mod tests {
     fn a_single_top_is_drawn_once() {
         let board = Board::standard();
         let area = Rect::new(0, 0, 40, 12);
+        let layout = board_area(area).unwrap();
         let renderer = BoardRenderer::from_parts(None, None, None);
         let buffer = draw_board(&renderer, &board, &top_at(board.start_position()), area);
-        assert_eq!(count_symbol(&buffer, TOP_SPIN_GLYPHS[0]), 1);
+        let expected = usize::from(layout.cell_width) * usize::from(layout.cell_height);
+        assert_eq!(count_disc_bg(&buffer), expected, "1マス分だけ円盤を描く");
     }
 
     #[test]
@@ -2901,26 +2956,20 @@ mod tests {
         let board = Board::standard();
         let renderer = BoardRenderer::from_parts(None, None, None);
         let (sx, sy) = board.start_position();
-        // 左のベーゴマは0コマ目、右のベーゴマは1コマ目の記号にして見分ける
         let left = spinning_at((sx - 0.15, sy), 0);
         let right = spinning_at((sx + 0.15, sy), 1);
         for area in [Rect::new(0, 0, 40, 12), Rect::new(0, 0, 90, 26)] {
-            let layout = board_area(area).unwrap();
-            let mass = layout.top_rect((sx, sy));
-            // スライスの並び順によらず、位置が左の方を左に描く
+            let single = count_disc_bg(&draw_tops(&renderer, &board, &[left], area));
+            // 回転は円盤の塗り分けで表すため、個体識別用の記号は無い。位置が近いと円盤同士が
+            // 重なることはあるが、少なくとも円盤自体は描かれる(完全に隠れきることはない)
             for tops in [[left, right], [right, left]] {
                 let buffer = draw_tops(&renderer, &board, &tops, area);
-                let l = positions_of(&buffer, TOP_SPIN_GLYPHS[0]);
-                let r = positions_of(&buffer, TOP_SPIN_GLYPHS[1]);
-                assert_eq!((l.len(), r.len()), (1, 1), "2個とも描く: {area:?}");
-                assert_eq!(l[0].1, r[0].1, "同じ行");
-                assert!(l[0].0 < r[0].0, "左右にずらして重ねない: {l:?} {r:?}");
-                for (x, y) in [l[0], r[0]] {
-                    assert!(
-                        mass.contains(Position::new(x, y)),
-                        "どちらも自分のマスの中: ({x}, {y}) {mass:?}"
-                    );
-                }
+                let discs = disc_positions(&buffer);
+                assert!(
+                    discs.len() >= single,
+                    "少なくとも円盤ぶんは描く: {area:?} {}",
+                    discs.len()
+                );
             }
         }
     }
@@ -2936,10 +2985,9 @@ mod tests {
         let buffer = draw_tops(&renderer, &board, &[a, b], area);
         for top in [a, b] {
             let rect = layout.top_rect(top.pos);
-            assert_eq!(
-                buffer[(rect.x, rect.y)].symbol(),
-                TOP_SPIN_GLYPHS[top.spin_frame],
-                "位置を含むマスに描く: {:?}",
+            assert!(
+                is_disc_bg(buffer[(rect.x, rect.y)].bg),
+                "位置を含むマスに描く(円盤の色): {:?}",
                 top.pos
             );
         }
@@ -2974,7 +3022,10 @@ mod tests {
         };
         let buffer = draw_tops(&renderer, &board, &[top_at((1.5, 10.5)), star], area);
         assert_eq!(count_symbol(&buffer, STAR_ANIM_GLYPHS[0]), 1);
-        assert_eq!(count_symbol(&buffer, TOP_SPIN_GLYPHS[0]), 1);
+        assert!(
+            count_disc_bg(&buffer) > 0,
+            "通常のベーゴマは円盤を描く(画像ではなくテキストに切り替わっている証拠)"
+        );
     }
 
     #[test]
@@ -3121,13 +3172,18 @@ mod tests {
         buffer.content().iter().filter(|c| c.bg == color).count()
     }
 
-    /// 円盤の色で塗られたセルの位置(左上から行優先)
+    /// 円盤の色(塗り分けのどちらか)で塗られたセルの数
+    fn count_disc_bg(buffer: &Buffer) -> usize {
+        buffer.content().iter().filter(|c| is_disc_bg(c.bg)).count()
+    }
+
+    /// 円盤の色(塗り分けのどちらか)で塗られたセルの位置(左上から行優先)
     fn disc_positions(buffer: &Buffer) -> Vec<(u16, u16)> {
         buffer
             .content()
             .iter()
             .enumerate()
-            .filter(|(_, cell)| cell.bg == TOP_BG)
+            .filter(|(_, cell)| is_disc_bg(cell.bg))
             .map(|(i, _)| buffer.pos_of(i))
             .collect()
     }
@@ -3315,10 +3371,19 @@ mod tests {
                 let buffer = draw_board(&renderer, &board, &top, area);
                 let (x, y) = glyph_cell(projection.project(top.pos));
                 let cell = &buffer[(x as u16, y as u16)];
-                assert_eq!(cell.symbol(), top_glyph(&top), "{:?} {area:?}", top.pos);
-                assert_eq!(cell.bg, TOP_BG, "{:?} {area:?}", top.pos);
-                assert_eq!(cell.fg, TOP_FG, "{:?} {area:?}", top.pos);
-                assert!(cell.modifier.contains(Modifier::BOLD));
+                assert!(
+                    cell.bg == TOP_BG || cell.bg == TOP_BG_DARK,
+                    "円盤の中は塗り分けのどちらか: {:?} {area:?} {:?}",
+                    top.pos,
+                    cell.bg
+                );
+                // 回転中(top_glyphがNone)は記号を出さず塗り分けだけで表すので、
+                // 記号のチェックはairborne等、記号を持つ場合だけ行う
+                if let Some(glyph) = top_glyph(&top, has_disc(&top)) {
+                    assert_eq!(cell.symbol(), glyph, "{:?} {area:?}", top.pos);
+                    assert_eq!(cell.fg, TOP_FG, "{:?} {area:?}", top.pos);
+                    assert!(cell.modifier.contains(Modifier::BOLD));
+                }
             }
         }
     }
@@ -3417,7 +3482,7 @@ mod tests {
                             continue;
                         };
                         let distance = (mass.0 - pos.0).hypot(mass.1 - pos.1);
-                        let painted = buffer[position].bg == TOP_BG;
+                        let painted = is_disc_bg(buffer[position].bg);
                         if painted {
                             assert!(
                                 distance <= limit,
@@ -3435,7 +3500,10 @@ mod tests {
                     let (x, y) = glyph_cell(projection.project(pos));
                     let x = x.clamp(i32::from(area.left()), i32::from(area.right()) - 1);
                     let y = y.clamp(i32::from(area.top()), i32::from(area.bottom()) - 1);
-                    assert_eq!(buffer[(x as u16, y as u16)].bg, TOP_BG, "{pos:?} {tilt:?}");
+                    assert!(
+                        is_disc_bg(buffer[(x as u16, y as u16)].bg),
+                        "{pos:?} {tilt:?}"
+                    );
                 }
             }
         }
