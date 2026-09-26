@@ -1,3 +1,4 @@
+pub mod beigoma;
 pub mod color_stack;
 pub mod count_mania;
 pub mod feedback;
