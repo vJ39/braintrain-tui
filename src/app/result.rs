@@ -41,7 +41,8 @@ impl App {
     /// 最初から始める(履歴への保存はしない)。本文が流れている間はタイプライターSEを鳴らす
     pub(super) fn show_result(&mut self, result: GameResult, save_error: Option<String>) {
         self.result_typewriter = Typewriter::new(typewriter::char_count(&result_lines(&result)));
-        self.result_typewriter.start_loop_se();
+        self.result_typewriter
+            .start_loop_se(audio::TypewriterSeKind::Result);
         self.result_sprite.reset();
         self.screen = Screen::Result(result, save_error);
     }
@@ -388,6 +389,11 @@ mod tests {
         assert!(
             audio::is_typewriter_loop_playing(),
             "リザルト画面で文字が流れ始めたら鳴らす"
+        );
+        assert_eq!(
+            audio::playing_typewriter_kind(),
+            Some(audio::TypewriterSeKind::Result),
+            "リザルト専用のSEを使う"
         );
         app.update(CHAR_INTERVAL * 3);
         assert!(!app.result_typewriter.is_finished());

@@ -32,7 +32,8 @@ impl App {
         self.pending_scrollback_clear = true;
         let total = typewriter::char_count(&menu_item_lines(screen_rect(self.last_area)));
         self.menu_typewriter = Typewriter::with_interval(total, MENU_CHAR_INTERVAL);
-        self.menu_typewriter.start_loop_se();
+        self.menu_typewriter
+            .start_loop_se(audio::TypewriterSeKind::Menu);
     }
 
     /// メニュー以外の画面で[q]を押した時にメニューへ戻る。既にメニュー用BGMが
@@ -1159,6 +1160,11 @@ mod tests {
         assert!(
             audio::is_typewriter_loop_playing(),
             "メニューに入って文字が流れ始めたら鳴らす"
+        );
+        assert_eq!(
+            audio::playing_typewriter_kind(),
+            Some(audio::TypewriterSeKind::Menu),
+            "メニュー専用のSEを使う"
         );
         app.update(MENU_CHAR_INTERVAL * 5);
         assert!(!app.menu_typewriter.is_finished());

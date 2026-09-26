@@ -55,12 +55,12 @@ impl Typewriter {
 
     /// 文字が流れている間、タイプライターSEのループ再生を始める(画面に入って流し始める時に呼ぶ)。
     /// 既に流れ終わっていれば鳴らさない
-    pub fn start_loop_se(&mut self) {
+    pub fn start_loop_se(&mut self, kind: audio::TypewriterSeKind) {
         if self.is_finished() {
             audio::stop_typewriter_loop();
             self.loop_se = false;
         } else {
-            audio::play_typewriter_loop();
+            audio::play_typewriter_loop(kind);
             self.loop_se = true;
         }
     }
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn start_loop_se_plays_the_loop_while_typing() {
         let mut t = Typewriter::with_interval(3, ms(10));
-        t.start_loop_se();
+        t.start_loop_se(audio::TypewriterSeKind::Menu);
         assert!(t.plays_loop_se());
         assert!(audio::is_typewriter_loop_playing(), "流れ始めたら鳴らす");
         t.tick(ms(20));
@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn loop_se_stops_the_moment_typing_finishes() {
         let mut t = Typewriter::with_interval(3, ms(10));
-        t.start_loop_se();
+        t.start_loop_se(audio::TypewriterSeKind::Menu);
         t.tick(ms(29));
         assert!(audio::is_typewriter_loop_playing(), "最後の1文字の手前");
         t.tick(ms(1));
@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn skip_stops_the_loop_se() {
         let mut t = Typewriter::new(50);
-        t.start_loop_se();
+        t.start_loop_se(audio::TypewriterSeKind::Menu);
         t.skip();
         assert!(!audio::is_typewriter_loop_playing());
         assert!(!t.plays_loop_se());
@@ -352,7 +352,7 @@ mod tests {
     #[test]
     fn start_loop_se_on_already_finished_text_does_not_play() {
         for mut t in [Typewriter::new(0), Typewriter::completed(CHAR_INTERVAL)] {
-            t.start_loop_se();
+            t.start_loop_se(audio::TypewriterSeKind::Menu);
             assert!(!audio::is_typewriter_loop_playing());
             assert!(!t.plays_loop_se());
         }
@@ -362,7 +362,7 @@ mod tests {
     fn shrinking_total_to_finished_stops_the_loop_se() {
         // 画面サイズの変化で全文字数が減り、表示済み文字数に届いた時も止める
         let mut t = Typewriter::with_interval(10, ms(10));
-        t.start_loop_se();
+        t.start_loop_se(audio::TypewriterSeKind::Menu);
         t.tick(ms(50));
         assert!(audio::is_typewriter_loop_playing());
         t.set_total_chars(5);

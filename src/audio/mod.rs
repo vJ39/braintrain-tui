@@ -228,12 +228,27 @@ fn whoosh_source() -> impl Source<Item = f32> {
     rodio::buffer::SamplesBuffer::new(1, WHOOSH_SAMPLE_RATE, samples)
 }
 
-/// タイプライター演出で文字が流れている間ループ再生するSEの音源ファイル
-const TYPEWRITER_SE_PATH: &str = "se_typewriter.mp3";
+/// タイプライター演出で文字が流れている間ループ再生するSEの種類。画面ごとに音源を変える
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypewriterSeKind {
+    /// メニュー画面の説明文表示
+    Menu,
+    /// リザルト画面の表示
+    Result,
+}
+
+impl TypewriterSeKind {
+    fn asset_path(self) -> &'static str {
+        match self {
+            TypewriterSeKind::Menu => "se_typewriter.mp3",
+            TypewriterSeKind::Result => "se_typewriter_result.mp3",
+        }
+    }
+}
 
 /// タイプライターSEをデコードし、終わりなくループさせた音源。音源が無い/デコードできなければNone
-fn typewriter_loop_source() -> Option<impl Source<Item = i16>> {
-    let file = Assets::get(TYPEWRITER_SE_PATH)?;
+fn typewriter_loop_source(kind: TypewriterSeKind) -> Option<impl Source<Item = i16>> {
+    let file = Assets::get(kind.asset_path())?;
     let source = rodio::Decoder::new(Cursor::new(file.data.into_owned())).ok()?;
     Some(source.repeat_infinite())
 }
@@ -246,9 +261,9 @@ pub struct RodioPlayer {
     bgm_sink: RefCell<Option<Sink>>,
     /// タイプライターSEをループ再生しているSink。BGMとは別に持ち、互いの再生・停止に影響させない
     typewriter_sink: RefCell<Option<Sink>>,
-    /// タイプライターSEのループ再生中か。音声デバイスの有無に関わらず、再生を始めてから
-    /// 止めるまでtrueにする(デバイスが無くSinkを作れない環境でも状態を確かめられるように)
-    typewriter_looping: Cell<bool>,
+    /// タイプライターSEのループ再生中の種類。音声デバイスの有無に関わらず、再生を始めてから
+    /// 止めるまでSomeにする(デバイスが無くSinkを作れない環境でも状態を確かめられるように)
+    typewriter_looping: Cell<Option<TypewriterSeKind>>,
 }
 
 impl RodioPlayer {
@@ -258,7 +273,7 @@ impl RodioPlayer {
             handle,
             bgm_sink: RefCell::new(None),
             typewriter_sink: RefCell::new(None),
-            typewriter_looping: Cell::new(false),
+            typewriter_looping: Cell::new(None),
         }
     }
 
@@ -269,7 +284,7 @@ impl RodioPlayer {
             handle: None,
             bgm_sink: RefCell::new(None),
             typewriter_sink: RefCell::new(None),
-            typewriter_looping: Cell::new(false),
+            typewriter_looping: Cell::new(None),
         }
     }
 
@@ -341,11 +356,15 @@ impl RodioPlayer {
         }
     }
 
-    /// タイプライターSEのループ再生を始める。既に再生中なら頭から鳴らし直さず、そのまま鳴らし続ける。
+    /// タイプライターSEのループ再生を始める。既に同じ種類を再生中なら頭から鳴らし直さず、
+    /// そのまま鳴らし続ける。別の種類が鳴っていれば、それを止めてから鳴らし直す。
     /// BGM用のSinkには触れない
-    fn play_typewriter_loop(&self) {
-        if self.typewriter_looping.replace(true) {
+    fn play_typewriter_loop(&self, kind: TypewriterSeKind) {
+        if self.typewriter_looping.replace(Some(kind)) == Some(kind) {
             return;
+        }
+        if let Some(sink) = self.typewriter_sink.borrow_mut().take() {
+            sink.stop();
         }
         let Some((_, stream_handle)) = &self.handle else {
             return;
@@ -353,12 +372,12 @@ impl RodioPlayer {
         let Ok(sink) = Sink::try_new(stream_handle) else {
             return;
         };
-        self.start_typewriter_sink(sink);
+        self.start_typewriter_sink(sink, kind);
     }
 
     /// sinkにループさせたタイプライターSEを入れ、止める時のために保持する
-    fn start_typewriter_sink(&self, sink: Sink) {
-        if let Some(source) = typewriter_loop_source() {
+    fn start_typewriter_sink(&self, sink: Sink, kind: TypewriterSeKind) {
+        if let Some(source) = typewriter_loop_source(kind) {
             sink.append(source);
             *self.typewriter_sink.borrow_mut() = Some(sink);
         }
@@ -366,7 +385,7 @@ impl RodioPlayer {
 
     /// タイプライターSEのループ再生を止める。BGM用のSinkには触れない
     fn stop_typewriter_loop(&self) {
-        self.typewriter_looping.set(false);
+        self.typewriter_looping.set(None);
         if let Some(sink) = self.typewriter_sink.borrow_mut().take() {
             sink.stop();
         }
@@ -374,7 +393,7 @@ impl RodioPlayer {
 
     #[cfg(test)]
     fn is_typewriter_loop_playing(&self) -> bool {
-        self.typewriter_looping.get()
+        self.typewriter_looping.get().is_some()
     }
 }
 
@@ -400,9 +419,9 @@ pub fn stop_bgm() {
     PLAYER.with(|p| p.borrow().stop_bgm());
 }
 
-/// タイプライターSEのループ再生を始める(BGMとは独立。既に再生中ならそのまま鳴らし続ける)
-pub fn play_typewriter_loop() {
-    PLAYER.with(|p| p.borrow().play_typewriter_loop());
+/// タイプライターSEのループ再生を始める(BGMとは独立。既に同じ種類を再生中ならそのまま鳴らし続ける)
+pub fn play_typewriter_loop(kind: TypewriterSeKind) {
+    PLAYER.with(|p| p.borrow().play_typewriter_loop(kind));
 }
 
 /// タイプライターSEのループ再生を止める(BGMは止めない)
@@ -414,6 +433,12 @@ pub fn stop_typewriter_loop() {
 #[cfg(test)]
 pub fn is_typewriter_loop_playing() -> bool {
     PLAYER.with(|p| p.borrow().is_typewriter_loop_playing())
+}
+
+/// 現在ループ再生中のタイプライターSEの種類(テストでの確認用。鳴っていなければNone)
+#[cfg(test)]
+pub fn playing_typewriter_kind() -> Option<TypewriterSeKind> {
+    PLAYER.with(|p| p.borrow().typewriter_looping.get())
 }
 
 #[cfg(test)]
@@ -499,24 +524,35 @@ mod tests {
     }
 
     #[test]
-    fn typewriter_se_asset_is_embedded_and_decodable() {
-        let file =
-            Assets::get(TYPEWRITER_SE_PATH).expect("se_typewriter.mp3が埋め込まれていること");
-        assert!(
-            rodio::Decoder::new(Cursor::new(file.data.into_owned())).is_ok(),
-            "mp3としてデコードできること"
+    fn typewriter_se_assets_are_embedded_and_decodable() {
+        for kind in [TypewriterSeKind::Menu, TypewriterSeKind::Result] {
+            let file = Assets::get(kind.asset_path())
+                .unwrap_or_else(|| panic!("{}が埋め込まれていること", kind.asset_path()));
+            assert!(
+                rodio::Decoder::new(Cursor::new(file.data.into_owned())).is_ok(),
+                "{:?}: mp3としてデコードできること",
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn typewriter_se_assets_are_distinct() {
+        assert_ne!(
+            TypewriterSeKind::Menu.asset_path(),
+            TypewriterSeKind::Result.asset_path()
         );
     }
 
     #[test]
     fn typewriter_loop_source_repeats_the_se_endlessly() {
         // 1回分の長さを超えて取り出しても途切れない(repeat_infiniteでループしている)
-        let file = Assets::get(TYPEWRITER_SE_PATH).unwrap();
+        let file = Assets::get(TypewriterSeKind::Menu.asset_path()).unwrap();
         let one_pass = rodio::Decoder::new(Cursor::new(file.data.into_owned()))
             .unwrap()
             .count();
         assert!(one_pass > 0, "無音(空)ではないこと");
-        let looped = typewriter_loop_source()
+        let looped = typewriter_loop_source(TypewriterSeKind::Menu)
             .expect("ループ用の音源を作れること")
             .take(one_pass * 3)
             .count();
@@ -532,9 +568,9 @@ mod tests {
     #[test]
     fn play_and_stop_typewriter_loop_switch_its_state_without_audio_device() {
         let player = RodioPlayer::without_device();
-        player.play_typewriter_loop();
+        player.play_typewriter_loop(TypewriterSeKind::Menu);
         assert!(player.is_typewriter_loop_playing(), "再生中になる");
-        player.play_typewriter_loop();
+        player.play_typewriter_loop(TypewriterSeKind::Menu);
         assert!(
             player.is_typewriter_loop_playing(),
             "続けて呼んでも再生中のまま"
@@ -549,10 +585,26 @@ mod tests {
     }
 
     #[test]
+    fn play_typewriter_loop_with_a_different_kind_restarts_it() {
+        let player = RodioPlayer::without_device();
+        player.play_typewriter_loop(TypewriterSeKind::Menu);
+        assert_eq!(
+            player.typewriter_looping.get(),
+            Some(TypewriterSeKind::Menu)
+        );
+        player.play_typewriter_loop(TypewriterSeKind::Result);
+        assert_eq!(
+            player.typewriter_looping.get(),
+            Some(TypewriterSeKind::Result),
+            "別の種類に切り替わる"
+        );
+    }
+
+    #[test]
     fn start_typewriter_sink_appends_the_loop_and_keeps_the_sink() {
         let player = RodioPlayer::without_device();
         let (sink, _output) = Sink::new_idle();
-        player.start_typewriter_sink(sink);
+        player.start_typewriter_sink(sink, TypewriterSeKind::Menu);
         let guard = player.typewriter_sink.borrow();
         let sink = guard.as_ref().expect("Sinkを保持している");
         assert!(!sink.empty(), "ループ用の音源が入っている");
@@ -563,9 +615,9 @@ mod tests {
         let player = RodioPlayer::without_device();
         let (bgm, _bgm_output) = idle_sink_with_sound();
         *player.bgm_sink.borrow_mut() = Some(bgm);
-        player.play_typewriter_loop();
+        player.play_typewriter_loop(TypewriterSeKind::Menu);
         let (typewriter, _typewriter_output) = Sink::new_idle();
-        player.start_typewriter_sink(typewriter);
+        player.start_typewriter_sink(typewriter, TypewriterSeKind::Menu);
 
         player.stop_typewriter_loop();
         assert!(
@@ -580,9 +632,9 @@ mod tests {
     #[test]
     fn stopping_or_switching_bgm_does_not_stop_the_typewriter_loop() {
         let player = RodioPlayer::without_device();
-        player.play_typewriter_loop();
+        player.play_typewriter_loop(TypewriterSeKind::Menu);
         let (typewriter, _output) = Sink::new_idle();
-        player.start_typewriter_sink(typewriter);
+        player.start_typewriter_sink(typewriter, TypewriterSeKind::Menu);
         let (bgm, _bgm_output) = idle_sink_with_sound();
         *player.bgm_sink.borrow_mut() = Some(bgm);
 
@@ -599,7 +651,7 @@ mod tests {
         // 公開関数(スレッドごとのPLAYER)経由でも、BGMの停止・切り替えで状態が変わらない
         stop_typewriter_loop();
         assert!(!is_typewriter_loop_playing());
-        play_typewriter_loop();
+        play_typewriter_loop(TypewriterSeKind::Menu);
         assert!(is_typewriter_loop_playing());
         stop_bgm();
         play_bgm_track("Calculated_Play");
