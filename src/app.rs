@@ -112,6 +112,8 @@ pub enum Screen {
     /// 起動直後のタイトル画面。Enterを押すとMenuへ進む
     Splash,
     Menu,
+    /// 「べー」開始前に挟む専用スプラッシュ画面。Enter/クリックでべーが始まる
+    BeigomaSplash,
     /// リズムゲームの曲選択(選択中の曲 = SONGSのインデックス)。
     /// TTRスプラッシュ画像を背景に、その上へ曲リストのパネルを重ねて描く
     SelectSong(usize),
@@ -148,6 +150,8 @@ pub struct App {
     splash_renderer: SplashRenderer,
     /// 曲選択画面(Screen::SelectSong)の背景に描くTTRスプラッシュ画像用
     ttr_splash_renderer: SplashRenderer,
+    /// 「べー」開始前のスプラッシュ画面(Screen::BeigomaSplash)用
+    beigoma_splash_renderer: SplashRenderer,
     /// メニューへ戻った直後にtrueになる。main.rsがtake_pending_scrollback_clear()で
     /// 検知して端末のスクロールバッファをクリアする(画像プロトコルの残留対策)
     pending_scrollback_clear: bool,
@@ -180,6 +184,10 @@ impl App {
             ttr_splash_renderer: SplashRenderer::new(
                 splash::TTR_SPLASH_IMAGE_PATH,
                 splash::TTR_FALLBACK,
+            ),
+            beigoma_splash_renderer: SplashRenderer::new(
+                splash::BEIGOMA_SPLASH_IMAGE_PATH,
+                splash::BEIGOMA_FALLBACK,
             ),
             pending_scrollback_clear: false,
             // 画面に入る時(enter_menu/show_result)にリセットするので、それまでは表示済みにしておく
@@ -239,6 +247,11 @@ impl App {
             Screen::Splash => {
                 if matches!(key.code, KeyCode::Enter) {
                     self.leave_splash();
+                }
+            }
+            Screen::BeigomaSplash => {
+                if matches!(key.code, KeyCode::Enter) {
+                    self.leave_beigoma_splash();
                 }
             }
             Screen::Menu => self.handle_menu_key(key),
@@ -306,6 +319,9 @@ impl App {
             Screen::Splash => {
                 self.leave_splash();
             }
+            Screen::BeigomaSplash => {
+                self.leave_beigoma_splash();
+            }
             Screen::Menu => {
                 let offset = self.menu_state.row_offset;
                 if let Some(index) = menu_card_at(screen, offset, mouse.column, mouse.row) {
@@ -344,6 +360,12 @@ impl App {
     fn leave_splash(&mut self) {
         audio::play_se(SeKind::Confirm);
         self.enter_menu();
+    }
+
+    /// べースプラッシュ画面からべーを開始する(Enter/クリック共通)
+    fn leave_beigoma_splash(&mut self) {
+        audio::play_se(SeKind::Confirm);
+        self.start_beigoma();
     }
 
     /// ゲーム終了後、リザルト画面へ進む(キー/クリック共通)。リザルト用BGMに切り替える。
@@ -391,9 +413,10 @@ impl App {
             return;
         }
         if selected == BEIGOMA_ITEM_INDEX {
-            // べーも難易度を持たず、ROUND1・ROUND2が固定の内容で進むため、難易度選択を挟まない。
-            // ROUNDごとに自前の「3.2.1.GO!!」を持つため、画面遷移側のカウントダウンも挟まない
-            self.start_beigoma();
+            // べーは難易度選択の代わりに専用スプラッシュ画面を挟む(TTRと同じ仕組み)。
+            // Enter/クリックでstart_beigoma()が呼ばれ、ROUND1のカウントダウンから始まる
+            audio::play_se(SeKind::Transition);
+            self.screen = Screen::BeigomaSplash;
             return;
         }
         if selected == MEMORY_ITEM_INDEX {
@@ -643,6 +666,13 @@ impl App {
                 let inner = block.inner(screen);
                 frame.render_widget(block, screen);
                 self.splash_renderer.render(frame, inner);
+            }
+            Screen::BeigomaSplash => {
+                let screen = render_background(frame, background, area);
+                let block = theme::panel("");
+                let inner = block.inner(screen);
+                frame.render_widget(block, screen);
+                self.beigoma_splash_renderer.render(frame, inner);
             }
             Screen::Menu => {
                 let screen = render_background(frame, background, area);
@@ -2119,9 +2149,34 @@ mod tests {
     }
 
     #[test]
-    fn selecting_beigoma_skips_difficulty_and_the_outer_countdown() {
+    fn selecting_beigoma_shows_the_splash_screen_first() {
         let mut app = App::new();
         app.select_menu_item(BEIGOMA_ITEM_INDEX);
+        assert!(
+            matches!(app.screen, Screen::BeigomaSplash),
+            "難易度選択の代わりに専用スプラッシュ画面を挟む"
+        );
+    }
+
+    #[test]
+    fn enter_on_beigoma_splash_skips_difficulty_and_the_outer_countdown() {
+        let mut app = App::new();
+        app.select_menu_item(BEIGOMA_ITEM_INDEX);
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_beigoma_round1_countdown_in_game(&mut app);
+    }
+
+    #[test]
+    fn clicking_beigoma_splash_also_starts_the_game() {
+        let mut app = App::new();
+        app.select_menu_item(BEIGOMA_ITEM_INDEX);
+        app.last_area = rect(0, 0, 40, 12);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
         assert_beigoma_round1_countdown_in_game(&mut app);
     }
 
@@ -2130,6 +2185,11 @@ mod tests {
         let mut app = App::new();
         app.screen = Screen::Menu;
         app.menu_state.select(BEIGOMA_ITEM_INDEX);
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(app.screen, Screen::BeigomaSplash),
+            "メニューからのEnterはまずスプラッシュ画面を挟む"
+        );
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         assert_beigoma_round1_countdown_in_game(&mut app);
     }
