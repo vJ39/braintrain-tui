@@ -69,13 +69,13 @@ pub struct TopView {
     pub airborne: bool,
     /// 回転の見た目のコマ(テキスト表示のみ。画像では再エンコードを避けるため使わない)
     pub spin_frame: usize,
-    /// 場外・吹っ飛びGAME OVERの「キラーン」演出のコマ(Noneなら通常のベーゴマを描く)
+    /// 場外・吹っ飛びGAME OVERの星の演出のコマ(Noneなら通常のベーゴマを描く)
     pub star_frame: Option<usize>,
 }
 
-/// 「キラーン」演出のコマ(だんだん小さくなり、最後は消える)
+/// 星の演出のコマ(だんだん小さくなり、最後は消える)
 pub const STAR_ANIM_GLYPHS: [&str; 4] = ["★", "☆", "✦", "･"];
-/// 「キラーン」演出の1コマの表示時間
+/// 星の演出の1コマの表示時間
 pub const STAR_ANIM_FRAME: Duration = Duration::from_millis(180);
 
 /// 盤を描く範囲とマスの大きさ(セル)
@@ -237,7 +237,7 @@ impl BoardRenderer {
         let Some(layout) = board_area(area) else {
             return;
         };
-        // 「キラーン」演出中は画像のパッチ更新に乗せず、テキストで星を描く
+        // 星の演出中は画像のパッチ更新に乗せず、テキストで星を描く
         if top.star_frame.is_none() && self.render_image(frame, area, layout, board, top) {
             return;
         }

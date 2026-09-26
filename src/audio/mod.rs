@@ -28,7 +28,7 @@ pub enum SeKind {
     Transition,
     /// タイトル画面(Splash)でEnter/クリックした時の決定音
     Confirm,
-    /// 「べー」でベーゴマが盤外に吹っ飛んだ時の「キラーン」という星の音
+    /// 「べー」でベーゴマが盤外に吹っ飛んだ時の「ふいっ」という星の音
     Star,
 }
 
@@ -149,21 +149,18 @@ fn buzz_source() -> impl Source<Item = f32> {
     rodio::buffer::SamplesBuffer::new(1, BUZZ_SAMPLE_RATE, samples)
 }
 
-/// 「キラーン」音のサンプリングレート
-const KIRAN_SAMPLE_RATE: u32 = 44100;
+/// 「ふいっ」音のサンプリングレート
+const WHOOSH_SAMPLE_RATE: u32 = 44100;
 /// 立ち上がり(アタック)の時間。定常音にならないよう、すぐに減衰へ移る
-const KIRAN_ATTACK_SECS: f32 = 0.003;
-/// 「キラーン」の各音(start_freq, end_freq, duration_ms, decay, volume, delay_ms)。
-/// AQUATERM(vJ39/aquaterm)のスター取得音(SfxEvent::StarPickup)の質感を参考にした、
-/// 周波数スイープ+指数減衰による、明るく上昇する2音のキラキラしたアルペジオ
-const KIRAN_TONES: [(f32, f32, u64, f32, f32, u64); 2] = [
-    (900.0, 1300.0, 70, 20.0, 0.20, 0),
-    (1300.0, 1700.0, 90, 16.0, 0.18, 60),
-];
+const WHOOSH_ATTACK_SECS: f32 = 0.003;
+/// 「ふいっ」の各音(start_freq, end_freq, duration_ms, decay, volume, delay_ms)。
+/// 高い音から低い音へ一瞬で抜ける下降スイープ+速い減衰で、
+/// 何かがすっと消え去る「ふいっ」という質感にする
+const WHOOSH_TONES: [(f32, f32, u64, f32, f32, u64); 1] = [(2200.0, 300.0, 110, 18.0, 0.24, 0)];
 
 /// 1音ぶんの波形をbufferのdelay_ms位置から加算する(周波数は指数補間でスイープさせ、
 /// アタック→指数減衰のエンベロープをかける)
-fn add_kiran_tone(
+fn add_whoosh_tone(
     buffer: &mut [f32],
     start_freq: f32,
     end_freq: f32,
@@ -172,22 +169,22 @@ fn add_kiran_tone(
     volume: f32,
     delay_ms: u64,
 ) {
-    let delay_samples = (KIRAN_SAMPLE_RATE as u64 * delay_ms / 1000) as usize;
-    let tone_samples = (KIRAN_SAMPLE_RATE as u64 * duration_ms / 1000).max(1) as usize;
+    let delay_samples = (WHOOSH_SAMPLE_RATE as u64 * delay_ms / 1000) as usize;
+    let tone_samples = (WHOOSH_SAMPLE_RATE as u64 * duration_ms / 1000).max(1) as usize;
     let ratio = (end_freq / start_freq).max(1e-6);
     let mut phase = 0.0f32;
     for i in 0..tone_samples {
-        let t = i as f32 / KIRAN_SAMPLE_RATE as f32;
+        let t = i as f32 / WHOOSH_SAMPLE_RATE as f32;
         let progress = (i as f32 / tone_samples as f32).clamp(0.0, 1.0);
         let freq_now = start_freq * ratio.powf(progress);
-        phase += 2.0 * std::f32::consts::PI * freq_now / KIRAN_SAMPLE_RATE as f32;
+        phase += 2.0 * std::f32::consts::PI * freq_now / WHOOSH_SAMPLE_RATE as f32;
         if phase > 2.0 * std::f32::consts::PI {
             phase -= 2.0 * std::f32::consts::PI;
         }
-        let envelope = if t < KIRAN_ATTACK_SECS {
-            t / KIRAN_ATTACK_SECS
+        let envelope = if t < WHOOSH_ATTACK_SECS {
+            t / WHOOSH_ATTACK_SECS
         } else {
-            (-decay * (t - KIRAN_ATTACK_SECS)).exp()
+            (-decay * (t - WHOOSH_ATTACK_SECS)).exp()
         };
         if let Some(sample) = buffer.get_mut(delay_samples + i) {
             *sample += phase.sin() * envelope * volume;
@@ -195,17 +192,17 @@ fn add_kiran_tone(
     }
 }
 
-/// 「キラーン」という星のキラキラ音。「べー」でベーゴマが盤外に吹っ飛んだ時に鳴らす
-fn kiran_source() -> impl Source<Item = f32> {
-    let total_ms = KIRAN_TONES
+/// 「ふいっ」という、何かがすっと消え去る音。「べー」でベーゴマが盤外に吹っ飛んだ時に鳴らす
+fn whoosh_source() -> impl Source<Item = f32> {
+    let total_ms = WHOOSH_TONES
         .iter()
         .map(|&(_, _, duration_ms, _, _, delay_ms)| duration_ms + delay_ms)
         .max()
         .unwrap_or(0);
-    let total_samples = (KIRAN_SAMPLE_RATE as u64 * total_ms / 1000).max(1) as usize;
+    let total_samples = (WHOOSH_SAMPLE_RATE as u64 * total_ms / 1000).max(1) as usize;
     let mut samples = vec![0.0f32; total_samples];
-    for &(start_freq, end_freq, duration_ms, decay, volume, delay_ms) in &KIRAN_TONES {
-        add_kiran_tone(
+    for &(start_freq, end_freq, duration_ms, decay, volume, delay_ms) in &WHOOSH_TONES {
+        add_whoosh_tone(
             &mut samples,
             start_freq,
             end_freq,
@@ -215,7 +212,7 @@ fn kiran_source() -> impl Source<Item = f32> {
             delay_ms,
         );
     }
-    rodio::buffer::SamplesBuffer::new(1, KIRAN_SAMPLE_RATE, samples)
+    rodio::buffer::SamplesBuffer::new(1, WHOOSH_SAMPLE_RATE, samples)
 }
 
 /// 実際にrodioで音声デバイスへ再生するプレイヤー。
@@ -246,7 +243,7 @@ impl RodioPlayer {
         let Some(path) = se.asset_path() else {
             match se {
                 SeKind::Incorrect => sink.append(buzz_source()),
-                SeKind::Star => sink.append(kiran_source()),
+                SeKind::Star => sink.append(whoosh_source()),
                 _ => return,
             }
             sink.detach();
@@ -456,41 +453,41 @@ mod tests {
         player.play_se(SeKind::Incorrect);
     }
 
-    // --- 生成音(「キラーン」音) ---
+    // --- 生成音(「ふいっ」という音) ---
 
     #[test]
-    fn kiran_tones_are_defined_as_rising_pitches() {
-        for &(start_freq, end_freq, ..) in &KIRAN_TONES {
+    fn whoosh_tones_sweep_downward() {
+        for &(start_freq, end_freq, ..) in &WHOOSH_TONES {
             assert!(
-                end_freq > start_freq,
-                "「キラーン」の各音は上昇するアルペジオ"
+                start_freq > end_freq,
+                "「ふいっ」は高い音から低い音へ抜けるように下降する"
             );
         }
     }
 
     #[test]
-    fn kiran_source_is_mono_at_expected_sample_rate() {
-        let source = kiran_source();
+    fn whoosh_source_is_mono_at_expected_sample_rate() {
+        let source = whoosh_source();
         assert_eq!(source.channels(), 1);
-        assert_eq!(source.sample_rate(), KIRAN_SAMPLE_RATE);
+        assert_eq!(source.sample_rate(), WHOOSH_SAMPLE_RATE);
     }
 
     #[test]
-    fn kiran_source_is_not_silent_but_quieter_than_full_volume_se() {
-        let peak = kiran_source().map(f32::abs).fold(0.0_f32, f32::max);
+    fn whoosh_source_is_not_silent_but_quieter_than_full_volume_se() {
+        let peak = whoosh_source().map(f32::abs).fold(0.0_f32, f32::max);
         assert!(peak > 0.0, "無音ではないこと");
         assert!(peak < 1.0, "振幅{peak}が元の振幅(1.0)より小さいこと");
     }
 
     #[test]
-    fn kiran_source_length_matches_the_last_tone_ending() {
+    fn whoosh_source_length_matches_the_last_tone_ending() {
         // 総サンプル数は、最後に終わる音(delay_ms + duration_ms)に一致する
-        let expected_ms = KIRAN_TONES
+        let expected_ms = WHOOSH_TONES
             .iter()
             .map(|&(_, _, duration_ms, _, _, delay_ms)| duration_ms + delay_ms)
             .max()
             .unwrap();
-        let source = kiran_source();
+        let source = whoosh_source();
         let rate = source.sample_rate() as u128;
         let expected = rate * expected_ms as u128 / 1000;
         let count = source.count() as u128;
@@ -498,6 +495,15 @@ mod tests {
             count + 1 >= expected && count <= expected + 1,
             "サンプル数{count}(期待値{expected})"
         );
+    }
+
+    #[test]
+    fn whoosh_source_is_short_enough_to_feel_instantaneous() {
+        // 「ふいっ」は一瞬で消える音なので、200msを超えるような長い音にはしない
+        let source = whoosh_source();
+        let rate = source.sample_rate() as u128;
+        let duration_ms = source.count() as u128 * 1000 / rate;
+        assert!(duration_ms <= 200, "{duration_ms}msは長すぎる");
     }
 
     #[test]

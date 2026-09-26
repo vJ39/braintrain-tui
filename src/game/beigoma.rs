@@ -232,7 +232,7 @@ impl BeigomaGame {
             Outcome::Flown | Outcome::TimeUp => (false, TIME_LIMIT),
         };
         self.tracker.record(success, latency.as_millis() as f64);
-        // 場外・吹っ飛びは専用の「キラーン」音、時間切れは従来のブザー音のまま
+        // 場外・吹っ飛びは専用の「ふいっ」という音、時間切れは従来のブザー音のまま
         audio::play_se(match outcome {
             Outcome::Cleared { .. } => SeKind::Correct,
             Outcome::Flown => SeKind::Star,
@@ -250,7 +250,7 @@ impl BeigomaGame {
             % render::TOP_SPIN_GLYPHS.len()
     }
 
-    /// 場外・吹っ飛びGAME OVERの「キラーン」演出のコマ(それ以外はNone)
+    /// 場外・吹っ飛びGAME OVERの星の演出のコマ(それ以外はNone)
     fn star_frame(&self) -> Option<usize> {
         let Status::Ended {
             outcome: Outcome::Flown,
