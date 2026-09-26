@@ -63,11 +63,11 @@ const MESSAGE_HOLD: Duration = Duration::from_millis(900);
 /// 物理を進める1ステップの上限。大きなdtはこの長さに分けて進める(マスの飛び越し防止)
 const MAX_STEP: Duration = Duration::from_millis(10);
 
-/// ベーゴマの回転の見た目が1コマ進む間隔。8コマで1周280ms(従来の4コマ×70msと同じ速さ)
-const SPIN_FRAME_INTERVAL: Duration = Duration::from_millis(35);
+/// ベーゴマの回転の見た目が1コマ進む間隔。8コマで1周64ms(実物の高速回転に近づける。#205)
+const SPIN_FRAME_INTERVAL: Duration = Duration::from_millis(8);
 
 /// 吹っ飛んで飛んでいる間の回転の見た目が1コマ進む間隔。転がっている時の2倍以上の速さで回す
-const FLY_SPIN_FRAME_INTERVAL: Duration = Duration::from_millis(15);
+const FLY_SPIN_FRAME_INTERVAL: Duration = Duration::from_millis(4);
 
 /// 吹っ飛んで飛んでいる間、描く位置を進む向きの左右へ振る幅(マス)と、1往復の周期
 const FLY_WOBBLE: f64 = 0.8;
@@ -937,12 +937,11 @@ mod tests {
 
     #[test]
     fn spin_frame_interval_is_fast_enough_to_look_energetic() {
-        // 回転をもっと激しく見せるため、1周の長さは4コマ×70ms(#129)のまま、コマ数を増やして滑らかにする
-        assert_eq!(SPIN_FRAME_INTERVAL, Duration::from_millis(35));
+        // 実物のベーゴマは高速回転するため、1周64ms(秒間15.6周)まで速める(#205)
+        assert_eq!(SPIN_FRAME_INTERVAL, Duration::from_millis(8));
         assert_eq!(
             SPIN_FRAME_INTERVAL * render::TOP_SPIN_GLYPHS.len() as u32,
-            Duration::from_millis(280),
-            "1周の長さは変えない"
+            Duration::from_millis(64),
         );
     }
 
