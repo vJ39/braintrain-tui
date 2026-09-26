@@ -79,10 +79,12 @@ fn feint_headline() -> String {
 
 /// 合図(「撃て!」)の画像。黒い文字・透明背景の正方形
 const SIGNAL_PNG: &[u8] = include_bytes!("../../assets/image/quick_draw/utte.png");
+/// フェイント(「撃つな」)の画像。本物の合図と同じフォントサイズで見分けられるようにする
+const FEINT_PNG: &[u8] = include_bytes!("../../assets/image/quick_draw/utsuna.png");
 
-/// 合図の画像を読み込む。読めない場合はNone
-fn load_signal_image() -> Option<RgbaImage> {
-    let image = image::load_from_memory(SIGNAL_PNG).ok()?;
+/// 見出しの画像(bytes)を読み込む。読めない場合はNone
+fn load_glyph_image(bytes: &[u8]) -> Option<RgbaImage> {
+    let image = image::load_from_memory(bytes).ok()?;
     Some(image.to_rgba8())
 }
 
@@ -107,9 +109,11 @@ struct SignalCache {
     protocol: StatefulProtocol,
 }
 
-/// 合図(「撃て!」)の描画器。画像プロトコルが使える端末では画像で大きく表示する
+/// 見出し画像(「撃て!」・「撃つな」)の描画器。画像プロトコルが使える端末では画像で大きく表示する。
+/// 表示する画像(image_bytes)を指定して作るので、本物の合図・フェイントで共用できる
 struct SignalRenderer {
     picker: Option<Picker>,
+    image_bytes: &'static [u8],
     /// 直前に読み込んだ画像。描画範囲の計算に画像の寸法が要るので、
     /// 毎フレームPNGを読み直さないよう持っておく
     glyph: RefCell<Option<RgbaImage>>,
@@ -117,14 +121,15 @@ struct SignalRenderer {
 }
 
 impl SignalRenderer {
-    fn new() -> Self {
-        Self::with_picker(detect_picker())
+    fn new(image_bytes: &'static [u8]) -> Self {
+        Self::with_picker(detect_picker(), image_bytes)
     }
 
     /// 画像プロトコルを指定して作る(None=テキスト表示)。テストで使う
-    fn with_picker(picker: Option<Picker>) -> Self {
+    fn with_picker(picker: Option<Picker>, image_bytes: &'static [u8]) -> Self {
         Self {
             picker,
+            image_bytes,
             glyph: RefCell::new(None),
             cache: RefCell::new(None),
         }
@@ -136,7 +141,7 @@ impl SignalRenderer {
         self.picker.is_some()
     }
 
-    /// areaの中央に合図の画像を描く。画像プロトコルが使えない/画像が読めない/
+    /// areaの中央に見出しの画像を描く。画像プロトコルが使えない/画像が読めない/
     /// 描く場所が無い場合は何もせずfalse(呼び出し側がテキスト表示に切り替える)
     fn render(&self, frame: &mut Frame, area: Rect, background: Color) -> bool {
         let Color::Rgb(r, g, b) = background else {
@@ -147,7 +152,7 @@ impl SignalRenderer {
         };
         let mut glyph_cache = self.glyph.borrow_mut();
         if glyph_cache.is_none() {
-            let Some(image) = load_signal_image() else {
+            let Some(image) = load_glyph_image(self.image_bytes) else {
                 return false;
             };
             *glyph_cache = Some(image);
@@ -299,6 +304,8 @@ pub struct QuickDrawGame {
     mark_renderer: MarkRenderer,
     /// 合図(「撃て!」)の描画器
     signal_renderer: SignalRenderer,
+    /// フェイント(「撃つな」)の描画器
+    feint_renderer: SignalRenderer,
 }
 
 impl QuickDrawGame {
@@ -311,7 +318,8 @@ impl QuickDrawGame {
             pattern: WaitPattern::Normal,
             feedback: AnswerFeedback::new(),
             mark_renderer: MarkRenderer::new(),
-            signal_renderer: SignalRenderer::new(),
+            signal_renderer: SignalRenderer::new(SIGNAL_PNG),
+            feint_renderer: SignalRenderer::new(FEINT_PNG),
         };
         game.start_round();
         game
@@ -328,15 +336,16 @@ impl QuickDrawGame {
         self.phase = Phase::Countdown { state };
     }
 
-    /// キー/クリックで押された時の処理。合図前(カウントダウン中・待機中)ならフライング、
-    /// 合図後なら反応時間を記録する。押した後はまず結果表示(◯/✗)に入り、
+    /// キー/クリックで押された時の処理。カウントダウン中の入力は受け付けない(無視する)。
+    /// 待機中ならフライング、合図後なら反応時間を記録する。押した後はまず結果表示(◯/✗)に入り、
     /// 結果表示中の入力は無視する(次のラウンドへの誤入力を防ぐ)
     fn press(&mut self) {
         if self.is_finished() {
             return;
         }
         let (is_correct, latency_ms) = match &self.phase {
-            Phase::Countdown { .. } | Phase::Waiting { .. } | Phase::Feint { .. } => {
+            Phase::Countdown { .. } | Phase::Result { .. } => return,
+            Phase::Waiting { .. } | Phase::Feint { .. } => {
                 self.tracker.record(false, self.pattern.fail_latency_ms());
                 self.feedback.record(false, "フライング");
                 audio::play_se(SeKind::Incorrect);
@@ -349,7 +358,6 @@ impl QuickDrawGame {
                 audio::play_se(SeKind::Correct);
                 (true, Some(latency_ms))
             }
-            Phase::Result { .. } => return,
         };
         self.phase = Phase::Result {
             is_correct,
@@ -388,11 +396,16 @@ impl QuickDrawGame {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        // 画像(SIGNAL_PNG)は「撃て!」専用なので、本物の合図でだけ使う
-        if matches!(self.phase, Phase::Signal { .. })
-            && self.signal_renderer.render(frame, inner, background)
-        {
-            return;
+        // フェイントも本物の合図と同じフォントサイズ(画像表示)にする。専用画像(FEINT_PNG)を使う
+        let image_renderer = match self.phase {
+            Phase::Signal { .. } => Some(&self.signal_renderer),
+            Phase::Feint { .. } => Some(&self.feint_renderer),
+            _ => None,
+        };
+        if let Some(renderer) = image_renderer {
+            if renderer.render(frame, inner, background) {
+                return;
+            }
         }
 
         let mut lines = vec![Line::from(Span::styled(
@@ -875,37 +888,32 @@ mod tests {
     }
 
     #[test]
-    fn key_during_countdown_is_false_start() {
-        // カウントダウン中もまだ合図が出ていないので、待機中と同じくフライング
+    fn key_during_countdown_is_ignored() {
+        // カウントダウン中の入力は受け付けない(フライングにもしない)
         for pattern in ALL_PATTERNS {
             let mut game = QuickDrawGame::new();
             game.pattern = pattern;
             game.update(PHASE_DURATION * 3); // GO!!の表示中
             assert!(is_countdown(&game));
             game.handle_key(key(KeyCode::Char(' ')));
+            assert!(is_countdown(&game), "{pattern:?}: カウントダウンが続く");
             let result = game.result();
-            assert_eq!(result.total, 1, "{pattern:?}");
-            assert_eq!(
-                result.correct, 0,
-                "{pattern:?}: カウントダウン中の入力は失敗"
+            assert_eq!(result.total, 0, "{pattern:?}: 記録されない");
+            assert!(
+                game.feedback.current().is_none(),
+                "{pattern:?}: フィードバックも出さない"
             );
-            assert_eq!(result.avg_latency_ms, pattern.fail_latency_ms());
-            assert!(!game.is_finished(), "{pattern:?}: GAME OVERにはならない");
-            let flash = game
-                .feedback
-                .current()
-                .expect("フライング直後は結果を表示する");
-            assert!(flash.detail.contains("フライング"), "{}", flash.detail);
         }
     }
 
     #[test]
-    fn click_during_countdown_is_false_start() {
+    fn click_during_countdown_is_ignored() {
         let mut game = QuickDrawGame::new();
+        assert!(is_countdown(&game));
         game.handle_mouse(left_click(10, 10), AREA);
+        assert!(is_countdown(&game), "カウントダウンが続く");
         let result = game.result();
-        assert_eq!(result.total, 1);
-        assert_eq!(result.correct, 0);
+        assert_eq!(result.total, 0, "記録されない");
     }
 
     #[test]
@@ -1195,6 +1203,7 @@ mod tests {
     fn mixed_session_averages_reaction_and_penalty() {
         let mut game = QuickDrawGame::new();
         game.pattern = WaitPattern::Normal;
+        finish_countdown(&mut game);
         game.handle_key(key(KeyCode::Enter)); // フライング(ペナルティ4000ms)
         show_signal_since(&mut game, ms(300));
         game.handle_key(key(KeyCode::Enter));
@@ -1215,6 +1224,7 @@ mod tests {
     fn input_after_session_finished_is_ignored() {
         let mut game = QuickDrawGame::new();
         for round in 0..ROUNDS_PER_SESSION {
+            finish_countdown(&mut game);
             game.handle_key(key(KeyCode::Enter));
             if round + 1 < ROUNDS_PER_SESSION {
                 finish_result(&mut game);
@@ -1419,22 +1429,23 @@ mod tests {
         picker
     }
 
-    /// 画像プロトコルを固定したPickerで、合図の描画器を作り直す
+    /// 画像プロトコルを固定したPickerで、合図とフェイントの描画器を作り直す
     fn use_picker(game: &mut QuickDrawGame, protocol: ProtocolType) {
         let mut picker = Picker::from_fontsize((10, 20));
         picker.set_protocol_type(protocol);
-        game.signal_renderer = SignalRenderer::with_picker(Some(picker));
+        game.signal_renderer = SignalRenderer::with_picker(Some(picker.clone()), SIGNAL_PNG);
+        game.feint_renderer = SignalRenderer::with_picker(Some(picker), FEINT_PNG);
     }
 
     #[test]
     fn signal_image_asset_is_embedded_and_decodes() {
-        let image = load_signal_image().expect("「撃て!」の画像が埋め込まれていること");
+        let image = load_glyph_image(SIGNAL_PNG).expect("「撃て!」の画像が埋め込まれていること");
         assert_eq!(image.dimensions(), (512, 512), "正方形");
     }
 
     #[test]
     fn signal_renderer_without_picker_falls_back_to_text() {
-        let renderer = SignalRenderer::with_picker(None);
+        let renderer = SignalRenderer::with_picker(None, SIGNAL_PNG);
         assert!(!renderer.uses_image());
         let mut terminal = Terminal::new(TestBackend::new(20, 10)).unwrap();
         let mut drawn_as_image = false;
@@ -1448,7 +1459,7 @@ mod tests {
 
     #[test]
     fn signal_renderer_with_picker_draws_the_image_inside_the_area() {
-        let renderer = SignalRenderer::with_picker(Some(halfblocks_picker()));
+        let renderer = SignalRenderer::with_picker(Some(halfblocks_picker()), SIGNAL_PNG);
         assert!(renderer.uses_image());
         let area = Rect::new(2, 3, 40, 12);
         let mut terminal = Terminal::new(TestBackend::new(area.right(), area.bottom())).unwrap();
@@ -1473,6 +1484,37 @@ mod tests {
         assert!(
             !text.contains(SIGNAL_TEXT),
             "画像で描く時は文字間を広げたテキスト見出しを出さない: {text}"
+        );
+    }
+
+    #[test]
+    fn feint_image_asset_is_embedded_and_decodes() {
+        let image = load_glyph_image(FEINT_PNG).expect("「撃つな」の画像が埋め込まれていること");
+        assert_eq!(image.dimensions(), (512, 512), "正方形");
+    }
+
+    #[test]
+    fn game_renders_the_feint_as_an_image_with_the_same_size_as_the_signal() {
+        let mut game = QuickDrawGame::new();
+        use_picker(&mut game, ProtocolType::Halfblocks);
+        game.phase = Phase::Feint {
+            remaining: ms(100),
+            resume_waiting: ms(500),
+        };
+        let buffer = rendered(&game);
+        let text = text_of(&buffer);
+        assert!(
+            !text.contains(FEINT_TEXT),
+            "画像で描く時は文字間を広げたテキスト見出しを出さない: {text}"
+        );
+        assert!(
+            game.feint_renderer.uses_image(),
+            "フェイントも画像プロトコルが使えれば画像で描く"
+        );
+        assert_eq!(
+            load_glyph_image(FEINT_PNG).unwrap().dimensions(),
+            load_glyph_image(SIGNAL_PNG).unwrap().dimensions(),
+            "フェイントと本物の合図は同じ画像サイズ(=同じフォントサイズ相当)で描く"
         );
     }
 
