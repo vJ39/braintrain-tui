@@ -391,8 +391,9 @@ impl App {
             return;
         }
         if selected == BEIGOMA_ITEM_INDEX {
-            // べーも難易度を持たず、決まったコース・制限時間60秒で進むため、難易度選択を挟まない
-            self.start_playing(BEIGOMA_ITEM_INDEX, crate::game::beigoma::SESSION_DIFFICULTY);
+            // べーも難易度を持たず、ROUND1・ROUND2が固定の内容で進むため、難易度選択を挟まない。
+            // ROUNDごとに自前の「3.2.1.GO!!」を持つため、画面遷移側のカウントダウンも挟まない
+            self.start_beigoma();
             return;
         }
         if selected == MEMORY_ITEM_INDEX {
@@ -456,6 +457,16 @@ impl App {
             self.current_bgm = Some(name);
         }
         self.screen = Screen::Playing(Box::new(QuickDrawGame::new()));
+    }
+
+    /// べーを開始する。ROUNDごとの「3.2.1.GO!!」を自前で持つため、
+    /// 画面遷移側のカウントダウン(start_playing)は経由しない
+    fn start_beigoma(&mut self) {
+        if let Some(name) = audio::random_bgm_track(BgmCategory::Playing) {
+            audio::play_bgm_track(&name);
+            self.current_bgm = Some(name);
+        }
+        self.screen = Screen::Playing(Box::new(BeigomaGame::new()));
     }
 
     /// リズムゲームを開始する(常に上級の譜面・判定)。譜面生成を先に済ませ、選んだ曲のBGM再生を
@@ -786,7 +797,7 @@ fn new_game(item: usize, difficulty: Difficulty) -> Box<dyn Game> {
         RHYTHM_ITEM_INDEX => unreachable!("rhythm is started via start_rhythm with a song"),
         // ハヤウチは難易度を持たず、10問固定で進む
         QUICK_DRAW_ITEM_INDEX => Box::new(QuickDrawGame::new()),
-        // べーは難易度を持たず、決まったコース・制限時間60秒で進む
+        // べーは難易度を持たず、ROUND1・ROUND2が固定の内容で進む
         BEIGOMA_ITEM_INDEX => Box::new(BeigomaGame::new()),
         _ => unreachable!("history is handled without creating a game"),
     }
@@ -2083,56 +2094,44 @@ mod tests {
         }
     }
 
-    /// べーが始まり、ベーゴマが盤に投入されて制限時間60秒から数え始めていることを確かめる
-    fn assert_beigoma_is_playing(app: &mut App) {
-        finish_countdown(app);
+    /// べーが始まり、ゲーム内のROUND1の「3.2.1.GO!!」から始まっていることを確かめる。
+    /// べーはROUNDごとに自前のカウントダウンを持つため、
+    /// 画面遷移側のカウントダウン(Screen::Countdown)は経由しない
+    fn assert_beigoma_round1_countdown_in_game(app: &mut App) {
         let Screen::Playing(game) = &app.screen else {
-            panic!("Playing画面のはず");
+            panic!("外側のカウントダウンを挟まず直接Playing画面になるはず");
         };
         assert_eq!(game.result().game_id, crate::game::beigoma::GAME_ID);
         assert!(!game.is_finished());
         // 全角文字の2セル目は空白で埋まるため、空白を除いて比較する
         let text = rendered_text(app).replace(' ', "");
         assert!(text.contains("べー"), "{text}");
-        assert!(text.contains("残り60.0秒"), "カウントダウン後から数え始める: {text}");
+        assert!(text.contains("ROUND1やさしい"), "ROUND1から始まる: {text}");
+        assert!(text.contains("残り60.0秒"), "カウントダウン中はまだ数えない: {text}");
         assert!(text.contains("盤面") && text.contains("軽トラ視点"), "2視点を出す");
+        assert!(text.contains("█"), "ゲーム内のカウントダウンを大きな文字で出す: {text}");
+        // ゲーム内のカウントダウン(GO!!まで)が終わってから制限時間を数え始める
+        app.update(COUNTDOWN_TOTAL);
+        app.update(Duration::from_secs(1));
+        assert!(matches!(app.screen, Screen::Playing(_)), "Playing画面のまま");
+        let text = rendered_text(app).replace(' ', "");
+        assert!(text.contains("残り59.0秒"), "GO!!の後から数える: {text}");
     }
 
     #[test]
-    fn selecting_beigoma_skips_difficulty_and_starts_after_countdown() {
+    fn selecting_beigoma_skips_difficulty_and_the_outer_countdown() {
         let mut app = App::new();
         app.select_menu_item(BEIGOMA_ITEM_INDEX);
-        let Screen::Countdown {
-            item,
-            difficulty,
-            state,
-        } = &app.screen
-        else {
-            panic!("難易度選択を挟まずカウントダウンになるはず");
-        };
-        assert_eq!(*item, BEIGOMA_ITEM_INDEX);
-        assert_eq!(*difficulty, crate::game::beigoma::SESSION_DIFFICULTY);
-        assert_eq!(state.phase(), Some(Phase::Three), "3から始まる");
-        // GO!!の表示が終わるまではまだベーゴマを投入しない(ゲームを作らない)
-        app.update(COUNTDOWN_TOTAL - Duration::from_millis(1));
-        assert!(matches!(app.screen, Screen::Countdown { .. }));
-        assert_beigoma_is_playing(&mut app);
+        assert_beigoma_round1_countdown_in_game(&mut app);
     }
 
     #[test]
-    fn enter_on_beigoma_in_menu_goes_straight_to_countdown() {
+    fn enter_on_beigoma_in_menu_goes_straight_to_playing() {
         let mut app = App::new();
         app.screen = Screen::Menu;
         app.menu_state.select(BEIGOMA_ITEM_INDEX);
         app.handle_key(KeyEvent::from(KeyCode::Enter));
-        assert!(matches!(
-            app.screen,
-            Screen::Countdown {
-                item: BEIGOMA_ITEM_INDEX,
-                ..
-            }
-        ));
-        assert_beigoma_is_playing(&mut app);
+        assert_beigoma_round1_countdown_in_game(&mut app);
     }
 
     #[test]

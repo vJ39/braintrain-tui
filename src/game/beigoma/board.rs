@@ -1,6 +1,9 @@
-//! べーの盤面: 固定配置の盤(障害物・ゴール)、連打式の2軸の傾き、ベーゴマの転がり。
+//! べーの盤面: ROUNDごとの盤(凹凸・投入位置は固定配置、ゴールは毎回ランダム)、連打式の2軸の傾き、
+//! ベーゴマの転がり。
 //!
 //! 座標は盤のマス単位(左上が(0,0)、xは右、yは下)。画面の上が軽トラの前方。
+//! - 1セッションは2ROUND(ROUND1=やさしい、ROUND2=むずかしい)。ROUND2は縁の内側に凹凸の輪があり、
+//!   ゴールは投入位置からの直線上に必ず凹凸が挟まる位置にだけ置く(直線移動だけでは届かない)
 //! - 傾き: pitch(前後軸、+が前傾)・roll(左右軸、+が右傾)。-TILT_MAX〜+TILT_MAX
 //! - 軽トラのG(軽トラの加速度の向き)は、ベーゴマには慣性として逆向きにかかる
 //!   (ブレーキ=後方向のGで、ベーゴマは前(画面の上)へ押される)
@@ -14,17 +17,22 @@
 
 use std::time::Duration;
 
+use rand::Rng;
+
 use super::truck::GForce;
 
 /// 盤の大きさ(マス)
 pub const BOARD_WIDTH: usize = 20;
 pub const BOARD_HEIGHT: usize = 12;
 
-/// 盤の固定配置。'.'=平坦、'#'=凸(でっぱり)、'u'=凹(くぼみ)、'S'=投入位置、'G'=ゴール(唯一)。
-/// 毎回同じ配置なので、繰り返しプレイしてコースを覚えられる
-const LAYOUT: [&str; BOARD_HEIGHT] = [
+/// 1セッションのROUND数
+pub const ROUNDS_PER_SESSION: u32 = 2;
+
+/// ROUND1の配置。'.'=平坦、'#'=凸(でっぱり)、'u'=凹(くぼみ)、'S'=投入位置。
+/// ゴールは毎回ランダムに置くので文字を持たない
+const LAYOUT_ROUND1: [&str; BOARD_HEIGHT] = [
     "....................",
-    "...........#.....G..",
+    "...........#........",
     "....#...........u...",
     "..........u.........",
     ".......#.......u....",
@@ -36,6 +44,68 @@ const LAYOUT: [&str; BOARD_HEIGHT] = [
     ".S..#...............",
     "....................",
 ];
+
+/// ROUND2の配置(文字はLAYOUT_ROUND1と同じ)。縁の1マス内側に凸と凹を交互に並べた輪を置き、
+/// 上・下・左・右に1か所ずつ2マスの切れ目を作る。投入位置は輪の内側で、内側にも凹凸を数個置く
+const LAYOUT_ROUND2: [&str; BOARD_HEIGHT] = [
+    "....................",
+    ".#u#u#u#u..#u#u#u#u.",
+    ".u................#.",
+    ".#....u...........u.",
+    "............u.....#.",
+    "....................",
+    ".u......#...........",
+    ".#............#...u.",
+    ".u..S......u......#.",
+    ".#................u.",
+    ".u#u#u#u#u#u#u..#u#.",
+    "....................",
+];
+
+/// ゴールを置いてよいマスの条件
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GoalRule {
+    /// 投入位置からゴールまでの最短距離(マス。マスの中心どうしの距離)
+    pub min_distance: f64,
+    /// 投入位置からゴールへの直線上に凹凸が1つ以上あること(直線移動だけでは届かない)
+    pub blocked_straight_line: bool,
+}
+
+/// ROUNDごとのパラメータ
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RoundParams {
+    /// HUDに出すROUNDの名前
+    pub label: &'static str,
+    /// 凹凸と投入位置の配置
+    pub layout: &'static [&'static str; BOARD_HEIGHT],
+    /// ゴールを置いてよいマスの条件
+    pub goal_rule: GoalRule,
+}
+
+/// round_index番目(0始まり)のROUNDのパラメータ。最後のROUNDより先は最後のROUNDのまま
+pub fn round_params(round_index: u32) -> RoundParams {
+    match round_index {
+        0 => RoundParams {
+            label: "ROUND 1 やさしい",
+            layout: &LAYOUT_ROUND1,
+            goal_rule: GoalRule {
+                min_distance: 10.0,
+                blocked_straight_line: false,
+            },
+        },
+        _ => RoundParams {
+            label: "ROUND 2 むずかしい",
+            layout: &LAYOUT_ROUND2,
+            goal_rule: GoalRule {
+                min_distance: 6.0,
+                blocked_straight_line: true,
+            },
+        },
+    }
+}
+
+/// 直線上に凹凸があるかを調べる間隔(マス)
+const LINE_SAMPLE_STEP: f64 = 0.25;
 
 /// 傾きの最大値(前後・左右それぞれ)
 pub const TILT_MAX: f64 = 4.0;
@@ -91,33 +161,93 @@ pub enum Cell {
     Goal,
 }
 
-/// 固定配置の盤
+/// 盤。凹凸と投入位置は配置(layout)どおり、ゴールはgoalに1つ置く
 #[derive(Debug, Clone)]
 pub struct Board {
+    /// 凹凸の配置(Flat/Bump/Hollowだけ。ゴールはgoalで持つ)
     cells: Vec<Cell>,
     start: (usize, usize),
+    goal: (usize, usize),
 }
 
 impl Board {
-    /// 固定配置(LAYOUT)の盤
+    /// paramsの配置に、ルールを満たす候補からランダムに選んだゴールを置いた盤
+    pub fn generate(params: &RoundParams, rng: &mut impl Rng) -> Self {
+        let candidates = Self::goal_candidates(params.layout, &params.goal_rule);
+        assert!(
+            !candidates.is_empty(),
+            "{}: ゴールの候補が無い",
+            params.label
+        );
+        let goal = candidates[rng.gen_range(0..candidates.len())];
+        Self::with_goal(params.layout, goal)
+    }
+
+    /// 配置layoutにゴールをgoalに置いた盤(テストで決定的にするため)。
+    /// goalは盤の上の平坦なマス(投入位置を除く)でなければpanicする
+    pub fn with_goal(layout: &[&str; BOARD_HEIGHT], goal: (usize, usize)) -> Self {
+        let (cells, start) = parse_layout(layout);
+        assert!(
+            goal.0 < BOARD_WIDTH && goal.1 < BOARD_HEIGHT,
+            "ゴール{goal:?}が盤の外"
+        );
+        assert!(
+            cells[goal.1 * BOARD_WIDTH + goal.0] == Cell::Flat && goal != start,
+            "ゴール{goal:?}は平坦なマス(投入位置以外)に置く"
+        );
+        Self { cells, start, goal }
+    }
+
+    /// 配置layoutでルールruleを満たすゴールの候補(左上から行優先の順)。
+    /// 候補は平坦なマス(投入位置を除く)のうち、投入位置からmin_distance以上離れていて、
+    /// blocked_straight_lineなら投入位置からの直線上に凹凸があるもの
+    pub fn goal_candidates(layout: &[&str; BOARD_HEIGHT], rule: &GoalRule) -> Vec<(usize, usize)> {
+        let (cells, start) = parse_layout(layout);
+        // 直線の判定には凹凸だけ使うので、ゴールは仮に投入位置へ置いておく
+        let board = Self {
+            cells,
+            start,
+            goal: start,
+        };
+        let from = board.start_position();
+        (0..BOARD_HEIGHT)
+            .flat_map(|y| (0..BOARD_WIDTH).map(move |x| (x, y)))
+            .filter(|&cell| {
+                if cell == start || board.cells[cell.1 * BOARD_WIDTH + cell.0] != Cell::Flat {
+                    return false;
+                }
+                let to = cell_center(cell);
+                (to.0 - from.0).hypot(to.1 - from.1) >= rule.min_distance
+                    && (!rule.blocked_straight_line || board.straight_line_is_blocked(from, to))
+            })
+            .collect()
+    }
+
+    /// ゴールのマス
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn goal(&self) -> (usize, usize) {
+        self.goal
+    }
+
+    /// fromからtoへの線分上(LINE_SAMPLE_STEP刻み、両端を含む)に凹凸があるか
+    pub fn straight_line_is_blocked(&self, from: (f64, f64), to: (f64, f64)) -> bool {
+        let length = (to.0 - from.0).hypot(to.1 - from.1);
+        let samples = (length / LINE_SAMPLE_STEP).ceil() as usize;
+        (0..=samples).any(|i| {
+            let t = if samples == 0 {
+                0.0
+            } else {
+                i as f64 / samples as f64
+            };
+            let pos = (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
+            matches!(self.cell_at(pos), Cell::Bump | Cell::Hollow)
+        })
+    }
+
+    /// render.rsのテスト用: ROUND1の配置で、ゴールを旧来の固定配置の位置(17,1)に置いた盤
+    #[cfg(test)]
     pub fn standard() -> Self {
-        let mut cells = Vec::with_capacity(BOARD_WIDTH * BOARD_HEIGHT);
-        let mut start = (0, 0);
-        for (y, row) in LAYOUT.iter().enumerate() {
-            for (x, c) in row.chars().enumerate() {
-                cells.push(match c {
-                    '#' => Cell::Bump,
-                    'u' => Cell::Hollow,
-                    'G' => Cell::Goal,
-                    'S' => {
-                        start = (x, y);
-                        Cell::Flat
-                    }
-                    _ => Cell::Flat,
-                });
-            }
-        }
-        Self { cells, start }
+        Self::with_goal(&LAYOUT_ROUND1, (17, 1))
     }
 
     /// 位置が盤の上にあるか。ベーゴマの中心が縁を越えたら場外(落ちる)
@@ -125,10 +255,13 @@ impl Board {
         (0.0..BOARD_WIDTH as f64).contains(&pos.0) && (0.0..BOARD_HEIGHT as f64).contains(&pos.1)
     }
 
-    /// マス(x, y)。盤の外は平坦として扱う(場外に出た時点でゲームは終わる)
+    /// マス(x, y)。ゴールのマスはCell::Goal。盤の外は平坦として扱う(場外に出た時点でゲームは終わる)
     pub fn cell(&self, x: usize, y: usize) -> Cell {
         if x >= BOARD_WIDTH || y >= BOARD_HEIGHT {
             return Cell::Flat;
+        }
+        if (x, y) == self.goal {
+            return Cell::Goal;
         }
         self.cells[y * BOARD_WIDTH + x]
     }
@@ -143,19 +276,34 @@ impl Board {
 
     /// ベーゴマの投入位置(マスの中央)
     pub fn start_position(&self) -> (f64, f64) {
-        (self.start.0 as f64 + 0.5, self.start.1 as f64 + 0.5)
+        cell_center(self.start)
     }
+}
 
-    /// ゴールのマス(テストでゴールの手前に置くため)
-    #[cfg(test)]
-    pub fn goal(&self) -> (usize, usize) {
-        let index = self
-            .cells
-            .iter()
-            .position(|&cell| cell == Cell::Goal)
-            .expect("ゴールがある");
-        (index % BOARD_WIDTH, index / BOARD_WIDTH)
+/// 配置の文字列を凹凸のマス(Flat/Bump/Hollow)と投入位置にする
+fn parse_layout(layout: &[&str; BOARD_HEIGHT]) -> (Vec<Cell>, (usize, usize)) {
+    let mut cells = Vec::with_capacity(BOARD_WIDTH * BOARD_HEIGHT);
+    let mut start = None;
+    for (y, row) in layout.iter().enumerate() {
+        assert_eq!(row.chars().count(), BOARD_WIDTH, "{y}行目の幅");
+        for (x, c) in row.chars().enumerate() {
+            cells.push(match c {
+                '#' => Cell::Bump,
+                'u' => Cell::Hollow,
+                'S' => {
+                    start = Some((x, y));
+                    Cell::Flat
+                }
+                _ => Cell::Flat,
+            });
+        }
     }
+    (cells, start.expect("配置に投入位置'S'がある"))
+}
+
+/// マスの中心の座標
+fn cell_center(cell: (usize, usize)) -> (f64, f64) {
+    (cell.0 as f64 + 0.5, cell.1 as f64 + 0.5)
 }
 
 /// 傾きを動かすキーの向き
@@ -560,8 +708,17 @@ fn clamp_into_cell(pos: (f64, f64), cell: (usize, usize)) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     const STEP: Duration = Duration::from_millis(10);
+
+    /// 旧来の固定配置でゴールがあった位置。ROUND1の盤をこのゴールで作ると、既存のテストの前提がそのまま使える
+    const ROUND1_GOAL: (usize, usize) = (17, 1);
+
+    fn round1_board() -> Board {
+        Board::with_goal(&LAYOUT_ROUND1, ROUND1_GOAL)
+    }
     const NO_G: GForce = GForce {
         longitudinal: 0.0,
         lateral: 0.0,
@@ -596,7 +753,7 @@ mod tests {
 
     /// 障害物を踏ませ、飛び上がりの間はafter_contactのGにして着地まで進める
     fn land_after_contact(contact: GForce, after_contact: GForce) -> (Top, Landing) {
-        let board = Board::standard();
+        let board = round1_board();
         let mut top = top_just_left_of_bump(&board);
         let tilt = Tilt::new();
         let event = top.step(&board, STEP, &tilt, contact);
@@ -622,59 +779,361 @@ mod tests {
 
     // --- 盤の配置 ---
 
+    const LAYOUTS: [&[&str; BOARD_HEIGHT]; 2] = [&LAYOUT_ROUND1, &LAYOUT_ROUND2];
+
     #[test]
-    fn layout_is_fixed_with_one_goal_and_one_start() {
-        for row in LAYOUT {
-            assert_eq!(row.chars().count(), BOARD_WIDTH);
+    fn layouts_have_one_start_and_no_fixed_goal() {
+        for (i, layout) in LAYOUTS.iter().enumerate() {
+            for row in layout.iter() {
+                assert_eq!(row.chars().count(), BOARD_WIDTH, "layout{i}");
+            }
+            let all: String = layout.concat();
+            assert_eq!(
+                all.matches('G').count(),
+                0,
+                "layout{i}: ゴールは毎回ランダムなので文字を持たない"
+            );
+            assert_eq!(all.matches('S').count(), 1, "layout{i}");
+            assert!(
+                all.chars().all(|c| ".#uS".contains(c)),
+                "layout{i}: 使う文字は4種だけ"
+            );
         }
-        let all: String = LAYOUT.concat();
-        assert_eq!(all.matches('G').count(), 1, "ゴールは唯一");
-        assert_eq!(all.matches('S').count(), 1);
-        assert!(all.matches('#').count() >= 8, "障害物を複数置く");
-        let board = Board::standard();
-        let (gx, gy) = board.goal();
-        assert_eq!(board.cell(gx, gy), Cell::Goal);
+        let board = round1_board();
+        assert_eq!(board.goal(), ROUND1_GOAL);
+        assert_eq!(board.cell(ROUND1_GOAL.0, ROUND1_GOAL.1), Cell::Goal);
         assert_eq!(
             board.cell_at(board.start_position()),
             Cell::Flat,
             "投入位置は平坦"
         );
         assert_eq!(board.start_position(), (1.5, 10.5));
-        // 毎回同じ配置(ランダム生成しない)
-        let again = Board::standard();
-        assert_eq!(again.goal(), board.goal());
-        assert_eq!(again.cells, board.cells);
     }
 
     #[test]
     fn layout_chars_map_to_bump_and_hollow() {
-        let board = Board::standard();
-        let (mut bumps, mut hollows) = (0, 0);
-        for (y, row) in LAYOUT.iter().enumerate() {
-            for (x, c) in row.chars().enumerate() {
-                match c {
-                    '#' => {
-                        assert_eq!(board.cell(x, y), Cell::Bump, "({x},{y}): '#'は凸");
-                        bumps += 1;
+        for layout in LAYOUTS {
+            let goal = Board::goal_candidates(
+                layout,
+                &GoalRule {
+                    min_distance: 0.0,
+                    blocked_straight_line: false,
+                },
+            )[0];
+            let board = Board::with_goal(layout, goal);
+            let (mut bumps, mut hollows) = (0, 0);
+            for (y, row) in layout.iter().enumerate() {
+                for (x, c) in row.chars().enumerate() {
+                    match c {
+                        '#' => {
+                            assert_eq!(board.cell(x, y), Cell::Bump, "({x},{y}): '#'は凸");
+                            bumps += 1;
+                        }
+                        'u' => {
+                            assert_eq!(board.cell(x, y), Cell::Hollow, "({x},{y}): 'u'は凹");
+                            hollows += 1;
+                        }
+                        _ => assert!(
+                            !matches!(board.cell(x, y), Cell::Bump | Cell::Hollow),
+                            "({x},{y}): '#'/'u'以外は凹凸にしない"
+                        ),
                     }
-                    'u' => {
-                        assert_eq!(board.cell(x, y), Cell::Hollow, "({x},{y}): 'u'は凹");
-                        hollows += 1;
-                    }
-                    _ => assert!(
-                        !matches!(board.cell(x, y), Cell::Bump | Cell::Hollow),
-                        "({x},{y}): '#'/'u'以外は凹凸にしない"
-                    ),
+                }
+            }
+            assert!(bumps >= 4, "凸を複数置く: {bumps}");
+            assert!(hollows >= 4, "凹を複数置く: {hollows}");
+        }
+    }
+
+    #[test]
+    fn round1_keeps_the_previous_obstacles() {
+        // ROUND1は旧来の固定配置から'G'を外しただけ(凹凸と投入位置はそのまま)
+        let board = round1_board();
+        for &(x, y) in &[(11, 1), (4, 2), (16, 2), (10, 3), (2, 5), (4, 10)] {
+            assert!(
+                matches!(board.cell(x, y), Cell::Bump | Cell::Hollow),
+                "({x},{y})"
+            );
+        }
+        assert_eq!(board.cell(4, 10), Cell::Bump);
+        assert_eq!(board.cell(16, 2), Cell::Hollow);
+    }
+
+    // --- ROUNDとゴール ---
+
+    fn start_of(layout: &[&str; BOARD_HEIGHT]) -> (f64, f64) {
+        let goal = Board::goal_candidates(
+            layout,
+            &GoalRule {
+                min_distance: 0.0,
+                blocked_straight_line: false,
+            },
+        )[0];
+        Board::with_goal(layout, goal).start_position()
+    }
+
+    fn center_of(cell: (usize, usize)) -> (f64, f64) {
+        (cell.0 as f64 + 0.5, cell.1 as f64 + 0.5)
+    }
+
+    fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
+        (a.0 - b.0).hypot(a.1 - b.1)
+    }
+
+    #[test]
+    fn round_params_has_two_rounds_and_clamps_beyond() {
+        assert_eq!(ROUNDS_PER_SESSION, 2);
+        let round1 = round_params(0);
+        let round2 = round_params(1);
+        assert_eq!(round1.label, "ROUND 1 やさしい");
+        assert_eq!(round2.label, "ROUND 2 むずかしい");
+        assert_eq!(round1.layout, &LAYOUT_ROUND1);
+        assert_eq!(round2.layout, &LAYOUT_ROUND2);
+        assert!(
+            !round1.goal_rule.blocked_straight_line,
+            "ROUND1は直線で届いてもよい"
+        );
+        assert!(
+            round2.goal_rule.blocked_straight_line,
+            "ROUND2は直線では届かない"
+        );
+        assert_ne!(round1, round2);
+        for beyond in [2, 5, 100] {
+            assert_eq!(
+                round_params(beyond),
+                round2,
+                "最後のROUNDより先は最後のまま"
+            );
+        }
+    }
+
+    #[test]
+    fn goal_candidates_are_never_empty_for_every_round() {
+        for round in 0..ROUNDS_PER_SESSION {
+            let params = round_params(round);
+            let candidates = Board::goal_candidates(params.layout, &params.goal_rule);
+            assert!(
+                candidates.len() >= 5,
+                "ROUND{}: ゴール候補が十分にある: {}",
+                round + 1,
+                candidates.len()
+            );
+        }
+    }
+
+    #[test]
+    fn every_candidate_satisfies_the_rule() {
+        for round in 0..ROUNDS_PER_SESSION {
+            let params = round_params(round);
+            let start = start_of(params.layout);
+            for goal in Board::goal_candidates(params.layout, &params.goal_rule) {
+                let ch = params.layout[goal.1].as_bytes()[goal.0];
+                assert_eq!(
+                    ch,
+                    b'.',
+                    "ROUND{} {goal:?}: 平坦なマス(投入位置でもない)",
+                    round + 1
+                );
+                assert!(
+                    distance(start, center_of(goal)) >= params.goal_rule.min_distance,
+                    "ROUND{} {goal:?}: 投入位置から離れている",
+                    round + 1
+                );
+                if params.goal_rule.blocked_straight_line {
+                    let board = Board::with_goal(params.layout, goal);
+                    assert!(
+                        board.straight_line_is_blocked(start, center_of(goal)),
+                        "ROUND{} {goal:?}: 直線上に凹凸がある",
+                        round + 1
+                    );
                 }
             }
         }
-        assert!(bumps >= 4, "凸を複数置く: {bumps}");
-        assert!(hollows >= 4, "凹を複数置く: {hollows}");
+    }
+
+    #[test]
+    fn candidates_exclude_cells_that_break_the_rule() {
+        // ROUND2: 投入位置の真上(4,2)は平坦で十分に遠いが、直線で届くので候補にしない
+        let params = round_params(1);
+        let start = start_of(params.layout);
+        let clear = (4, 2);
+        assert_eq!(params.layout[clear.1].as_bytes()[clear.0], b'.');
+        assert!(distance(start, center_of(clear)) >= params.goal_rule.min_distance);
+        let candidates = Board::goal_candidates(params.layout, &params.goal_rule);
+        assert!(!candidates.contains(&clear), "直線で届くマスは候補にしない");
+        // 近すぎるマス・凹凸・投入位置も候補にしない
+        let round1 = round_params(0);
+        let candidates = Board::goal_candidates(round1.layout, &round1.goal_rule);
+        assert!(!candidates.contains(&(2, 10)), "投入位置の隣は近すぎる");
+        assert!(!candidates.contains(&(1, 10)), "投入位置");
+        assert!(!candidates.contains(&(11, 1)), "凸");
+        assert!(!candidates.contains(&(16, 2)), "凹");
+        assert!(
+            candidates.contains(&ROUND1_GOAL),
+            "旧来のゴール位置は候補に入る"
+        );
+    }
+
+    #[test]
+    fn round2_goal_is_never_reachable_in_a_straight_line() {
+        let params = round_params(1);
+        for seed in 0..100 {
+            let board = Board::generate(&params, &mut StdRng::seed_from_u64(seed));
+            let goal = board.goal();
+            assert!(
+                board.straight_line_is_blocked(board.start_position(), center_of(goal)),
+                "seed={seed} {goal:?}: 直線上に凹凸がある"
+            );
+            assert_eq!(board.cell(goal.0, goal.1), Cell::Goal);
+        }
+    }
+
+    #[test]
+    fn round2_has_obstacles_on_the_rim() {
+        // 盤の縁から1マス以内(上下左右それぞれ)に凹凸がある
+        let board = Board::with_goal(
+            &LAYOUT_ROUND2,
+            Board::goal_candidates(&LAYOUT_ROUND2, &round_params(1).goal_rule)[0],
+        );
+        let is_obstacle =
+            |x: usize, y: usize| matches!(board.cell(x, y), Cell::Bump | Cell::Hollow);
+        let sides: [(&str, Vec<(usize, usize)>); 4] = [
+            (
+                "上",
+                (0..BOARD_WIDTH).flat_map(|x| [(x, 0), (x, 1)]).collect(),
+            ),
+            (
+                "下",
+                (0..BOARD_WIDTH)
+                    .flat_map(|x| [(x, BOARD_HEIGHT - 1), (x, BOARD_HEIGHT - 2)])
+                    .collect(),
+            ),
+            (
+                "左",
+                (0..BOARD_HEIGHT).flat_map(|y| [(0, y), (1, y)]).collect(),
+            ),
+            (
+                "右",
+                (0..BOARD_HEIGHT)
+                    .flat_map(|y| [(BOARD_WIDTH - 1, y), (BOARD_WIDTH - 2, y)])
+                    .collect(),
+            ),
+        ];
+        for (name, cells) in sides {
+            let count = cells.iter().filter(|&&(x, y)| is_obstacle(x, y)).count();
+            assert!(count >= 5, "{name}の縁に凹凸がある: {count}");
+        }
+        // 投入位置は輪の内側(縁から2マス以上内側)
+        let (sx, sy) = board.start_position();
+        assert!(
+            sx > 2.0 && sx < BOARD_WIDTH as f64 - 2.0 && sy > 2.0 && sy < BOARD_HEIGHT as f64 - 2.0
+        );
+        // ROUND1より凹凸が多い
+        let count = |layout: &[&str; BOARD_HEIGHT]| {
+            layout
+                .concat()
+                .chars()
+                .filter(|&c| c == '#' || c == 'u')
+                .count()
+        };
+        assert!(count(&LAYOUT_ROUND2) > count(&LAYOUT_ROUND1) * 2);
+    }
+
+    #[test]
+    fn goal_is_random_across_seeds() {
+        for round in 0..ROUNDS_PER_SESSION {
+            let params = round_params(round);
+            let goals: std::collections::HashSet<_> = (0..20)
+                .map(|seed| Board::generate(&params, &mut StdRng::seed_from_u64(seed)).goal())
+                .collect();
+            assert!(
+                goals.len() >= 2,
+                "ROUND{}: ゴールが毎回変わる: {goals:?}",
+                round + 1
+            );
+        }
+    }
+
+    #[test]
+    fn generate_keeps_the_layout_and_puts_one_goal() {
+        for round in 0..ROUNDS_PER_SESSION {
+            let params = round_params(round);
+            let board = Board::generate(&params, &mut StdRng::seed_from_u64(7));
+            let goal = board.goal();
+            assert!(Board::goal_candidates(params.layout, &params.goal_rule).contains(&goal));
+            let goals = (0..BOARD_HEIGHT)
+                .flat_map(|y| (0..BOARD_WIDTH).map(move |x| (x, y)))
+                .filter(|&(x, y)| board.cell(x, y) == Cell::Goal)
+                .count();
+            assert_eq!(goals, 1, "ゴールは唯一");
+            assert_eq!(board.start_position(), start_of(params.layout));
+        }
+    }
+
+    #[test]
+    fn with_goal_places_the_goal_where_asked() {
+        let board = Board::with_goal(&LAYOUT_ROUND1, (10, 0));
+        assert_eq!(board.goal(), (10, 0));
+        assert_eq!(board.cell(10, 0), Cell::Goal);
+        assert_eq!(
+            board.cell(ROUND1_GOAL.0, ROUND1_GOAL.1),
+            Cell::Flat,
+            "指定した位置以外はゴールにしない"
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn with_goal_rejects_a_non_candidate() {
+        // 凸(11,1)にはゴールを置けない
+        Board::with_goal(&LAYOUT_ROUND1, (11, 1));
+    }
+
+    #[test]
+    #[should_panic]
+    fn with_goal_rejects_the_start() {
+        Board::with_goal(&LAYOUT_ROUND1, (1, 10));
+    }
+
+    #[test]
+    #[should_panic]
+    fn with_goal_rejects_outside_the_board() {
+        Board::with_goal(&LAYOUT_ROUND1, (BOARD_WIDTH, 0));
+    }
+
+    #[test]
+    fn straight_line_is_blocked_detects_a_bump_on_the_segment() {
+        let board = round1_board();
+        // 投入位置(1,10)から右へ: (4,10)の凸を通る
+        assert!(board.straight_line_is_blocked((1.5, 10.5), (6.5, 10.5)));
+        // 凹(2,5)も遮るものとして扱う
+        assert!(board.straight_line_is_blocked((0.5, 5.5), (5.5, 5.5)));
+        // 向きを逆にしても同じ
+        assert!(board.straight_line_is_blocked((6.5, 10.5), (1.5, 10.5)));
+        // 斜めの線分でも途中の凸を見つける((11,1)の凸を斜めに横切る)
+        assert!(board.straight_line_is_blocked((9.5, 3.5), (13.5, -0.5)));
+    }
+
+    #[test]
+    fn straight_line_is_blocked_is_false_on_a_clear_row() {
+        let board = round1_board();
+        // 最上段は全部平坦
+        assert!(!board.straight_line_is_blocked((0.5, 0.5), (19.5, 0.5)));
+        // 凸の手前で止まる線分は遮られない
+        assert!(!board.straight_line_is_blocked((1.5, 10.5), (3.5, 10.5)));
+        // ゴールのマスは遮るものではない
+        let (gx, gy) = board.goal();
+        assert!(!board.straight_line_is_blocked(
+            (gx as f64 - 3.5, gy as f64 + 0.5),
+            (gx as f64 + 0.5, gy as f64 + 0.5)
+        ));
+        // 長さ0の線分
+        assert!(!board.straight_line_is_blocked((0.5, 0.5), (0.5, 0.5)));
     }
 
     #[test]
     fn cell_at_uses_the_cell_containing_the_position() {
-        let board = Board::standard();
+        let board = round1_board();
         let (bx, by) = some_bump(&board);
         assert_eq!(
             board.cell_at((bx as f64 + 0.1, by as f64 + 0.9)),
@@ -875,7 +1334,7 @@ mod tests {
 
     #[test]
     fn top_stays_still_on_a_level_board_without_g() {
-        let board = Board::standard();
+        let board = round1_board();
         let mut top = Top::new(board.start_position());
         for _ in 0..100 {
             assert_eq!(top.step(&board, STEP, &Tilt::new(), NO_G), None);
@@ -886,7 +1345,7 @@ mod tests {
 
     #[test]
     fn tilt_accelerates_the_top_in_the_tilted_direction() {
-        let board = Board::standard();
+        let board = round1_board();
         let center = (10.5, 0.5);
         let cases = [
             (TiltKey::Right, (1.0, 0.0)),
@@ -914,7 +1373,7 @@ mod tests {
 
     #[test]
     fn stronger_tilt_accelerates_more() {
-        let board = Board::standard();
+        let board = round1_board();
         let run = |presses: usize| {
             let mut tilt = Tilt::new();
             for _ in 0..presses {
@@ -931,7 +1390,7 @@ mod tests {
 
     #[test]
     fn g_pushes_the_top_opposite_to_the_truck_acceleration() {
-        let board = Board::standard();
+        let board = round1_board();
         let tilt = Tilt::new();
         // ブレーキ(後方向のG)で、ベーゴマは前(画面の上)へ押される
         let mut top = Top::new((10.5, 11.5));
@@ -959,7 +1418,7 @@ mod tests {
 
     #[test]
     fn rolling_friction_slows_the_top_down() {
-        let board = Board::standard();
+        let board = round1_board();
         let mut top = Top::new((2.5, 0.5));
         top.vel = (4.0, 0.0);
         let mut previous = speed(&top);
@@ -973,7 +1432,7 @@ mod tests {
     #[test]
     fn flat_ground_never_causes_hops_even_under_huge_g() {
         // 最上段は全部平坦。左右のGで左右に振り回しても、平坦なら特別な影響は無い
-        let board = Board::standard();
+        let board = round1_board();
         let mut top = Top::new((10.5, 0.5));
         for i in 0..300 {
             let g = if (i / 50) % 2 == 0 { 3.0 } else { -3.0 };
@@ -1003,7 +1462,7 @@ mod tests {
 
     /// 転がしてFellOffが返るまで進め、その時の位置を返す(FellOff以外の出来事は起きない前提)
     fn roll_until_fell_off(top: &mut Top) -> (f64, f64) {
-        let board = Board::standard();
+        let board = round1_board();
         for i in 0..200 {
             let before = top.pos;
             match top.step(&board, STEP, &Tilt::new(), NO_G) {
@@ -1049,7 +1508,7 @@ mod tests {
     #[test]
     fn strong_tilt_rolls_the_top_off_the_board() {
         // 強く傾け続けると、縁で止まらずに盤から落ちる
-        let board = Board::standard();
+        let board = round1_board();
         let mut tilt = Tilt::new();
         for _ in 0..10 {
             tilt.press(TiltKey::Forward);
@@ -1063,7 +1522,7 @@ mod tests {
     #[test]
     fn airborne_top_also_falls_off_the_rim() {
         // 飛び上がっている最中でも、中心が縁を越えたら着地を待たずに落ちる
-        let board = Board::standard();
+        let board = round1_board();
         let mut top = Top::new((0.6, 5.5));
         top.vel = (-5.0, 0.0);
         top.state = TopState::Airborne {
@@ -1102,7 +1561,7 @@ mod tests {
     fn bounce_from_the_center_stays_on_the_board() {
         // 盤の中央付近で弾かれても、縁まで飛ばずに盤の上で止まる。
         // 縁まで一番近いのは縦方向(中央から6マス)。13列目は障害物が無い列なので、途中で飛び上がらない
-        let board = Board::standard();
+        let board = round1_board();
         let cy = BOARD_HEIGHT as f64 / 2.0;
         let cx = BOARD_WIDTH as f64 / 2.0;
         let cases = [
@@ -1132,7 +1591,7 @@ mod tests {
 
     #[test]
     fn speed_is_capped() {
-        let board = Board::standard();
+        let board = round1_board();
         let mut top = Top::new((10.5, 0.5));
         for _ in 0..500 {
             top.step(&board, STEP, &Tilt::new(), lateral(5.0));
@@ -1157,7 +1616,7 @@ mod tests {
         assert!(top.vel.0 < 0.0, "来た方向へ弾き返される");
         // 着地の直前の位置から、BOUNCE_KICKだけ来た方向へ一気に戻される
         // (着地のステップで進む分はBOUNCE_KICKより十分小さい)
-        let board = Board::standard();
+        let board = round1_board();
         let mut before_landing = top_just_left_of_bump(&board);
         let tilt = Tilt::new();
         let previous = loop {
@@ -1194,7 +1653,7 @@ mod tests {
 
     #[test]
     fn airborne_lasts_for_the_hop_duration() {
-        let board = Board::standard();
+        let board = round1_board();
         let mut top = top_just_left_of_bump(&board);
         let tilt = Tilt::new();
         assert!(matches!(
@@ -1215,7 +1674,7 @@ mod tests {
     fn staying_on_the_same_bump_does_not_hop_again() {
         let (mut top, landing) = land_after_contact(lateral(-0.1), NO_G);
         assert_eq!(landing, Landing::Light);
-        let board = Board::standard();
+        let board = round1_board();
         // 着地後もしばらく同じ障害物の上にいても、入った瞬間ではないので飛び上がらない
         top.vel = (0.0, 0.0);
         for _ in 0..20 {
@@ -1225,7 +1684,7 @@ mod tests {
 
     #[test]
     fn entering_the_goal_cell_reports_goal() {
-        let board = Board::standard();
+        let board = round1_board();
         let (gx, gy) = board.goal();
         let mut top = Top::new((gx as f64 - 0.02, gy as f64 + 0.5));
         top.vel = (3.0, 0.0);
@@ -1246,6 +1705,7 @@ mod tests {
         let mut board = Board {
             cells: vec![Cell::Flat; BOARD_WIDTH * BOARD_HEIGHT],
             start: (1, 10),
+            goal: (BOARD_WIDTH - 1, 0),
         };
         for &((x, y), cell) in cells {
             board.cells[y * BOARD_WIDTH + x] = cell;

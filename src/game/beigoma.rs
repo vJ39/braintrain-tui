@@ -6,8 +6,11 @@
 //! - 凸を踏んだ瞬間のGが大きいと弾かれ、さらに大きいと吹っ飛んで即GAME OVER
 //! - 凹に正面から入るとハマり(強く傾けると抜け出せる)、斜めに入ると側面をこすって弾かれる・吹っ飛ぶ
 //! - 盤の縁に壁は無く、盤から落ちても(場外)即GAME OVER
-//! - 制限時間60秒。ゴールで成功、吹っ飛び・場外・時間切れで失敗。難易度選択は無い
-//! - 開始前の「3.2.1.GO!!」はapp.rsのカウントダウンで行い、終わってからゲームを作る(=ベーゴマを投入する)
+//! - 1セッションは2ROUND(ROUND1=やさしい、ROUND2=むずかしい)。ゴールの位置はROUNDごとにランダム
+//! - 制限時間はROUNDごとに60秒。ゴールで成功、吹っ飛び・場外・時間切れで失敗。難易度選択は無い
+//! - ROUND1をクリアした時だけROUND2へ進む。ROUND1が失敗ならROUND2へ進まずセッション終了
+//! - 各ROUNDの開始前に「3.2.1.GO!!」をゲーム内で行い、GO!!が終わったらベーゴマを投入する
+//!   (app.rsの画面遷移側のカウントダウンは経由しない)
 
 mod board;
 mod render;
@@ -25,8 +28,11 @@ use ratatui::Frame;
 use crate::audio::{self, SeKind};
 use crate::game::theme;
 use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
+use crate::ui::countdown::{self, CountdownState};
 
-use board::{Board, Landing, StepEvent, Tilt, TiltKey, Top};
+use board::{
+    round_params, Board, Landing, RoundParams, StepEvent, Tilt, TiltKey, Top, ROUNDS_PER_SESSION,
+};
 use render::{BoardRenderer, TopView, TruckViewInfo, TruckViewRenderer};
 use truck::Truck;
 
@@ -35,7 +41,7 @@ pub const GAME_ID: &str = "beigoma";
 /// 結果に記録する難易度。べーは難易度を選ばないので固定値にする
 pub const SESSION_DIFFICULTY: Difficulty = Difficulty::Intermediate;
 
-/// 制限時間
+/// 1ROUNDの制限時間
 pub const TIME_LIMIT: Duration = Duration::from_secs(60);
 
 /// 終了(ゴール・GAME OVER・時間切れ)の表示を出し続けてからリザルトへ進むまでの時間
@@ -68,10 +74,14 @@ pub enum Outcome {
     TimeUp,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// ROUNDの進み具合
 enum Status {
+    /// ROUND開始前の「3.2.1.GO!!」。新しい盤は見せておき、ベーゴマは投入位置で待たせる
+    Countdown {
+        state: CountdownState,
+    },
     Playing,
-    /// 終わった。shownは終了表示を出してからの時間
+    /// ROUNDが終わった。shownは終了表示を出してからの時間
     Ended {
         outcome: Outcome,
         shown: Duration,
@@ -79,11 +89,14 @@ enum Status {
 }
 
 pub struct BeigomaGame {
+    /// 現在のROUND(0始まり)
+    round_index: u32,
+    params: RoundParams,
     board: Board,
     top: Top,
     tilt: Tilt,
     truck: Truck,
-    /// ベーゴマを投入してからの経過時間
+    /// このROUNDでベーゴマを投入してからの経過時間
     elapsed: Duration,
     status: Status,
     tracker: ScoreTracker,
@@ -94,34 +107,78 @@ pub struct BeigomaGame {
 }
 
 impl BeigomaGame {
-    /// ベーゴマを盤の投入位置に置き、軽トラが決まったコースを走り始める
+    /// ROUND1をカウントダウンから始める。軽トラは決まったコースを走る
     pub fn new() -> Self {
         Self::with_truck(Truck::new())
     }
 
     /// 軽トラを指定して作る(テストで特定のGの場面を作るため)
     fn with_truck(truck: Truck) -> Self {
-        let board = Board::standard();
+        let params = round_params(0);
+        let board = Board::generate(&params, &mut rand::thread_rng());
         let top = Top::new(board.start_position());
-        Self {
+        let mut game = Self {
+            round_index: 0,
+            params,
             board,
             top,
             tilt: Tilt::new(),
             truck,
             elapsed: Duration::ZERO,
             status: Status::Playing,
-            tracker: ScoreTracker::with_session_length(1),
+            tracker: ScoreTracker::with_session_length(ROUNDS_PER_SESSION),
             message: None,
             board_renderer: BoardRenderer::new(),
             truck_view: TruckViewRenderer::new(),
+        };
+        game.start_round(0);
+        game
+    }
+
+    /// round_index番目のROUNDをカウントダウンから始める。盤を作り直し(ゴールはランダム)、
+    /// ベーゴマは投入位置で待たせる。軽トラのコースはそのまま続く
+    fn start_round(&mut self, round_index: u32) {
+        self.round_index = round_index;
+        self.params = round_params(round_index);
+        self.board = Board::generate(&self.params, &mut rand::thread_rng());
+        self.top = Top::new(self.board.start_position());
+        self.tilt = Tilt::new();
+        self.elapsed = Duration::ZERO;
+        self.message = None;
+        let state = CountdownState::new();
+        // 最初のフェーズ「3」の音
+        if let Some(phase) = state.phase() {
+            audio::play_se(phase.se());
+        }
+        self.status = Status::Countdown { state };
+    }
+
+    /// GO!!が終わった: ベーゴマを投入位置に投入し、制限時間を数え始める
+    fn drop_top(&mut self) {
+        self.top = Top::new(self.board.start_position());
+        self.elapsed = Duration::ZERO;
+        self.status = Status::Playing;
+    }
+
+    fn is_playing(&self) -> bool {
+        matches!(self.status, Status::Playing)
+    }
+
+    /// このROUNDの終わり方(まだ終わっていなければNone)
+    pub fn outcome(&self) -> Option<Outcome> {
+        match self.status {
+            Status::Countdown { .. } | Status::Playing => None,
+            Status::Ended { outcome, .. } => Some(outcome),
         }
     }
 
-    /// 終わり方(まだ終わっていなければNone)
-    pub fn outcome(&self) -> Option<Outcome> {
-        match self.status {
-            Status::Playing => None,
-            Status::Ended { outcome, .. } => Some(outcome),
+    /// セッションがこのROUNDで終わりか。最後のROUNDが終わった時と、
+    /// ROUNDがクリア以外(吹っ飛び・場外・時間切れ)で終わった時(次のROUNDへ進まない)
+    fn is_last_round_ended(&self) -> bool {
+        match self.outcome() {
+            Some(Outcome::Cleared { .. }) => self.tracker.is_session_finished(),
+            Some(Outcome::Flown | Outcome::TimeUp) => true,
+            None => false,
         }
     }
 
@@ -135,7 +192,7 @@ impl BeigomaGame {
         if let Some(event) = event {
             self.on_step_event(event);
         }
-        if self.status == Status::Playing && self.elapsed >= TIME_LIMIT {
+        if self.is_playing() && self.elapsed >= TIME_LIMIT {
             self.finish(Outcome::TimeUp);
         }
     }
@@ -143,7 +200,7 @@ impl BeigomaGame {
     /// 盤上の出来事を反映する(弾かれたらSE、凹にハマった・抜けたら一言、
     /// 吹っ飛んだ・盤から落ちたら即GAME OVER、ゴールなら成功)
     fn on_step_event(&mut self, event: StepEvent) {
-        if self.status != Status::Playing {
+        if !self.is_playing() {
             return;
         }
         match event {
@@ -165,9 +222,9 @@ impl BeigomaGame {
         }
     }
 
-    /// ゲームを終える。結果は1回だけ記録する(成功はクリアタイム、失敗は制限時間を反応時間として記録)
+    /// ROUNDを終える。結果はROUNDごとに1回だけ記録する(成功はクリアタイム、失敗は制限時間を反応時間として記録)
     fn finish(&mut self, outcome: Outcome) {
-        if self.status != Status::Playing {
+        if !self.is_playing() {
             return;
         }
         let (success, latency) = match outcome {
@@ -192,9 +249,10 @@ impl BeigomaGame {
             % render::TOP_SPIN_GLYPHS.len()
     }
 
-    /// 上段: 残り時間・一言(終わったら結果)・傾き
+    /// 上段: 残り時間・一言(終わったら結果)・傾き。枠のタイトルにROUNDの名前を出す
     fn render_hud(&self, frame: &mut Frame, area: Rect) {
-        let block = theme::panel(" ◆ べー ").border_style(Style::default().fg(self.status_color()));
+        let block = theme::panel(format!(" ◆ べー  {} ", self.params.label))
+            .border_style(Style::default().fg(self.status_color()));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let cols = Layout::default()
@@ -266,9 +324,9 @@ impl Default for BeigomaGame {
 }
 
 impl Game for BeigomaGame {
-    /// 矢印キーで盤を傾ける(押すたびに一定量。終わった後は受け付けない)
+    /// 矢印キーで盤を傾ける(押すたびに一定量)。プレイ中以外(カウントダウン中・終わった後)は受け付けない
     fn handle_key(&mut self, key: KeyEvent) {
-        if self.status != Status::Playing {
+        if !self.is_playing() {
             return;
         }
         let tilt_key = match key.code {
@@ -282,12 +340,25 @@ impl Game for BeigomaGame {
     }
 
     fn update(&mut self, dt: Duration) {
-        if let Status::Ended { outcome, shown } = self.status {
-            self.status = Status::Ended {
-                outcome,
-                shown: shown.saturating_add(dt),
-            };
-            return;
+        match &mut self.status {
+            Status::Countdown { state } => {
+                if let Some(phase) = state.tick(dt) {
+                    audio::play_se(phase.se());
+                }
+                if state.is_finished() {
+                    self.drop_top();
+                }
+                return;
+            }
+            Status::Ended { shown, .. } => {
+                *shown = shown.saturating_add(dt);
+                // 結果の表示を出し終えたら、クリアしていて次のROUNDがあれば進む
+                if *shown >= END_HOLD && !self.is_last_round_ended() {
+                    self.start_round(self.round_index + 1);
+                }
+                return;
+            }
+            Status::Playing => {}
         }
         if let Some((text, shown)) = self.message {
             let shown = shown.saturating_add(dt);
@@ -295,14 +366,14 @@ impl Game for BeigomaGame {
         }
         // 大きなdtは小さなステップに分けて進める(途中で終わったらそこで止める)
         let mut remaining = dt;
-        while !remaining.is_zero() && self.status == Status::Playing {
+        while !remaining.is_zero() && self.is_playing() {
             let step = remaining.min(MAX_STEP);
             self.step(step);
             remaining -= step;
         }
     }
 
-    /// 上段にHUD、下段の左に軽トラ視点・右に盤面視点を並べる
+    /// 上段にHUD、下段の左に軽トラ視点・右に盤面視点を並べる。カウントダウン中は盤面の上に重ねる
     fn render(&self, frame: &mut Frame, area: Rect) {
         let area = area.intersection(frame.area());
         if area.is_empty() {
@@ -342,11 +413,15 @@ impl Game for BeigomaGame {
         };
         self.board_renderer
             .render(frame, board_inner, &self.board, &top);
+        if let Status::Countdown { state } = &self.status {
+            countdown::render(frame, board_inner, state);
+        }
     }
 
-    /// 終わってから終了表示(END_HOLD)を出し終えたらセッション終了
+    /// 最後のROUND(またはクリアできなかったROUND)の終了表示(END_HOLD)を出し終えたらセッション終了
     fn is_finished(&self) -> bool {
         matches!(self.status, Status::Ended { shown, .. } if shown >= END_HOLD)
+            && self.is_last_round_ended()
     }
 
     fn result(&self) -> GameResult {
@@ -356,22 +431,64 @@ impl Game for BeigomaGame {
 
 #[cfg(test)]
 mod tests {
-    use super::board::{Cell, TopState, BOARD_HEIGHT, BOARD_WIDTH, HIGH_G_THRESHOLD, TILT_STEP};
+    use super::board::{
+        round_params, Cell, TopState, BOARD_HEIGHT, BOARD_WIDTH, HIGH_G_THRESHOLD,
+        ROUNDS_PER_SESSION, TILT_STEP,
+    };
     use super::truck::RoadEvent;
     use super::*;
+    use crate::ui::countdown::{Phase, PHASE_DURATION};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
     const AREA: Rect = Rect::new(0, 0, 100, 24);
     const STEP: Duration = Duration::from_millis(10);
+    /// ROUND開始前の「3.2.1.GO!!」全体の長さ
+    const COUNTDOWN_TOTAL: Duration = Duration::from_millis(2400);
+    /// ROUND1の盤をテストで決定的にするためのゴール(旧来の固定配置のゴール位置)
+    const ROUND1_GOAL: (usize, usize) = (17, 1);
+    /// カウントダウンの大きな文字に使う記号
+    const BIG_DOT: &str = "█";
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::from(code)
     }
 
-    /// イベントの起きない軽トラ(ずっと巡航・Gなし)で始める
+    fn is_countdown(game: &BeigomaGame) -> bool {
+        matches!(game.status, Status::Countdown { .. })
+    }
+
+    fn is_playing(game: &BeigomaGame) -> bool {
+        matches!(game.status, Status::Playing)
+    }
+
+    fn countdown_phase(game: &BeigomaGame) -> Option<Phase> {
+        match &game.status {
+            Status::Countdown { state } => state.phase(),
+            _ => None,
+        }
+    }
+
+    /// カウントダウンを最後まで進めて、ベーゴマを投入させる
+    fn finish_countdown(game: &mut BeigomaGame) {
+        assert!(is_countdown(game), "カウントダウン中のはず");
+        game.update(COUNTDOWN_TOTAL);
+        assert!(is_playing(game), "GO!!の後はプレイ中のはず");
+    }
+
+    /// イベントの起きない軽トラ(ずっと巡航・Gなし)で、ROUND1をカウントダウン前の状態で作る。
+    /// ゴールは決定的にするため旧来の位置に置き直す
+    fn calm_game_before_go() -> BeigomaGame {
+        let mut game = BeigomaGame::with_truck(Truck::with_course(Vec::new(), 1000.0));
+        game.board = Board::with_goal(round_params(0).layout, ROUND1_GOAL);
+        game
+    }
+
+    /// calm_game_before_goのカウントダウンを終え、ベーゴマを投入した直後
     fn calm_game() -> BeigomaGame {
-        BeigomaGame::with_truck(Truck::with_course(Vec::new(), 1000.0))
+        let mut game = calm_game_before_go();
+        finish_countdown(&mut game);
+        game
     }
 
     fn rendered_text(game: &BeigomaGame, area: Rect) -> String {
@@ -403,25 +520,106 @@ mod tests {
             .expect("下が平坦な障害物がある")
     }
 
-    // --- 開始(カウントダウン後の投入) ---
+    // --- 開始(ROUNDごとのカウントダウン→投入) ---
 
     #[test]
-    fn new_game_puts_the_top_on_the_start_and_is_playing() {
+    fn countdown_total_is_four_phases() {
+        assert_eq!(PHASE_DURATION * 4, COUNTDOWN_TOTAL);
+    }
+
+    #[test]
+    fn new_game_starts_round1_with_a_countdown_and_the_top_waiting() {
         let game = BeigomaGame::new();
+        assert!(is_countdown(&game), "ROUND1はカウントダウンから始まる");
+        assert_eq!(countdown_phase(&game), Some(Phase::Three), "3から始まる");
+        assert_eq!(game.round_index, 0);
+        assert_eq!(game.params, round_params(0));
+        assert_eq!(
+            game.board.start_position(),
+            Board::with_goal(round_params(0).layout, ROUND1_GOAL).start_position(),
+            "ROUND1の盤"
+        );
         assert_eq!(
             game.top.pos,
             game.board.start_position(),
-            "投入位置に置かれる"
+            "ベーゴマは投入位置で待っている"
         );
         assert_eq!(game.top.vel, (0.0, 0.0));
         assert!(!game.top.is_airborne());
-        assert_eq!(game.elapsed, Duration::ZERO, "制限時間はここから数える");
+        assert_eq!(game.elapsed, Duration::ZERO, "制限時間はまだ数えない");
         assert_eq!(game.outcome(), None);
         assert!(!game.is_finished());
         let result = game.result();
         assert_eq!(result.game_id, GAME_ID);
         assert_eq!(result.difficulty, SESSION_DIFFICULTY);
         assert_eq!(result.total, 0);
+        // 盤は見えていて、その上にカウントダウンを重ねる
+        // (ゴールはランダムでカウントダウンの文字の下に隠れることがあるので、配置が決まった盤で見る)
+        let text = rendered_text(&calm_game_before_go(), AREA);
+        assert!(text.contains("盤面"), "{text}");
+        assert!(
+            text.contains(render::BUMP_GLYPH) || text.contains(render::HOLLOW_GLYPH),
+            "新しい盤を見せておく: {text}"
+        );
+        assert!(text.contains(BIG_DOT), "カウントダウンの大きな文字: {text}");
+        assert!(text.contains("残り60.0秒"), "{text}");
+    }
+
+    #[test]
+    fn the_countdown_goes_three_two_one_go() {
+        let mut game = calm_game_before_go();
+        for phase in [Phase::Two, Phase::One, Phase::Go] {
+            game.update(PHASE_DURATION);
+            assert_eq!(countdown_phase(&game), Some(phase));
+        }
+    }
+
+    #[test]
+    fn keys_are_ignored_during_the_countdown() {
+        let mut game = calm_game_before_go();
+        for code in [
+            KeyCode::Up,
+            KeyCode::Right,
+            KeyCode::Right,
+            KeyCode::Left,
+            KeyCode::Down,
+        ] {
+            game.handle_key(key(code));
+        }
+        assert_eq!(game.tilt.pitch(), 0.0, "カウントダウン中の連打で傾かない");
+        assert_eq!(game.tilt.roll(), 0.0);
+        game.update(COUNTDOWN_TOTAL - STEP);
+        assert!(is_countdown(&game));
+        assert_eq!(
+            game.top.pos,
+            game.board.start_position(),
+            "カウントダウン中は転がらない"
+        );
+        assert_eq!(game.elapsed, Duration::ZERO);
+    }
+
+    #[test]
+    fn go_drops_the_top_and_starts_the_clock() {
+        let mut game = calm_game_before_go();
+        game.update(COUNTDOWN_TOTAL - Duration::from_millis(1));
+        assert!(is_countdown(&game), "GO!!の表示が終わるまでは投入しない");
+        assert_eq!(game.elapsed, Duration::ZERO);
+        game.update(Duration::from_millis(1));
+        assert!(is_playing(&game), "GO!!が終わったら投入する");
+        assert_eq!(
+            game.top.pos,
+            game.board.start_position(),
+            "投入位置に置かれる"
+        );
+        assert_eq!(game.top.vel, (0.0, 0.0));
+        assert_eq!(game.elapsed, Duration::ZERO, "制限時間はここから数える");
+        game.update(Duration::from_secs(1));
+        assert_eq!(game.elapsed, Duration::from_secs(1));
+        // 投入後はキーで傾けられる
+        game.handle_key(key(KeyCode::Right));
+        assert_eq!(game.tilt.roll(), TILT_STEP);
+        let text = rendered_text(&game, AREA);
+        assert!(!text.contains(BIG_DOT), "カウントダウンは消える: {text}");
     }
 
     #[test]
@@ -569,6 +767,7 @@ mod tests {
             1000.0,
         );
         let mut game = BeigomaGame::with_truck(truck);
+        finish_countdown(&mut game);
         let mut t = Duration::ZERO;
         while game.truck.current_g().magnitude() <= HIGH_G_THRESHOLD {
             game.update(STEP);
@@ -659,6 +858,162 @@ mod tests {
         );
     }
 
+    // --- 2ROUND制 ---
+
+    /// ROUND1をゴールで終える
+    fn clear_round(game: &mut BeigomaGame) {
+        game.on_step_event(StepEvent::Goal);
+        assert!(matches!(game.outcome(), Some(Outcome::Cleared { .. })));
+    }
+
+    #[test]
+    fn round1_end_leads_to_round2_countdown_after_the_hold() {
+        let mut game = calm_game();
+        game.handle_key(key(KeyCode::Right));
+        game.update(Duration::from_secs(3));
+        clear_round(&mut game);
+        game.update(END_HOLD - STEP);
+        assert!(game.outcome().is_some(), "結果の表示をしばらく出す");
+        assert_eq!(game.round_index, 0);
+        assert!(!game.is_finished(), "ROUND1をクリアしたらROUND2へ進む");
+        game.update(STEP);
+        assert!(!game.is_finished());
+        assert!(is_countdown(&game), "ROUND2もカウントダウンから");
+        assert_eq!(countdown_phase(&game), Some(Phase::Three));
+        assert_eq!(game.round_index, 1);
+        assert_eq!(game.params, round_params(1));
+        assert_eq!(game.outcome(), None);
+        // 盤はROUND2の配置に作り直し、ベーゴマは投入位置に戻る
+        let layout = round_params(1).layout;
+        for (y, row) in layout.iter().enumerate() {
+            for (x, c) in row.chars().enumerate() {
+                let expected = match c {
+                    '#' => Some(Cell::Bump),
+                    'u' => Some(Cell::Hollow),
+                    _ => None,
+                };
+                if let Some(cell) = expected {
+                    assert_eq!(game.board.cell(x, y), cell, "({x},{y})");
+                }
+            }
+        }
+        assert_eq!(game.top.pos, game.board.start_position());
+        assert_eq!(game.top.vel, (0.0, 0.0));
+        assert_eq!(game.tilt.roll(), 0.0, "傾きもROUNDごとに水平へ戻す");
+        assert_eq!(game.elapsed, Duration::ZERO, "制限時間はROUNDごと");
+        assert_eq!(game.result().total, 1, "ROUND1の結果は記録済み");
+        game.update(COUNTDOWN_TOTAL);
+        assert!(is_playing(&game));
+        let text = rendered_text(&game, AREA);
+        assert!(text.contains("残り60.0秒"), "{text}");
+    }
+
+    #[test]
+    fn round1_failure_ends_the_session_without_round2() {
+        // 吹っ飛び・場外・時間切れのどれでも、ROUND2へ進まずそこでセッション終了
+        let failures: [fn(&mut BeigomaGame); 3] = [
+            |game| game.on_step_event(StepEvent::Landed(Landing::Flown)),
+            |game| game.on_step_event(StepEvent::FellOff),
+            |game| game.update(TIME_LIMIT + STEP),
+        ];
+        for (i, fail) in failures.into_iter().enumerate() {
+            let mut game = calm_game();
+            fail(&mut game);
+            assert!(
+                matches!(game.outcome(), Some(Outcome::Flown | Outcome::TimeUp)),
+                "case{i}: {:?}",
+                game.outcome()
+            );
+            assert!(
+                !game.is_finished(),
+                "case{i}: GAME OVERの表示をしばらく出す"
+            );
+            game.update(END_HOLD);
+            assert!(
+                game.is_finished(),
+                "case{i}: ROUND2へは進まずセッション終了"
+            );
+            assert_eq!(game.round_index, 0, "case{i}");
+            assert!(
+                !is_countdown(&game),
+                "case{i}: ROUND2のカウントダウンを始めない"
+            );
+            game.update(Duration::from_secs(5));
+            assert!(game.is_finished(), "case{i}");
+            assert_eq!(game.round_index, 0, "case{i}");
+            let result = game.result();
+            assert_eq!(
+                (result.correct, result.total),
+                (0, 1),
+                "case{i}: ROUND1の1件だけ"
+            );
+        }
+    }
+
+    #[test]
+    fn session_finishes_after_round2_end_display() {
+        for round2_cleared in [true, false] {
+            let mut game = calm_game();
+            clear_round(&mut game);
+            game.update(END_HOLD);
+            finish_countdown(&mut game);
+            assert_eq!(game.round_index, 1);
+            if round2_cleared {
+                clear_round(&mut game);
+            } else {
+                game.on_step_event(StepEvent::FellOff);
+            }
+            assert!(!game.is_finished(), "ROUND2の結果の表示をしばらく出す");
+            game.update(END_HOLD - STEP);
+            assert!(!game.is_finished());
+            game.update(STEP);
+            assert!(game.is_finished(), "ROUND2で終わり");
+            assert_eq!(game.round_index + 1, ROUNDS_PER_SESSION);
+            game.update(END_HOLD);
+            assert!(!is_countdown(&game), "3つ目のROUNDは無い");
+            let result = game.result();
+            assert_eq!(result.total, 2);
+            assert_eq!(result.correct, if round2_cleared { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn each_round_generates_a_goal_from_its_rule() {
+        for _ in 0..10 {
+            let mut game = BeigomaGame::new();
+            let rule = round_params(0).goal_rule;
+            assert!(
+                Board::goal_candidates(round_params(0).layout, &rule).contains(&game.board.goal())
+            );
+            game.update(COUNTDOWN_TOTAL);
+            clear_round(&mut game);
+            game.update(END_HOLD);
+            let params = round_params(1);
+            let goal = game.board.goal();
+            assert!(Board::goal_candidates(params.layout, &params.goal_rule).contains(&goal));
+            assert!(game.board.straight_line_is_blocked(
+                game.board.start_position(),
+                (goal.0 as f64 + 0.5, goal.1 as f64 + 0.5)
+            ));
+        }
+    }
+
+    #[test]
+    fn hud_shows_the_round_label() {
+        let mut game = calm_game();
+        let text = rendered_text(&game, AREA);
+        assert!(text.contains("ROUND1やさしい"), "{text}");
+        assert!(text.contains("べー"), "{text}");
+        clear_round(&mut game);
+        game.update(END_HOLD);
+        let text = rendered_text(&game, AREA);
+        assert!(
+            text.contains("ROUND2むずかしい"),
+            "ROUND2のカウントダウン中から出す: {text}"
+        );
+        assert!(!text.contains("ROUND1"), "{text}");
+    }
+
     #[test]
     fn the_session_finishes_after_the_end_display() {
         let mut game = calm_game();
@@ -676,11 +1031,13 @@ mod tests {
         place_just_before_goal(&mut game);
         game.update(STEP);
         assert!(matches!(game.outcome(), Some(Outcome::Cleared { .. })));
-        // 終わった後は時間切れにも吹っ飛びにもならない
-        game.update(TIME_LIMIT);
+        // 終わった後(結果の表示中)は時間切れにも吹っ飛びにもならない
+        game.elapsed = TIME_LIMIT;
+        game.update(END_HOLD - STEP);
         game.on_step_event(StepEvent::Landed(Landing::Flown));
+        game.finish(Outcome::TimeUp);
         assert!(matches!(game.outcome(), Some(Outcome::Cleared { .. })));
-        assert_eq!(game.result().total, 1);
+        assert_eq!(game.result().total, 1, "ROUNDごとに1回だけ記録する");
     }
 
     #[test]
