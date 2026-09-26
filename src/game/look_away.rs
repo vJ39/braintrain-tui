@@ -267,6 +267,9 @@ pub struct LookAwayGame {
     mark_renderer: MarkRenderer,
     /// カウントダウンの「GO!!」の音を1問目だけ鳴らすためのゲート
     go_se: GoSeOnce,
+    /// 「3.2.1.GO!!」のカウントダウン演出自体を出したことがあるか。1問目だけ出し、
+    /// 2問目以降は演出を挟まず直接待機から始める
+    shown_countdown_once: bool,
 }
 
 /// 結果表示(◯/✗)のエリアを塗る色。画像表示の時は画像の背景と周りのセルを同じ色で塗れる
@@ -308,6 +311,7 @@ impl LookAwayGame {
             feedback: AnswerFeedback::new(),
             mark_renderer: MarkRenderer::new(),
             go_se: GoSeOnce::new(),
+            shown_countdown_once: false,
         };
         game.start_round();
         game
@@ -328,9 +332,16 @@ impl LookAwayGame {
         self.is_game_over() || self.tracker.is_session_finished()
     }
 
-    /// 新しい問題を始める。カウントダウンから始め、フェイント回数を数え直す
+    /// 新しい問題を始める。フェイント回数を数え直す。1問目だけ「3.2.1.GO!!」の
+    /// カウントダウンから始め、2問目以降は演出を挟まず直接待機から始める
     fn start_round(&mut self) {
         self.feints_in_round = 0;
+        if self.shown_countdown_once {
+            self.phase = Phase::Idle {
+                remaining: random_between(&mut rand::thread_rng(), IDLE_WAIT_MS),
+            };
+            return;
+        }
         let state = CountdownState::new();
         // 最初のフェーズ「3」の音
         if let Some(phase) = state.phase() {
@@ -396,6 +407,7 @@ impl LookAwayGame {
                     }
                 }
                 if state.is_finished() {
+                    self.shown_countdown_once = true;
                     self.phase = Phase::Idle {
                         remaining: random_between(&mut rand::thread_rng(), IDLE_WAIT_MS),
                     };
@@ -713,9 +725,11 @@ mod tests {
         };
     }
 
-    /// カウントダウンを終えて「ヤー!!」を出し、correctに応じて正解/不正解のキーを押す
+    /// (1問目ならカウントダウンを終えて)「ヤー!!」を出し、correctに応じて正解/不正解のキーを押す
     fn answer_round(game: &mut LookAwayGame, correct: bool) {
-        finish_countdown(game);
+        if is_countdown(game) {
+            finish_countdown(game);
+        }
         shout(game, Side::Left);
         let code = if correct {
             KeyCode::Right
@@ -1193,7 +1207,7 @@ mod tests {
     // --- 結果表示と次の問題 ---
 
     #[test]
-    fn result_holds_then_next_round_starts_with_countdown() {
+    fn result_holds_then_next_round_starts_without_countdown() {
         let mut game = LookAwayGame::new();
         answer_round(&mut game, true);
         game.update(RESULT_HOLD - ms(1));
@@ -1202,8 +1216,25 @@ mod tests {
             "表示時間中は結果のまま"
         );
         game.update(ms(1));
-        assert!(is_countdown(&game), "次の問題もカウントダウンから");
+        assert!(
+            matches!(game.phase, Phase::Idle { .. }),
+            "2問目以降はカウントダウンを挟まず直接待機から始まる"
+        );
         assert!(!game.is_finished());
+    }
+
+    #[test]
+    fn countdown_is_shown_on_the_first_round_only() {
+        let mut game = LookAwayGame::new();
+        assert!(is_countdown(&game), "1問目はカウントダウンから");
+        for _ in 0..3 {
+            answer_round(&mut game, true);
+            game.update(RESULT_HOLD);
+            assert!(
+                matches!(game.phase, Phase::Idle { .. }),
+                "2問目以降はカウントダウンを挟まない"
+            );
+        }
     }
 
     #[test]
