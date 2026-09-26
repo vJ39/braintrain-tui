@@ -41,11 +41,8 @@ pub enum Screen {
     Splash,
     Menu,
     /// 「べー」開始前に挟む専用スプラッシュ画面(コマ送りアニメーション)。
-    /// Enter/クリックでBeigomaCharacterSplashへ進む
-    BeigomaSplash,
-    /// BeigomaSplashの後、べー本編開始前に挟むキャラクター静止画スプラッシュ画面。
     /// Enter/クリックでべーが始まる
-    BeigomaCharacterSplash,
+    BeigomaSplash,
     /// リズムゲームの曲選択(選択中の曲 = SONGSのインデックス)。
     /// TTRスプラッシュ画像を背景に、その上へ曲リストのパネルを重ねて描く
     SelectSong(usize),
@@ -84,8 +81,6 @@ pub struct App {
     ttr_splash_renderer: SplashRenderer,
     /// 「べー」開始前のスプラッシュ画面(Screen::BeigomaSplash)用のコマ送りアニメーション
     beigoma_splash_renderer: AnimatedSplash,
-    /// 「べー」本編開始前のキャラクター静止画スプラッシュ画面(Screen::BeigomaCharacterSplash)用
-    beigoma_character_splash_renderer: SplashRenderer,
     /// メニューへ戻った直後にtrueになる。main.rsがtake_pending_scrollback_clear()で
     /// 検知して端末のスクロールバッファをクリアする(画像プロトコルの残留対策)
     pending_scrollback_clear: bool,
@@ -123,10 +118,6 @@ impl App {
                 crate::ui::splash::TTR_FALLBACK,
             ),
             beigoma_splash_renderer: AnimatedSplash::new(crate::ui::splash::BEIGOMA_FALLBACK),
-            beigoma_character_splash_renderer: SplashRenderer::new(
-                crate::ui::splash::BEIGOMA_CHARACTER_SPLASH_IMAGE_PATH,
-                crate::ui::splash::BEIGOMA_CHARACTER_FALLBACK,
-            ),
             pending_scrollback_clear: false,
             // 画面に入る時(enter_menu/show_result)にリセットするので、それまでは表示済みにしておく
             menu_typewriter: Typewriter::completed(MENU_CHAR_INTERVAL),
@@ -182,11 +173,6 @@ impl App {
                     self.leave_beigoma_splash();
                 }
             }
-            Screen::BeigomaCharacterSplash => {
-                if matches!(key.code, KeyCode::Enter) {
-                    self.leave_beigoma_character_splash();
-                }
-            }
             Screen::Menu => self.handle_menu_key(key),
             Screen::SelectSong(selected) => {
                 let selected = *selected;
@@ -229,9 +215,6 @@ impl App {
             }
             Screen::BeigomaSplash => {
                 self.leave_beigoma_splash();
-            }
-            Screen::BeigomaCharacterSplash => {
-                self.leave_beigoma_character_splash();
             }
             Screen::Menu => self.handle_menu_mouse(mouse),
             Screen::SelectSong(_) => self.handle_song_mouse(mouse),
@@ -292,14 +275,6 @@ impl App {
             Screen::BeigomaSplash => {
                 let screen = render_background(frame, background, area);
                 splash_screens::render_beigoma(frame, screen, &mut self.beigoma_splash_renderer);
-            }
-            Screen::BeigomaCharacterSplash => {
-                let screen = render_background(frame, background, area);
-                splash_screens::render_still(
-                    frame,
-                    screen,
-                    &mut self.beigoma_character_splash_renderer,
-                );
             }
             Screen::Menu => {
                 let screen = render_background(frame, background, area);
