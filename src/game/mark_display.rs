@@ -2,6 +2,7 @@
 //! イロピッタン・記憶ゲームの正誤表示で共通に使う。
 //!
 //! 記号は黒・透明背景の画像(maru.png/batsu.png)を背景色の上に重ねて大きく表示する。
+//! 正解時の画像はゲームごとに差し替えられる(オイカケは専用のイラスト)。不正解時の✗は全ゲーム共通。
 //! sixel/kitty/iTerm2の画像プロトコルに対応した端末では画像を、非対応の端末では
 //! 通常サイズの黒い文字をテキストで表示する。
 //! 画像を縦横比を保ってセルの矩形に収める処理(glyph_area/compose_glyph_image)は、
@@ -38,10 +39,9 @@ pub fn mark_text(is_correct: bool) -> &'static str {
     }
 }
 
-/// 正誤の記号の画像を読み込む。読めない場合はNone
-fn load_mark_image(is_correct: bool) -> Option<RgbaImage> {
-    let data = if is_correct { MARU_PNG } else { BATSU_PNG };
-    let image = image::load_from_memory(data).ok()?;
+/// 記号の画像(PNG/JPEG等のバイト列)を読み込む。読めない場合はNone
+fn load_mark_image(bytes: &[u8]) -> Option<RgbaImage> {
+    let image = image::load_from_memory(bytes).ok()?;
     Some(image.to_rgba8())
 }
 
@@ -140,8 +140,10 @@ struct MarkCache {
 /// 正誤の記号の描画器。画像プロトコルが使える端末では記号を画像で大きく表示する
 pub struct MarkRenderer {
     picker: Option<Picker>,
+    /// 正解時に表示する画像のバイト列。既定はMARU_PNG
+    correct_image: &'static [u8],
     /// 直前に読み込んだ記号の画像(正誤, 画像)。描画範囲の計算に画像の寸法が要るので、
-    /// 同じ記号の間は毎フレームPNGを読み直さないよう持っておく
+    /// 同じ記号の間は毎フレーム画像を読み直さないよう持っておく
     glyph: RefCell<Option<(bool, RgbaImage)>>,
     cache: RefCell<Option<MarkCache>>,
 }
@@ -161,10 +163,34 @@ impl MarkRenderer {
     /// 画像プロトコルを指定して作る(None=テキスト表示)。
     /// 出題文字の画像と同じPickerを使い回す時や、テストで使う
     pub fn with_picker(picker: Option<Picker>) -> Self {
+        Self::with_picker_and_correct_image(picker, MARU_PNG)
+    }
+
+    /// 端末の画像プロトコルを調べ、正解時の画像を差し替えた描画器を作る。
+    /// correct_imageは画像のバイト列(PNG/JPEG等)。不正解時の✗は差し替えない
+    pub fn with_correct_image(correct_image: &'static [u8]) -> Self {
+        Self::with_picker_and_correct_image(detect_picker(), correct_image)
+    }
+
+    /// 画像プロトコルと正解時の画像を指定して作る(None=テキスト表示)
+    pub fn with_picker_and_correct_image(
+        picker: Option<Picker>,
+        correct_image: &'static [u8],
+    ) -> Self {
         Self {
             picker,
+            correct_image,
             glyph: RefCell::new(None),
             cache: RefCell::new(None),
+        }
+    }
+
+    /// 正誤に対応する画像のバイト列。正解=差し替えた画像(既定は◯)、不正解=✗
+    fn image_bytes(&self, is_correct: bool) -> &'static [u8] {
+        if is_correct {
+            self.correct_image
+        } else {
+            BATSU_PNG
         }
     }
 
@@ -181,7 +207,10 @@ impl MarkRenderer {
         if area.is_empty() {
             return;
         }
-        frame.render_widget(Block::default().style(Style::default().bg(background)), area);
+        frame.render_widget(
+            Block::default().style(Style::default().bg(background)),
+            area,
+        );
         let drawn_as_image = match background {
             Color::Rgb(r, g, b) => self.render_image(frame, area, is_correct, [r, g, b]),
             _ => false,
@@ -200,7 +229,7 @@ impl MarkRenderer {
         // 描画範囲は画像の縦横比で決まるので、先に画像を読み込む
         let mut glyph_cache = self.glyph.borrow_mut();
         if !matches!(glyph_cache.as_ref(), Some((cached, _)) if *cached == is_correct) {
-            let Some(image) = load_mark_image(is_correct) else {
+            let Some(image) = load_mark_image(self.image_bytes(is_correct)) else {
                 return false;
             };
             *glyph_cache = Some((is_correct, image));
@@ -243,6 +272,12 @@ impl MarkRenderer {
             .borrow()
             .as_ref()
             .map(|cached| (cached.is_correct, cached.bg, cached.area))
+    }
+
+    /// 正誤に対応して使う画像のバイト列。テストで差し替えを確かめる用
+    #[cfg(test)]
+    pub fn mark_image_bytes(&self, is_correct: bool) -> &'static [u8] {
+        self.image_bytes(is_correct)
     }
 }
 
@@ -308,18 +343,149 @@ mod tests {
 
     #[test]
     fn mark_images_are_embedded_as_squares() {
-        for is_correct in [true, false] {
-            let image = load_mark_image(is_correct).unwrap_or_else(|| {
-                panic!("「{}」の画像が埋め込まれていること", mark_text(is_correct))
-            });
+        for (bytes, label) in [(MARU_PNG, "◯"), (BATSU_PNG, "✗")] {
+            let image = load_mark_image(bytes)
+                .unwrap_or_else(|| panic!("「{label}」の画像が埋め込まれていること"));
             assert_eq!(image.dimensions(), (512, 512), "正方形");
         }
     }
 
     #[test]
+    fn load_mark_image_returns_none_for_broken_bytes() {
+        assert!(load_mark_image(b"not an image").is_none());
+        assert!(load_mark_image(&[]).is_none());
+    }
+
+    #[test]
+    fn default_renderer_uses_maru_for_correct_and_batsu_for_incorrect() {
+        // 差し替えていないゲーム(イロピッタン等)は従来通り◯/✗の画像を使う
+        for renderer in [
+            MarkRenderer::new(),
+            MarkRenderer::default(),
+            MarkRenderer::with_picker(None),
+            MarkRenderer::with_picker(Some(halfblocks_picker())),
+        ] {
+            // constは使う箇所ごとにアドレスが変わり得るので、中身で比べる
+            assert!(renderer.mark_image_bytes(true) == MARU_PNG);
+            assert!(renderer.mark_image_bytes(false) == BATSU_PNG);
+        }
+    }
+
+    #[test]
+    fn custom_correct_image_replaces_only_correct_mark() {
+        let custom = leaked_png(300, 100, [255, 0, 0]);
+        for renderer in [
+            MarkRenderer::with_correct_image(custom),
+            MarkRenderer::with_picker_and_correct_image(None, custom),
+            MarkRenderer::with_picker_and_correct_image(Some(halfblocks_picker()), custom),
+        ] {
+            assert!(renderer.mark_image_bytes(true) == custom);
+            assert!(
+                renderer.mark_image_bytes(false) == BATSU_PNG,
+                "不正解の画像は全ゲーム共通のまま"
+            );
+        }
+        // テストでは端末に問い合わせず、常にテキスト表示にする
+        assert!(!MarkRenderer::with_correct_image(custom).uses_image());
+        assert!(
+            MarkRenderer::with_picker_and_correct_image(Some(halfblocks_picker()), custom)
+                .uses_image()
+        );
+    }
+
+    /// width x height の単色のPNGを作り、'staticなバイト列にする(テスト専用)
+    fn leaked_png(width: u32, height: u32, rgb: [u8; 3]) -> &'static [u8] {
+        let image = RgbaImage::from_pixel(width, height, Rgba([rgb[0], rgb[1], rgb[2], 255]));
+        let mut bytes = Vec::new();
+        DynamicImage::ImageRgba8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        Box::leak(bytes.into_boxed_slice())
+    }
+
+    /// 描画範囲のピクセル換算の縦横比(幅/高さ)
+    fn pixel_aspect(area: Rect, font_size: (u16, u16)) -> f64 {
+        f64::from(area.width) * f64::from(font_size.0)
+            / (f64::from(area.height) * f64::from(font_size.1))
+    }
+
+    #[test]
+    fn image_mode_draws_custom_correct_image_and_default_batsu() {
+        // 横長(4:1)の真っ赤な画像を正解の画像にすると、正解の時だけその画像で描かれる
+        let custom = leaked_png(400, 100, [255, 0, 0]);
+        let renderer =
+            MarkRenderer::with_picker_and_correct_image(Some(halfblocks_picker()), custom);
+        let area = Rect::new(0, 0, 60, 16);
+        let background = Color::Rgb(40, 190, 70);
+
+        let buffer = render_mark(&renderer, (60, 16), area, true, background);
+        let (cached_correct, _, drawn) = renderer.cached_mark().expect("画像で描かれていること");
+        assert!(cached_correct);
+        let aspect = pixel_aspect(drawn, (10, 20));
+        assert!(
+            (3.0..=5.0).contains(&aspect),
+            "正解は差し替えた横長の画像: {aspect}"
+        );
+        let has_red = area_cells(drawn).any(|pos| {
+            let cell = &buffer[pos];
+            [cell.fg, cell.bg].contains(&Color::Rgb(255, 0, 0))
+        });
+        assert!(has_red, "差し替えた画像の色で描かれる");
+
+        // 不正解は従来通りの✗(正方形・赤を含まない)
+        let buffer = render_mark(&renderer, (60, 16), area, false, background);
+        let (cached_correct, _, drawn) = renderer.cached_mark().expect("画像で描かれていること");
+        assert!(!cached_correct);
+        let aspect = pixel_aspect(drawn, (10, 20));
+        assert!(
+            (0.8..=1.25).contains(&aspect),
+            "不正解は正方形の✗: {aspect}"
+        );
+        let has_red = area_cells(drawn).any(|pos| {
+            let cell = &buffer[pos];
+            [cell.fg, cell.bg].contains(&Color::Rgb(255, 0, 0))
+        });
+        assert!(!has_red, "不正解では差し替えた画像を使わない");
+    }
+
+    #[test]
+    fn image_mode_default_renderer_draws_square_maru() {
+        // 差し替えていない描画器は、正解でも正方形の◯で描く
+        let renderer = MarkRenderer::with_picker(Some(halfblocks_picker()));
+        let area = Rect::new(0, 0, 60, 16);
+        render_mark(&renderer, (60, 16), area, true, Color::Rgb(40, 190, 70));
+        let (_, _, drawn) = renderer.cached_mark().expect("画像で描かれていること");
+        let aspect = pixel_aspect(drawn, (10, 20));
+        assert!((0.8..=1.25).contains(&aspect), "正方形の◯: {aspect}");
+    }
+
+    #[test]
+    fn opaque_custom_image_is_composed_without_transparency() {
+        // 背景込みの不透明な画像(JPEG等)でも合成でき、透明な部分は残らない
+        let custom = leaked_png(512, 512, [10, 20, 200]);
+        let glyph = load_mark_image(custom).unwrap();
+        let image = compose_glyph_image(&glyph, 40, 10, (10, 20), [240, 210, 0]);
+        assert_eq!(image.dimensions(), (400, 200));
+        assert!(image.pixels().all(|p| p.0[3] == 255));
+        assert_eq!(
+            image.get_pixel(0, 0).0,
+            [240, 210, 0, 255],
+            "左右の余白は背景色"
+        );
+        assert_eq!(
+            image.get_pixel(200, 100).0,
+            [10, 20, 200, 255],
+            "中央は画像の色"
+        );
+    }
+
+    #[test]
     fn composed_mark_image_has_black_glyph_on_background() {
-        for is_correct in [true, false] {
-            let glyph = load_mark_image(is_correct).unwrap();
+        for (bytes, is_correct) in [(MARU_PNG, true), (BATSU_PNG, false)] {
+            let glyph = load_mark_image(bytes).unwrap();
             let image = compose_glyph_image(&glyph, 20, 10, (10, 20), [240, 210, 0]);
             assert_eq!(image.dimensions(), (200, 200));
             assert!(

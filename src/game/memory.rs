@@ -16,6 +16,9 @@ use crate::game::{contains, Difficulty, Game, GameResult, ScoreTracker};
 
 pub const GAME_ID: &str = "memory";
 
+/// 正解時に大きく表示するオイカケ専用の画像(背景込みの不透明なイラスト)
+const CORRECT_IMAGE_JPG: &[u8] = include_bytes!("../../assets/image/memory/correct.jpg");
+
 /// 結果・HUDに出す難易度。問題が進むと手数が増えるため、最後の区間の上級を代表値にする
 pub const SESSION_DIFFICULTY: Difficulty = Difficulty::Advanced;
 
@@ -165,7 +168,7 @@ impl MemoryGame {
             active_panel,
             input_started_at: Instant::now(),
             feedback: AnswerFeedback::new(),
-            mark_renderer: MarkRenderer::new(),
+            mark_renderer: MarkRenderer::with_correct_image(CORRECT_IMAGE_JPG),
         }
     }
 
@@ -235,7 +238,11 @@ impl MemoryGame {
                         .add_modifier(Modifier::BOLD),
                 )
             } else if is_showing {
-                (BorderType::Rounded, theme::MUTED, Style::default().fg(theme::MUTED))
+                (
+                    BorderType::Rounded,
+                    theme::MUTED,
+                    Style::default().fg(theme::MUTED),
+                )
             } else {
                 (BorderType::Rounded, color, Style::default().fg(color))
             };
@@ -358,7 +365,8 @@ impl Game for MemoryGame {
             Phase::Interval { is_correct, .. } => {
                 // 正誤確定後はパネルの代わりに、グリッドのエリアいっぱいに大きな◯/✗を出す
                 let background = mark_background(is_correct, self.mark_renderer.uses_image());
-                self.mark_renderer.render(frame, grid_area, is_correct, background);
+                self.mark_renderer
+                    .render(frame, grid_area, is_correct, background);
             }
             Phase::Blank { .. } => {
                 // 次の問題が始まる前の何もない間。パネル・記号は出さず枠だけにする
@@ -803,7 +811,63 @@ mod tests {
     fn halfblocks_renderer() -> MarkRenderer {
         let mut picker = Picker::from_fontsize((10, 20));
         picker.set_protocol_type(ProtocolType::Halfblocks);
-        MarkRenderer::with_picker(Some(picker))
+        MarkRenderer::with_picker_and_correct_image(Some(picker), CORRECT_IMAGE_JPG)
+    }
+
+    #[test]
+    fn correct_image_is_embedded_and_decodable() {
+        let image = image::load_from_memory(CORRECT_IMAGE_JPG)
+            .expect("オイカケの正解画像が埋め込まれ、読み込めること");
+        assert_eq!((image.width(), image.height()), (512, 512));
+    }
+
+    #[test]
+    fn game_uses_own_correct_image_and_common_incorrect_image() {
+        let game = MemoryGame::new();
+        assert!(
+            game.mark_renderer.mark_image_bytes(true) == CORRECT_IMAGE_JPG,
+            "正解時はオイカケ専用の画像"
+        );
+        let common = MarkRenderer::with_picker(None);
+        assert!(
+            game.mark_renderer.mark_image_bytes(false) == common.mark_image_bytes(false),
+            "不正解時は全ゲーム共通の✗"
+        );
+        assert!(
+            game.mark_renderer.mark_image_bytes(true) != common.mark_image_bytes(true),
+            "正解時は共通の◯を使わない"
+        );
+    }
+
+    #[test]
+    fn correct_interval_is_drawn_with_own_image_colors() {
+        // 共通の◯は黒と背景色(緑)を混ぜた色だけで描かれ、どの色も緑の成分が赤・青より大きい。
+        // オイカケの画像はイラストなので、赤や青が緑より強い色が一定数含まれる
+        let mut game = MemoryGame::new();
+        game.mark_renderer = halfblocks_renderer();
+        play_current_sequence(&mut game, true);
+        let (buffer, _) = render_game(&game, 60, 20);
+        let (cached_correct, _, drawn) = game
+            .mark_renderer
+            .cached_mark()
+            .expect("画像で描かれていること");
+        assert!(cached_correct);
+        let colors: Vec<Color> = (drawn.y..drawn.bottom())
+            .flat_map(|y| (drawn.x..drawn.right()).map(move |x| (x, y)))
+            .flat_map(|pos| [buffer[pos].fg, buffer[pos].bg])
+            .collect();
+        let not_greenish = colors
+            .iter()
+            .filter(|color| match color {
+                Color::Rgb(r, g, b) => u16::from(*r).max(u16::from(*b)) > u16::from(*g) + 30,
+                _ => false,
+            })
+            .count();
+        assert!(
+            not_greenish * 10 > colors.len(),
+            "イラストの色で描かれる: {not_greenish}/{}",
+            colors.len()
+        );
     }
 
     #[test]
@@ -857,7 +921,10 @@ mod tests {
         play_current_sequence(&mut game, true);
         let (buffer, _) = render_game(&game, 60, 16);
         let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
-        assert!(text.replace(' ', "").contains("せいかい"), "footerに補足を残す");
+        assert!(
+            text.replace(' ', "").contains("せいかい"),
+            "footerに補足を残す"
+        );
     }
 
     #[test]
@@ -891,14 +958,20 @@ mod tests {
         let mut game = MemoryGame::new();
         let (buffer, grid_area) = render_game(&game, 40, 16);
         let text = area_text(&buffer, grid_area);
-        assert!(!text.contains(CORRECT_MARK) && !text.contains(INCORRECT_MARK), "提示中");
+        assert!(
+            !text.contains(CORRECT_MARK) && !text.contains(INCORRECT_MARK),
+            "提示中"
+        );
         let len = game.sequence.len();
         for _ in 0..len {
             advance_one_step(&mut game);
         }
         let (buffer, grid_area) = render_game(&game, 40, 16);
         let text = area_text(&buffer, grid_area);
-        assert!(!text.contains(CORRECT_MARK) && !text.contains(INCORRECT_MARK), "入力中");
+        assert!(
+            !text.contains(CORRECT_MARK) && !text.contains(INCORRECT_MARK),
+            "入力中"
+        );
     }
 
     #[test]
@@ -908,8 +981,10 @@ mod tests {
             game.mark_renderer = halfblocks_renderer();
             play_current_sequence(&mut game, correct);
             let (buffer, grid_area) = render_game(&game, 60, 20);
-            let (cached_correct, bg, drawn) =
-                game.mark_renderer.cached_mark().expect("画像で描かれていること");
+            let (cached_correct, bg, drawn) = game
+                .mark_renderer
+                .cached_mark()
+                .expect("画像で描かれていること");
             assert_eq!(cached_correct, correct);
             let expected_bg = mark_background(correct, true);
             assert_eq!(Color::Rgb(bg[0], bg[1], bg[2]), expected_bg);
@@ -931,7 +1006,8 @@ mod tests {
                 let mut picker = Picker::from_fontsize((10, 20));
                 picker.set_protocol_type(protocol);
                 let mut game = MemoryGame::new();
-                game.mark_renderer = MarkRenderer::with_picker(Some(picker));
+                game.mark_renderer =
+                    MarkRenderer::with_picker_and_correct_image(Some(picker), CORRECT_IMAGE_JPG);
                 play_current_sequence(&mut game, correct);
                 for (width, height) in [(60u16, 20u16), (12, 9), (4, 4), (1, 1)] {
                     render_game(&game, width, height);
