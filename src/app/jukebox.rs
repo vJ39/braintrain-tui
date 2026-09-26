@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use crate::audio;
+use crate::audio::{self, SeKind};
 use crate::game::theme;
 
 use super::{App, Screen};
@@ -42,11 +42,13 @@ impl App {
 
         match key.code {
             KeyCode::Up => {
+                audio::play_se(SeKind::CursorMove);
                 if let Screen::Jukebox(state) = &mut self.screen {
                     state.select(Some((selected + len - 1) % len));
                 }
             }
             KeyCode::Down => {
+                audio::play_se(SeKind::CursorMove);
                 if let Screen::Jukebox(state) = &mut self.screen {
                     state.select(Some((selected + 1) % len));
                 }

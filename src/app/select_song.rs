@@ -37,8 +37,14 @@ impl App {
     pub(super) fn handle_song_key(&mut self, key: KeyEvent, selected: usize) {
         let len = SONGS.len().max(1);
         match key.code {
-            KeyCode::Up => self.screen = Screen::SelectSong((selected + len - 1) % len),
-            KeyCode::Down => self.screen = Screen::SelectSong((selected + 1) % len),
+            KeyCode::Up => {
+                audio::play_se(SeKind::CursorMove);
+                self.screen = Screen::SelectSong((selected + len - 1) % len);
+            }
+            KeyCode::Down => {
+                audio::play_se(SeKind::CursorMove);
+                self.screen = Screen::SelectSong((selected + 1) % len);
+            }
             KeyCode::Enter => self.select_song(selected),
             // 数字キーで直接選ぶ(1始まり)。曲数を超える番号は無視する
             KeyCode::Char(c) => {
