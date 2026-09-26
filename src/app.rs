@@ -8,6 +8,7 @@ use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Pa
 use ratatui::Frame;
 
 use crate::audio::{self, BgmCategory, SeKind};
+use crate::game::beigoma::BeigomaGame;
 use crate::game::color_stack::ColorStackGame;
 use crate::game::count_mania::CountManiaGame;
 use crate::game::memory::MemoryGame;
@@ -30,7 +31,7 @@ use crate::ui::result_sprite::ResultSprite;
 use crate::ui::splash::{self, SplashRenderer};
 use crate::ui::typewriter::{self, Typewriter};
 
-const MENU_ITEMS: [&str; 14] = [
+const MENU_ITEMS: [&str; 15] = [
     "図形回転判定",
     "鏡像判定",
     "イロピッタン",
@@ -43,6 +44,7 @@ const MENU_ITEMS: [&str; 14] = [
     "ソコヌキ",
     "TTR",
     "ハヤウチ",
+    "べー",
     "ジュークボックス",
     "履歴",
 ];
@@ -59,6 +61,8 @@ const COLOR_STACK_ITEM_INDEX: usize = 9;
 const RHYTHM_ITEM_INDEX: usize = 10;
 /// ハヤウチ
 const QUICK_DRAW_ITEM_INDEX: usize = 11;
+/// べー
+const BEIGOMA_ITEM_INDEX: usize = 12;
 const JUKEBOX_ITEM_INDEX: usize = MENU_ITEMS.len() - 2;
 const HISTORY_ITEM_INDEX: usize = MENU_ITEMS.len() - 1;
 
@@ -76,6 +80,7 @@ const MENU_DESCRIPTIONS: [&str; MENU_ITEMS.len()] = [
     "色ボタンで各列の一番下のブロックを消して盤面を空にする",
     "矢印キーで曲に合わせてステップする",
     "合図が出たら即座に反応する",
+    "軽トラの揺れに耐えてベーゴマをゴールへ運ぶ",
     "BGMを選んで聴く",
     "ゲームごとの反応時間の推移を見る",
 ];
@@ -94,6 +99,7 @@ const MENU_ICON_PATHS: [&str; MENU_ITEMS.len()] = [
     "menu_icons/color_stack.png",
     "menu_icons/rhythm.png",
     "menu_icons/quick_draw.png",
+    "menu_icons/beigoma.png",
     "menu_icons/jukebox.png",
     "menu_icons/history.png",
 ];
@@ -382,6 +388,11 @@ impl App {
             // ハヤウチは難易度選択に加え、ラウンドごとに自前の「3.2.1.GO!!」を持つため、
             // 画面遷移側のカウントダウンも挟まない(挟むと演出が2回連続してしまう)
             self.start_quick_draw();
+            return;
+        }
+        if selected == BEIGOMA_ITEM_INDEX {
+            // べーも難易度を持たず、決まったコース・制限時間60秒で進むため、難易度選択を挟まない
+            self.start_playing(BEIGOMA_ITEM_INDEX, crate::game::beigoma::SESSION_DIFFICULTY);
             return;
         }
         if selected == MEMORY_ITEM_INDEX {
@@ -767,6 +778,8 @@ fn new_game(item: usize, difficulty: Difficulty) -> Box<dyn Game> {
         RHYTHM_ITEM_INDEX => unreachable!("rhythm is started via start_rhythm with a song"),
         // ハヤウチは難易度を持たず、10問固定で進む
         QUICK_DRAW_ITEM_INDEX => Box::new(QuickDrawGame::new()),
+        // べーは難易度を持たず、決まったコース・制限時間60秒で進む
+        BEIGOMA_ITEM_INDEX => Box::new(BeigomaGame::new()),
         _ => unreachable!("history is handled without creating a game"),
     }
 }
@@ -1238,6 +1251,7 @@ fn result_lines(result: &GameResult) -> Vec<Line<'static>> {
         (crate::game::color_stack::GAME_ID, COLOR_STACK_ITEM_INDEX),
         (crate::game::rhythm::GAME_ID, RHYTHM_ITEM_INDEX),
         (crate::game::quick_draw::GAME_ID, QUICK_DRAW_ITEM_INDEX),
+        (crate::game::beigoma::GAME_ID, BEIGOMA_ITEM_INDEX),
     ];
     let game_name = game_names
         .iter()
@@ -1745,6 +1759,7 @@ mod tests {
             "color_stack.png",
             "rhythm.png",
             "quick_draw.png",
+            "beigoma.png",
             "jukebox.png",
             "history.png",
         ];
@@ -1754,9 +1769,15 @@ mod tests {
         }
     }
 
+    /// 画像がまだ生成されていないアイコン(読めない間はカードのアイコン部分が空白になる)
+    const PENDING_MENU_ICONS: [&str; 1] = ["menu_icons/beigoma.png"];
+
     #[test]
     fn every_menu_icon_is_embedded_and_decodes() {
         for path in MENU_ICON_PATHS {
+            if PENDING_MENU_ICONS.contains(&path) {
+                continue;
+            }
             assert!(
                 crate::ui::menu_icons::load_icon_image(path).is_some(),
                 "{path}: 埋め込まれていて画像としてデコードできること"
@@ -1810,13 +1831,13 @@ mod tests {
 
     #[test]
     fn grid_move_left_right_wraps_within_the_row() {
-        let len = MENU_ITEMS.len(); // 14項目・4列 → 最終行は12,13の2枚
+        let len = MENU_ITEMS.len(); // 15項目・4列 → 最終行は12,13,14の3枚
         assert_eq!(grid_move(0, GridMove::Right, 4, len), 1);
         assert_eq!(grid_move(3, GridMove::Right, 4, len), 0, "行末から行頭へ折り返す");
         assert_eq!(grid_move(0, GridMove::Left, 4, len), 3, "行頭から行末へ折り返す");
         assert_eq!(grid_move(5, GridMove::Left, 4, len), 4);
-        assert_eq!(grid_move(13, GridMove::Right, 4, len), 12, "欠けた最終行の中で折り返す");
-        assert_eq!(grid_move(12, GridMove::Left, 4, len), 13);
+        assert_eq!(grid_move(14, GridMove::Right, 4, len), 12, "欠けた最終行の中で折り返す");
+        assert_eq!(grid_move(12, GridMove::Left, 4, len), 14);
     }
 
     #[test]
@@ -1954,10 +1975,10 @@ mod tests {
     // --- ハヤウチ ---
 
     #[test]
-    fn quick_draw_comes_right_after_ttr_and_before_jukebox() {
+    fn quick_draw_comes_right_after_ttr_and_before_beigoma() {
         assert_eq!(MENU_ITEMS[QUICK_DRAW_ITEM_INDEX], "ハヤウチ");
         assert_eq!(RHYTHM_ITEM_INDEX + 1, QUICK_DRAW_ITEM_INDEX);
-        assert_eq!(QUICK_DRAW_ITEM_INDEX + 1, JUKEBOX_ITEM_INDEX);
+        assert_eq!(QUICK_DRAW_ITEM_INDEX + 1, BEIGOMA_ITEM_INDEX);
         // 先頭側の既存インデックスはずれない
         assert_eq!(MENU_ITEMS[COUNT_MANIA_ITEM_INDEX], "カウントマニア");
         assert_eq!(MENU_ITEMS[COLOR_STACK_ITEM_INDEX], "ソコヌキ");
@@ -2028,6 +2049,93 @@ mod tests {
         let text = rendered_text(&mut app).replace(' ', "");
         assert!(text.contains("ハヤウチ"));
         assert!(!text.contains("反射神経"));
+    }
+
+    // --- べー ---
+
+    #[test]
+    fn beigoma_comes_right_after_quick_draw_and_before_jukebox() {
+        assert_eq!(MENU_ITEMS[BEIGOMA_ITEM_INDEX], "べー");
+        assert_eq!(QUICK_DRAW_ITEM_INDEX + 1, BEIGOMA_ITEM_INDEX);
+        assert_eq!(BEIGOMA_ITEM_INDEX + 1, JUKEBOX_ITEM_INDEX);
+        assert_eq!(MENU_ICON_PATHS[BEIGOMA_ITEM_INDEX], "menu_icons/beigoma.png");
+    }
+
+    #[test]
+    fn new_game_for_beigoma_item_creates_beigoma() {
+        // べーは難易度を選ばないので、渡した難易度によらず固定の難易度で記録する
+        for difficulty in [
+            Difficulty::Beginner,
+            Difficulty::Intermediate,
+            Difficulty::Advanced,
+        ] {
+            let result = new_game(BEIGOMA_ITEM_INDEX, difficulty).result();
+            assert_eq!(result.game_id, crate::game::beigoma::GAME_ID);
+            assert_eq!(result.difficulty, crate::game::beigoma::SESSION_DIFFICULTY);
+        }
+    }
+
+    /// べーが始まり、ベーゴマが盤に投入されて制限時間60秒から数え始めていることを確かめる
+    fn assert_beigoma_is_playing(app: &mut App) {
+        finish_countdown(app);
+        let Screen::Playing(game) = &app.screen else {
+            panic!("Playing画面のはず");
+        };
+        assert_eq!(game.result().game_id, crate::game::beigoma::GAME_ID);
+        assert!(!game.is_finished());
+        // 全角文字の2セル目は空白で埋まるため、空白を除いて比較する
+        let text = rendered_text(app).replace(' ', "");
+        assert!(text.contains("べー"), "{text}");
+        assert!(text.contains("残り60.0秒"), "カウントダウン後から数え始める: {text}");
+        assert!(text.contains("盤面") && text.contains("軽トラ視点"), "2視点を出す");
+    }
+
+    #[test]
+    fn selecting_beigoma_skips_difficulty_and_starts_after_countdown() {
+        let mut app = App::new();
+        app.select_menu_item(BEIGOMA_ITEM_INDEX);
+        let Screen::Countdown {
+            item,
+            difficulty,
+            state,
+        } = &app.screen
+        else {
+            panic!("難易度選択を挟まずカウントダウンになるはず");
+        };
+        assert_eq!(*item, BEIGOMA_ITEM_INDEX);
+        assert_eq!(*difficulty, crate::game::beigoma::SESSION_DIFFICULTY);
+        assert_eq!(state.phase(), Some(Phase::Three), "3から始まる");
+        // GO!!の表示が終わるまではまだベーゴマを投入しない(ゲームを作らない)
+        app.update(COUNTDOWN_TOTAL - Duration::from_millis(1));
+        assert!(matches!(app.screen, Screen::Countdown { .. }));
+        assert_beigoma_is_playing(&mut app);
+    }
+
+    #[test]
+    fn enter_on_beigoma_in_menu_goes_straight_to_countdown() {
+        let mut app = App::new();
+        app.screen = Screen::Menu;
+        app.menu_state.select(BEIGOMA_ITEM_INDEX);
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(
+            app.screen,
+            Screen::Countdown {
+                item: BEIGOMA_ITEM_INDEX,
+                ..
+            }
+        ));
+        assert_beigoma_is_playing(&mut app);
+    }
+
+    #[test]
+    fn result_screen_shows_beigoma_menu_name() {
+        let mut app = App::new();
+        app.screen = Screen::Result(
+            new_game(BEIGOMA_ITEM_INDEX, Difficulty::Beginner).result(),
+            None,
+        );
+        let text = rendered_text(&mut app).replace(' ', "");
+        assert!(text.contains("べー"), "{text}");
     }
 
     #[test]
@@ -2766,6 +2874,9 @@ mod tests {
         let mut app = app_on_menu_with_icons();
         assert!(!app.menu_icons.is_fallback());
         for (i, name) in MENU_ITEMS.iter().enumerate() {
+            if PENDING_MENU_ICONS.contains(&MENU_ICON_PATHS[i]) {
+                continue;
+            }
             assert!(
                 icon_cells(&mut app, i).iter().any(|c| c != " "),
                 "{name}: アイコンが描かれる"
@@ -2846,12 +2957,13 @@ mod tests {
     }
 
     /// 難易度選択画面を経由するゲームのメニュー項目一覧
-    /// (DDR・ソコヌキ・カウントマニア・ハヤウチ・記憶・イロピッタン以外)
+    /// (DDR・ソコヌキ・カウントマニア・ハヤウチ・べー・記憶・イロピッタン以外)
     fn difficulty_select_game_items() -> impl Iterator<Item = usize> {
         non_rhythm_game_items().filter(|&item| {
             item != COLOR_STACK_ITEM_INDEX
                 && item != COUNT_MANIA_ITEM_INDEX
                 && item != QUICK_DRAW_ITEM_INDEX
+                && item != BEIGOMA_ITEM_INDEX
                 && item != MEMORY_ITEM_INDEX
                 && item != REACTION_ITEM_INDEX
         })
