@@ -1,19 +1,24 @@
 //! ハヤウチ(quick_draw): いつ来るかわからない合図を待ち、合図が出た瞬間に反応する。
 //! 仕様は docs/quick-draw-spec.md・docs/quick-draw-fixed-rounds-spec.md
 
+use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use image::{DynamicImage, RgbaImage};
 use rand::Rng;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
+use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::StatefulImage;
 
 use crate::audio::{self, SeKind};
 use crate::game::feedback::AnswerFeedback;
-use crate::game::mark_display::MarkRenderer;
+use crate::game::mark_display::{compose_glyph_image, glyph_area, MarkRenderer};
 use crate::game::theme;
 use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
 use crate::ui::countdown::{self, CountdownState};
@@ -36,18 +41,128 @@ pub const SIGNAL_BG: Color = Color::Rgb(0, 230, 64);
 /// 待機中の表示
 pub const WAITING_TEXT: &str = "まだ待て";
 /// 合図の表示
-pub const SIGNAL_TEXT: &str = "今だ!";
+pub const SIGNAL_TEXT: &str = "撃て!";
 
 /// 合図の文字と文字の間の区切り。全角スペースで間隔を広げ、目立つ見た目にする
 const SIGNAL_TEXT_GAP: &str = "　";
 
-/// 合図表示用に、文字間を広げた見出し文字列("今　だ　！")を作る
+/// 合図表示用に、文字間を広げた見出し文字列("撃　て　！")を作る
 fn signal_headline() -> String {
     SIGNAL_TEXT
         .chars()
         .map(|c| c.to_string())
         .collect::<Vec<_>>()
         .join(SIGNAL_TEXT_GAP)
+}
+
+/// 合図(「撃て!」)の画像。黒い文字・透明背景の正方形
+const SIGNAL_PNG: &[u8] = include_bytes!("../../assets/image/quick_draw/utte.png");
+
+/// 合図の画像を読み込む。読めない場合はNone
+fn load_signal_image() -> Option<RgbaImage> {
+    let image = image::load_from_memory(SIGNAL_PNG).ok()?;
+    Some(image.to_rgba8())
+}
+
+/// 端末の画像プロトコルを調べる。sixel/kitty/iTerm2のどれかが使える時だけSome。
+/// テストでは端末に問い合わせず、常にテキスト表示にする(実行環境で結果が変わらないように)
+fn detect_picker() -> Option<Picker> {
+    if cfg!(test) {
+        return None;
+    }
+    Picker::from_query_stdio().ok().filter(|picker| {
+        matches!(
+            picker.protocol_type(),
+            ProtocolType::Sixel | ProtocolType::Kitty | ProtocolType::Iterm2
+        )
+    })
+}
+
+/// 直前に作った合図の画像。背景色・描画範囲が同じなら再エンコードを省く
+struct SignalCache {
+    bg: [u8; 3],
+    area: Rect,
+    protocol: StatefulProtocol,
+}
+
+/// 合図(「撃て!」)の描画器。画像プロトコルが使える端末では画像で大きく表示する
+struct SignalRenderer {
+    picker: Option<Picker>,
+    /// 直前に読み込んだ画像。描画範囲の計算に画像の寸法が要るので、
+    /// 毎フレームPNGを読み直さないよう持っておく
+    glyph: RefCell<Option<RgbaImage>>,
+    cache: RefCell<Option<SignalCache>>,
+}
+
+impl SignalRenderer {
+    fn new() -> Self {
+        Self::with_picker(detect_picker())
+    }
+
+    /// 画像プロトコルを指定して作る(None=テキスト表示)。テストで使う
+    fn with_picker(picker: Option<Picker>) -> Self {
+        Self {
+            picker,
+            glyph: RefCell::new(None),
+            cache: RefCell::new(None),
+        }
+    }
+
+    /// 画像プロトコルを使うか(false=テキスト表示)。テストでの確認用
+    #[cfg(test)]
+    fn uses_image(&self) -> bool {
+        self.picker.is_some()
+    }
+
+    /// areaの中央に合図の画像を描く。画像プロトコルが使えない/画像が読めない/
+    /// 描く場所が無い場合は何もせずfalse(呼び出し側がテキスト表示に切り替える)
+    fn render(&self, frame: &mut Frame, area: Rect, background: Color) -> bool {
+        let Color::Rgb(r, g, b) = background else {
+            return false;
+        };
+        let Some(picker) = &self.picker else {
+            return false;
+        };
+        let mut glyph_cache = self.glyph.borrow_mut();
+        if glyph_cache.is_none() {
+            let Some(image) = load_signal_image() else {
+                return false;
+            };
+            *glyph_cache = Some(image);
+        }
+        let Some(glyph) = glyph_cache.as_ref() else {
+            return false;
+        };
+        let drawn = glyph_area(area, picker.font_size(), glyph.dimensions());
+        if drawn.is_empty() {
+            return false;
+        }
+        let bg = [r, g, b];
+        let mut cache = self.cache.borrow_mut();
+        let needs_regen =
+            !matches!(cache.as_ref(), Some(cached) if cached.bg == bg && cached.area == drawn);
+        if needs_regen {
+            let composed =
+                compose_glyph_image(glyph, drawn.width, drawn.height, picker.font_size(), bg);
+            let protocol = picker.new_resize_protocol(DynamicImage::ImageRgba8(composed));
+            *cache = Some(SignalCache {
+                bg,
+                area: drawn,
+                protocol,
+            });
+        }
+        let Some(cached) = cache.as_mut() else {
+            return false;
+        };
+        frame.render_stateful_widget(StatefulImage::default(), drawn, &mut cached.protocol);
+        true
+    }
+
+    /// 直前に画像で描いた範囲。テストで描画内容を確かめる用
+    #[cfg(test)]
+    fn cached_area(&self) -> Option<Rect> {
+        self.cache.borrow().as_ref().map(|cached| cached.area)
+    }
 }
 
 /// 押した後の結果(◯/✗)を表示し続ける時間。この間は次のラウンドへ進まない
@@ -133,6 +248,8 @@ pub struct QuickDrawGame {
     feedback: AnswerFeedback,
     /// 結果表示(◯/✗の大表示)の描画器
     mark_renderer: MarkRenderer,
+    /// 合図(「撃て!」)の描画器
+    signal_renderer: SignalRenderer,
 }
 
 impl QuickDrawGame {
@@ -145,6 +262,7 @@ impl QuickDrawGame {
             pattern: WaitPattern::Normal,
             feedback: AnswerFeedback::new(),
             mark_renderer: MarkRenderer::new(),
+            signal_renderer: SignalRenderer::new(),
         };
         game.start_round();
         game
@@ -219,6 +337,12 @@ impl QuickDrawGame {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        if matches!(self.phase, Phase::Signal { .. })
+            && self.signal_renderer.render(frame, inner, background)
+        {
+            return;
+        }
+
         let mut lines = vec![Line::from(Span::styled(
             headline,
             Style::default().fg(text_color).add_modifier(Modifier::BOLD),
@@ -239,23 +363,33 @@ impl QuickDrawGame {
 
     /// 押した後の結果表示。成功時は大きな◯の下に反応時間(ms)を表示し、
     /// フライング時は大きな✗を単独で表示する
-    fn render_result(&self, frame: &mut Frame, area: Rect, is_correct: bool, latency_ms: Option<f64>) {
+    fn render_result(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        is_correct: bool,
+        latency_ms: Option<f64>,
+    ) {
         let background = result_background(is_correct, self.mark_renderer.uses_image());
         let Some(latency_ms) = latency_ms else {
-            self.mark_renderer.render(frame, area, is_correct, background);
+            self.mark_renderer
+                .render(frame, area, is_correct, background);
             return;
         };
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(3), Constraint::Length(3)])
             .split(area);
-        self.mark_renderer.render(frame, rows[0], is_correct, background);
+        self.mark_renderer
+            .render(frame, rows[0], is_correct, background);
         let footer = Block::default().style(Style::default().bg(background));
         let inner = footer.inner(rows[1]);
         frame.render_widget(footer, rows[1]);
         let line = Line::from(Span::styled(
             format!("{latency_ms:.0}ms"),
-            Style::default().fg(Color::Black).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
         ));
         frame.render_widget(
             Paragraph::new(line).alignment(Alignment::Center),
@@ -608,7 +742,13 @@ mod tests {
         show_signal_since(&mut game, ms(250));
         game.handle_key(key(KeyCode::Enter));
         assert!(
-            matches!(game.phase, Phase::Result { is_correct: true, .. }),
+            matches!(
+                game.phase,
+                Phase::Result {
+                    is_correct: true,
+                    ..
+                }
+            ),
             "反応直後はまず結果表示"
         );
         finish_result(&mut game);
@@ -700,7 +840,13 @@ mod tests {
         finish_countdown(&mut game);
         game.handle_key(key(KeyCode::Char(' ')));
         assert!(
-            matches!(game.phase, Phase::Result { is_correct: false, .. }),
+            matches!(
+                game.phase,
+                Phase::Result {
+                    is_correct: false,
+                    ..
+                }
+            ),
             "フライング直後はまず結果表示(✗)"
         );
         let flash = game
@@ -959,7 +1105,10 @@ mod tests {
         game.handle_key(key(KeyCode::Enter));
         let buffer = rendered(&game);
         let text = text_of(&buffer);
-        assert!(text.contains(INCORRECT_MARK), "フライング時は大きな✗: {text}");
+        assert!(
+            text.contains(INCORRECT_MARK),
+            "フライング時は大きな✗: {text}"
+        );
         assert!(!text.contains("ms"), "反応時間は表示しない: {text}");
     }
 
@@ -1009,7 +1158,7 @@ mod tests {
         let buffer = rendered(&game);
         let text = text_of(&buffer);
         for c in SIGNAL_TEXT.chars() {
-            assert!(text.contains(c), "合図後は「今だ!」の文字を含む: {c}");
+            assert!(text.contains(c), "合図後は「撃て!」の文字を含む: {c}");
         }
         assert!(!text.contains(WAITING_TEXT));
         assert_eq!(body_center_bg(&buffer), SIGNAL_BG);
@@ -1017,7 +1166,7 @@ mod tests {
 
     #[test]
     fn signal_headline_spaces_out_each_character() {
-        assert_eq!(signal_headline(), "今　だ　!");
+        assert_eq!(signal_headline(), "撃　て　!");
     }
 
     #[test]
@@ -1028,8 +1177,8 @@ mod tests {
         let cell = (0..buffer.area().height)
             .flat_map(|y| (0..buffer.area().width).map(move |x| (x, y)))
             .map(|pos| &buffer[pos])
-            .find(|c| c.symbol() == "今")
-            .expect("「今」が描かれること");
+            .find(|c| c.symbol() == "撃")
+            .expect("「撃」が描かれること");
         assert_eq!(cell.fg, Color::Black, "合図の文字は黒");
         assert!(
             cell.modifier.contains(Modifier::BOLD),
@@ -1046,6 +1195,71 @@ mod tests {
         assert!(
             !text.contains("Enter"),
             "合図表示中は見出しだけを目立たせ、操作説明は出さない"
+        );
+    }
+
+    // --- 合図の画像表示 ---
+
+    fn halfblocks_picker() -> Picker {
+        let mut picker = Picker::from_fontsize((10, 20));
+        picker.set_protocol_type(ProtocolType::Halfblocks);
+        picker
+    }
+
+    /// 画像プロトコルを固定したPickerで、合図の描画器を作り直す
+    fn use_picker(game: &mut QuickDrawGame, protocol: ProtocolType) {
+        let mut picker = Picker::from_fontsize((10, 20));
+        picker.set_protocol_type(protocol);
+        game.signal_renderer = SignalRenderer::with_picker(Some(picker));
+    }
+
+    #[test]
+    fn signal_image_asset_is_embedded_and_decodes() {
+        let image = load_signal_image().expect("「撃て!」の画像が埋め込まれていること");
+        assert_eq!(image.dimensions(), (512, 512), "正方形");
+    }
+
+    #[test]
+    fn signal_renderer_without_picker_falls_back_to_text() {
+        let renderer = SignalRenderer::with_picker(None);
+        assert!(!renderer.uses_image());
+        let mut terminal = Terminal::new(TestBackend::new(20, 10)).unwrap();
+        let mut drawn_as_image = false;
+        terminal
+            .draw(|frame| {
+                drawn_as_image = renderer.render(frame, frame.area(), SIGNAL_BG);
+            })
+            .unwrap();
+        assert!(!drawn_as_image, "画像プロトコルが無ければテキストに任せる");
+    }
+
+    #[test]
+    fn signal_renderer_with_picker_draws_the_image_inside_the_area() {
+        let renderer = SignalRenderer::with_picker(Some(halfblocks_picker()));
+        assert!(renderer.uses_image());
+        let area = Rect::new(2, 3, 40, 12);
+        let mut terminal = Terminal::new(TestBackend::new(area.right(), area.bottom())).unwrap();
+        let mut drawn_as_image = false;
+        terminal
+            .draw(|frame| {
+                drawn_as_image = renderer.render(frame, area, SIGNAL_BG);
+            })
+            .unwrap();
+        assert!(drawn_as_image, "画像プロトコルが使えれば画像で描く");
+        let drawn = renderer.cached_area().expect("描画範囲が記録されること");
+        assert_eq!(drawn.intersection(area), drawn, "areaの内側に描く");
+    }
+
+    #[test]
+    fn game_renders_the_signal_as_an_image_when_available() {
+        let mut game = QuickDrawGame::new();
+        use_picker(&mut game, ProtocolType::Halfblocks);
+        show_signal_since(&mut game, ms(0));
+        let buffer = rendered(&game);
+        let text = text_of(&buffer);
+        assert!(
+            !text.contains(SIGNAL_TEXT),
+            "画像で描く時は文字間を広げたテキスト見出しを出さない: {text}"
         );
     }
 
