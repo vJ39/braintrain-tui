@@ -182,11 +182,18 @@ impl MentalCalcGame {
         if bands.iter().any(|band| band.height < 2) {
             return false;
         }
+        // row_bandsは余りを最後の帯に集めるため、そのまま使うと最後の選択肢だけ
+        // 文字が大きくなる。全選択肢を同じ大きさにそろえるため、最小の帯の高さに合わせる
+        let uniform_height = bands
+            .iter()
+            .map(|band| band.height)
+            .min()
+            .unwrap_or(0);
         let max_cols = inner.width.saturating_sub(CHOICE_KEY_WIDTH);
         let texts: Vec<String> = self.current.choices.iter().map(|v| v.to_string()).collect();
         let mut fits = Vec::with_capacity(CHOICE_COUNT);
-        for ((renderer, text), band) in self.choice_renderers.iter().zip(&texts).zip(&bands) {
-            let Some(fit) = renderer.fit(text, max_cols, band.height - 1) else {
+        for (renderer, text) in self.choice_renderers.iter().zip(&texts) {
+            let Some(fit) = renderer.fit(text, max_cols, uniform_height - 1) else {
                 return false;
             };
             fits.push(fit);
@@ -633,6 +640,30 @@ mod tests {
             .map(|r| r.last_area().unwrap().x)
             .collect();
         assert!(lefts.windows(2).all(|w| w[0] == w[1]), "左端: {lefts:?}");
+    }
+
+    #[test]
+    fn image_mode_draws_every_choice_at_the_same_size() {
+        // 選択肢エリアの高さがCHOICE_COUNTで割り切れない時、row_bandsは余りを最後の帯に
+        // 集めるため、対策が無いと最後の選択肢だけ文字が大きく描かれてしまう
+        if !font_available() {
+            return;
+        }
+        let mut game = MentalCalcGame::new(Difficulty::Beginner);
+        use_picker(&mut game, ProtocolType::Halfblocks);
+        fixed_question(&mut game, "79 + 72", [150, 147, 146, 151]);
+        // 高さがCHOICE_COUNT(4)で割り切れないエリアを選ぶ
+        let area = Rect::new(0, 0, 80, 41);
+        rendered_rows(&game, area);
+        let heights: Vec<u16> = game
+            .choice_renderers
+            .iter()
+            .map(|r| r.last_area().unwrap().height)
+            .collect();
+        assert!(
+            heights.windows(2).all(|w| w[0] == w[1]),
+            "全選択肢の描画高さが揃うこと: {heights:?}"
+        );
     }
 
     #[test]
