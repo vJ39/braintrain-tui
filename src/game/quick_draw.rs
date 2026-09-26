@@ -52,17 +52,29 @@ pub const SIGNAL_BG: Color = Color::Rgb(0, 230, 64);
 pub const WAITING_TEXT: &str = "まだ待て";
 /// 合図の表示
 pub const SIGNAL_TEXT: &str = "撃て!";
+/// フェイントの表示。本物の合図(SIGNAL_TEXT)とは違う文言にし、それでも一瞬で見分けにくい
+/// 紛らわしさは背景色(FEINT_BG)で出す
+pub const FEINT_TEXT: &str = "撃つな";
 
 /// 合図の文字と文字の間の区切り。全角スペースで間隔を広げ、目立つ見た目にする
 const SIGNAL_TEXT_GAP: &str = "　";
 
-/// 合図表示用に、文字間を広げた見出し文字列("撃　て　！")を作る
-fn signal_headline() -> String {
-    SIGNAL_TEXT
-        .chars()
+/// 見出し用に、文字間を広げた文字列を作る("撃　て　！"のように)
+fn spaced_headline(text: &str) -> String {
+    text.chars()
         .map(|c| c.to_string())
         .collect::<Vec<_>>()
         .join(SIGNAL_TEXT_GAP)
+}
+
+/// 合図表示用に、文字間を広げた見出し文字列("撃　て　！")を作る
+fn signal_headline() -> String {
+    spaced_headline(SIGNAL_TEXT)
+}
+
+/// フェイント表示用に、文字間を広げた見出し文字列を作る
+fn feint_headline() -> String {
+    spaced_headline(FEINT_TEXT)
 }
 
 /// 合図(「撃て!」)の画像。黒い文字・透明背景の正方形
@@ -364,8 +376,8 @@ impl QuickDrawGame {
             Phase::Waiting { .. } => (WAITING_BG, WAITING_TEXT.to_string(), theme::TEXT, true),
             // 合図は文字間を広げて単独表示し、操作説明を消して見出しだけに注目を集める
             Phase::Signal { .. } => (SIGNAL_BG, signal_headline(), Color::Black, false),
-            // フェイントは本物の合図と同じ見出しだが、色を変えて紛らわしくする
-            Phase::Feint { .. } => (FEINT_BG, signal_headline(), Color::Black, false),
+            // フェイントは本物の合図と紛らわしい色(FEINT_BG)だが、文言は「撃つな」で見分けられる
+            Phase::Feint { .. } => (FEINT_BG, feint_headline(), Color::Black, false),
             Phase::Countdown { .. } | Phase::Result { .. } => unreachable!("上で処理済み"),
         };
         let block = Block::default()
@@ -376,7 +388,8 @@ impl QuickDrawGame {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        if matches!(self.phase, Phase::Signal { .. } | Phase::Feint { .. })
+        // 画像(SIGNAL_PNG)は「撃て!」専用なので、本物の合図でだけ使う
+        if matches!(self.phase, Phase::Signal { .. })
             && self.signal_renderer.render(frame, inner, background)
         {
             return;
@@ -1026,6 +1039,24 @@ mod tests {
             resume_waiting: ms(500),
         };
         assert_eq!(body_center_bg(&rendered(&game)), FEINT_BG);
+    }
+
+    #[test]
+    fn feint_shows_its_own_text_not_the_real_signal_text() {
+        assert_ne!(FEINT_TEXT, SIGNAL_TEXT);
+        let mut game = QuickDrawGame::new();
+        game.phase = Phase::Feint {
+            remaining: ms(100),
+            resume_waiting: ms(500),
+        };
+        let text = text_of(&rendered(&game));
+        for c in FEINT_TEXT.chars() {
+            assert!(text.contains(c), "{text}");
+        }
+        assert!(
+            !text.contains(SIGNAL_TEXT),
+            "フェイントは本物の合図の文字を出さない: {text}"
+        );
     }
 
     #[test]
