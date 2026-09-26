@@ -58,7 +58,7 @@ const MESSAGE_HOLD: Duration = Duration::from_millis(900);
 const MAX_STEP: Duration = Duration::from_millis(10);
 
 /// ベーゴマの回転の見た目が1コマ進む間隔
-const SPIN_FRAME_INTERVAL: Duration = Duration::from_millis(120);
+const SPIN_FRAME_INTERVAL: Duration = Duration::from_millis(70);
 
 /// 画面左の軽トラ視点の幅(%)。残りを盤面に使う
 const TRUCK_VIEW_PERCENT: u16 = 40;
@@ -211,7 +211,7 @@ impl BeigomaGame {
             // 凹の側面をこすって弾かれた時も、凸で弾かれた時と同じ演出
             StepEvent::Landed(Landing::Bounce) | StepEvent::Grazed(Landing::Bounce) => {
                 audio::play_se(SeKind::Incorrect);
-                self.message = Some(("ピューン!", Duration::ZERO));
+                self.message = Some(("ぴよーん!! ああっ!!", Duration::ZERO));
             }
             StepEvent::Sank => self.message = Some(("ズボッ", Duration::ZERO)),
             StepEvent::Escaped => self.message = Some(("ぬけた!", Duration::ZERO)),
@@ -645,6 +645,12 @@ mod tests {
         assert_ne!(game.spin_frame(), first, "投入されると回転を始める");
     }
 
+    #[test]
+    fn spin_frame_interval_is_fast_enough_to_look_energetic() {
+        // 回転をもっと激しく見せるため、コマ送りの間隔は短くする(#129)
+        assert_eq!(SPIN_FRAME_INTERVAL, Duration::from_millis(70));
+    }
+
     // --- 操作 ---
 
     #[test]
@@ -807,7 +813,7 @@ mod tests {
         let mut game = calm_game();
         game.on_step_event(StepEvent::Landed(Landing::Bounce));
         assert_eq!(game.outcome(), None, "弾かれても続く");
-        assert!(game.message.is_some(), "ピューンと弾かれた一言を出す");
+        assert!(game.message.is_some(), "ぴよーんと弾かれた一言を出す");
         game.on_step_event(StepEvent::Landed(Landing::Light));
         assert_eq!(game.outcome(), None);
     }
@@ -834,7 +840,7 @@ mod tests {
         assert_eq!(game.outcome(), None, "側面をこすって弾かれても続く");
         assert_eq!(
             message_text(&game),
-            Some("ピューン!"),
+            Some("ぴよーん!! ああっ!!"),
             "凸で弾かれた時と同じ一言"
         );
         game.on_step_event(StepEvent::Grazed(Landing::Light));
