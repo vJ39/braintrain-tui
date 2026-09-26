@@ -467,7 +467,7 @@ impl BeigomaGame {
         // 場外落下は専用の落下音、吹っ飛びは「ふいっ」という音
         // (どちらもブブーはOFF_BOARD_BUZZ_DELAY後に鳴らす)、時間切れは従来のブザー音のまま
         self.play_se(match outcome {
-            Outcome::Cleared { .. } => SeKind::Correct,
+            Outcome::Cleared { .. } => SeKind::BeigomaGoal,
             Outcome::Flown if fell_off => SeKind::BeigomaFalloff,
             Outcome::Flown => SeKind::Star,
             Outcome::TimeUp => SeKind::Incorrect,
@@ -2173,7 +2173,7 @@ mod tests {
         clear_se_log(&mut cleared);
         clear_round(&mut cleared);
         cleared.update(OFF_BOARD_BUZZ_DELAY * 2);
-        assert_eq!(cleared.se_log, vec![SeKind::Correct]);
+        assert_eq!(cleared.se_log, vec![SeKind::BeigomaGoal]);
     }
 
     #[test]

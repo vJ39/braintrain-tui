@@ -39,6 +39,8 @@ pub enum SeKind {
     BeigomaBump,
     /// 「べー」でベーゴマが場外に落ちた時の音
     BeigomaFalloff,
+    /// 「べー」でベーゴマがゴール旗に到着した時の音
+    BeigomaGoal,
     /// 「ハヤウチ」で「まだ撃つな」が出た瞬間の構え(準備)の音
     QuickDrawReady,
     /// 「ハヤウチ」で合図に反応して撃った時の音
@@ -165,6 +167,7 @@ impl SeKind {
             SeKind::BeigomaSink => Some("se_beigoma_sink.mp3"),
             SeKind::BeigomaBump => Some("se_beigoma_bump.mp3"),
             SeKind::BeigomaFalloff => Some("se_beigoma_falloff.mp3"),
+            SeKind::BeigomaGoal => Some("se_beigoma_goal.mp3"),
             SeKind::QuickDrawReady => Some("se_hayauchi_ready.mp3"),
             SeKind::QuickDrawShoot => Some("se_hayauchi_shoot.mp3"),
             SeKind::QuickDrawMiss => Some("se_hayauchi_miss.mp3"),
@@ -521,7 +524,7 @@ pub fn playing_typewriter_kind() -> Option<TypewriterSeKind> {
 mod tests {
     use super::*;
 
-    const ALL_SE_KINDS: [SeKind; 20] = [
+    const ALL_SE_KINDS: [SeKind; 21] = [
         SeKind::Correct,
         SeKind::Incorrect,
         SeKind::Transition,
@@ -531,6 +534,7 @@ mod tests {
         SeKind::BeigomaSink,
         SeKind::BeigomaBump,
         SeKind::BeigomaFalloff,
+        SeKind::BeigomaGoal,
         SeKind::QuickDrawReady,
         SeKind::QuickDrawShoot,
         SeKind::QuickDrawMiss,
