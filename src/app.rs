@@ -37,7 +37,7 @@ const MENU_ITEMS: [&str; 15] = [
     "イロピッタン",
     "暗算スピード",
     "パターン補完",
-    "記憶(位置と色)",
+    "オイカケ",
     "数列予測",
     "組み合わせパズル",
     "カウントマニア",
@@ -51,7 +51,7 @@ const MENU_ITEMS: [&str; 15] = [
 
 /// イロピッタン(3問→4問→3問で難易度が上がる固定10問)
 const REACTION_ITEM_INDEX: usize = 2;
-/// 記憶(位置と色)(3問→4問→3問で手数が増える固定10問)
+/// オイカケ(3問→4問→3問で手数が増える固定10問)
 const MEMORY_ITEM_INDEX: usize = 5;
 /// カウントマニア(マウス専用)
 const COUNT_MANIA_ITEM_INDEX: usize = 8;
@@ -1659,7 +1659,7 @@ mod tests {
 
     #[test]
     fn memory_and_reaction_item_indices_match_menu() {
-        assert_eq!(MENU_ITEMS[MEMORY_ITEM_INDEX], "記憶(位置と色)");
+        assert_eq!(MENU_ITEMS[MEMORY_ITEM_INDEX], "オイカケ");
         assert_eq!(MENU_ITEMS[REACTION_ITEM_INDEX], "イロピッタン");
     }
 

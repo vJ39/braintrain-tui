@@ -67,6 +67,8 @@ const SHOW_ON_DURATION: Duration = Duration::from_millis(400);
 const SHOW_OFF_DURATION: Duration = Duration::from_millis(200);
 /// 正誤確定後、次のシーケンスに移るまで結果を表示しておく時間
 const RESULT_INTERVAL: Duration = Duration::from_millis(1200);
+/// 結果表示(◯/✗)の後、次の問題が始まる前に何も表示せず置く間
+const BLANK_INTERVAL: Duration = Duration::from_millis(1000);
 
 fn panel_color(panel: usize) -> Color {
     PANEL_COLORS
@@ -123,6 +125,8 @@ enum Phase {
     Input { entered: usize },
     /// 正誤確定後、次のシーケンスへ移るまでの間(結果表示)
     Interval { is_correct: bool, elapsed: Duration },
+    /// 結果表示の後、次の問題が始まる前の何も表示しない間
+    Blank { elapsed: Duration },
 }
 
 pub struct MemoryGame {
@@ -323,6 +327,14 @@ impl Game for MemoryGame {
             Phase::Interval { elapsed, .. } => {
                 *elapsed += dt;
                 if *elapsed >= RESULT_INTERVAL {
+                    self.phase = Phase::Blank {
+                        elapsed: Duration::ZERO,
+                    };
+                }
+            }
+            Phase::Blank { elapsed } => {
+                *elapsed += dt;
+                if *elapsed >= BLANK_INTERVAL {
                     self.next_sequence();
                 }
             }
@@ -336,18 +348,23 @@ impl Game for MemoryGame {
         theme::render_hud(
             frame,
             hud_area,
-            "記憶(位置と色)",
+            "オイカケ",
             SESSION_DIFFICULTY,
             self.tracker.total(),
             &self.feedback,
         );
 
-        if let Phase::Interval { is_correct, .. } = self.phase {
-            // 正誤確定後はパネルの代わりに、グリッドのエリアいっぱいに大きな◯/✗を出す
-            let background = mark_background(is_correct, self.mark_renderer.uses_image());
-            self.mark_renderer.render(frame, grid_area, is_correct, background);
-        } else {
-            self.render_panels(frame, grid_area);
+        match self.phase {
+            Phase::Interval { is_correct, .. } => {
+                // 正誤確定後はパネルの代わりに、グリッドのエリアいっぱいに大きな◯/✗を出す
+                let background = mark_background(is_correct, self.mark_renderer.uses_image());
+                self.mark_renderer.render(frame, grid_area, is_correct, background);
+            }
+            Phase::Blank { .. } => {
+                // 次の問題が始まる前の何もない間。パネル・記号は出さず枠だけにする
+                frame.render_widget(Block::default().borders(Borders::ALL), grid_area);
+            }
+            _ => self.render_panels(frame, grid_area),
         }
 
         let (status, status_color) = match &self.phase {
@@ -378,6 +395,7 @@ impl Game for MemoryGame {
                     ("ざんねん…   つぎいくよ…".to_string(), theme::INCORRECT)
                 }
             }
+            Phase::Blank { .. } => (String::new(), theme::MUTED),
         };
         let footer = Paragraph::new(Line::from(Span::styled(
             status,
@@ -483,6 +501,7 @@ mod tests {
             assert_eq!(game.tracker.total(), index as u32 + 1);
             if !game.is_finished() {
                 game.update(RESULT_INTERVAL);
+                game.update(BLANK_INTERVAL);
             }
         }
         assert!(game.is_finished(), "10問で終わる");
@@ -597,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn interval_advances_to_next_sequence_after_result_interval() {
+    fn interval_advances_to_blank_after_result_interval() {
         let mut game = MemoryGame::new();
         let len = game.sequence.len();
         for _ in 0..len {
@@ -617,11 +636,37 @@ mod tests {
             }
         ));
 
-        // インターバル時間が経過するまでは次のシーケンスへ進まない
+        // インターバル時間が経過するまでは次のフェーズへ進まない
         game.update(RESULT_INTERVAL - Duration::from_millis(1));
         assert!(matches!(game.phase, Phase::Interval { .. }));
 
-        // インターバル時間が経過すると次のシーケンス(提示フェーズ)が始まる
+        // インターバル時間が経過すると、何も表示しない間(Blank)に移る
+        // (次の問題がすぐ始まらないよう、◯✗表示の後にもう1秒間を置く)
+        game.update(Duration::from_millis(1));
+        assert!(matches!(game.phase, Phase::Blank { .. }));
+    }
+
+    #[test]
+    fn blank_advances_to_next_sequence_after_blank_interval() {
+        let mut game = MemoryGame::new();
+        let len = game.sequence.len();
+        for _ in 0..len {
+            advance_one_step(&mut game);
+        }
+        let sequence = game.sequence.clone();
+        for &panel in &sequence {
+            game.handle_key(KeyEvent::from(KeyCode::Char(
+                std::char::from_digit(panel as u32, 10).unwrap(),
+            )));
+        }
+        game.update(RESULT_INTERVAL);
+        assert!(matches!(game.phase, Phase::Blank { .. }));
+
+        // 空白の時間が経過するまでは次のシーケンスへ進まない
+        game.update(BLANK_INTERVAL - Duration::from_millis(1));
+        assert!(matches!(game.phase, Phase::Blank { .. }));
+
+        // 空白の時間が経過すると次のシーケンス(提示フェーズ)が始まる
         game.update(Duration::from_millis(1));
         assert!(matches!(
             game.phase,
@@ -681,9 +726,10 @@ mod tests {
                 ));
                 game.handle_key(key);
             }
-            // 正誤確定後のインターバルを経過させて次のシーケンスへ進める
+            // 正誤確定後のインターバル・空白時間を経過させて次のシーケンスへ進める
             if !game.tracker.is_session_finished() {
                 game.update(RESULT_INTERVAL);
+                game.update(BLANK_INTERVAL);
             }
         }
         assert!(game.is_finished());
@@ -819,6 +865,18 @@ mod tests {
         let mut game = MemoryGame::new();
         play_current_sequence(&mut game, true);
         game.update(RESULT_INTERVAL);
+        // ◯✗表示が終わった直後は、次の問題が始まる前の何もない間(Blank)。
+        // マークもパネルもまだ出さない
+        assert!(matches!(game.phase, Phase::Blank { .. }));
+        let (buffer, grid_area) = render_game(&game, 40, 16);
+        let text = area_text(&buffer, grid_area);
+        assert!(!text.contains(CORRECT_MARK) && !text.contains(INCORRECT_MARK));
+        for number in ['1', '2', '3', '4'] {
+            assert!(!text.contains(number), "空白の間はパネル{number}も出さない");
+        }
+
+        // 空白の時間が経つと、次の問題の提示(パネル)に戻る
+        game.update(BLANK_INTERVAL);
         assert!(matches!(game.phase, Phase::Showing { shown: 0, .. }));
         let (buffer, grid_area) = render_game(&game, 40, 16);
         let text = area_text(&buffer, grid_area);
