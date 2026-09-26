@@ -410,6 +410,7 @@ impl Game for BeigomaGame {
             speed: self.truck.speed(),
             g: self.truck.current_g(),
             upcoming: self.truck.upcoming(),
+            elapsed: self.elapsed,
         };
         self.truck_view.render(frame, truck_inner, &info);
 

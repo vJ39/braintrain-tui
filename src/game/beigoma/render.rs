@@ -590,6 +590,8 @@ pub struct TruckViewInfo {
     pub speed: f64,
     pub g: GForce,
     pub upcoming: Option<Upcoming>,
+    /// ゲーム開始からの経過時間。揺れのアニメーションの位相に使う
+    pub elapsed: Duration,
 }
 
 impl TruckViewInfo {
@@ -597,6 +599,14 @@ impl TruckViewInfo {
     pub fn bracing(&self) -> bool {
         self.g.magnitude() >= BRACE_G
     }
+}
+
+/// 前方のイベントを強調表示する距離(m)。これより近いと目立たせる
+const URGENT_DISTANCE: f64 = 15.0;
+
+/// 前方のイベントが強調表示するほど近いか
+fn upcoming_is_urgent(upcoming: Option<Upcoming>) -> bool {
+    upcoming.is_some_and(|u| u.distance <= URGENT_DISTANCE)
 }
 
 /// 前方のイベントの案内文(例: "信号(黄) あと18m")。何も無ければ"前方: なし"
@@ -611,6 +621,31 @@ pub fn upcoming_text(upcoming: Option<Upcoming>) -> String {
         UpcomingKind::Obstacle(Side::Left) => "障害物(左へよける)".to_string(),
     };
     format!("前方: {label} あと{:.0}m", upcoming.distance)
+}
+
+/// 揺れの周期。Gの大きさによらず一定にし、振幅だけをGで変える
+const SHAKE_PERIOD_MS: f64 = 90.0;
+/// Gの大きさ1あたりの揺れの振幅(セル)。#135の巡航中の微振動(CRUISE_VIBRATION_G)程度の
+/// Gでも、ごく僅かに動いているのが分かる強さにする
+const SHAKE_AMPLITUDE_PER_G: f64 = 8.0;
+
+/// Gの大きさとelapsed(経過時間)から、女の子の絵の描画位置のずれ(x, y。セル単位の小数)を求める。
+/// 前後・左右で異なる位相にして、単調な往復に見えないようにする
+fn shake_offset(g: GForce, elapsed: Duration) -> (f64, f64) {
+    let t = elapsed.as_secs_f64() * 1000.0 / SHAKE_PERIOD_MS * std::f64::consts::TAU;
+    let amplitude = g.magnitude() * SHAKE_AMPLITUDE_PER_G;
+    (t.sin() * amplitude, (t * 1.3).cos() * amplitude * 0.6)
+}
+
+/// rectをdx,dyだけずらす(boundsの範囲内でクランプし、はみ出さないようにする)
+fn offset_within(rect: Rect, dx: i32, dy: i32, bounds: Rect) -> Rect {
+    let min_x = i32::from(bounds.x);
+    let min_y = i32::from(bounds.y);
+    let max_x = min_x + i32::from(bounds.width) - i32::from(rect.width);
+    let max_y = min_y + i32::from(bounds.height) - i32::from(rect.height);
+    let x = (i32::from(rect.x) + dx).clamp(min_x, max_x.max(min_x));
+    let y = (i32::from(rect.y) + dy).clamp(min_y, max_y.max(min_y));
+    Rect::new(x as u16, y as u16, rect.width, rect.height)
 }
 
 fn signal_label(light: SignalLight) -> &'static str {
@@ -696,19 +731,28 @@ impl TruckViewRenderer {
             area.height - header_height - footer_height,
         );
 
+        let mut header_style = Style::default()
+            .fg(upcoming_color(info.upcoming))
+            .add_modifier(Modifier::BOLD);
+        if upcoming_is_urgent(info.upcoming) {
+            // 近づいてきたら前景色と背景色を反転させ、目立たせる
+            header_style = header_style.add_modifier(Modifier::REVERSED);
+        }
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                upcoming_text(info.upcoming),
-                Style::default()
-                    .fg(upcoming_color(info.upcoming))
-                    .add_modifier(Modifier::BOLD),
-            )))
-            .alignment(Alignment::Center),
+            Paragraph::new(Line::from(Span::styled(upcoming_text(info.upcoming), header_style)))
+                .alignment(Alignment::Center),
             header,
         );
 
         let bracing = info.bracing();
-        self.render_picture(frame, picture, bracing);
+        let (shake_x, shake_y) = shake_offset(info.g, info.elapsed);
+        let shaken_picture = offset_within(
+            picture,
+            shake_x.round() as i32,
+            shake_y.round() as i32,
+            area,
+        );
+        self.render_picture(frame, shaken_picture, bracing);
 
         let brace_line = if bracing {
             Line::from(Span::styled(
@@ -859,6 +903,7 @@ mod tests {
             speed: 11.0,
             g,
             upcoming,
+            elapsed: Duration::ZERO,
         }
     }
 
@@ -1296,6 +1341,104 @@ mod tests {
         assert!(!info(g(BRACE_G - 0.01), None).bracing());
         assert!(info(g(BRACE_G), None).bracing());
         assert!(info(g(-0.5), None).bracing());
+    }
+
+    // --- 速度感・接近の可視化(#130) ---
+
+    #[test]
+    fn shake_offset_is_zero_with_no_g() {
+        assert_eq!(shake_offset(GForce::default(), Duration::from_millis(123)), (0.0, 0.0));
+    }
+
+    #[test]
+    fn shake_offset_grows_with_the_size_of_g() {
+        let elapsed = Duration::from_millis(30);
+        let small = GForce {
+            longitudinal: 0.05,
+            lateral: 0.0,
+        };
+        let big = GForce {
+            longitudinal: 0.5,
+            lateral: 0.0,
+        };
+        let (small_x, small_y) = shake_offset(small, elapsed);
+        let (big_x, big_y) = shake_offset(big, elapsed);
+        assert!(big_x.abs() > small_x.abs());
+        assert!(big_y.abs() > small_y.abs());
+    }
+
+    #[test]
+    fn shake_offset_changes_over_time() {
+        let g = GForce {
+            longitudinal: 0.3,
+            lateral: 0.0,
+        };
+        let first = shake_offset(g, Duration::from_millis(0));
+        let later = shake_offset(g, Duration::from_millis(40));
+        assert_ne!(first, later, "経過時間が変われば揺れも変わる(固定値ではない)");
+    }
+
+    #[test]
+    fn offset_within_clamps_to_the_bounds() {
+        let bounds = Rect::new(0, 0, 20, 10);
+        let rect = Rect::new(5, 5, 4, 3);
+        // 範囲を大きく超えるオフセットでもboundsの外に出ない
+        let moved = offset_within(rect, -1000, -1000, bounds);
+        assert!(bounds.contains(Position::new(moved.x, moved.y)));
+        let moved = offset_within(rect, 1000, 1000, bounds);
+        assert!(bounds.contains(Position::new(
+            moved.x + moved.width - 1,
+            moved.y + moved.height - 1
+        )));
+    }
+
+    #[test]
+    fn upcoming_is_urgent_only_within_the_urgent_distance() {
+        let at = |distance: f64| {
+            upcoming_is_urgent(Some(Upcoming {
+                kind: UpcomingKind::Bump,
+                distance,
+            }))
+        };
+        assert!(!at(URGENT_DISTANCE + 0.1));
+        assert!(at(URGENT_DISTANCE));
+        assert!(at(0.0));
+        assert!(!upcoming_is_urgent(None));
+    }
+
+    #[test]
+    fn truck_view_reverses_the_header_style_when_urgent() {
+        let renderer = TruckViewRenderer::new();
+        let area = Rect::new(0, 0, 30, 14);
+        let near = Upcoming {
+            kind: UpcomingKind::Bump,
+            distance: URGENT_DISTANCE,
+        };
+        let far = Upcoming {
+            kind: UpcomingKind::Bump,
+            distance: URGENT_DISTANCE + 1.0,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(area.right(), area.bottom())).unwrap();
+        terminal
+            .draw(|frame| renderer.render(frame, area, &info(GForce::default(), Some(near))))
+            .unwrap();
+        let near_reversed = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .any(|cell| cell.modifier.contains(Modifier::REVERSED));
+        terminal
+            .draw(|frame| renderer.render(frame, area, &info(GForce::default(), Some(far))))
+            .unwrap();
+        let far_reversed = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .any(|cell| cell.modifier.contains(Modifier::REVERSED));
+        assert!(near_reversed, "近い前方イベントは反転表示で強調する");
+        assert!(!far_reversed, "遠い前方イベントは反転表示にしない");
     }
 
     #[test]
