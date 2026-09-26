@@ -33,6 +33,18 @@ pub enum SeKind {
     Star,
     /// カウントダウン(3.2.1.GO!!)の「GO!!」の音
     CountdownGo,
+    /// 「べー」でベーゴマが凹にはまった時の音
+    BeigomaSink,
+    /// 「べー」でベーゴマが凸に触れた時の音
+    BeigomaBump,
+    /// 「べー」でベーゴマが場外に落ちた時の音
+    BeigomaFalloff,
+    /// 「ハヤウチ」で「まだ撃つな」が出た瞬間の構え(準備)の音
+    QuickDrawReady,
+    /// 「ハヤウチ」で合図に反応して撃った時の音
+    QuickDrawShoot,
+    /// 「ハヤウチ」でフェイント(「撃つな」)にひっかかって撃ってしまった時の音
+    QuickDrawMiss,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +131,12 @@ impl SeKind {
             SeKind::Confirm => Some("se_confirm.mp3"),
             SeKind::Star => None,
             SeKind::CountdownGo => Some("se_countdown_go.mp3"),
+            SeKind::BeigomaSink => Some("se_beigoma_sink.mp3"),
+            SeKind::BeigomaBump => Some("se_beigoma_bump.mp3"),
+            SeKind::BeigomaFalloff => Some("se_beigoma_falloff.mp3"),
+            SeKind::QuickDrawReady => Some("se_hayauchi_ready.mp3"),
+            SeKind::QuickDrawShoot => Some("se_hayauchi_shoot.mp3"),
+            SeKind::QuickDrawMiss => Some("se_hayauchi_miss.mp3"),
         }
     }
 }
@@ -445,13 +463,19 @@ pub fn playing_typewriter_kind() -> Option<TypewriterSeKind> {
 mod tests {
     use super::*;
 
-    const ALL_SE_KINDS: [SeKind; 6] = [
+    const ALL_SE_KINDS: [SeKind; 12] = [
         SeKind::Correct,
         SeKind::Incorrect,
         SeKind::Transition,
         SeKind::Confirm,
         SeKind::Star,
         SeKind::CountdownGo,
+        SeKind::BeigomaSink,
+        SeKind::BeigomaBump,
+        SeKind::BeigomaFalloff,
+        SeKind::QuickDrawReady,
+        SeKind::QuickDrawShoot,
+        SeKind::QuickDrawMiss,
     ];
 
     #[test]

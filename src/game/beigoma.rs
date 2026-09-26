@@ -230,9 +230,14 @@ impl Reaction {
         }
     }
 
-    /// 弾かれ系の一言の時だけSE(SeKind::Incorrect)を鳴らす
-    fn plays_se(self) -> bool {
-        self == Self::Bounce
+    /// この一言と一緒に鳴らすSE(セーフ・ぬけた!はSEなし)
+    fn se(self) -> Option<SeKind> {
+        match self {
+            Self::Safe | Self::Escaped => None,
+            Self::Hop => Some(SeKind::BeigomaBump),
+            Self::Sank => Some(SeKind::BeigomaSink),
+            Self::Bounce => Some(SeKind::Incorrect),
+        }
     }
 }
 
@@ -399,7 +404,7 @@ impl BeigomaGame {
         self.elapsed += dt;
         self.on_step_events(events);
         if self.is_playing() && self.elapsed >= TIME_LIMIT {
-            self.finish(Outcome::TimeUp);
+            self.finish(Outcome::TimeUp, false);
         }
     }
 
@@ -418,7 +423,8 @@ impl BeigomaGame {
             return;
         }
         if events.iter().any(|&(_, event)| is_game_over_event(event)) {
-            self.finish(Outcome::Flown);
+            let fell_off = events.iter().any(|&(_, event)| event == StepEvent::FellOff);
+            self.finish(Outcome::Flown, fell_off);
             return;
         }
         for &(i, event) in &events {
@@ -429,20 +435,21 @@ impl BeigomaGame {
             }
         }
         if self.tops.iter().all(|slot| slot.settled) {
-            self.finish(Outcome::Cleared { time: self.elapsed });
+            self.finish(Outcome::Cleared { time: self.elapsed }, false);
             return;
         }
         let step_events: Vec<StepEvent> = events.iter().map(|&(_, event)| event).collect();
         if let Some(reaction) = strongest_reaction(&step_events) {
-            if reaction.plays_se() {
-                self.play_se(SeKind::Incorrect);
+            if let Some(se) = reaction.se() {
+                self.play_se(se);
             }
             self.message = Some((reaction.text(), Duration::ZERO));
         }
     }
 
-    /// ROUNDを終える。結果はROUNDごとに1回だけ記録する(成功はクリアタイム、失敗は制限時間を反応時間として記録)
-    fn finish(&mut self, outcome: Outcome) {
+    /// ROUNDを終える。結果はROUNDごとに1回だけ記録する(成功はクリアタイム、失敗は制限時間を反応時間として記録)。
+    /// fell_offは吹っ飛び(Outcome::Flown)の原因が場外落下(StepEvent::FellOff)だったか
+    fn finish(&mut self, outcome: Outcome, fell_off: bool) {
         if !self.is_playing() {
             return;
         }
@@ -451,10 +458,11 @@ impl BeigomaGame {
             Outcome::Flown | Outcome::TimeUp => (false, TIME_LIMIT),
         };
         self.tracker.record(success, latency.as_millis() as f64);
-        // 場外・吹っ飛びは専用の「ふいっ」という音(ブブーはOFF_BOARD_BUZZ_DELAY後に鳴らす)、
-        // 時間切れは従来のブザー音のまま
+        // 場外落下は専用の落下音、吹っ飛びは「ふいっ」という音
+        // (どちらもブブーはOFF_BOARD_BUZZ_DELAY後に鳴らす)、時間切れは従来のブザー音のまま
         self.play_se(match outcome {
             Outcome::Cleared { .. } => SeKind::Correct,
+            Outcome::Flown if fell_off => SeKind::BeigomaFalloff,
             Outcome::Flown => SeKind::Star,
             Outcome::TimeUp => SeKind::Incorrect,
         });
@@ -1366,7 +1374,7 @@ mod tests {
     #[test]
     fn the_session_finishes_after_the_end_display() {
         let mut game = calm_game();
-        game.finish(Outcome::Flown);
+        game.finish(Outcome::Flown, false);
         assert!(!game.is_finished(), "GAME OVERの表示をしばらく出す");
         game.update(END_HOLD - STEP);
         assert!(!game.is_finished());
@@ -1384,7 +1392,7 @@ mod tests {
         game.elapsed = TIME_LIMIT;
         game.update(END_HOLD - STEP);
         game.on_step_event(StepEvent::Landed(Landing::Flown));
-        game.finish(Outcome::TimeUp);
+        game.finish(Outcome::TimeUp, false);
         assert!(matches!(game.outcome(), Some(Outcome::Cleared { .. })));
         assert_eq!(game.result().total, 1, "ROUNDごとに1回だけ記録する");
     }
@@ -1400,7 +1408,7 @@ mod tests {
         ] {
             let mut game = calm_game();
             game.handle_key(key(KeyCode::Right));
-            game.finish(outcome);
+            game.finish(outcome, false);
             let (pos, roll) = (game.tops[0].top.pos, game.tilt.roll());
             game.handle_key(key(KeyCode::Right));
             game.update(Duration::from_millis(500));
@@ -1415,7 +1423,7 @@ mod tests {
             );
         }
         let mut game = calm_game();
-        game.finish(Outcome::Flown);
+        game.finish(Outcome::Flown, false);
         let roll = game.tilt.roll();
         game.handle_key(key(KeyCode::Right));
         game.update(Duration::from_millis(500));
@@ -1613,15 +1621,15 @@ mod tests {
         assert_eq!(Reaction::Sank.text(), "ズボッ");
         assert_eq!(Reaction::Escaped.text(), "ぬけた!");
         assert_eq!(Reaction::Bounce.text(), "ぴよーん!! ああっ!!");
-        for reaction in [
-            Reaction::Safe,
-            Reaction::Hop,
-            Reaction::Sank,
-            Reaction::Escaped,
-        ] {
-            assert!(!reaction.plays_se(), "{reaction:?}");
-        }
-        assert!(Reaction::Bounce.plays_se(), "弾かれた時だけSEを鳴らす");
+    }
+
+    #[test]
+    fn each_reaction_plays_its_own_se_except_safe_and_escaped() {
+        assert_eq!(Reaction::Safe.se(), None);
+        assert_eq!(Reaction::Hop.se(), Some(SeKind::BeigomaBump), "凸に触れた時の音");
+        assert_eq!(Reaction::Sank.se(), Some(SeKind::BeigomaSink), "凹にはまった時の音");
+        assert_eq!(Reaction::Escaped.se(), None);
+        assert_eq!(Reaction::Bounce.se(), Some(SeKind::Incorrect), "弾かれた時の音");
     }
 
     #[test]
@@ -1781,7 +1789,7 @@ mod tests {
             ),
         ] {
             let mut game = calm_game();
-            game.finish(outcome);
+            game.finish(outcome, false);
             let text = rendered_text(&game, AREA);
             assert!(text.contains(label), "{outcome:?}: {text}");
         }
@@ -1843,7 +1851,7 @@ mod tests {
     #[test]
     fn timeup_and_cleared_do_not_show_the_star_animation() {
         let mut timeup = calm_game();
-        timeup.finish(Outcome::TimeUp);
+        timeup.finish(Outcome::TimeUp, false);
         timeup.update(Duration::from_millis(500));
         assert_eq!(star_frame(&timeup, 0), None, "時間切れは星の演出を出さない");
         assert!(!timeup.top_views()[0].flying, "時間切れは吹っ飛ばない");
@@ -2051,23 +2059,33 @@ mod tests {
         game.se_log.iter().filter(|&&s| s == se).count()
     }
 
+    /// GAME OVERの原因ごとに、まず鳴らす専用の音(場外に落ちた時だけ専用音、それ以外は「ふいっ」)
+    fn first_game_over_se(event: StepEvent) -> SeKind {
+        if event == StepEvent::FellOff {
+            SeKind::BeigomaFalloff
+        } else {
+            SeKind::Star
+        }
+    }
+
     #[test]
-    fn game_over_plays_the_star_sound_then_the_buzzer() {
+    fn game_over_plays_its_first_sound_then_the_buzzer() {
         const {
             assert!(OFF_BOARD_BUZZ_DELAY.as_millis() >= 100);
             assert!(OFF_BOARD_BUZZ_DELAY.as_millis() <= 300);
         };
         for event in GAME_OVER_EVENTS {
+            let first = first_game_over_se(event);
             let mut game = calm_game();
             clear_se_log(&mut game);
             game.on_step_event(event);
-            assert_eq!(game.se_log, vec![SeKind::Star], "{event:?}: まず「ふいっ」");
+            assert_eq!(game.se_log, vec![first], "{event:?}: まず専用の落下音/「ふいっ」");
             game.update(OFF_BOARD_BUZZ_DELAY - Duration::from_millis(1));
-            assert_eq!(game.se_log, vec![SeKind::Star], "{event:?}: ブブーはまだ");
+            assert_eq!(game.se_log, vec![first], "{event:?}: ブブーはまだ");
             game.update(Duration::from_millis(1));
             assert_eq!(
                 game.se_log,
-                vec![SeKind::Star, SeKind::Incorrect],
+                vec![first, SeKind::Incorrect],
                 "{event:?}: 少し遅れてブブー"
             );
             game.update(END_HOLD);
@@ -2076,8 +2094,21 @@ mod tests {
                 1,
                 "{event:?}: ブブーは1回だけ"
             );
-            assert_eq!(count_se(&game, SeKind::Star), 1, "{event:?}");
+            assert_eq!(count_se(&game, first), 1, "{event:?}");
         }
+    }
+
+    #[test]
+    fn falling_off_the_board_plays_the_falloff_sound_not_the_star() {
+        let mut game = calm_game();
+        clear_se_log(&mut game);
+        game.on_step_event(StepEvent::FellOff);
+        assert_eq!(
+            game.se_log,
+            vec![SeKind::BeigomaFalloff],
+            "場外に落ちた時は専用の落下音"
+        );
+        assert_eq!(count_se(&game, SeKind::Star), 0, "「ふいっ」は鳴らさない");
     }
 
     #[test]
@@ -2086,7 +2117,7 @@ mod tests {
         clear_se_log(&mut game);
         game.on_step_event(StepEvent::FellOff);
         game.update(END_HOLD * 2);
-        assert_eq!(game.se_log, vec![SeKind::Star, SeKind::Incorrect]);
+        assert_eq!(game.se_log, vec![SeKind::BeigomaFalloff, SeKind::Incorrect]);
     }
 
     #[test]
@@ -2098,7 +2129,7 @@ mod tests {
             (1, StepEvent::Landed(Landing::Flown)),
         ]);
         game.update(END_HOLD);
-        assert_eq!(game.se_log, vec![SeKind::Star, SeKind::Incorrect]);
+        assert_eq!(game.se_log, vec![SeKind::BeigomaFalloff, SeKind::Incorrect]);
     }
 
     #[test]
