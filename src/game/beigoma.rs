@@ -236,7 +236,8 @@ impl Reaction {
             Self::Safe | Self::Escaped => None,
             Self::Hop => Some(SeKind::BeigomaBump),
             Self::Sank => Some(SeKind::BeigomaSink),
-            Self::Bounce => Some(SeKind::Incorrect),
+            // 弾かれるのも凹凸への接触なので、不正解のブブーでなく凸接触音を流用する
+            Self::Bounce => Some(SeKind::BeigomaBump),
         }
     }
 }
@@ -1647,7 +1648,11 @@ mod tests {
         assert_eq!(Reaction::Hop.se(), Some(SeKind::BeigomaBump), "凸に触れた時の音");
         assert_eq!(Reaction::Sank.se(), Some(SeKind::BeigomaSink), "凹にはまった時の音");
         assert_eq!(Reaction::Escaped.se(), None);
-        assert_eq!(Reaction::Bounce.se(), Some(SeKind::Incorrect), "弾かれた時の音");
+        assert_eq!(
+            Reaction::Bounce.se(),
+            Some(SeKind::BeigomaBump),
+            "弾かれた時の音。不正解のブブーは意味的に合わないので凸接触音を流用する"
+        );
     }
 
     #[test]
@@ -2173,11 +2178,11 @@ mod tests {
     }
 
     #[test]
-    fn a_bounce_still_plays_the_buzzer_immediately() {
+    fn a_bounce_plays_the_bump_sound_immediately() {
         let mut game = calm_game();
         clear_se_log(&mut game);
         game.on_step_event(StepEvent::Landed(Landing::Bounce));
-        assert_eq!(game.se_log, vec![SeKind::Incorrect]);
+        assert_eq!(game.se_log, vec![SeKind::BeigomaBump]);
         assert_eq!(game.outcome(), None);
     }
 
