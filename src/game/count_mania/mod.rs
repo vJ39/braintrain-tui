@@ -6,11 +6,12 @@
 //! ScoreTrackerに1件として記録する。キー入力は受け付けない。
 
 mod circle_image;
+mod fish;
 mod layout;
 mod ripple;
 mod wrong_mark;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -27,7 +28,8 @@ use crate::game::feedback::AnswerFeedback;
 use crate::game::theme;
 use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
 
-use circle_image::{BoardCircle, CircleRenderer};
+use circle_image::{BoardCircle, BoardFish, CircleRenderer};
+use fish::Fish;
 use layout::{
     back_to_front, clamp_position, hit_test, layout_circles, numbers_stay_readable, scatter_offset,
     CircleSize, Placement, CELL_ASPECT,
@@ -103,6 +105,15 @@ const SCATTER_CANDIDATES: [(f64, f64); 8] = [
     (0.0, 0.5),
     (0.0, 0.25),
 ];
+
+/// 盤面(水槽)を泳ぐ魚の数
+const FISH_COUNT: usize = 3;
+
+/// 魚の色(ネオンテトラの青・赤と、差し色の黄緑)。FISH_COUNT匹に順に割り当てる
+const FISH_COLORS: [[u8; 3]; FISH_COUNT] = [[70, 190, 255], [255, 90, 90], [170, 235, 120]];
+
+/// 円の無い所をクリックした時、この見た目の距離(横のセル数)以内にいる魚が驚いて逃げる
+const SPOOK_RADIUS: f64 = 14.0;
 
 /// 結果の記録に使う難易度。ラウンドごとに難易度が変わるため、最後のラウンドの上級を代表値にする
 pub const SESSION_DIFFICULTY: Difficulty = Difficulty::Advanced;
@@ -477,6 +488,12 @@ pub struct CountManiaGame {
     renderer: CircleRenderer,
     /// ライフが尽きた・時間切れ(GAME OVER)か。trueになったら残りラウンドを待たずセッションを終える
     game_over: bool,
+    /// 盤面を水槽に見立てて泳ぐ魚(見た目だけの演出)。盤面の大きさが分かるまでは空
+    fish: Vec<Fish>,
+    /// 魚を放した盤面。盤面の大きさが変わったら放し直す
+    fish_board: Option<Rect>,
+    /// 直前に描いた盤面。update(dt)は描画エリアを受け取らないので、魚を泳がせる範囲をここから取る
+    last_board: Cell<Option<Rect>>,
 }
 
 /// ゲームの描画エリアのうち、円を並べるボード(枠の内側)。renderとhandle_mouseで共有する
@@ -501,6 +518,76 @@ impl CountManiaGame {
             layout: RefCell::new(None),
             renderer: CircleRenderer::new(),
             game_over: false,
+            fish: Vec::new(),
+            fish_board: None,
+            last_board: Cell::new(None),
+        }
+    }
+
+    /// boardに魚を放す。すでにboardに放してあれば何もしない
+    fn place_fish(&mut self, board: Rect) {
+        if self.fish_board == Some(board) {
+            return;
+        }
+        let mut rng = rand::thread_rng();
+        self.fish = (0..FISH_COUNT)
+            .map(|_| Fish::random(&mut rng, board))
+            .collect();
+        self.fish_board = Some(board);
+    }
+
+    /// 直前に描いた盤面の中で魚を泳がせる。まだ描いていなければ何もしない
+    fn swim_fish(&mut self, dt: Duration) {
+        let Some(board) = self.last_board.get() else {
+            return;
+        };
+        self.place_fish(board);
+        let mut rng = rand::thread_rng();
+        for fish in &mut self.fish {
+            fish.update(dt, board, &mut rng);
+        }
+    }
+
+    /// 円の無い所(column, row)がクリックされた。近くの魚をクリック位置から逃げさせる
+    fn spook_fish(&mut self, board: Rect, column: u16, row: u16) {
+        self.place_fish(board);
+        let click = (f64::from(column) + 0.5, f64::from(row) + 0.5);
+        for fish in &mut self.fish {
+            let (x, y) = fish.center();
+            if (x - click.0).hypot((y - click.1) * CELL_ASPECT) <= SPOOK_RADIUS {
+                fish.spook(click);
+            }
+        }
+    }
+
+    /// 画像表示で円の描画器に渡す魚(テキスト表示と同じく丸めたセル位置)。
+    /// テキスト表示の時・まだboardに魚を放していない時は空
+    fn board_fish(&self, board: Rect) -> Vec<BoardFish> {
+        if !self.renderer.uses_image() || self.fish_board != Some(board) {
+            return Vec::new();
+        }
+        self.fish
+            .iter()
+            .zip(FISH_COLORS.iter().cycle())
+            .map(|(fish, &color)| BoardFish {
+                x: fish.x.round().max(0.0) as u16,
+                y: fish.y.round().max(0.0) as u16,
+                facing_right: fish.facing_right,
+                color,
+            })
+            .collect()
+    }
+
+    /// 魚を文字で描く(画像プロトコル非対応の端末のみ)。円より先に描き、円の後ろを泳ぐようにする
+    fn render_fish(&self, frame: &mut Frame, board: Rect) {
+        // 画像表示では盤面全体が1枚の画像で覆われ、その下に描いた文字は見えないため、
+        // 円の描画器が盤面の画像・パッチに魚を描く(board_fish)
+        if self.renderer.uses_image() || self.fish_board != Some(board) {
+            return;
+        }
+        let buffer = frame.buffer_mut();
+        for (fish, color) in self.fish.iter().zip(FISH_COLORS.iter().cycle()) {
+            fish::render_text(buffer, board, fish, *color);
         }
     }
 
@@ -843,7 +930,8 @@ impl Game for CountManiaGame {
         let placements = self.placements(board);
         let Some(number) = hit_test(&placements, |n| self.is_visible(n), mouse.column, mouse.row)
         else {
-            // 円の無い場所(消えた円の跡も含む)のクリックは何もしない
+            // 円の無い場所(消えた円の跡も含む)のクリックはゲームを進めず、近くの魚を驚かすだけ
+            self.spook_fish(board, mouse.column, mouse.row);
             return;
         };
         if number == self.round.next {
@@ -855,6 +943,8 @@ impl Game for CountManiaGame {
 
     fn update(&mut self, dt: Duration) {
         self.feedback.tick(dt);
+        // 魚はゲームの進行と関係なく、待ち時間中・GAME OVER後も泳ぎ続ける
+        self.swim_fish(dt);
         // 波紋はラウンド間の待ち時間中も時間を進め、持続時間を過ぎたら消す
         self.ripple = self.ripple.and_then(|ripple| ripple.advanced(dt));
         // バツ印も同じく時間で消す
@@ -892,6 +982,8 @@ impl Game for CountManiaGame {
         if board.is_empty() {
             return;
         }
+        self.last_board.set(Some(board));
+        self.render_fish(frame, board);
         if self.interval.is_some() {
             self.render_interval_message(frame, board);
             return;
@@ -918,12 +1010,13 @@ impl Game for CountManiaGame {
                     })
             })
             .collect();
-        self.renderer.render_board(
+        self.renderer.render_board_with_fish(
             frame,
             board,
             &circles,
             self.ripple.as_ref(),
             self.wrong_mark.as_ref(),
+            &self.board_fish(board),
         );
     }
 
@@ -1681,6 +1774,9 @@ mod tests {
         let mut picker = Picker::from_fontsize((4, 8));
         picker.set_protocol_type(ProtocolType::Halfblocks);
         game.renderer = CircleRenderer::with_picker(picker);
+        // 泳ぐ魚のパッチを数えないよう、魚のいない水槽にする
+        game.fish_board = Some(board_area(AREA));
+        game.fish.clear();
         rendered_text(&game, AREA.width, AREA.height);
         click_circle(&mut game, 1);
         rendered_text(&game, AREA.width, AREA.height);
@@ -2911,5 +3007,203 @@ mod tests {
                 "円{number}の数字が隠れていないこと: {placements:?}"
             );
         }
+    }
+
+    // --- 水槽の魚 ---
+
+    use fish::{FISH_WIDTH, FLEE_DURATION};
+
+    const FISH_TICK: Duration = Duration::from_millis(33);
+
+    /// 魚を盤面に放し、全部を左上(x, y)に止めて置く
+    fn put_all_fish_at(game: &mut CountManiaGame, x: u16, y: u16) {
+        game.place_fish(board_area(AREA));
+        for fish in &mut game.fish {
+            *fish = Fish::new(f64::from(x), f64::from(y));
+        }
+    }
+
+    fn fish_inside(fish: &Fish, board: Rect) -> bool {
+        fish.x >= f64::from(board.x)
+            && fish.x <= f64::from(board.right() - FISH_WIDTH)
+            && fish.y >= f64::from(board.y)
+            && fish.y < f64::from(board.bottom())
+    }
+
+    #[test]
+    fn fish_are_released_into_board_after_render_and_update() {
+        let mut game = CountManiaGame::new();
+        rendered_text(&game, AREA.width, AREA.height);
+        game.update(FISH_TICK);
+        let board = board_area(AREA);
+        assert_eq!(game.fish.len(), FISH_COUNT);
+        assert!((2..=3).contains(&FISH_COUNT));
+        for _ in 0..300 {
+            game.update(FISH_TICK);
+            assert!(game.fish.iter().all(|fish| fish_inside(fish, board)));
+        }
+    }
+
+    #[test]
+    fn fish_keep_swimming_during_round_interval_and_after_game_over() {
+        let mut game = CountManiaGame::new();
+        rendered_text(&game, AREA.width, AREA.height);
+        game.update(FISH_TICK);
+        clear_round(&mut game);
+        assert!(game.interval.is_some());
+        let before = game.fish.clone();
+        for _ in 0..10 {
+            game.update(FISH_TICK);
+        }
+        assert_ne!(game.fish, before, "待ち時間中も泳ぐ");
+
+        let mut game = CountManiaGame::new();
+        rendered_text(&game, AREA.width, AREA.height);
+        game.update(FISH_TICK);
+        lose_all_lives(&mut game);
+        assert!(game.game_over);
+        let before = game.fish.clone();
+        for _ in 0..10 {
+            game.update(FISH_TICK);
+        }
+        assert_ne!(game.fish, before, "GAME OVER後も泳ぐ");
+    }
+
+    #[test]
+    fn empty_click_spooks_only_nearby_fish() {
+        let mut game = CountManiaGame::new();
+        let (column, row) = empty_cell(&game);
+        put_all_fish_at(&mut game, column, row);
+        let board = board_area(AREA);
+        game.fish[0] = Fish::new(
+            f64::from(board.right() - FISH_WIDTH),
+            f64::from(board.bottom() - 1),
+        );
+        let (fx, fy) = game.fish[0].center();
+        let distance = (fx - f64::from(column)).hypot((fy - f64::from(row)) * CELL_ASPECT);
+        assert!(
+            distance > SPOOK_RADIUS,
+            "遠い魚は驚かない範囲にいる: {distance}"
+        );
+        let lives = game.round.lives;
+
+        game.handle_mouse(left_click(column, row), AREA);
+
+        assert_eq!(game.fish[0].flee_timer, 0.0, "遠い魚は驚かない");
+        for fish in &game.fish[1..] {
+            assert_eq!(fish.flee_timer, FLEE_DURATION, "近くの魚は驚く");
+        }
+        assert_eq!(game.round.next, 1, "ゲームは進まない");
+        assert_eq!(game.round.lives, lives, "ライフも減らない");
+    }
+
+    #[test]
+    fn circle_clicks_do_not_spook_fish() {
+        let mut game = CountManiaGame::new();
+        let (column, row) = clickable_cell(&game, 1);
+        put_all_fish_at(&mut game, column, row);
+        click_circle(&mut game, 1);
+        assert_eq!(game.round.next, 2);
+        assert!(
+            game.fish.iter().all(|fish| fish.flee_timer == 0.0),
+            "正解では驚かない"
+        );
+
+        let wrong = wrong_number(&game);
+        let (column, row) = clickable_cell(&game, wrong);
+        put_all_fish_at(&mut game, column, row);
+        let lives = game.round.lives;
+        click_circle(&mut game, wrong);
+        assert_eq!(game.round.lives, lives - 1);
+        assert!(
+            game.fish.iter().all(|fish| fish.flee_timer == 0.0),
+            "不正解でも驚かない"
+        );
+    }
+
+    #[test]
+    fn text_mode_draws_fish_behind_circles() {
+        let mut game = CountManiaGame::new();
+        let (column, row) = empty_cell(&game);
+        put_all_fish_at(&mut game, column, row);
+        for fish in &mut game.fish {
+            fish.facing_right = true;
+        }
+        assert_eq!(rendered_buffer(&game)[(column, row)].symbol(), ">");
+
+        // 円の中心に置いた魚は、手前の円に隠れる
+        let (cx, cy) = center_of(&game, 1);
+        put_all_fish_at(&mut game, cx, cy);
+        let symbol = rendered_buffer(&game)[(cx, cy)].symbol().to_string();
+        assert!(symbol != ">" && symbol != "<", "円が魚より手前: {symbol}");
+    }
+
+    #[test]
+    fn text_mode_render_with_fish_does_not_panic_on_tiny_areas() {
+        let mut game = CountManiaGame::new();
+        rendered_text(&game, AREA.width, AREA.height);
+        game.update(FISH_TICK);
+        for (width, height) in [(20, 6), (5, 5), (1, 1), (AREA.width, AREA.height)] {
+            rendered_text(&game, width, height);
+            game.update(FISH_TICK);
+        }
+        clear_round(&mut game);
+        rendered_text(&game, AREA.width, AREA.height);
+    }
+
+    #[test]
+    fn image_mode_render_with_fish_does_not_panic() {
+        use ratatui_image::picker::{Picker, ProtocolType};
+        let mut game = CountManiaGame::new();
+        let mut picker = Picker::from_fontsize((4, 8));
+        picker.set_protocol_type(ProtocolType::Halfblocks);
+        game.renderer = CircleRenderer::with_picker(picker);
+        rendered_text(&game, AREA.width, AREA.height);
+        game.update(FISH_TICK);
+        let (column, row) = empty_cell(&game);
+        game.handle_mouse(left_click(column, row), AREA);
+        for (width, height) in [(AREA.width, AREA.height), (20, 6), (1, 1)] {
+            rendered_text(&game, width, height);
+            game.update(FISH_TICK);
+        }
+        rendered_text(&game, AREA.width, AREA.height);
+    }
+
+    #[test]
+    fn image_mode_draws_moving_fish_as_patches_without_rebuilding_board() {
+        use ratatui_image::picker::{Picker, ProtocolType};
+        let mut game = CountManiaGame::new();
+        let mut picker = Picker::from_fontsize((4, 8));
+        picker.set_protocol_type(ProtocolType::Halfblocks);
+        game.renderer = CircleRenderer::with_picker(picker);
+        let (column, row) = empty_cell(&game);
+        put_all_fish_at(&mut game, column, row);
+        rendered_text(&game, AREA.width, AREA.height);
+        let boards = game.renderer.board_encode_count();
+        assert_eq!(
+            game.renderer.ripple_encode_count(),
+            0,
+            "最初は盤面の画像に魚も描く"
+        );
+
+        // 魚が別のセルへ動くと、盤面全体は作り直さず、魚の周りのパッチだけを作る
+        game.fish[0].x += 2.0;
+        rendered_text(&game, AREA.width, AREA.height);
+        assert_eq!(game.renderer.board_encode_count(), boards);
+        assert!(game.renderer.ripple_encode_count() > 0);
+        assert!(!game.renderer.patch_rects().is_empty());
+    }
+
+    #[test]
+    fn text_mode_does_not_pass_fish_to_image_patches() {
+        // テキスト表示では魚を文字で描き、画像のパッチは作らない
+        let mut game = CountManiaGame::new();
+        let (column, row) = empty_cell(&game);
+        put_all_fish_at(&mut game, column, row);
+        rendered_text(&game, AREA.width, AREA.height);
+        game.fish[0].x += 2.0;
+        rendered_text(&game, AREA.width, AREA.height);
+        assert_eq!(game.renderer.ripple_encode_count(), 0);
+        assert!(game.renderer.patch_rects().is_empty());
     }
 }

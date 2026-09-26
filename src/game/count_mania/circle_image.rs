@@ -4,9 +4,13 @@
 //! 指定色に塗り替えて表示する。sixel/kitty/iTerm2の画像プロトコルに対応した端末では画像を、
 //! 非対応の端末では丸囲み数字(①②…)を色付きテキストで表示する。
 //! 円どうしは重なり合い、渡された並び順に描く(後の円ほど手前)。
+//! 画像表示では、盤面を泳ぐ魚も円の後ろに描く(テキスト表示の魚は呼び出し側が文字で描く)。
 //! 図形描画用のShapeCanvasとは独立した、このゲーム専用の部品。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
 use image::imageops::{self, FilterType};
 use image::{DynamicImage, RgbaImage};
@@ -19,6 +23,7 @@ use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
 use rust_embed::RustEmbed;
 
+use super::fish::{sprite, FISH_HEIGHT, FISH_WIDTH, SPRITE_HEIGHT, SPRITE_WIDTH};
 use super::layout::{circle_contains, label_area};
 use super::ripple::{ring_image, Ripple, RIPPLE_COLOR, RIPPLE_THICKNESS_CELLS};
 use super::wrong_mark::{
@@ -89,12 +94,29 @@ pub struct BoardCircle {
     pub color: [u8; 3],
 }
 
-/// 直前に作った盤面の画像(円だけ。波紋は含まない)。描画エリア・円の並びが同じなら再エンコードを省く
+/// 盤面を泳ぐ魚1匹(画像表示用)。x, yは魚の左上のセル(テキスト表示と同じく丸めたセル位置)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BoardFish {
+    pub x: u16,
+    pub y: u16,
+    pub facing_right: bool,
+    pub color: [u8; 3],
+}
+
+impl BoardFish {
+    /// 魚が占めるセル範囲(テキスト表示の"><>"と同じ大きさ)
+    fn rect(&self) -> Rect {
+        Rect::new(self.x, self.y, FISH_WIDTH, FISH_HEIGHT)
+    }
+}
+
+/// 直前に作った盤面の画像。描画エリア・円の並びが同じなら再エンコードを省く
 struct BoardCache {
     board: Rect,
     circles: Vec<BoardCircle>,
-    /// エンコード前の合成画像。波紋のパッチはここから切り出す
+    /// 円だけを重ねた合成画像(魚・波紋は含まない)。パッチはここから切り出す
     composed: RgbaImage,
+    /// 端末へ送る画像(作った時の位置の魚を円の後ろに描いたもの)
     protocol: StatefulProtocol,
 }
 
@@ -102,14 +124,34 @@ struct BoardCache {
 /// どちらもNoneは演出が消えた後の、何も重ねていない切り出し
 type EffectsKey = (Option<((u16, u16), u32)>, Option<(u16, u16)>);
 
-/// 直前に作った演出のパッチ(盤面の一部を切り出して波紋のリング・バツ印を重ねた画像)
-struct RippleCache {
+/// パッチに描いたもの。(演出(パッチが波紋・バツ印の範囲を含む時だけSome), パッチにかかる魚)
+type PatchKey = (Option<EffectsKey>, Vec<BoardFish>);
+
+/// パッチの画像の指紋(幅, 高さ, ピクセルのハッシュ)。同じなら端末へ送る画像データも同じになる
+type Fingerprint = (u32, u32, u64);
+
+/// パッチにする範囲1つ。effectsは波紋・バツ印の範囲か(falseは動いた魚の範囲)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PatchItem {
+    rect: Rect,
+    effects: bool,
+}
+
+/// 直前のフレームに描いたパッチ(盤面の一部を切り出して魚・波紋のリング・バツ印を重ねた画像)
+struct PatchCache {
     /// パッチを置くセル範囲
     rect: Rect,
-    /// 描いた演出
-    key: EffectsKey,
+    /// 描いたもの
+    key: PatchKey,
+    fingerprint: Fingerprint,
     protocol: StatefulProtocol,
 }
+
+/// このフレームに描くパッチ1枚の予定。(範囲, 描くもの, 作り直す画像と指紋(Noneは直前のフレームのものを使い回す))
+type PlannedPatch = (PatchItem, PatchKey, Option<(RgbaImage, Fingerprint)>);
+
+/// 同じ起点に同じ画像のパッチを作りそうになった時に、範囲を広げて作り直す回数の上限
+const MAX_PATCH_GROWS: usize = 4;
 
 /// 数字付き円の描画器。画像プロトコルが使える端末では、ボード上の全ての円を1枚の画像に
 /// 重ね合わせてから表示する(円ごとに別の画像にすると、重なった所で手前の画像が矩形ごと
@@ -123,17 +165,32 @@ struct RippleCache {
 /// パッチはコマ(RIPPLE_FRAME_INTERVAL)が変わった時だけ作り直す。
 /// 波紋が消えた後は、端末に残った最後のリングを消すため、リングの無い切り出しを1回描いて置いておく。
 /// 誤クリックのバツ印も同じパッチに重ねて描く(パッチ同士が重なると、後に描いた方の起点セルが
-/// 先の方の画像データを上書きして端末へ送られなくなるため、演出は1枚のパッチにまとめる)
+/// 先の方の画像データを上書きして端末へ送られなくなるため、演出は1枚のパッチにまとめる)。
+///
+/// 泳ぐ魚は、盤面の画像を作る時にその時の位置で円の後ろに描いておき、その後セルを移った
+/// (または向きを変えた)魚だけを、前の位置と今の位置を合わせた範囲のパッチで描き直す
+/// (前の位置も描き直すので、端末に古い魚が残らない)。パッチ同士が重なる・左右に隣り合う時は
+/// 1枚にまとめる(merge_patch_itemsを参照)
 pub struct CircleRenderer {
     picker: Option<Picker>,
     board: RefCell<Option<BoardCache>>,
-    ripple: RefCell<Option<RippleCache>>,
+    /// 波紋・バツ印のパッチの範囲(前の演出の範囲も含む)。演出が消えて何も重ねていない
+    /// 切り出しを1回描いた時・盤面を作り直した時に捨てる
+    effects_rect: Cell<Option<Rect>>,
+    /// 直前のフレームに描いたパッチ
+    patches: RefCell<Vec<PatchCache>>,
+    /// 端末にいま見えている魚(盤面の画像かパッチに最後に描いた位置・向き)
+    shown_fish: RefCell<Vec<BoardFish>>,
+    /// パッチの起点セルごとに、最後に置いた画像の指紋。端末側のImageDedupBackendは同じ位置へ
+    /// 前回と同じ画像データを送り直さないため、間に別のパッチ・盤面で上書きされた所へ同じ画像を
+    /// 置いても端末に出ない。これと同じ画像になるパッチは、範囲を広げて別の画像にする
+    sent: RefCell<HashMap<(u16, u16), Fingerprint>>,
     /// テスト用: 盤面の画像を作り直した回数
     #[cfg(test)]
-    board_encodes: std::cell::Cell<usize>,
-    /// テスト用: 波紋のパッチを作り直した回数
+    board_encodes: Cell<usize>,
+    /// テスト用: パッチ(波紋・バツ印・魚)を作り直した回数
     #[cfg(test)]
-    ripple_encodes: std::cell::Cell<usize>,
+    ripple_encodes: Cell<usize>,
 }
 
 impl CircleRenderer {
@@ -145,11 +202,14 @@ impl CircleRenderer {
         Self {
             picker,
             board: RefCell::new(None),
-            ripple: RefCell::new(None),
+            effects_rect: Cell::new(None),
+            patches: RefCell::new(Vec::new()),
+            shown_fish: RefCell::new(Vec::new()),
+            sent: RefCell::new(HashMap::new()),
             #[cfg(test)]
-            board_encodes: std::cell::Cell::new(0),
+            board_encodes: Cell::new(0),
             #[cfg(test)]
-            ripple_encodes: std::cell::Cell::new(0),
+            ripple_encodes: Cell::new(0),
         }
     }
 
@@ -159,20 +219,33 @@ impl CircleRenderer {
         self.board_encodes.get()
     }
 
-    /// テスト用: 波紋・バツ印のパッチを作り直した回数
+    /// テスト用: パッチ(波紋・バツ印・魚)を作り直した回数
     #[cfg(test)]
     pub fn ripple_encode_count(&self) -> usize {
         self.ripple_encodes.get()
     }
 
-    /// テスト用: 直前に描いた演出のパッチの範囲
+    /// テスト用: 直前に描いた、演出(波紋・バツ印)を含むパッチの範囲
     #[cfg(test)]
     pub fn patch_rect(&self) -> Option<Rect> {
-        self.ripple.borrow().as_ref().map(|cached| cached.rect)
+        self.patches
+            .borrow()
+            .iter()
+            .find(|patch| patch.key.0.is_some())
+            .map(|patch| patch.rect)
     }
 
-    /// 画像プロトコルを使うか(false=丸囲み数字のテキスト表示)。テストでの確認用
+    /// テスト用: 直前のフレームに描いたパッチ全部の範囲
     #[cfg(test)]
+    pub fn patch_rects(&self) -> Vec<Rect> {
+        self.patches
+            .borrow()
+            .iter()
+            .map(|patch| patch.rect)
+            .collect()
+    }
+
+    /// 画像プロトコルを使うか(false=丸囲み数字のテキスト表示)
     pub fn uses_image(&self) -> bool {
         self.picker.is_some()
     }
@@ -183,9 +256,8 @@ impl CircleRenderer {
         Self::from_picker(Some(picker))
     }
 
-    /// board内にcirclesを並び順に描く。後の円ほど手前に重なる。
-    /// rippleがあれば円の手前に波紋を重ねる(画像プロトコルが使える時だけ。テキスト表示では描かない)。
-    /// markがあれば円の手前にバツ印を重ねる(テキスト表示では、クリックしたセルに赤い✗を置く)
+    /// 魚のいない盤面を描く(render_board_with_fishを参照)
+    #[cfg(test)]
     pub fn render_board(
         &self,
         frame: &mut Frame,
@@ -194,12 +266,29 @@ impl CircleRenderer {
         ripple: Option<&Ripple>,
         mark: Option<&WrongMark>,
     ) {
+        self.render_board_with_fish(frame, board, circles, ripple, mark, &[]);
+    }
+
+    /// board内にcirclesを並び順に描く。後の円ほど手前に重なる。
+    /// rippleがあれば円の手前に波紋を重ねる(画像プロトコルが使える時だけ。テキスト表示では描かない)。
+    /// markがあれば円の手前にバツ印を重ねる(テキスト表示では、クリックしたセルに赤い✗を置く)。
+    /// fishは円の後ろに描く(画像プロトコルが使える時だけ。テキスト表示の魚は呼び出し側が描く)。
+    /// fishは毎フレーム同じ並びで渡す(何番目の魚が動いたかで描き直す範囲を決めるため)
+    pub fn render_board_with_fish(
+        &self,
+        frame: &mut Frame,
+        board: Rect,
+        circles: &[BoardCircle],
+        ripple: Option<&Ripple>,
+        mark: Option<&WrongMark>,
+        fish: &[BoardFish],
+    ) {
         // 描画先がフレームからはみ出さないよう切り詰める
         let board = board.intersection(frame.area());
         if board.is_empty() {
             return;
         }
-        if self.render_board_image(frame, board, circles, ripple, mark) {
+        if self.render_board_image(frame, board, circles, ripple, mark, fish) {
             return;
         }
         for circle in circles {
@@ -221,11 +310,12 @@ impl CircleRenderer {
         circles: &[BoardCircle],
         ripple: Option<&Ripple>,
         mark: Option<&WrongMark>,
+        fish: &[BoardFish],
     ) -> bool {
         let Some(picker) = &self.picker else {
             return false;
         };
-        if circles.is_empty() && ripple.is_none() && mark.is_none() {
+        if circles.is_empty() && ripple.is_none() && mark.is_none() && fish.is_empty() {
             return true;
         }
         let mut cache = self.board.borrow_mut();
@@ -238,7 +328,10 @@ impl CircleRenderer {
                 return false;
             };
             let composed = compose_circles(board, picker.font_size(), circles, &images);
-            let protocol = picker.new_resize_protocol(DynamicImage::ImageRgba8(composed.clone()));
+            // 盤面の画像を送り直すと、端末ではそれまでのパッチ(に描いた魚)も上書きされるので、
+            // いまの位置の魚も盤面の画像に描いておく
+            let scene = compose_scene(&composed, board, picker.font_size(), fish);
+            let protocol = picker.new_resize_protocol(DynamicImage::ImageRgba8(scene));
             *cache = Some(BoardCache {
                 board,
                 circles: circles.to_vec(),
@@ -246,7 +339,9 @@ impl CircleRenderer {
                 protocol,
             });
             // 盤面の画像がパッチの範囲も描き直すので、パッチは新しい盤面から作り直す
-            *self.ripple.borrow_mut() = None;
+            self.effects_rect.set(None);
+            self.patches.borrow_mut().clear();
+            *self.shown_fish.borrow_mut() = fish.to_vec();
             #[cfg(test)]
             self.board_encodes.set(self.board_encodes.get() + 1);
         }
@@ -255,33 +350,29 @@ impl CircleRenderer {
         };
         frame.render_stateful_widget(StatefulImage::default(), board, &mut cached.protocol);
         // パッチは盤面の画像より後に描き、盤面の上に重ねる
-        self.render_effects_patch(frame, picker, cached, ripple, mark);
+        self.render_patches(frame, picker, cached, ripple, mark, fish);
         true
     }
 
-    /// 波紋・バツ印の周りを切り出したパッチを盤面の上に描く。演出の見た目
-    /// (波紋のコマ・バツ印の位置)が変わった時だけ作り直す。
-    /// 演出が消えた後は、何も重ねていない切り出しを同じ範囲に描き続ける
-    /// (描くのをやめると端末に最後のリング・バツ印が残るため。盤面が変わった時に破棄する)
-    fn render_effects_patch(
+    /// 波紋・バツ印のパッチの範囲と、描く演出。演出が消えたフレームには、何も重ねていない切り出しを
+    /// 同じ範囲に1回描き(描かずにやめると端末に最後のリング・バツ印が残るため)、範囲を手放す
+    /// (持ち続けると、その範囲を泳ぐ魚が動くたびに範囲全体のパッチを作り直すことになるため)。
+    /// 範囲が無ければNone
+    fn effects_item(
         &self,
-        frame: &mut Frame,
-        picker: &Picker,
-        board: &BoardCache,
+        board: Rect,
+        font_size: (u16, u16),
         ripple: Option<&Ripple>,
         mark: Option<&WrongMark>,
-    ) {
-        let font_size = picker.font_size();
-        let mut cache = self.ripple.borrow_mut();
+    ) -> Option<(Rect, EffectsKey)> {
+        let previous = self.effects_rect.get();
         let (rect, key) = if ripple.is_some() || mark.is_some() {
-            let own = effects_rect(board.board, font_size, ripple, mark);
+            let own = effects_rect(board, font_size, ripple, mark);
             // 盤面が同じまま演出の位置が変わった時は、前のパッチの範囲も含めて描き直し、
             // 前のリング・バツ印を端末に残さない
-            let rect = match cache.as_ref() {
-                Some(cached) if !cached.rect.is_empty() && !own.is_empty() => {
-                    cached.rect.union(own)
-                }
-                Some(cached) if own.is_empty() => cached.rect,
+            let rect = match previous {
+                Some(previous) if !previous.is_empty() && !own.is_empty() => previous.union(own),
+                Some(previous) if own.is_empty() => previous,
                 _ => own,
             };
             let key = (
@@ -290,44 +381,143 @@ impl CircleRenderer {
             );
             (rect, key)
         } else {
-            match cache.as_ref() {
-                Some(cached) => (cached.rect, (None, None)),
-                None => return,
-            }
+            let previous = previous?;
+            self.effects_rect.set(None);
+            return (!previous.is_empty()).then_some((previous, (None, None)));
         };
         if rect.is_empty() {
-            return;
+            return None;
         }
-        let same =
-            matches!(cache.as_ref(), Some(cached) if cached.rect == rect && cached.key == key);
-        if !same {
-            let patch = effects_patch(&board.composed, board.board, font_size, rect, ripple, mark);
-            let protocol = picker.new_resize_protocol(DynamicImage::ImageRgba8(patch));
-            *cache = Some(RippleCache {
+        self.effects_rect.set(Some(rect));
+        Some((rect, key))
+    }
+
+    /// 演出(波紋・バツ印)と、セルを移った魚の周りのパッチを盤面の上に描く。
+    /// 直前のフレームと同じ範囲・同じ中身のパッチは作り直さない
+    fn render_patches(
+        &self,
+        frame: &mut Frame,
+        picker: &Picker,
+        board: &BoardCache,
+        ripple: Option<&Ripple>,
+        mark: Option<&WrongMark>,
+        fish: &[BoardFish],
+    ) {
+        let font_size = picker.font_size();
+        let area = patch_area(board.board);
+        let effects = self.effects_item(board.board, font_size, ripple, mark);
+        let mut items: Vec<PatchItem> = effects
+            .iter()
+            .map(|&(rect, _)| PatchItem {
                 rect,
-                key,
-                protocol,
-            });
-            #[cfg(test)]
-            self.ripple_encodes.set(self.ripple_encodes.get() + 1);
+                effects: true,
+            })
+            .collect();
+        items.extend(
+            moved_fish_rects(&self.shown_fish.borrow(), fish, area)
+                .into_iter()
+                .map(|rect| PatchItem {
+                    rect,
+                    effects: false,
+                }),
+        );
+        let effects_key = effects.map(|(_, key)| key);
+        let mut previous = std::mem::take(&mut *self.patches.borrow_mut());
+        let mut sent = self.sent.borrow_mut();
+
+        let mut planned: Vec<PlannedPatch>;
+        let mut grows = 0;
+        loop {
+            planned = Vec::new();
+            let mut grown = Vec::new();
+            for group in merge_patch_items(&items) {
+                let key: PatchKey = (
+                    if group.effects { effects_key } else { None },
+                    fish_in(fish, group.rect),
+                );
+                if previous
+                    .iter()
+                    .any(|patch| patch.rect == group.rect && patch.key == key)
+                {
+                    planned.push((group, key, None));
+                    continue;
+                }
+                let (group_ripple, group_mark) = if group.effects {
+                    (ripple, mark)
+                } else {
+                    (None, None)
+                };
+                let image = effects_patch(
+                    &board.composed,
+                    board.board,
+                    font_size,
+                    group.rect,
+                    group_ripple,
+                    group_mark,
+                    &key.1,
+                );
+                let print = fingerprint(&image);
+                if grows < MAX_PATCH_GROWS
+                    && sent.get(&(group.rect.x, group.rect.y)) == Some(&print)
+                {
+                    if let Some(rect) = grow_within(group.rect, area) {
+                        grown.push(PatchItem {
+                            rect,
+                            effects: false,
+                        });
+                    }
+                }
+                planned.push((group, key, Some((image, print))));
+            }
+            if grown.is_empty() {
+                break;
+            }
+            // 広げた範囲が他のパッチにかかることがあるので、まとめ直す
+            items.extend(grown);
+            grows += 1;
         }
-        if let Some(cached) = cache.as_mut() {
+
+        let mut current = Vec::with_capacity(planned.len());
+        for (group, key, image) in planned {
+            let patch = match image {
+                Some((image, fingerprint)) => {
+                    #[cfg(test)]
+                    self.ripple_encodes.set(self.ripple_encodes.get() + 1);
+                    PatchCache {
+                        rect: group.rect,
+                        key,
+                        fingerprint,
+                        protocol: picker.new_resize_protocol(DynamicImage::ImageRgba8(image)),
+                    }
+                }
+                None => {
+                    let Some(index) = previous
+                        .iter()
+                        .position(|patch| patch.rect == group.rect && patch.key == key)
+                    else {
+                        continue;
+                    };
+                    previous.swap_remove(index)
+                }
+            };
+            current.push(patch);
+        }
+        for patch in &mut current {
             // 盤面の画像は起点以外の全セルをskip(ratatuiの差分出力の対象外)にしており、
             // ratatui-imageはパッチの起点セルに画像データを入れる時にskipを戻さない。
             // そのままではパッチが端末へ一切出力されないので、パッチの範囲のskipを先に外す
             // (起点以外はパッチの描画で再びskipになる)
             let buffer = frame.buffer_mut();
-            for y in cached.rect.top()..cached.rect.bottom() {
-                for x in cached.rect.left()..cached.rect.right() {
+            for y in patch.rect.top()..patch.rect.bottom() {
+                for x in patch.rect.left()..patch.rect.right() {
                     buffer[(x, y)].set_skip(false);
                 }
             }
-            frame.render_stateful_widget(
-                StatefulImage::default(),
-                cached.rect,
-                &mut cached.protocol,
-            );
+            frame.render_stateful_widget(StatefulImage::default(), patch.rect, &mut patch.protocol);
+            sent.insert((patch.rect.x, patch.rect.y), patch.fingerprint);
         }
+        *self.patches.borrow_mut() = current;
+        *self.shown_fish.borrow_mut() = fish.to_vec();
     }
 }
 
@@ -458,8 +648,8 @@ fn patch_rect_around(
     )
 }
 
-/// 盤面の画像(円だけ)からセル範囲rectを切り出し、rippleがあればリングを、markがあれば
-/// バツ印を重ねたパッチを作る(バツ印が手前)
+/// 盤面の画像(円だけ)からセル範囲rectを切り出し、fishのうち範囲にかかる魚を円の後ろに、
+/// rippleがあればリングを、markがあればバツ印を円の手前に重ねたパッチを作る(バツ印が一番手前)
 fn effects_patch(
     board_image: &RgbaImage,
     board: Rect,
@@ -467,10 +657,11 @@ fn effects_patch(
     rect: Rect,
     ripple: Option<&Ripple>,
     mark: Option<&WrongMark>,
+    fish: &[BoardFish],
 ) -> RgbaImage {
     let cell_width = u32::from(font_size.0.max(1));
     let cell_height = u32::from(font_size.1.max(1));
-    let mut patch = imageops::crop_imm(
+    let circles = imageops::crop_imm(
         board_image,
         u32::from(rect.x.saturating_sub(board.x)) * cell_width,
         u32::from(rect.y.saturating_sub(board.y)) * cell_height,
@@ -478,6 +669,13 @@ fn effects_patch(
         u32::from(rect.height) * cell_height,
     )
     .to_image();
+    let mut patch = if fish.is_empty() {
+        circles
+    } else {
+        let mut layer = fish_layer(rect, font_size, patch_area(board), fish);
+        imageops::overlay(&mut layer, &circles, 0, 0);
+        layer
+    };
     if let Some(ripple) = ripple {
         add_ripple(&mut patch, rect, font_size, ripple);
     }
@@ -485,6 +683,167 @@ fn effects_patch(
         add_mark(&mut patch, rect, font_size, mark);
     }
     patch
+}
+
+/// パッチ・魚を描ける範囲。盤面から左端の2列を除いたもの(理由はripple_patch_rectを参照)。
+/// 魚もここにしか描かない(描き直せない所に描くと、魚が離れた後も消せずに残るため)
+fn patch_area(board: Rect) -> Rect {
+    let left = board.x.saturating_add(2).min(board.right());
+    Rect::new(left, board.y, board.right() - left, board.height)
+}
+
+/// 円だけの盤面の画像circles_onlyの後ろに、魚を描いたボード全体の画像
+fn compose_scene(
+    circles_only: &RgbaImage,
+    board: Rect,
+    font_size: (u16, u16),
+    fish: &[BoardFish],
+) -> RgbaImage {
+    if fish.is_empty() {
+        return circles_only.clone();
+    }
+    let mut scene = fish_layer(board, font_size, patch_area(board), fish);
+    imageops::overlay(&mut scene, circles_only, 0, 0);
+    scene
+}
+
+/// canvas(セル範囲)と同じ大きさのピクセル画像に、fishを並び順に描く(後の魚ほど手前)。
+/// clip(セル範囲)の外には描かない
+fn fish_layer(canvas: Rect, font_size: (u16, u16), clip: Rect, fish: &[BoardFish]) -> RgbaImage {
+    let cell_width = i64::from(font_size.0.max(1));
+    let cell_height = i64::from(font_size.1.max(1));
+    let mut layer = RgbaImage::new(
+        u32::from(canvas.width) * cell_width as u32,
+        u32::from(canvas.height) * cell_height as u32,
+    );
+    for one in fish {
+        let (sprite, (dx, dy)) = fish_sprite_image(font_size, one);
+        let x = (i64::from(one.x) - i64::from(canvas.x)) * cell_width + dx;
+        let y = (i64::from(one.y) - i64::from(canvas.y)) * cell_height + dy;
+        imageops::overlay(&mut layer, &sprite, x, y);
+    }
+    let clip = clip.intersection(canvas);
+    if clip != canvas {
+        // clipのピクセル範囲(canvasの左上から)
+        let left = i64::from(clip.x) - i64::from(canvas.x);
+        let top = i64::from(clip.y) - i64::from(canvas.y);
+        let columns = (left * cell_width)..((left + i64::from(clip.width)) * cell_width);
+        let rows = (top * cell_height)..((top + i64::from(clip.height)) * cell_height);
+        for (x, y, pixel) in layer.enumerate_pixels_mut() {
+            if !columns.contains(&i64::from(x)) || !rows.contains(&i64::from(y)) {
+                pixel.0 = [0, 0, 0, 0];
+            }
+        }
+    }
+    layer
+}
+
+/// 魚のドット絵を魚の色に塗り、魚のセル範囲に縦横比を保って収まる大きさにしたものと、
+/// セル範囲の左上からの位置(ピクセル)。ドットがつぶれないよう、収まるなら整数倍に拡大する
+fn fish_sprite_image(font_size: (u16, u16), fish: &BoardFish) -> (RgbaImage, (i64, i64)) {
+    let frame_width = u32::from(FISH_WIDTH) * u32::from(font_size.0.max(1));
+    let frame_height = u32::from(FISH_HEIGHT) * u32::from(font_size.1.max(1));
+    let scale = f64::min(
+        f64::from(frame_width) / f64::from(SPRITE_WIDTH),
+        f64::from(frame_height) / f64::from(SPRITE_HEIGHT),
+    );
+    let scale = if scale >= 1.0 { scale.floor() } else { scale };
+    let width = ((f64::from(SPRITE_WIDTH) * scale).round() as u32).clamp(1, frame_width);
+    let height = ((f64::from(SPRITE_HEIGHT) * scale).round() as u32).clamp(1, frame_height);
+    let image = imageops::resize(
+        &recolor(&sprite(fish.facing_right), fish.color),
+        width,
+        height,
+        FilterType::Nearest,
+    );
+    let offset = (
+        i64::from((frame_width - width) / 2),
+        i64::from((frame_height - height) / 2),
+    );
+    (image, offset)
+}
+
+/// 前に見えていた魚shownから、いまの魚fishへ位置・向き・色が変わった魚ごとに、
+/// 前の位置と今の位置を合わせたセル範囲(areaの中)
+fn moved_fish_rects(shown: &[BoardFish], fish: &[BoardFish], area: Rect) -> Vec<Rect> {
+    (0..shown.len().max(fish.len()))
+        .filter_map(|index| {
+            let (old, new) = (shown.get(index), fish.get(index));
+            if old == new {
+                return None;
+            }
+            [old, new]
+                .into_iter()
+                .flatten()
+                .map(|one| one.rect().intersection(area))
+                .filter(|rect| !rect.is_empty())
+                .reduce(|a, b| a.union(b))
+        })
+        .collect()
+}
+
+/// fishのうち、セル範囲rectにかかる魚
+fn fish_in(fish: &[BoardFish], rect: Rect) -> Vec<BoardFish> {
+    fish.iter()
+        .copied()
+        .filter(|one| one.rect().intersects(rect))
+        .collect()
+}
+
+/// パッチにする範囲のうち、重なるもの・左右に隣り合うものを1つにまとめる(まとめた範囲が
+/// さらに別の範囲にかかれば、それもまとめる)。演出の範囲を含むものは演出の範囲として扱う。
+/// 1フレームに描くパッチ同士が重なると、後に描いた方の起点セルが先の方の画像データを上書きして
+/// 端末へ送られなくなる。左右に隣り合うと、左のパッチの画像データのセル(kittyでは各行の左端)の
+/// すぐ右に右のパッチの起点が来ることがあり、ratatuiの差分処理がそのセルを出力しない
+fn merge_patch_items(items: &[PatchItem]) -> Vec<PatchItem> {
+    let mut merged: Vec<PatchItem> = items
+        .iter()
+        .copied()
+        .filter(|item| !item.rect.is_empty())
+        .collect();
+    loop {
+        let pair = (0..merged.len()).find_map(|i| {
+            (i + 1..merged.len())
+                .find(|&j| patches_touch(merged[i].rect, merged[j].rect))
+                .map(|j| (i, j))
+        });
+        let Some((i, j)) = pair else {
+            return merged;
+        };
+        let other = merged.swap_remove(j);
+        merged[i] = PatchItem {
+            rect: merged[i].rect.union(other.rect),
+            effects: merged[i].effects || other.effects,
+        };
+    }
+}
+
+/// 2つのパッチの範囲が、重なるか左右に隣り合うか
+fn patches_touch(a: Rect, b: Rect) -> bool {
+    let widened = |rect: Rect| Rect::new(rect.x, rect.y, rect.width.saturating_add(1), rect.height);
+    widened(a).intersects(b) || widened(b).intersects(a)
+}
+
+/// rectをareaの中で1セル広げる(右・下・上・左の順に、広げられる向きへ)。広げられなければNone
+fn grow_within(rect: Rect, area: Rect) -> Option<Rect> {
+    if rect.right() < area.right() {
+        Some(Rect::new(rect.x, rect.y, rect.width + 1, rect.height))
+    } else if rect.bottom() < area.bottom() {
+        Some(Rect::new(rect.x, rect.y, rect.width, rect.height + 1))
+    } else if rect.y > area.y {
+        Some(Rect::new(rect.x, rect.y - 1, rect.width, rect.height + 1))
+    } else if rect.x > area.x {
+        Some(Rect::new(rect.x - 1, rect.y, rect.width + 1, rect.height))
+    } else {
+        None
+    }
+}
+
+/// パッチの画像の指紋
+fn fingerprint(image: &RgbaImage) -> Fingerprint {
+    let mut hasher = DefaultHasher::new();
+    image.as_raw().hash(&mut hasher);
+    (image.width(), image.height(), hasher.finish())
 }
 
 /// area(セル範囲)を写したimageに、バツ印を重ねる。
@@ -1077,6 +1436,7 @@ mod tests {
             rect,
             Some(&ripple),
             None,
+            &[],
         );
         let full = build_board_image(RIPPLE_BOARD, RIPPLE_FONT, &[big], Some(&ripple)).unwrap();
         assert_eq!(patch, crop_cells(&full, RIPPLE_BOARD, RIPPLE_FONT, rect));
@@ -1086,7 +1446,15 @@ mod tests {
             "リングが重なっている"
         );
         // 波紋が消えた後のパッチはリングの無いボードの切り出し
-        let clean = effects_patch(&circles_only, RIPPLE_BOARD, RIPPLE_FONT, rect, None, None);
+        let clean = effects_patch(
+            &circles_only,
+            RIPPLE_BOARD,
+            RIPPLE_FONT,
+            rect,
+            None,
+            None,
+            &[],
+        );
         assert_eq!(
             clean,
             crop_cells(&circles_only, RIPPLE_BOARD, RIPPLE_FONT, rect)
@@ -1474,6 +1842,7 @@ mod tests {
             rect,
             None,
             Some(&mark),
+            &[],
         );
         // セル(10, 5)の中心のピクセル = ボード画像の(105, 110)。パッチの中での位置に直す
         let (cw, ch) = (u32::from(RIPPLE_FONT.0), u32::from(RIPPLE_FONT.1));
@@ -1488,7 +1857,15 @@ mod tests {
         assert_ne!(patch, clean, "バツ印が重なっている");
         // バツ印が無ければ、盤面の切り出しそのまま
         assert_eq!(
-            effects_patch(&circles_only, RIPPLE_BOARD, RIPPLE_FONT, rect, None, None),
+            effects_patch(
+                &circles_only,
+                RIPPLE_BOARD,
+                RIPPLE_FONT,
+                rect,
+                None,
+                None,
+                &[]
+            ),
             clean
         );
     }
@@ -1505,6 +1882,7 @@ mod tests {
             RIPPLE_BOARD,
             None,
             Some(&mark),
+            &[],
         );
         let (cw, ch) = (u32::from(RIPPLE_FONT.0), u32::from(RIPPLE_FONT.1));
         let painted: Vec<(u32, u32)> = full
@@ -1619,5 +1997,605 @@ mod tests {
         // rectの外には何も描かない
         let outside: String = (0..30).map(|x| buffer[(x, 0)].symbol()).collect();
         assert_eq!(outside.trim(), "");
+    }
+
+    // --- 水槽の魚(画像表示) ---
+
+    use super::super::fish::{FISH_HEIGHT, FISH_WIDTH};
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    const FISH_RED: [u8; 3] = [255, 0, 0];
+
+    /// 左上のセル(x, y)にいる、右向きの赤い魚
+    fn fish_at(x: u16, y: u16) -> BoardFish {
+        BoardFish {
+            x,
+            y,
+            facing_right: true,
+            color: FISH_RED,
+        }
+    }
+
+    fn fish_cells(fish: &BoardFish) -> Rect {
+        Rect::new(fish.x, fish.y, FISH_WIDTH, FISH_HEIGHT)
+    }
+
+    /// ボード画像のピクセル(x, y)が、セル範囲rectに入るか
+    fn pixel_in_cells(board: Rect, font: (u16, u16), rect: Rect, x: u32, y: u32) -> bool {
+        let (cw, ch) = (u32::from(font.0), u32::from(font.1));
+        let left = u32::from(rect.x - board.x) * cw;
+        let top = u32::from(rect.y - board.y) * ch;
+        (left..left + u32::from(rect.width) * cw).contains(&x)
+            && (top..top + u32::from(rect.height) * ch).contains(&y)
+    }
+
+    /// ボード画像のうち、セル範囲rectにあって不透明な、RGBがrgbのピクセルの数
+    fn count_rgb_in_cells(
+        image: &RgbaImage,
+        board: Rect,
+        font: (u16, u16),
+        rect: Rect,
+        rgb: [u8; 3],
+    ) -> usize {
+        image
+            .enumerate_pixels()
+            .filter(|(x, y, p)| {
+                p.0[3] > 0 && p.0[..3] == rgb && pixel_in_cells(board, font, rect, *x, *y)
+            })
+            .count()
+    }
+
+    #[test]
+    fn scene_draws_fish_in_its_cells_with_its_color() {
+        let circles_only = RgbaImage::new(200, 200);
+        let fish = fish_at(12, 7);
+        let scene = compose_scene(&circles_only, RIPPLE_BOARD, RIPPLE_FONT, &[fish]);
+        assert_eq!(scene.dimensions(), (200, 200));
+        let cells = fish_cells(&fish);
+        assert!(
+            count_rgb_in_cells(&scene, RIPPLE_BOARD, RIPPLE_FONT, cells, FISH_RED) > 20,
+            "体が魚の色で描かれる"
+        );
+        assert!(
+            count_rgb_in_cells(&scene, RIPPLE_BOARD, RIPPLE_FONT, cells, [0, 0, 0]) > 0,
+            "目は黒のまま"
+        );
+        for (x, y, p) in scene.enumerate_pixels() {
+            if !pixel_in_cells(RIPPLE_BOARD, RIPPLE_FONT, cells, x, y) {
+                assert_eq!(p.0[3], 0, "魚のセルの外({x},{y})は透明");
+            }
+        }
+        // 左向きの魚は左右反転した絵になる
+        let left = BoardFish {
+            facing_right: false,
+            ..fish
+        };
+        let flipped = compose_scene(&circles_only, RIPPLE_BOARD, RIPPLE_FONT, &[left]);
+        assert_ne!(scene, flipped);
+    }
+
+    #[test]
+    fn circles_are_drawn_in_front_of_fish() {
+        // ボード全体を覆う大きな円。中央の魚は円に隠れ、円の外(ボードの角)にいる魚は見える
+        let big = BoardCircle {
+            rect: RIPPLE_BOARD,
+            number: 2,
+            color: [0, 0, 255],
+        };
+        let images = recolored_images(&[big]).unwrap();
+        let circles_only = compose_circles(RIPPLE_BOARD, RIPPLE_FONT, &[big], &images);
+        let hidden = fish_at(8, 4);
+        let corner = fish_at(17, 0);
+        let scene = compose_scene(&circles_only, RIPPLE_BOARD, RIPPLE_FONT, &[hidden, corner]);
+        for (x, y, p) in circles_only.enumerate_pixels() {
+            if p.0[3] == 255 {
+                assert_eq!(
+                    scene.get_pixel(x, y),
+                    p,
+                    "円の不透明な所({x},{y})は円のまま"
+                );
+            }
+        }
+        assert_eq!(
+            count_rgb_in_cells(
+                &scene,
+                RIPPLE_BOARD,
+                RIPPLE_FONT,
+                fish_cells(&hidden),
+                FISH_RED
+            ),
+            0,
+            "円の後ろの魚は見えない"
+        );
+        assert!(
+            count_rgb_in_cells(
+                &scene,
+                RIPPLE_BOARD,
+                RIPPLE_FONT,
+                fish_cells(&corner),
+                FISH_RED
+            ) > 0,
+            "円の外の魚は見える"
+        );
+    }
+
+    #[test]
+    fn fish_is_not_drawn_in_two_left_columns_of_board() {
+        // 左端の2列はパッチで描き直せない(patch_rect_aroundを参照)ので、魚も描かない。
+        // 描くと、魚が離れた後も消せずに残る
+        let board = Rect::new(2, 3, 20, 10);
+        let circles_only = RgbaImage::new(200, 200);
+        let scene = compose_scene(&circles_only, board, RIPPLE_FONT, &[fish_at(2, 5)]);
+        for (x, y, p) in scene.enumerate_pixels() {
+            if x < 2 * u32::from(RIPPLE_FONT.0) {
+                assert_eq!(p.0[3], 0, "左端の2列({x},{y})には描かない");
+            }
+        }
+        assert!(
+            count_rgb_in_cells(&scene, board, RIPPLE_FONT, Rect::new(4, 5, 1, 1), FISH_RED) > 0,
+            "3列目からは描く"
+        );
+    }
+
+    #[test]
+    fn fish_patch_shows_fish_at_new_cells_and_board_at_old_cells() {
+        // 魚が(5,4)から(6,4)へ動いた。パッチは前の位置と今の位置を合わせた範囲を、
+        // 今の魚で描き直す(前の位置に魚の絵を残さない)
+        let circles_only = RgbaImage::new(200, 200);
+        let rect = Rect::new(5, 4, 4, 1);
+        // 範囲の端に一部だけ入っている別の魚も、はみ出した分を切って描く
+        let fish = [fish_at(6, 4), fish_at(8, 4)];
+        let patch = effects_patch(
+            &circles_only,
+            RIPPLE_BOARD,
+            RIPPLE_FONT,
+            rect,
+            None,
+            None,
+            &fish,
+        );
+        let scene = compose_scene(&circles_only, RIPPLE_BOARD, RIPPLE_FONT, &fish);
+        assert_eq!(patch, crop_cells(&scene, RIPPLE_BOARD, RIPPLE_FONT, rect));
+        let old_cell = imageops::crop_imm(&patch, 0, 0, 10, 20).to_image();
+        assert!(
+            old_cell.pixels().all(|p| p.0[3] == 0),
+            "前の位置の左端のセルには何も残らない"
+        );
+    }
+
+    fn item(x: u16, y: u16, width: u16, height: u16) -> PatchItem {
+        PatchItem {
+            rect: Rect::new(x, y, width, height),
+            effects: false,
+        }
+    }
+
+    fn merged_rects(items: &[PatchItem]) -> Vec<Rect> {
+        let mut rects: Vec<Rect> = merge_patch_items(items)
+            .into_iter()
+            .map(|item| item.rect)
+            .collect();
+        rects.sort_by_key(|rect| (rect.y, rect.x));
+        rects
+    }
+
+    #[test]
+    fn merge_keeps_far_patches_apart_and_joins_overlapping_or_touching_ones() {
+        assert_eq!(
+            merged_rects(&[item(5, 2, 3, 1), item(20, 2, 3, 1)]),
+            vec![Rect::new(5, 2, 3, 1), Rect::new(20, 2, 3, 1)],
+            "離れたパッチは別々"
+        );
+        assert_eq!(
+            merged_rects(&[item(5, 2, 4, 2), item(7, 3, 4, 1)]),
+            vec![Rect::new(5, 2, 6, 2)],
+            "重なるパッチは1枚にまとめる"
+        );
+        // 左右に隣り合うと、左のパッチの画像データのセルの直後に右のパッチの起点が来ることがあり、
+        // ratatuiの差分処理がそのセルを出力しない。1枚にまとめる
+        assert_eq!(
+            merged_rects(&[item(5, 2, 1, 1), item(6, 2, 3, 1)]),
+            vec![Rect::new(5, 2, 4, 1)]
+        );
+        assert_eq!(
+            merged_rects(&[item(5, 2, 3, 1), item(5, 3, 3, 1)]),
+            vec![Rect::new(5, 2, 3, 1), Rect::new(5, 3, 3, 1)],
+            "上下に隣り合うだけなら別々"
+        );
+        // AとCは重ならないが、AとBをまとめた範囲にCが入るので全部1枚にする
+        assert_eq!(
+            merged_rects(&[item(0, 0, 4, 1), item(0, 3, 1, 1), item(2, 0, 1, 4)]),
+            vec![Rect::new(0, 0, 4, 4)]
+        );
+        // 演出(波紋・バツ印)の印はまとめた先に引き継ぐ
+        let effects = PatchItem {
+            rect: Rect::new(5, 2, 3, 1),
+            effects: true,
+        };
+        assert_eq!(
+            merge_patch_items(&[effects, item(7, 2, 3, 1)]),
+            vec![PatchItem {
+                rect: Rect::new(5, 2, 5, 1),
+                effects: true,
+            }]
+        );
+    }
+
+    /// 画像表示の描画器で、circles・演出・魚を描いたバッファを返す
+    fn draw_scene(
+        renderer: &CircleRenderer,
+        terminal: &mut Terminal<TestBackend>,
+        circles: &[BoardCircle],
+        ripple: Option<&Ripple>,
+        mark: Option<&WrongMark>,
+        fish: &[BoardFish],
+    ) {
+        terminal
+            .draw(|frame| {
+                renderer.render_board_with_fish(frame, frame.area(), circles, ripple, mark, fish)
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn moving_fish_reencodes_only_patch_covering_old_and_new_cells() {
+        let renderer = image_renderer();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        let mut draw = |fish: BoardFish| {
+            draw_scene(
+                &renderer,
+                &mut terminal,
+                &PATCH_CIRCLES,
+                None,
+                None,
+                &[fish],
+            )
+        };
+        draw(fish_at(20, 8));
+        assert_eq!(renderer.board_encode_count(), 1);
+        assert_eq!(
+            renderer.ripple_encode_count(),
+            0,
+            "最初の位置の魚は盤面の画像に描く"
+        );
+        assert!(renderer.patch_rects().is_empty());
+
+        draw(fish_at(21, 8));
+        assert_eq!(
+            renderer.board_encode_count(),
+            1,
+            "魚が動いても盤面全体は作り直さない"
+        );
+        assert_eq!(renderer.ripple_encode_count(), 1);
+        assert_eq!(
+            renderer.patch_rects(),
+            vec![Rect::new(20, 8, 4, 1)],
+            "前の位置と今の位置を合わせた範囲"
+        );
+
+        draw(fish_at(21, 8));
+        assert_eq!(
+            renderer.ripple_encode_count(),
+            1,
+            "止まっている間は作り直さない"
+        );
+        assert!(renderer.patch_rects().is_empty());
+
+        // 向きだけ変わっても描き直す
+        draw(BoardFish {
+            facing_right: false,
+            ..fish_at(21, 8)
+        });
+        assert_eq!(renderer.ripple_encode_count(), 2);
+        assert_eq!(renderer.patch_rects(), vec![Rect::new(21, 8, 3, 1)]);
+    }
+
+    #[test]
+    fn board_rebuild_draws_fish_into_board_image() {
+        let renderer = image_renderer();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        draw_scene(
+            &renderer,
+            &mut terminal,
+            &PATCH_CIRCLES,
+            None,
+            None,
+            &[fish_at(20, 8)],
+        );
+        draw_scene(
+            &renderer,
+            &mut terminal,
+            &PATCH_CIRCLES,
+            None,
+            None,
+            &[fish_at(21, 8)],
+        );
+        assert_eq!(renderer.ripple_encode_count(), 1);
+        // 円が1つ消えて盤面を作り直す時は、いまの位置の魚も盤面の画像に描くのでパッチは要らない
+        draw_scene(
+            &renderer,
+            &mut terminal,
+            &PATCH_CIRCLES[..1],
+            None,
+            None,
+            &[fish_at(21, 8)],
+        );
+        assert_eq!(renderer.board_encode_count(), 2);
+        assert_eq!(renderer.ripple_encode_count(), 1);
+        assert!(renderer.patch_rects().is_empty());
+        // その後に動いたら、盤面の画像に描いた位置から描き直す
+        draw_scene(
+            &renderer,
+            &mut terminal,
+            &PATCH_CIRCLES[..1],
+            None,
+            None,
+            &[fish_at(22, 8)],
+        );
+        assert_eq!(renderer.patch_rects(), vec![Rect::new(21, 8, 4, 1)]);
+    }
+
+    #[test]
+    fn fish_near_ripple_is_drawn_in_same_patch() {
+        // パッチ同士が重なると後に描いた方が先の方の画像データを上書きするため、1枚にまとめる
+        let renderer = image_renderer();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        let ripple = Ripple::new(20, 8, CircleSize::Small);
+        draw_scene(
+            &renderer,
+            &mut terminal,
+            &PATCH_CIRCLES,
+            Some(&ripple),
+            None,
+            &[fish_at(21, 8)],
+        );
+        let effects_only = renderer.patch_rect().expect("波紋のパッチ");
+        draw_scene(
+            &renderer,
+            &mut terminal,
+            &PATCH_CIRCLES,
+            Some(&ripple),
+            None,
+            &[fish_at(22, 8)],
+        );
+        let rects = renderer.patch_rects();
+        assert_eq!(rects.len(), 1, "波紋と魚は1枚のパッチ: {rects:?}");
+        assert_eq!(rects[0].union(effects_only), rects[0]);
+        assert_eq!(
+            rects[0].union(Rect::new(21, 8, 4, 1)),
+            rects[0],
+            "魚の前と今の位置も含む"
+        );
+        assert_eq!(renderer.patch_rect(), Some(rects[0]));
+    }
+
+    #[test]
+    fn after_effects_end_fish_patch_does_not_grow_to_old_effects_area() {
+        // 演出が消えたらリングの無い切り出しを1回だけ描き、その範囲は手放す。
+        // 手放さないと、跡を泳ぐ魚が動くたびに演出の範囲全体(特大の円の波紋では盤面の数割)を作り直す
+        let renderer = image_renderer();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        let ripple = Ripple::new(20, 8, CircleSize::Huge);
+        let still = [fish_at(20, 8)];
+        draw_scene(
+            &renderer,
+            &mut terminal,
+            &PATCH_CIRCLES,
+            Some(&ripple),
+            None,
+            &still,
+        );
+        let effects = renderer.patch_rect().expect("波紋のパッチ");
+        draw_scene(&renderer, &mut terminal, &PATCH_CIRCLES, None, None, &still);
+        assert_eq!(
+            renderer.patch_rects(),
+            vec![effects],
+            "消えた直後はリングの無い切り出しを描く"
+        );
+        draw_scene(&renderer, &mut terminal, &PATCH_CIRCLES, None, None, &still);
+        assert!(renderer.patch_rects().is_empty(), "その後は描かない");
+        draw_scene(
+            &renderer,
+            &mut terminal,
+            &PATCH_CIRCLES,
+            None,
+            None,
+            &[fish_at(21, 8)],
+        );
+        assert_eq!(
+            renderer.patch_rects(),
+            vec![Rect::new(20, 8, 4, 1)],
+            "波紋の跡を泳ぐ魚は魚の周りだけ描き直す"
+        );
+    }
+
+    #[test]
+    fn patches_in_one_frame_never_overlap_or_touch() {
+        // 魚3匹が泳ぎ回り、時々波紋・バツ印が出る。どのフレームでもパッチは重ならず、
+        // 左右にも隣り合わず、盤面の左端の2列にかからない
+        let renderer = image_renderer();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        let mut rng = StdRng::seed_from_u64(11);
+        let mut fish: Vec<BoardFish> = (0..3).map(|i| fish_at(5 + i * 15, 3 + i * 6)).collect();
+        let mut ripple: Option<Ripple> = None;
+        let mut mark: Option<WrongMark> = None;
+        for step in 0..300 {
+            for f in &mut fish {
+                f.x = (i32::from(f.x) + rng.gen_range(-1..=1)).clamp(0, 57) as u16;
+                f.y = (i32::from(f.y) + rng.gen_range(-1..=1)).clamp(0, 23) as u16;
+                f.facing_right = rng.gen_bool(0.5);
+            }
+            if step % 40 == 0 {
+                ripple = Some(Ripple::new(
+                    rng.gen_range(0..60),
+                    rng.gen_range(0..24),
+                    CircleSize::Small,
+                ));
+            }
+            if step % 55 == 0 {
+                mark = Some(WrongMark::new(rng.gen_range(0..60), rng.gen_range(0..24)));
+            }
+            draw_scene(
+                &renderer,
+                &mut terminal,
+                &PATCH_CIRCLES,
+                ripple.as_ref(),
+                mark.as_ref(),
+                &fish,
+            );
+            ripple = ripple.and_then(|r| r.advanced(crate::TICK_RATE));
+            mark = mark.and_then(|m| m.advanced(crate::TICK_RATE));
+            let rects = renderer.patch_rects();
+            for (i, a) in rects.iter().enumerate() {
+                assert!(a.x >= 2, "step{step}: 左端の2列にかかる {a:?}");
+                assert_eq!(a.intersection(Rect::new(0, 0, 60, 24)), *a);
+                for b in &rects[i + 1..] {
+                    let widened = |r: &Rect| Rect::new(r.x, r.y, r.width + 1, r.height);
+                    assert!(
+                        !widened(a).intersects(*b) && !widened(b).intersects(*a),
+                        "step{step}: パッチ{a:?}と{b:?}が重なる/隣り合う"
+                    );
+                }
+            }
+        }
+        assert_eq!(renderer.board_encode_count(), 1, "盤面全体は最初の1回だけ");
+    }
+
+    #[test]
+    fn image_mode_render_with_fish_does_not_panic_on_edges_and_tiny_areas() {
+        for (width, height) in [(60, 24), (5, 3), (3, 1), (2, 2), (1, 1)] {
+            let renderer = image_renderer();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let circle = BoardCircle {
+                rect: Rect::new(0, 0, width, height),
+                number: 1,
+                color: [10, 20, 30],
+            };
+            let ripple = Ripple::new(0, 0, CircleSize::Small);
+            let mark = WrongMark::new(width - 1, height - 1);
+            for fish in [
+                fish_at(0, 0),
+                fish_at(1, 0),
+                fish_at(width - 1, height - 1),
+                fish_at(width + 10, height + 10),
+                fish_at(u16::MAX - 1, u16::MAX - 1),
+            ] {
+                draw_scene(
+                    &renderer,
+                    &mut terminal,
+                    &[circle],
+                    Some(&ripple),
+                    Some(&mark),
+                    &[fish],
+                );
+                draw_scene(&renderer, &mut terminal, &[], None, None, &[fish]);
+            }
+        }
+    }
+
+    // --- 魚のパッチが端末へ実際に送られること ---
+
+    /// 魚を描いて1フレーム描き、端末へ送られた画像データのセル位置を返す
+    fn draw_sent_with_fish(
+        renderer: &CircleRenderer,
+        terminal: &mut Terminal<ImageDedupBackend<RecordingBackend>>,
+        ripple: Option<&Ripple>,
+        fish: &[BoardFish],
+    ) -> Vec<(u16, u16)> {
+        terminal
+            .draw(|frame| {
+                renderer.render_board_with_fish(
+                    frame,
+                    frame.area(),
+                    &PATCH_CIRCLES,
+                    ripple,
+                    None,
+                    fish,
+                )
+            })
+            .unwrap();
+        terminal.backend().inner().last_payload_positions()
+    }
+
+    /// パッチの画像データ(盤面の左端2列より右にあるもの)が送られたか
+    fn patch_was_sent(sent: &[(u16, u16)]) -> bool {
+        sent.iter().any(|&(x, _)| x >= PIPE_BOARD.x + 2)
+    }
+
+    #[test]
+    fn moving_fish_is_sent_to_terminal_every_time_it_moves() {
+        // 2回目に(20,8)から(21,8)へ動いた時のパッチは、1回目と同じ起点・同じ中身の画像になる。
+        // 端末では間に別の起点のパッチで上書きされているが、ImageDedupBackendは同じ位置へ同じ
+        // 画像データを送り直さないため、そのままでは(21,8)の魚が描かれず、古い絵が残る
+        let path = [(20, 8), (21, 8), (20, 7), (20, 8), (21, 8), (22, 8)];
+        for protocol in [
+            ProtocolType::Sixel,
+            ProtocolType::Iterm2,
+            ProtocolType::Kitty,
+        ] {
+            let renderer = protocol_renderer(protocol);
+            let mut terminal = pipeline_terminal();
+            let (x, y) = path[0];
+            draw_sent_with_fish(&renderer, &mut terminal, None, &[fish_at(x, y)]);
+            for window in path.windows(2) {
+                let (x, y) = window[1];
+                let sent = draw_sent_with_fish(&renderer, &mut terminal, None, &[fish_at(x, y)]);
+                assert!(
+                    patch_was_sent(&sent),
+                    "{protocol:?}: {:?}から{:?}へ動いたパッチが送られていない: {sent:?}",
+                    window[0],
+                    window[1]
+                );
+                if protocol != ProtocolType::Kitty {
+                    assert!(
+                        !sent.contains(&BOARD_ORIGIN),
+                        "{protocol:?}: 魚が動いても盤面の画像は送り直さない"
+                    );
+                }
+            }
+            if protocol != ProtocolType::Kitty {
+                let (x, y) = path[path.len() - 1];
+                assert!(
+                    draw_sent_with_fish(&renderer, &mut terminal, None, &[fish_at(x, y)])
+                        .is_empty(),
+                    "{protocol:?}: 止まっている間は何も送らない"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wandering_fish_are_sent_on_every_move_even_with_ripples() {
+        for protocol in [ProtocolType::Sixel, ProtocolType::Iterm2] {
+            let renderer = protocol_renderer(protocol);
+            let mut terminal = pipeline_terminal();
+            let mut rng = StdRng::seed_from_u64(21);
+            let mut fish: Vec<BoardFish> =
+                (0..3).map(|i| fish_at(10 + i * 12, 4 + i * 5)).collect();
+            let mut ripple: Option<Ripple> = None;
+            draw_sent_with_fish(&renderer, &mut terminal, None, &fish);
+            for step in 0..300 {
+                let before = fish.clone();
+                for f in &mut fish {
+                    // 小さな範囲を行き来させ、同じ位置の組み合わせが何度も出るようにする
+                    if rng.gen_bool(0.5) {
+                        f.x = (i32::from(f.x) + rng.gen_range(-1..=1)).clamp(8, 44) as u16;
+                        f.y = (i32::from(f.y) + rng.gen_range(-1..=1)).clamp(2, 20) as u16;
+                    }
+                }
+                if step % 60 == 0 {
+                    ripple = Some(Ripple::new(24, 10, CircleSize::Small));
+                }
+                let sent = draw_sent_with_fish(&renderer, &mut terminal, ripple.as_ref(), &fish);
+                ripple = ripple.and_then(|r| r.advanced(crate::TICK_RATE));
+                if fish != before {
+                    assert!(
+                        patch_was_sent(&sent),
+                        "{protocol:?} step{step}: 魚が動いたのにパッチが送られていない {before:?} -> {fish:?}"
+                    );
+                }
+            }
+        }
     }
 }
