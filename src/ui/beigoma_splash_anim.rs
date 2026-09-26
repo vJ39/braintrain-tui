@@ -55,8 +55,9 @@ pub fn frame_index(elapsed: Duration) -> usize {
 
 /// 「べー」スプラッシュ画面のコマ送りアニメーション
 pub struct AnimatedSplash {
-    /// 端末の1セルの大きさ(px)
-    font_size: (u16, u16),
+    /// 端末の1セルの大きさ(px)は描画のたびに取得する(SplashRendererと同じ。
+    /// 生成時に1回だけ保存すると、実機で画像が小さく表示される不具合があった: #157)
+    picker: Option<Picker>,
     /// 元画像の大きさ(px、全コマ共通)
     image_size: (u32, u32),
     /// 読み込み済みの全コマ。1枚でも読めなければ空(フォールバック表示)
@@ -72,7 +73,7 @@ impl AnimatedSplash {
 
     fn with_picker(picker: Option<Picker>, fallback: FallbackText) -> Self {
         let mut anim = Self {
-            font_size: (1, 1),
+            picker: picker.clone(),
             image_size: (1, 1),
             frames: Vec::new(),
             fallback,
@@ -92,7 +93,6 @@ impl AnimatedSplash {
         if let Some(first) = images.first() {
             anim.image_size = (first.width(), first.height());
         }
-        anim.font_size = picker.font_size();
         anim.frames = images
             .into_iter()
             .map(|image| picker.new_resize_protocol(image))
@@ -131,7 +131,8 @@ impl AnimatedSplash {
         let Some(protocol) = self.frames.get_mut(index) else {
             return;
         };
-        let target = splash::centered_image_rect(area, self.image_size, self.font_size);
+        let font_size = self.picker.as_ref().map_or((1, 1), Picker::font_size);
+        let target = splash::centered_image_rect(area, self.image_size, font_size);
         let widget = StatefulImage::default().resize(Resize::Fit(None));
         frame.render_stateful_widget(widget, target, protocol);
     }

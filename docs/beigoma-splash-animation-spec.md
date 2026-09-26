@@ -12,6 +12,7 @@
   - フォールバック(画像プロトコル非対応)は`splash::BEIGOMA_FALLBACK`のテキスト表示のまま
 - `App`の`beigoma_splash_renderer: SplashRenderer`を`AnimatedSplash`に置き換え、`Screen::BeigomaSplash`表示中は`update(dt)`で経過時間を進める(`ResultSprite`のように`Screen`に応じて進めるのを絞る)
 - `beigoma_splash_renderer`の経過時間は`Screen::BeigomaSplash`に入るたびに0へリセットする
+- 実機で画像が画面全体でなく小さく表示された不具合(#157)の修正: `font_size`を生成時に1回だけ保存せず、`SplashRenderer`と同様に`render`のたびに`picker.font_size()`を取得する。`AnimatedSplash`は`Picker`自体を保持し、`font_size`専用のフィールドは持たない
 
 ## 対象ファイル
 
