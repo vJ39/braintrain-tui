@@ -1,9 +1,11 @@
-//! べーの盤面: ROUNDごとの盤(凹凸・投入位置は固定配置、ゴールは毎回ランダム)、連打式の2軸の傾き、
-//! ベーゴマの転がり。
+//! べーの盤面: ROUNDごとの盤(凹凸・投入位置は固定配置、ゴールはROUNDごとの選び方で置く)、
+//! 連打式の2軸の傾き、ベーゴマの転がり。
 //!
 //! 座標は盤のマス単位(左上が(0,0)、xは右、yは下)。画面の上が軽トラの前方。
-//! - 1セッションは2ROUND(ROUND1=やさしい、ROUND2=むずかしい)。ROUND2は縁の内側に凹凸の輪があり、
-//!   ゴールは投入位置からの直線上に必ず凹凸が挟まる位置にだけ置く(直線移動だけでは届かない)
+//! - 1セッションは2ROUND(ROUND1=やさしい、ROUND2=むずかしい)。盤の配置はどちらもLAYOUT_ROUND1
+//! - ROUND1のゴールは投入位置から最も遠い候補に固定する
+//! - ROUND2はベーゴマ2個を投入位置の左右に並べて投入する。ゴールは候補からランダムに選び、
+//!   投入位置からの直線上に必ず凹凸が挟まる位置にだけ置く(直線移動だけでは届かない)
 //! - 傾き: pitch(前後軸、+が前傾)・roll(左右軸、+が右傾)。-TILT_MAX〜+TILT_MAX
 //! - 軽トラのG(軽トラの加速度の向き)は、ベーゴマには慣性として逆向きにかかる
 //!   (ブレーキ=後方向のGで、ベーゴマは前(画面の上)へ押される)
@@ -29,8 +31,8 @@ pub const BOARD_HEIGHT: usize = 12;
 /// 1セッションのROUND数
 pub const ROUNDS_PER_SESSION: u32 = 2;
 
-/// ROUND1の配置。'.'=平坦、'#'=凸(でっぱり)、'u'=凹(くぼみ)、'S'=投入位置。
-/// ゴールは毎回ランダムに置くので文字を持たない
+/// 盤の配置(ROUND1・ROUND2で共通)。'.'=平坦、'#'=凸(でっぱり)、'u'=凹(くぼみ)、'S'=投入位置。
+/// ゴールはROUNDごとの選び方で置くので文字を持たない
 const LAYOUT_ROUND1: [&str; BOARD_HEIGHT] = [
     "....................",
     "...........#........",
@@ -46,23 +48,6 @@ const LAYOUT_ROUND1: [&str; BOARD_HEIGHT] = [
     "....................",
 ];
 
-/// ROUND2の配置(文字はLAYOUT_ROUND1と同じ)。縁の1マス内側に凸と凹を交互に並べた輪を置き、
-/// 上・下・左・右に1か所ずつ2マスの切れ目を作る。投入位置は輪の内側で、内側にも凹凸を数個置く
-const LAYOUT_ROUND2: [&str; BOARD_HEIGHT] = [
-    "....................",
-    ".#u#u#u#u..#u#u#u#u.",
-    ".u................#.",
-    ".#....u...........u.",
-    "............u.....#.",
-    "....................",
-    ".u......#...........",
-    ".#............#...u.",
-    ".u..S......u......#.",
-    ".#................u.",
-    ".u#u#u#u#u#u#u..#u#.",
-    "....................",
-];
-
 /// ゴールを置いてよいマスの条件
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GoalRule {
@@ -70,6 +55,15 @@ pub struct GoalRule {
     pub min_distance: f64,
     /// 投入位置からゴールへの直線上に凹凸が1つ以上あること(直線移動だけでは届かない)
     pub blocked_straight_line: bool,
+}
+
+/// 候補からゴールを1つ選ぶ方法
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GoalSelection {
+    /// 候補からランダムに1つ選ぶ
+    Random,
+    /// 投入位置から最も遠い候補に固定する(同着なら候補の並び順=左上から行優先で先に出てくる方)
+    Farthest,
 }
 
 /// ROUNDごとのパラメータ
@@ -81,6 +75,10 @@ pub struct RoundParams {
     pub layout: &'static [&'static str; BOARD_HEIGHT],
     /// ゴールを置いてよいマスの条件
     pub goal_rule: GoalRule,
+    /// 候補からゴールを選ぶ方法
+    pub goal_selection: GoalSelection,
+    /// 同時に投入するベーゴマの数
+    pub top_count: usize,
 }
 
 /// round_index番目(0始まり)のROUNDのパラメータ。最後のROUNDより先は最後のROUNDのまま
@@ -93,17 +91,26 @@ pub fn round_params(round_index: u32) -> RoundParams {
                 min_distance: 10.0,
                 blocked_straight_line: false,
             },
+            goal_selection: GoalSelection::Farthest,
+            top_count: 1,
         },
+        // 2個同時操作という別の難易度軸があるので、ゴール自体はランダムのまま
         _ => RoundParams {
-            label: "ROUND 2 むずかしい",
-            layout: &LAYOUT_ROUND2,
+            label: "ROUND 2 むずかしい ベーゴマ2個",
+            layout: &LAYOUT_ROUND1,
             goal_rule: GoalRule {
                 min_distance: 6.0,
                 blocked_straight_line: true,
             },
+            goal_selection: GoalSelection::Random,
+            top_count: 2,
         },
     }
 }
+
+/// 2個投入時、投入位置から左右にこの分だけ離す(セル単位)。
+/// 投入マスの内側(中心±0.5)に収まり、両方とも隣接マスへはみ出さない値
+pub const TOP_PAIR_OFFSET_X: f64 = 0.15;
 
 /// 直線上に凹凸があるかを調べる間隔(マス)
 const LINE_SAMPLE_STEP: f64 = 0.25;
@@ -179,7 +186,7 @@ pub struct Board {
 }
 
 impl Board {
-    /// paramsの配置に、ルールを満たす候補からランダムに選んだゴールを置いた盤
+    /// paramsの配置に、ルールを満たす候補からparams.goal_selectionの方法で選んだゴールを置いた盤
     pub fn generate(params: &RoundParams, rng: &mut impl Rng) -> Self {
         let candidates = Self::goal_candidates(params.layout, &params.goal_rule);
         assert!(
@@ -187,7 +194,12 @@ impl Board {
             "{}: ゴールの候補が無い",
             params.label
         );
-        let goal = candidates[rng.gen_range(0..candidates.len())];
+        let (_, start) = parse_layout(params.layout);
+        let from = cell_center(start);
+        let goal = match params.goal_selection {
+            GoalSelection::Random => candidates[rng.gen_range(0..candidates.len())],
+            GoalSelection::Farthest => farthest_candidate(&candidates, from),
+        };
         Self::with_goal(params.layout, goal)
     }
 
@@ -286,6 +298,33 @@ impl Board {
     pub fn start_position(&self) -> (f64, f64) {
         cell_center(self.start)
     }
+
+    /// count個のベーゴマの投入位置。1個なら投入位置そのまま、2個なら左右にTOP_PAIR_OFFSET_Xずつ離す
+    /// (左から順。同じ位置に重ねると以降も同じ物理・同じ入力で重なったまま動くため、わずかにずらす)
+    pub fn start_positions(&self, count: usize) -> Vec<(f64, f64)> {
+        let (sx, sy) = self.start_position();
+        // 投入位置を中心に2×TOP_PAIR_OFFSET_X間隔で横に並べる(1個なら中心、2個なら±TOP_PAIR_OFFSET_X)
+        let center = (count as f64 - 1.0) / 2.0;
+        (0..count)
+            .map(|i| (sx + (i as f64 - center) * 2.0 * TOP_PAIR_OFFSET_X, sy))
+            .collect()
+    }
+}
+
+/// 候補のうち、fromからの(マスの中心までの)距離が最大のもの。候補は空でないこと。
+/// 厳密に遠い時だけ更新するので、同着なら並び順が先の候補を返す
+pub fn farthest_candidate(candidates: &[(usize, usize)], from: (f64, f64)) -> (usize, usize) {
+    let distance = |cell: (usize, usize)| {
+        let to = cell_center(cell);
+        (to.0 - from.0).hypot(to.1 - from.1)
+    };
+    let mut best = candidates[0];
+    for &cell in &candidates[1..] {
+        if distance(cell) > distance(best) {
+            best = cell;
+        }
+    }
+    best
 }
 
 /// 配置の文字列を凹凸のマス(Flat/Bump/Hollow)と投入位置にする
@@ -815,7 +854,8 @@ mod tests {
 
     // --- 盤の配置 ---
 
-    const LAYOUTS: [&[&str; BOARD_HEIGHT]; 2] = [&LAYOUT_ROUND1, &LAYOUT_ROUND2];
+    /// 盤の配置の一覧(ROUND2もLAYOUT_ROUND1を使うので1種類)
+    const LAYOUTS: [&[&str; BOARD_HEIGHT]; 1] = [&LAYOUT_ROUND1];
 
     #[test]
     fn layouts_have_one_start_and_no_fixed_goal() {
@@ -922,9 +962,13 @@ mod tests {
         let round1 = round_params(0);
         let round2 = round_params(1);
         assert_eq!(round1.label, "ROUND 1 やさしい");
-        assert_eq!(round2.label, "ROUND 2 むずかしい");
+        assert_eq!(round2.label, "ROUND 2 むずかしい ベーゴマ2個");
         assert_eq!(round1.layout, &LAYOUT_ROUND1);
-        assert_eq!(round2.layout, &LAYOUT_ROUND2);
+        assert_eq!(round2.layout, &LAYOUT_ROUND1, "ROUND2も盤はROUND1と同じ");
+        assert_eq!(round1.goal_selection, GoalSelection::Farthest);
+        assert_eq!(round2.goal_selection, GoalSelection::Random);
+        assert_eq!(round1.top_count, 1, "ROUND1はベーゴマ1個");
+        assert_eq!(round2.top_count, 2, "ROUND2はベーゴマ2個");
         assert!(
             !round1.goal_rule.blocked_straight_line,
             "ROUND1は直線で届いてもよい"
@@ -989,10 +1033,10 @@ mod tests {
 
     #[test]
     fn candidates_exclude_cells_that_break_the_rule() {
-        // ROUND2: 投入位置の真上(4,2)は平坦で十分に遠いが、直線で届くので候補にしない
+        // ROUND2: 投入位置の真上(1,0)は平坦で十分に遠いが、直線で届くので候補にしない
         let params = round_params(1);
         let start = start_of(params.layout);
-        let clear = (4, 2);
+        let clear = (1, 0);
         assert_eq!(params.layout[clear.1].as_bytes()[clear.0], b'.');
         assert!(distance(start, center_of(clear)) >= params.goal_rule.min_distance);
         let candidates = Board::goal_candidates(params.layout, &params.goal_rule);
@@ -1024,70 +1068,121 @@ mod tests {
         }
     }
 
+    /// ROUND1の固定のゴール(LAYOUT_ROUND1で投入位置から最も遠い候補)
+    const ROUND1_FARTHEST_GOAL: (usize, usize) = (19, 0);
+
     #[test]
-    fn round2_has_obstacles_on_the_rim() {
-        // 盤の縁から1マス以内(上下左右それぞれ)に凹凸がある
-        let board = Board::with_goal(
-            &LAYOUT_ROUND2,
-            Board::goal_candidates(&LAYOUT_ROUND2, &round_params(1).goal_rule)[0],
-        );
-        let is_obstacle =
-            |x: usize, y: usize| matches!(board.cell(x, y), Cell::Bump | Cell::Hollow);
-        let sides: [(&str, Vec<(usize, usize)>); 4] = [
-            (
-                "上",
-                (0..BOARD_WIDTH).flat_map(|x| [(x, 0), (x, 1)]).collect(),
-            ),
-            (
-                "下",
-                (0..BOARD_WIDTH)
-                    .flat_map(|x| [(x, BOARD_HEIGHT - 1), (x, BOARD_HEIGHT - 2)])
-                    .collect(),
-            ),
-            (
-                "左",
-                (0..BOARD_HEIGHT).flat_map(|y| [(0, y), (1, y)]).collect(),
-            ),
-            (
-                "右",
-                (0..BOARD_HEIGHT)
-                    .flat_map(|y| [(BOARD_WIDTH - 1, y), (BOARD_WIDTH - 2, y)])
-                    .collect(),
-            ),
-        ];
-        for (name, cells) in sides {
-            let count = cells.iter().filter(|&&(x, y)| is_obstacle(x, y)).count();
-            assert!(count >= 5, "{name}の縁に凹凸がある: {count}");
-        }
-        // 投入位置は輪の内側(縁から2マス以上内側)
-        let (sx, sy) = board.start_position();
-        assert!(
-            sx > 2.0 && sx < BOARD_WIDTH as f64 - 2.0 && sy > 2.0 && sy < BOARD_HEIGHT as f64 - 2.0
-        );
-        // ROUND1より凹凸が多い
-        let count = |layout: &[&str; BOARD_HEIGHT]| {
-            layout
-                .concat()
-                .chars()
-                .filter(|&c| c == '#' || c == 'u')
-                .count()
-        };
-        assert!(count(&LAYOUT_ROUND2) > count(&LAYOUT_ROUND1) * 2);
+    fn round2_uses_the_same_layout_as_round1() {
+        // 盤の配置はROUND1と同じ(凹凸と投入位置が一致する)
+        let round1 = round_params(0);
+        let round2 = round_params(1);
+        assert_eq!(round2.layout, round1.layout);
+        assert_eq!(start_of(round2.layout), start_of(round1.layout));
+        // LAYOUT_ROUND1でもROUND2の条件(直線上に凹凸が挟まる)を満たす候補がある
+        let candidates = Board::goal_candidates(round2.layout, &round2.goal_rule);
+        assert!(!candidates.is_empty(), "ROUND2のゴール候補がある");
     }
 
     #[test]
-    fn goal_is_random_across_seeds() {
-        for round in 0..ROUNDS_PER_SESSION {
-            let params = round_params(round);
-            let goals: std::collections::HashSet<_> = (0..20)
-                .map(|seed| Board::generate(&params, &mut StdRng::seed_from_u64(seed)).goal())
-                .collect();
-            assert!(
-                goals.len() >= 2,
-                "ROUND{}: ゴールが毎回変わる: {goals:?}",
-                round + 1
+    fn round1_goal_is_always_the_farthest_candidate() {
+        let params = round_params(0);
+        let candidates = Board::goal_candidates(params.layout, &params.goal_rule);
+        assert!(
+            candidates.contains(&ROUND1_FARTHEST_GOAL),
+            "固定のゴールは候補に含まれる"
+        );
+        for seed in 0..20 {
+            let board = Board::generate(&params, &mut StdRng::seed_from_u64(seed));
+            assert_eq!(
+                board.goal(),
+                ROUND1_FARTHEST_GOAL,
+                "seed={seed}: ROUND1のゴールは毎回同じ"
             );
         }
+        // 他のどの候補よりも投入位置から遠い(同着が無い)
+        let start = start_of(params.layout);
+        let farthest = distance(start, center_of(ROUND1_FARTHEST_GOAL));
+        for goal in candidates {
+            if goal != ROUND1_FARTHEST_GOAL {
+                assert!(distance(start, center_of(goal)) < farthest, "{goal:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn round2_goal_is_random_across_seeds() {
+        let params = round_params(1);
+        let goals: std::collections::HashSet<_> = (0..20)
+            .map(|seed| Board::generate(&params, &mut StdRng::seed_from_u64(seed)).goal())
+            .collect();
+        assert!(goals.len() >= 2, "ROUND2のゴールは毎回変わる: {goals:?}");
+    }
+
+    #[test]
+    fn farthest_candidate_picks_the_largest_distance() {
+        let from = (1.5, 10.5);
+        // 距離はそれぞれ約2.0・12.0・11.0・6.4
+        let candidates = [(3, 10), (10, 2), (12, 11), (5, 5)];
+        assert_eq!(farthest_candidate(&candidates, from), (10, 2));
+    }
+
+    #[test]
+    fn farthest_candidate_keeps_the_earlier_one_on_a_tie() {
+        // (5,5)の中心から見て、どれも距離3で同着
+        let from = (5.5, 5.5);
+        let tied = [(5, 2), (2, 5), (8, 5), (5, 8)];
+        assert_eq!(
+            farthest_candidate(&tied, from),
+            (5, 2),
+            "同着なら並び順が先の候補"
+        );
+        let reversed = [(5, 8), (8, 5), (2, 5), (5, 2)];
+        assert_eq!(farthest_candidate(&reversed, from), (5, 8));
+    }
+
+    // --- 複数のベーゴマの投入位置 ---
+
+    #[test]
+    fn a_single_top_is_dropped_at_the_start_position() {
+        let board = round1_board();
+        assert_eq!(board.start_positions(1), vec![board.start_position()]);
+    }
+
+    #[test]
+    fn a_pair_of_tops_is_dropped_side_by_side_inside_the_start_cell() {
+        assert_eq!(TOP_PAIR_OFFSET_X, 0.15);
+        let board = round1_board();
+        let (sx, sy) = board.start_position();
+        let positions = board.start_positions(2);
+        assert_eq!(positions.len(), 2);
+        assert!(approx(positions[0].0, sx - TOP_PAIR_OFFSET_X), "左へずらす");
+        assert!(approx(positions[1].0, sx + TOP_PAIR_OFFSET_X), "右へずらす");
+        for pos in &positions {
+            assert!(approx(pos.1, sy), "上下にはずらさない");
+            assert_eq!(
+                cell_index(*pos),
+                cell_index((sx, sy)),
+                "投入マスからはみ出さない"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pair_of_tops_moves_independently() {
+        // 同じ傾き・Gの下でも、先に凸へ入った方だけが飛び上がる(2個の間に当たり判定は無い)
+        let board = round1_board();
+        let lead = top_just_left_of_bump(&board);
+        let mut tops = [lead.clone(), lead];
+        tops[1].pos.0 -= 2.0 * TOP_PAIR_OFFSET_X;
+        let tilt = Tilt::new();
+        let events: Vec<_> = tops
+            .iter_mut()
+            .map(|top| top.step(&board, STEP, &tilt, NO_G))
+            .collect();
+        assert!(matches!(events[0], Some(StepEvent::Hopped { .. })));
+        assert_eq!(events[1], None, "後ろの方はまだ凸に入っていない");
+        assert!(tops[0].is_airborne());
+        assert!(!tops[1].is_airborne());
     }
 
     #[test]

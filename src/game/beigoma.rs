@@ -6,7 +6,10 @@
 //! - 凸を踏んだ瞬間のGが大きいと弾かれ、さらに大きいと吹っ飛んで即GAME OVER
 //! - 凹に正面から入るとハマり(強く傾けると抜け出せる)、斜めに入ると側面をこすって弾かれる・吹っ飛ぶ
 //! - 盤の縁に壁は無く、盤から落ちても(場外)即GAME OVER
-//! - 1セッションは2ROUND(ROUND1=やさしい、ROUND2=むずかしい)。ゴールの位置はROUNDごとにランダム
+//! - 1セッションは2ROUND(ROUND1=やさしい、ROUND2=むずかしい)。盤の配置は共通で、
+//!   ROUND1のゴールは投入位置から最も遠い位置に固定、ROUND2のゴールはランダム
+//! - ROUND2はベーゴマ2個を共通の傾きで同時に操作する。どちらか1個でも吹っ飛び・場外になったら即GAME OVER、
+//!   ゴールに入った方はその場で待機し(settled)、全部がゴールに揃ったらクリア
 //! - 制限時間はROUNDごとに60秒。ゴールで成功、吹っ飛び・場外・時間切れで失敗。難易度選択は無い
 //! - ROUND1をクリアした時だけROUND2へ進む。ROUND1が失敗ならROUND2へ進まずセッション終了
 //! - 各ROUNDの開始前に「3.2.1.GO!!」をゲーム内で行い、GO!!が終わったらベーゴマを投入する
@@ -74,6 +77,97 @@ pub enum Outcome {
     TimeUp,
 }
 
+/// 1個のベーゴマの進行状態
+struct TopSlot {
+    top: Top,
+    /// 個別にゴールへ達し、以後の物理更新を止めているか(他のベーゴマが揃うのを待つ)
+    settled: bool,
+}
+
+impl TopSlot {
+    fn new(pos: (f64, f64)) -> Self {
+        Self {
+            top: Top::new(pos),
+            settled: false,
+        }
+    }
+}
+
+/// 盤上の一言。重大度は低い順に セーフ < ガタッ < ズボッ/ぬけた! < ぴよーん!!ああっ!!
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reaction {
+    Safe,
+    Hop,
+    Sank,
+    Escaped,
+    Bounce,
+}
+
+impl Reaction {
+    /// 盤上の出来事に対応する一言。GAME OVER・ゴールは一言を出さないのでNone
+    fn of(event: StepEvent) -> Option<Self> {
+        match event {
+            StepEvent::Hopped { .. } => Some(Self::Hop),
+            StepEvent::Landed(Landing::Light) | StepEvent::Grazed(Landing::Light) => {
+                Some(Self::Safe)
+            }
+            // 凹凸の側面をこすって弾かれた時も、凸で弾かれた時と同じ演出
+            StepEvent::Landed(Landing::Bounce) | StepEvent::Grazed(Landing::Bounce) => {
+                Some(Self::Bounce)
+            }
+            StepEvent::Sank => Some(Self::Sank),
+            StepEvent::Escaped => Some(Self::Escaped),
+            StepEvent::Landed(Landing::Flown)
+            | StepEvent::Grazed(Landing::Flown)
+            | StepEvent::FellOff
+            | StepEvent::Goal => None,
+        }
+    }
+
+    fn severity(self) -> u8 {
+        match self {
+            Self::Safe => 0,
+            Self::Hop => 1,
+            Self::Sank | Self::Escaped => 2,
+            Self::Bounce => 3,
+        }
+    }
+
+    fn text(self) -> &'static str {
+        match self {
+            Self::Safe => "セーフ",
+            Self::Hop => "ガタッ!",
+            Self::Sank => "ズボッ",
+            Self::Escaped => "ぬけた!",
+            Self::Bounce => "ぴよーん!! ああっ!!",
+        }
+    }
+
+    /// 弾かれ系の一言の時だけSE(SeKind::Incorrect)を鳴らす
+    fn plays_se(self) -> bool {
+        self == Self::Bounce
+    }
+}
+
+/// 同じステップの出来事のうち、最も重大度の高い一言(同じ重大度なら先に来た方)
+fn strongest_reaction(events: &[StepEvent]) -> Option<Reaction> {
+    events.iter().filter_map(|&event| Reaction::of(event)).fold(
+        None,
+        |best: Option<Reaction>, reaction| match best {
+            Some(best) if best.severity() >= reaction.severity() => Some(best),
+            _ => Some(reaction),
+        },
+    )
+}
+
+/// 吹っ飛び・場外(GAME OVER相当)の出来事か
+fn is_game_over_event(event: StepEvent) -> bool {
+    matches!(
+        event,
+        StepEvent::Landed(Landing::Flown) | StepEvent::Grazed(Landing::Flown) | StepEvent::FellOff
+    )
+}
+
 /// ROUNDの進み具合
 enum Status {
     /// ROUND開始前の「3.2.1.GO!!」。新しい盤は見せておき、ベーゴマは投入位置で待たせる
@@ -93,7 +187,8 @@ pub struct BeigomaGame {
     round_index: u32,
     params: RoundParams,
     board: Board,
-    top: Top,
+    /// このROUNDのベーゴマ(要素数はparams.top_count。ROUND1=1、ROUND2=2)
+    tops: Vec<TopSlot>,
     tilt: Tilt,
     truck: Truck,
     /// このROUNDでベーゴマを投入してからの経過時間
@@ -116,12 +211,12 @@ impl BeigomaGame {
     fn with_truck(truck: Truck) -> Self {
         let params = round_params(0);
         let board = Board::generate(&params, &mut rand::thread_rng());
-        let top = Top::new(board.start_position());
+        let tops = Self::new_slots(&board, params.top_count);
         let mut game = Self {
             round_index: 0,
             params,
             board,
-            top,
+            tops,
             tilt: Tilt::new(),
             truck,
             elapsed: Duration::ZERO,
@@ -135,13 +230,22 @@ impl BeigomaGame {
         game
     }
 
-    /// round_index番目のROUNDをカウントダウンから始める。盤を作り直し(ゴールはランダム)、
+    /// 盤の投入位置に並べたcount個のベーゴマ
+    fn new_slots(board: &Board, count: usize) -> Vec<TopSlot> {
+        board
+            .start_positions(count)
+            .into_iter()
+            .map(TopSlot::new)
+            .collect()
+    }
+
+    /// round_index番目のROUNDをカウントダウンから始める。盤を作り直し(ゴールはROUNDごとの選び方で置く)、
     /// ベーゴマは投入位置で待たせる。軽トラのコースはそのまま続く
     fn start_round(&mut self, round_index: u32) {
         self.round_index = round_index;
         self.params = round_params(round_index);
         self.board = Board::generate(&self.params, &mut rand::thread_rng());
-        self.top = Top::new(self.board.start_position());
+        self.tops = Self::new_slots(&self.board, self.params.top_count);
         self.tilt = Tilt::new();
         self.elapsed = Duration::ZERO;
         self.message = None;
@@ -155,7 +259,7 @@ impl BeigomaGame {
 
     /// GO!!が終わった: ベーゴマを投入位置に投入し、制限時間を数え始める
     fn drop_top(&mut self) {
-        self.top = Top::new(self.board.start_position());
+        self.tops = Self::new_slots(&self.board, self.params.top_count);
         self.elapsed = Duration::ZERO;
         self.status = Status::Playing;
     }
@@ -182,43 +286,59 @@ impl BeigomaGame {
         }
     }
 
-    /// 1ステップ(MAX_STEP以下)だけ進める
+    /// 1ステップ(MAX_STEP以下)だけ進める。ゴールで待機中(settled)のベーゴマは物理更新しない
     fn step(&mut self, dt: Duration) {
         self.tilt.update(dt);
         self.truck.update(dt);
         let g = self.truck.current_g();
-        let event = self.top.step(&self.board, dt, &self.tilt, g);
-        self.elapsed += dt;
-        if let Some(event) = event {
-            self.on_step_event(event);
+        let mut events = Vec::new();
+        for (i, slot) in self.tops.iter_mut().enumerate().filter(|(_, s)| !s.settled) {
+            if let Some(event) = slot.top.step(&self.board, dt, &self.tilt, g) {
+                events.push((i, event));
+            }
         }
+        self.elapsed += dt;
+        self.on_step_events(events);
         if self.is_playing() && self.elapsed >= TIME_LIMIT {
             self.finish(Outcome::TimeUp);
         }
     }
 
-    /// 盤上の出来事を反映する(弾かれたらSE、凹にハマった・抜けたら一言、
-    /// 吹っ飛んだ・盤から落ちたら即GAME OVER、ゴールなら成功)
+    /// 1個目のベーゴマの出来事だけを反映する(ROUND1の単一ベーゴマの判定をテストで直接起こすため)
+    #[cfg(test)]
     fn on_step_event(&mut self, event: StepEvent) {
+        self.on_step_events(vec![(0, event)]);
+    }
+
+    /// 1ステップの間に各ベーゴマ(スロット番号, 出来事)で起きたことを反映する。
+    /// 1. どれか1個でも吹っ飛び・場外なら、他の状態によらず即GAME OVER
+    /// 2. ゴールに入ったスロットは待機(settled)にし、全部揃ったらクリア
+    /// 3. それ以外の出来事からは、最も重大度の高い一言を1つだけ出す(弾かれ系ならSEも1回だけ鳴らす)
+    fn on_step_events(&mut self, events: Vec<(usize, StepEvent)>) {
         if !self.is_playing() {
             return;
         }
-        match event {
-            StepEvent::Hopped { .. } => self.message = Some(("ガタッ!", Duration::ZERO)),
-            StepEvent::Landed(Landing::Light) | StepEvent::Grazed(Landing::Light) => {
-                self.message = Some(("セーフ", Duration::ZERO));
+        if events.iter().any(|&(_, event)| is_game_over_event(event)) {
+            self.finish(Outcome::Flown);
+            return;
+        }
+        for &(i, event) in &events {
+            if event == StepEvent::Goal {
+                if let Some(slot) = self.tops.get_mut(i) {
+                    slot.settled = true;
+                }
             }
-            // 凹凸の側面をこすって弾かれた時も、凸で弾かれた時と同じ演出
-            StepEvent::Landed(Landing::Bounce) | StepEvent::Grazed(Landing::Bounce) => {
+        }
+        if self.tops.iter().all(|slot| slot.settled) {
+            self.finish(Outcome::Cleared { time: self.elapsed });
+            return;
+        }
+        let step_events: Vec<StepEvent> = events.iter().map(|&(_, event)| event).collect();
+        if let Some(reaction) = strongest_reaction(&step_events) {
+            if reaction.plays_se() {
                 audio::play_se(SeKind::Incorrect);
-                self.message = Some(("ぴよーん!! ああっ!!", Duration::ZERO));
             }
-            StepEvent::Sank => self.message = Some(("ズボッ", Duration::ZERO)),
-            StepEvent::Escaped => self.message = Some(("ぬけた!", Duration::ZERO)),
-            StepEvent::Landed(Landing::Flown)
-            | StepEvent::Grazed(Landing::Flown)
-            | StepEvent::FellOff => self.finish(Outcome::Flown),
-            StepEvent::Goal => self.finish(Outcome::Cleared { time: self.elapsed }),
+            self.message = Some((reaction.text(), Duration::ZERO));
         }
     }
 
@@ -248,6 +368,22 @@ impl BeigomaGame {
     fn spin_frame(&self) -> usize {
         (self.elapsed.as_millis() / SPIN_FRAME_INTERVAL.as_millis()) as usize
             % render::TOP_SPIN_GLYPHS.len()
+    }
+
+    /// 盤面に描く各ベーゴマの見た目。GAME OVERの星の演出は、ゴールで待機中のもの以外の全ベーゴマに出す
+    /// (共通の傾きで一蓮托生のため、原因になった1個だけにしない)
+    fn top_views(&self) -> Vec<TopView> {
+        let spin_frame = self.spin_frame();
+        let star_frame = self.star_frame();
+        self.tops
+            .iter()
+            .map(|slot| TopView {
+                pos: slot.top.pos,
+                airborne: slot.top.is_airborne(),
+                spin_frame,
+                star_frame: if slot.settled { None } else { star_frame },
+            })
+            .collect()
     }
 
     /// 場外・吹っ飛びGAME OVERの星の演出のコマ(それ以外はNone)
@@ -421,14 +557,13 @@ impl Game for BeigomaGame {
             );
         let board_inner = board_block.inner(cols[1]);
         frame.render_widget(board_block, cols[1]);
-        let top = TopView {
-            pos: self.top.pos,
-            airborne: self.top.is_airborne(),
-            spin_frame: self.spin_frame(),
-            star_frame: self.star_frame(),
-        };
-        self.board_renderer
-            .render(frame, board_inner, &self.board, &top, &self.tilt);
+        self.board_renderer.render(
+            frame,
+            board_inner,
+            &self.board,
+            &self.top_views(),
+            &self.tilt,
+        );
         if let Status::Countdown { state } = &self.status {
             countdown::render(frame, board_inner, state);
         }
@@ -449,7 +584,7 @@ impl Game for BeigomaGame {
 mod tests {
     use super::board::{
         round_params, Cell, TopState, BOARD_HEIGHT, BOARD_WIDTH, HIGH_G_THRESHOLD,
-        ROUNDS_PER_SESSION, TILT_STEP,
+        ROUNDS_PER_SESSION, TILT_STEP, TOP_PAIR_OFFSET_X,
     };
     use super::truck::RoadEvent;
     use super::*;
@@ -523,8 +658,8 @@ mod tests {
     /// ゴールの左隣から、右へ転がってゴールに入る直前に置く
     fn place_just_before_goal(game: &mut BeigomaGame) {
         let (gx, gy) = game.board.goal();
-        game.top = Top::new((gx as f64 - 0.02, gy as f64 + 0.5));
-        game.top.vel = (3.0, 0.0);
+        game.tops[0].top = Top::new((gx as f64 - 0.02, gy as f64 + 0.5));
+        game.tops[0].top.vel = (3.0, 0.0);
     }
 
     /// 真下が平坦で真上が障害物のマス(障害物の1マス下)
@@ -556,12 +691,12 @@ mod tests {
             "ROUND1の盤"
         );
         assert_eq!(
-            game.top.pos,
+            game.tops[0].top.pos,
             game.board.start_position(),
             "ベーゴマは投入位置で待っている"
         );
-        assert_eq!(game.top.vel, (0.0, 0.0));
-        assert!(!game.top.is_airborne());
+        assert_eq!(game.tops[0].top.vel, (0.0, 0.0));
+        assert!(!game.tops[0].top.is_airborne());
         assert_eq!(game.elapsed, Duration::ZERO, "制限時間はまだ数えない");
         assert_eq!(game.outcome(), None);
         assert!(!game.is_finished());
@@ -607,7 +742,7 @@ mod tests {
         game.update(COUNTDOWN_TOTAL - STEP);
         assert!(is_countdown(&game));
         assert_eq!(
-            game.top.pos,
+            game.tops[0].top.pos,
             game.board.start_position(),
             "カウントダウン中は転がらない"
         );
@@ -623,11 +758,11 @@ mod tests {
         game.update(Duration::from_millis(1));
         assert!(is_playing(&game), "GO!!が終わったら投入する");
         assert_eq!(
-            game.top.pos,
+            game.tops[0].top.pos,
             game.board.start_position(),
             "投入位置に置かれる"
         );
-        assert_eq!(game.top.vel, (0.0, 0.0));
+        assert_eq!(game.tops[0].top.vel, (0.0, 0.0));
         assert_eq!(game.elapsed, Duration::ZERO, "制限時間はここから数える");
         game.update(Duration::from_secs(1));
         assert_eq!(game.elapsed, Duration::from_secs(1));
@@ -707,11 +842,11 @@ mod tests {
     #[test]
     fn tilting_rolls_the_top() {
         let mut game = calm_game();
-        let start = game.top.pos;
+        let start = game.tops[0].top.pos;
         game.handle_key(key(KeyCode::Right));
         game.handle_key(key(KeyCode::Right));
         game.update(Duration::from_millis(300));
-        assert!(game.top.pos.0 > start.0, "右へ傾けると右へ転がる");
+        assert!(game.tops[0].top.pos.0 > start.0, "右へ傾けると右へ転がる");
     }
 
     #[test]
@@ -726,7 +861,7 @@ mod tests {
             stepped.update(STEP);
         }
         once.update(STEP * 50);
-        assert_eq!(stepped.top.pos, once.top.pos);
+        assert_eq!(stepped.tops[0].top.pos, once.tops[0].top.pos);
         assert_eq!(stepped.elapsed, once.elapsed);
     }
 
@@ -791,8 +926,8 @@ mod tests {
     fn rolling_off_the_rim_during_play_is_a_game_over() {
         // 盤の縁には壁が無いので、左端から左へ転がると落ちてGAME OVERになる
         let mut game = calm_game();
-        game.top = Top::new((0.6, 0.5));
-        game.top.vel = (-3.0, 0.0);
+        game.tops[0].top = Top::new((0.6, 0.5));
+        game.tops[0].top.vel = (-3.0, 0.0);
         game.update(Duration::from_millis(500));
         assert_eq!(game.outcome(), Some(Outcome::Flown));
         assert_eq!(game.result().correct, 0);
@@ -818,7 +953,7 @@ mod tests {
         }
         // 障害物のすぐ下に置くと、ブレーキのGで前(上)へ押されて障害物を踏む
         let (x, y) = flat_below_a_bump(&game.board);
-        game.top = Top::new((x as f64 + 0.5, y as f64 + 0.1));
+        game.tops[0].top = Top::new((x as f64 + 0.5, y as f64 + 0.1));
         for _ in 0..100 {
             game.update(STEP);
             if game.outcome().is_some() {
@@ -886,15 +1021,18 @@ mod tests {
                 game.board.cell(x, y) == Cell::Hollow && game.board.cell(x - 1, y) == Cell::Flat
             })
             .expect("左隣が平坦な凹がある");
-        game.top = Top::new((hx as f64 - 0.02, hy as f64 + 0.5));
-        game.top.vel = (3.0, 0.0);
+        game.tops[0].top = Top::new((hx as f64 - 0.02, hy as f64 + 0.5));
+        game.tops[0].top.vel = (3.0, 0.0);
         game.update(STEP);
-        assert_eq!(game.top.state, TopState::Sunk);
+        assert_eq!(game.tops[0].top.state, TopState::Sunk);
         assert_eq!(message_text(&game), Some("ズボッ"));
         game.update(Duration::from_secs(2));
         assert_eq!(game.outcome(), None, "ハマっても続く");
         assert_eq!(
-            (game.top.pos.0 as usize, game.top.pos.1 as usize),
+            (
+                game.tops[0].top.pos.0 as usize,
+                game.tops[0].top.pos.1 as usize
+            ),
             (hx, hy),
             "傾けなければ凹から出ない"
         );
@@ -902,10 +1040,34 @@ mod tests {
 
     // --- 2ROUND制 ---
 
-    /// ROUND1をゴールで終える
+    /// ROUNDをゴールで終える(全部のベーゴマが同じステップでゴールに入る)
     fn clear_round(game: &mut BeigomaGame) {
-        game.on_step_event(StepEvent::Goal);
+        let goals = (0..game.tops.len()).map(|i| (i, StepEvent::Goal)).collect();
+        game.on_step_events(goals);
         assert!(matches!(game.outcome(), Some(Outcome::Cleared { .. })));
+    }
+
+    fn top_positions(game: &BeigomaGame) -> Vec<(f64, f64)> {
+        game.tops.iter().map(|slot| slot.top.pos).collect()
+    }
+
+    /// ROUND1をクリアしてROUND2のカウントダウンを終え、ベーゴマ2個を投入した直後。
+    /// ゴールは決定的にするためROUND1_GOALに置き直す
+    fn calm_round2() -> BeigomaGame {
+        let mut game = calm_game();
+        clear_round(&mut game);
+        game.update(END_HOLD);
+        finish_countdown(&mut game);
+        assert_eq!(game.round_index, 1);
+        game.board = Board::with_goal(round_params(1).layout, ROUND1_GOAL);
+        game
+    }
+
+    /// i番目のベーゴマを、ゴールの左隣から右へ転がってゴールに入る直前に置く
+    fn place_slot_just_before_goal(game: &mut BeigomaGame, i: usize) {
+        let (gx, gy) = game.board.goal();
+        game.tops[i].top = Top::new((gx as f64 - 0.02, gy as f64 + 0.5));
+        game.tops[i].top.vel = (3.0, 0.0);
     }
 
     #[test]
@@ -939,8 +1101,12 @@ mod tests {
                 }
             }
         }
-        assert_eq!(game.top.pos, game.board.start_position());
-        assert_eq!(game.top.vel, (0.0, 0.0));
+        // ROUND2はベーゴマ2個で、投入位置の左右に並んで待つ
+        assert_eq!(top_positions(&game), game.board.start_positions(2));
+        for slot in &game.tops {
+            assert_eq!(slot.top.vel, (0.0, 0.0));
+            assert!(!slot.settled);
+        }
         assert_eq!(game.tilt.roll(), 0.0, "傾きもROUNDごとに水平へ戻す");
         assert_eq!(game.elapsed, Duration::ZERO, "制限時間はROUNDごと");
         assert_eq!(game.result().total, 1, "ROUND1の結果は記録済み");
@@ -1057,6 +1223,17 @@ mod tests {
     }
 
     #[test]
+    fn hud_tells_that_round2_has_two_tops() {
+        let mut game = calm_game();
+        let text = rendered_text(&game, AREA);
+        assert!(!text.contains("ベーゴマ2個"), "ROUND1には出さない: {text}");
+        clear_round(&mut game);
+        game.update(END_HOLD);
+        let text = rendered_text(&game, AREA);
+        assert!(text.contains("ベーゴマ2個"), "{text}");
+    }
+
+    #[test]
     fn the_session_finishes_after_the_end_display() {
         let mut game = calm_game();
         game.finish(Outcome::Flown);
@@ -1087,11 +1264,321 @@ mod tests {
         let mut game = calm_game();
         game.handle_key(key(KeyCode::Right));
         game.finish(Outcome::Flown);
-        let (pos, roll) = (game.top.pos, game.tilt.roll());
+        let (pos, roll) = (game.tops[0].top.pos, game.tilt.roll());
         game.handle_key(key(KeyCode::Right));
         game.update(Duration::from_millis(500));
-        assert_eq!(game.top.pos, pos, "終わった後は転がらない");
+        assert_eq!(game.tops[0].top.pos, pos, "終わった後は転がらない");
         assert_eq!(game.tilt.roll(), roll, "終わった後のキーは無視する");
+    }
+
+    // --- ROUND2: ベーゴマ2個 ---
+
+    #[test]
+    fn round1_drops_a_single_top_at_the_start_position() {
+        let game = calm_game();
+        assert_eq!(game.tops.len(), 1);
+        assert_eq!(top_positions(&game), vec![game.board.start_position()]);
+    }
+
+    #[test]
+    fn round2_drops_two_tops_on_both_sides_of_the_start_position() {
+        let game = calm_round2();
+        assert_eq!(game.tops.len(), 2);
+        let (sx, sy) = game.board.start_position();
+        assert_eq!(
+            top_positions(&game),
+            vec![(sx - TOP_PAIR_OFFSET_X, sy), (sx + TOP_PAIR_OFFSET_X, sy)]
+        );
+        assert!(game.tops.iter().all(|slot| !slot.settled));
+    }
+
+    #[test]
+    fn both_tops_roll_under_the_same_tilt() {
+        let mut game = calm_round2();
+        let start = top_positions(&game);
+        game.handle_key(key(KeyCode::Up));
+        game.handle_key(key(KeyCode::Up));
+        game.update(Duration::from_millis(300));
+        for (i, slot) in game.tops.iter().enumerate() {
+            assert!(
+                slot.top.pos.1 < start[i].1,
+                "slot{i}: 前へ傾けると前へ転がる"
+            );
+        }
+        assert_eq!(game.outcome(), None);
+    }
+
+    #[test]
+    fn the_two_tops_have_independent_physics() {
+        // 片方だけ凸の手前に置くと、その片方だけが飛び上がる
+        let mut game = calm_round2();
+        let (x, y) = flat_below_a_bump(&game.board);
+        game.tops[0].top = Top::new((x as f64 + 0.5, y as f64 + 0.02));
+        game.tops[0].top.vel = (0.0, -3.0);
+        game.update(STEP);
+        assert!(game.tops[0].top.is_airborne(), "凸を踏んだ方は飛び上がる");
+        assert!(!game.tops[1].top.is_airborne(), "もう片方は影響を受けない");
+        assert_eq!(game.outcome(), None);
+    }
+
+    #[test]
+    fn one_top_failing_is_an_immediate_game_over_even_if_the_other_is_safe() {
+        for failure in [
+            StepEvent::FellOff,
+            StepEvent::Landed(Landing::Flown),
+            StepEvent::Grazed(Landing::Flown),
+        ] {
+            for i in 0..2 {
+                let mut game = calm_round2();
+                game.on_step_events(vec![(i, failure)]);
+                assert_eq!(
+                    game.outcome(),
+                    Some(Outcome::Flown),
+                    "slot{i} {failure:?}: 片方だけでも即GAME OVER"
+                );
+                let result = game.result();
+                assert_eq!((result.correct, result.total), (1, 2), "{failure:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn one_top_rolling_off_the_rim_ends_round2() {
+        let mut game = calm_round2();
+        game.tops[1].top = Top::new((0.6, 5.5));
+        game.tops[1].top.vel = (-3.0, 0.0);
+        game.update(Duration::from_millis(500));
+        assert_eq!(game.outcome(), Some(Outcome::Flown));
+        assert!(
+            Board::contains(game.tops[0].top.pos),
+            "もう片方は盤の上に残っている"
+        );
+    }
+
+    #[test]
+    fn both_tops_failing_in_the_same_step_finishes_only_once() {
+        let mut game = calm_round2();
+        game.on_step_events(vec![
+            (0, StepEvent::FellOff),
+            (1, StepEvent::Landed(Landing::Flown)),
+        ]);
+        assert_eq!(game.outcome(), Some(Outcome::Flown));
+        assert_eq!(game.result().total, 2, "ROUND2の結果は1件だけ記録する");
+    }
+
+    #[test]
+    fn one_top_at_the_goal_waits_for_the_other() {
+        let mut game = calm_round2();
+        place_slot_just_before_goal(&mut game, 0);
+        game.update(STEP);
+        assert!(game.tops[0].settled, "ゴールに入った方は待機する");
+        assert!(!game.tops[1].settled);
+        assert_eq!(game.outcome(), None, "もう片方が揃うまでは続く");
+        assert!(is_playing(&game));
+        game.update(Duration::from_secs(1));
+        place_slot_just_before_goal(&mut game, 1);
+        game.update(STEP);
+        let Some(Outcome::Cleared { time }) = game.outcome() else {
+            panic!("両方ゴールしたら成功: {:?}", game.outcome());
+        };
+        assert_eq!(time, game.elapsed, "揃った時点のタイムを記録する");
+        assert!(time >= Duration::from_secs(1));
+        assert_eq!(game.result().correct, 2);
+    }
+
+    #[test]
+    fn both_tops_reaching_the_goal_in_the_same_step_clears() {
+        let mut game = calm_round2();
+        game.on_step_events(vec![(0, StepEvent::Goal), (1, StepEvent::Goal)]);
+        assert!(matches!(game.outcome(), Some(Outcome::Cleared { .. })));
+    }
+
+    #[test]
+    fn a_game_over_beats_a_goal_in_the_same_step() {
+        for events in [
+            vec![(0, StepEvent::Goal), (1, StepEvent::FellOff)],
+            vec![(1, StepEvent::FellOff), (0, StepEvent::Goal)],
+            vec![(0, StepEvent::Goal), (1, StepEvent::Landed(Landing::Flown))],
+        ] {
+            let mut game = calm_round2();
+            game.on_step_events(events.clone());
+            assert_eq!(game.outcome(), Some(Outcome::Flown), "{events:?}");
+        }
+        // 先にゴールで待機していても、もう片方が吹っ飛んだらGAME OVER
+        let mut game = calm_round2();
+        game.on_step_events(vec![(0, StepEvent::Goal)]);
+        game.on_step_events(vec![(1, StepEvent::Grazed(Landing::Flown))]);
+        assert_eq!(game.outcome(), Some(Outcome::Flown));
+    }
+
+    #[test]
+    fn a_settled_top_stays_put_while_the_other_keeps_rolling() {
+        let mut game = calm_round2();
+        place_slot_just_before_goal(&mut game, 0);
+        game.update(STEP);
+        assert!(game.tops[0].settled);
+        let (settled_pos, other_pos) = (game.tops[0].top.pos, game.tops[1].top.pos);
+        game.handle_key(key(KeyCode::Up));
+        game.handle_key(key(KeyCode::Up));
+        game.update(Duration::from_millis(500));
+        assert_eq!(game.outcome(), None);
+        assert_eq!(game.tops[0].top.pos, settled_pos, "物理更新を止めている");
+        assert!(game.tops[0].settled, "settledのまま残る");
+        assert_ne!(game.tops[1].top.pos, other_pos, "もう片方は転がる");
+    }
+
+    #[test]
+    fn a_settled_top_stays_settled_through_the_other_tops_events() {
+        let mut game = calm_round2();
+        game.on_step_events(vec![(0, StepEvent::Goal)]);
+        game.on_step_events(vec![(1, StepEvent::Landed(Landing::Bounce))]);
+        game.on_step_events(vec![(1, StepEvent::Sank)]);
+        assert!(game.tops[0].settled);
+        assert!(!game.tops[1].settled);
+        assert_eq!(game.outcome(), None);
+    }
+
+    #[test]
+    fn a_time_up_ends_round2_even_if_one_top_is_settled() {
+        let mut game = calm_round2();
+        game.on_step_events(vec![(0, StepEvent::Goal)]);
+        game.update(TIME_LIMIT + STEP);
+        assert_eq!(game.outcome(), Some(Outcome::TimeUp));
+    }
+
+    #[test]
+    fn reactions_are_ordered_by_severity() {
+        assert!(Reaction::Safe.severity() < Reaction::Hop.severity());
+        assert!(Reaction::Hop.severity() < Reaction::Sank.severity());
+        assert_eq!(Reaction::Sank.severity(), Reaction::Escaped.severity());
+        assert!(Reaction::Escaped.severity() < Reaction::Bounce.severity());
+        assert_eq!(Reaction::Safe.text(), "セーフ");
+        assert_eq!(Reaction::Hop.text(), "ガタッ!");
+        assert_eq!(Reaction::Sank.text(), "ズボッ");
+        assert_eq!(Reaction::Escaped.text(), "ぬけた!");
+        assert_eq!(Reaction::Bounce.text(), "ぴよーん!! ああっ!!");
+        for reaction in [
+            Reaction::Safe,
+            Reaction::Hop,
+            Reaction::Sank,
+            Reaction::Escaped,
+        ] {
+            assert!(!reaction.plays_se(), "{reaction:?}");
+        }
+        assert!(Reaction::Bounce.plays_se(), "弾かれた時だけSEを鳴らす");
+    }
+
+    #[test]
+    fn the_strongest_reaction_of_the_step_is_picked() {
+        let light = StepEvent::Landed(Landing::Light);
+        let bounce = StepEvent::Grazed(Landing::Bounce);
+        assert_eq!(strongest_reaction(&[light, bounce]), Some(Reaction::Bounce));
+        assert_eq!(strongest_reaction(&[bounce, light]), Some(Reaction::Bounce));
+        assert_eq!(
+            strongest_reaction(&[StepEvent::Hopped { contact_g: 0.0 }, light]),
+            Some(Reaction::Hop)
+        );
+        assert_eq!(
+            strongest_reaction(&[StepEvent::Escaped, StepEvent::Sank]),
+            Some(Reaction::Escaped),
+            "同じ重大度なら先に来た方"
+        );
+        assert_eq!(strongest_reaction(&[StepEvent::Goal]), None);
+        assert_eq!(strongest_reaction(&[]), None);
+    }
+
+    #[test]
+    fn a_bounce_and_a_light_landing_in_the_same_step_show_the_bounce() {
+        for events in [
+            vec![
+                (0, StepEvent::Landed(Landing::Light)),
+                (1, StepEvent::Landed(Landing::Bounce)),
+            ],
+            vec![
+                (0, StepEvent::Grazed(Landing::Bounce)),
+                (1, StepEvent::Landed(Landing::Light)),
+            ],
+        ] {
+            let mut game = calm_round2();
+            game.on_step_events(events.clone());
+            assert_eq!(game.outcome(), None);
+            assert_eq!(
+                message_text(&game),
+                Some("ぴよーん!! ああっ!!"),
+                "{events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_goal_of_one_top_still_shows_the_other_tops_message() {
+        let mut game = calm_round2();
+        game.on_step_events(vec![(0, StepEvent::Goal), (1, StepEvent::Sank)]);
+        assert!(game.tops[0].settled);
+        assert_eq!(message_text(&game), Some("ズボッ"));
+    }
+
+    #[test]
+    fn the_star_animation_is_shown_on_every_top_still_on_the_board() {
+        let mut game = calm_round2();
+        game.on_step_events(vec![(1, StepEvent::FellOff)]);
+        let views = game.top_views();
+        assert_eq!(views.len(), 2);
+        assert!(
+            views.iter().all(|view| view.star_frame == Some(0)),
+            "原因でない方にも星を出す: {views:?}"
+        );
+        // ゴールで待機していた方は通常の見た目のまま
+        let mut game = calm_round2();
+        game.on_step_events(vec![(0, StepEvent::Goal)]);
+        game.on_step_events(vec![(1, StepEvent::FellOff)]);
+        let views = game.top_views();
+        assert_eq!(views[0].star_frame, None);
+        assert_eq!(views[1].star_frame, Some(0));
+    }
+
+    #[test]
+    fn top_views_follow_each_slot() {
+        let mut game = calm_round2();
+        game.tops[1].top.state = TopState::Airborne {
+            remaining: Duration::from_millis(100),
+            contact_g: 0.0,
+        };
+        let views = game.top_views();
+        assert_eq!(views[0].pos, game.tops[0].top.pos);
+        assert_eq!(views[1].pos, game.tops[1].top.pos);
+        assert!(!views[0].airborne);
+        assert!(views[1].airborne);
+        assert!(views
+            .iter()
+            .all(|view| view.spin_frame == game.spin_frame()));
+    }
+
+    /// 描画した盤面の中のベーゴマ記号の数
+    fn count_top_glyphs(game: &BeigomaGame) -> usize {
+        let glyph = render::TOP_SPIN_GLYPHS[game.spin_frame()];
+        rendered_text(game, AREA).matches(glyph).count()
+    }
+
+    #[test]
+    fn round2_draws_two_tops_and_round1_draws_one() {
+        assert_eq!(count_top_glyphs(&calm_game()), 1, "ROUND1は1個");
+        assert_eq!(
+            count_top_glyphs(&calm_round2()),
+            2,
+            "ROUND2は同じマスにいても2個とも描く"
+        );
+    }
+
+    #[test]
+    fn round2_renders_without_panicking_in_tiny_areas() {
+        let mut game = calm_round2();
+        for _ in 0..3 {
+            for (w, h) in [(1, 1), (5, 2), (10, 4), (30, 8), (60, 12)] {
+                rendered_text(&game, Rect::new(0, 0, w, h));
+            }
+            game.update(Duration::from_secs(20));
+        }
     }
 
     // --- 描画 ---

@@ -5,7 +5,9 @@
 //!   盤(障害物・ゴール)は固定なので、盤の画像は描画エリアが変わった時だけ1回合成・エンコードする。
 //!   ベーゴマは盤の画像から「前回の位置と今回の位置」を包む小さな範囲だけを切り出して重ねたパッチにし、
 //!   ベーゴマのマスが変わった時だけパッチを作り直す(count_mania/circle_image.rsと同じ考え方)。
+//!   パッチはベーゴマ(スロット)ごとに持ち、他のベーゴマが自分のパッチの範囲に出入りした時以外は作り直さない。
 //!   それ以外はマスごとに記号・色分けしたテキストで描く
+//! - ベーゴマが複数(ROUND2)の時、同じマスにいるものはマスを横に分けて左右に並べて描き、重ねない
 //! - 軽トラ視点: 女の子キャラの静止画2枚(通常時・踏ん張り時)を、Gがかかっている間だけ切り替える。
 //!   画像が無ければ同じ2通りのテキストの絵で描く
 
@@ -262,11 +264,59 @@ struct BaseCache {
     protocol: StatefulProtocol,
 }
 
-/// 直前に作ったベーゴマのパッチ。keyは(ベーゴマのマスのセル範囲, 飛び上がっているか)
+/// 同じ場所に描くベーゴマを横に並べるための区画。countは同じ場所にいる数、indexは左から何番目か
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Lane {
+    index: usize,
+    count: usize,
+}
+
+/// 各ベーゴマの区画。keys(topsと同じ並びの描く場所)が同じベーゴマどうしを、位置のxが小さい順
+/// (同じならスライスの順)に左から並べる。1個だけなら区画は1つ(従来どおりの描き方)
+fn lanes_by<K: PartialEq>(tops: &[TopView], keys: &[K]) -> Vec<Lane> {
+    let is_left_of = |a: usize, b: usize| {
+        tops[a]
+            .pos
+            .0
+            .total_cmp(&tops[b].pos.0)
+            .then(a.cmp(&b))
+            .is_lt()
+    };
+    (0..tops.len())
+        .map(|i| {
+            let same = (0..tops.len()).filter(|&j| keys[j] == keys[i]);
+            Lane {
+                index: same.clone().filter(|&j| is_left_of(j, i)).count(),
+                count: same.count(),
+            }
+        })
+        .collect()
+}
+
+/// 画像表示で1個のベーゴマを描く場所と見た目(ベーゴマのマスのセル範囲, 飛び上がっているか, 区画)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TopMark {
+    rect: Rect,
+    airborne: bool,
+    lane: Lane,
+}
+
+/// 直前に作ったベーゴマのパッチ。keyはこのスロットのベーゴマの描き方、drawnはパッチに描き込んだ
+/// 全ベーゴマ(範囲に入っている他のベーゴマも含む。後から描いたパッチが他のベーゴマを消さないように)
 struct PatchCache {
     rect: Rect,
-    key: (Rect, bool),
+    key: TopMark,
+    drawn: Vec<TopMark>,
     protocol: StatefulProtocol,
+}
+
+/// marksのうち、rectに掛かるもの
+fn marks_within(marks: &[TopMark], rect: Rect) -> Vec<TopMark> {
+    marks
+        .iter()
+        .copied()
+        .filter(|mark| mark.rect.intersects(rect))
+        .collect()
 }
 
 /// 盤面視点の描画器
@@ -275,12 +325,13 @@ pub struct BoardRenderer {
     board_image: Option<RgbaImage>,
     top_image: Option<RgbaImage>,
     base: RefCell<Option<BaseCache>>,
-    patch: RefCell<Option<PatchCache>>,
-    /// テスト用: 盤の画像・パッチを作り直した回数
+    /// ベーゴマ(スロット)ごとのパッチ。要素数は描くベーゴマの数に合わせる
+    patch: RefCell<Vec<Option<PatchCache>>>,
+    /// テスト用: 盤の画像・パッチ(スロットごと)を作り直した回数
     #[cfg(test)]
     base_encodes: std::cell::Cell<usize>,
     #[cfg(test)]
-    patch_encodes: std::cell::Cell<usize>,
+    patch_encodes: RefCell<Vec<usize>>,
 }
 
 impl BoardRenderer {
@@ -309,11 +360,11 @@ impl BoardRenderer {
             board_image,
             top_image,
             base: RefCell::new(None),
-            patch: RefCell::new(None),
+            patch: RefCell::new(Vec::new()),
             #[cfg(test)]
             base_encodes: std::cell::Cell::new(0),
             #[cfg(test)]
-            patch_encodes: std::cell::Cell::new(0),
+            patch_encodes: RefCell::new(Vec::new()),
         }
     }
 
@@ -338,23 +389,38 @@ impl BoardRenderer {
         self.base_encodes.get()
     }
 
+    /// 全スロットのパッチを作り直した回数の合計
     #[cfg(test)]
     pub fn patch_encode_count(&self) -> usize {
-        self.patch_encodes.get()
+        self.patch_encodes.borrow().iter().sum()
     }
 
-    /// area(盤面パネルの内側)に盤とベーゴマを描く。傾き(tilt)による疑似3D変形はテキスト表示のみで、
-    /// 画像表示(render_image)には適用しない
-    pub fn render(&self, frame: &mut Frame, area: Rect, board: &Board, top: &TopView, tilt: &Tilt) {
+    /// slot番目のベーゴマのパッチを作り直した回数
+    #[cfg(test)]
+    pub fn slot_patch_encode_count(&self, slot: usize) -> usize {
+        self.patch_encodes.borrow().get(slot).copied().unwrap_or(0)
+    }
+
+    /// area(盤面パネルの内側)に盤とベーゴマ(tops。ROUND1は1個、ROUND2は2個)を描く。
+    /// 傾き(tilt)による疑似3D変形はテキスト表示のみで、画像表示(render_image)には適用しない
+    pub fn render(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        board: &Board,
+        tops: &[TopView],
+        tilt: &Tilt,
+    ) {
         let area = area.intersection(frame.area());
         let Some(layout) = board_area(area) else {
             return;
         };
         // 星の演出中は画像のパッチ更新に乗せず、テキストで星を描く
-        if top.star_frame.is_none() && self.render_image(frame, area, layout, board, top) {
+        let starring = tops.iter().any(|top| top.star_frame.is_some());
+        if !starring && self.render_image(frame, area, layout, board, tops) {
             return;
         }
-        render_board_text(frame, area, layout, board, top, tilt);
+        render_board_text(frame, area, layout, board, tops, tilt);
     }
 
     /// 画像で描く。画像を使えない・盤全体がエリアに収まらない時はfalse(テキストで描く)
@@ -364,7 +430,7 @@ impl BoardRenderer {
         area: Rect,
         layout: BoardArea,
         board: &Board,
-        top: &TopView,
+        tops: &[TopView],
     ) -> bool {
         let (Some(picker), Some(board_image)) = (&self.picker, &self.board_image) else {
             return false;
@@ -383,7 +449,7 @@ impl BoardRenderer {
                 protocol,
             });
             // 盤の画像がパッチの範囲も描き直すので、パッチは新しい盤から作り直す
-            *self.patch.borrow_mut() = None;
+            self.patch.borrow_mut().clear();
             #[cfg(test)]
             self.base_encodes.set(self.base_encodes.get() + 1);
         }
@@ -392,40 +458,74 @@ impl BoardRenderer {
         };
         frame.render_stateful_widget(StatefulImage::default(), layout.rect, &mut cached.protocol);
         // パッチは盤の画像より後に描き、盤の上に重ねる
-        self.render_patch(frame, picker, cached, top);
+        self.render_patches(frame, picker, cached, tops);
         true
     }
 
-    /// ベーゴマのパッチを盤の上に描く。ベーゴマのマス(と飛び上がりの見た目)が変わった時だけ作り直す。
+    /// テスト用: slot番目のパッチを作り直した回数を数える(テスト以外では何もしない)
+    fn note_patch_encode(&self, _slot: usize) {
+        #[cfg(test)]
+        {
+            let mut counts = self.patch_encodes.borrow_mut();
+            if counts.len() <= _slot {
+                counts.resize(_slot + 1, 0);
+            }
+            counts[_slot] += 1;
+        }
+    }
+
+    /// ベーゴマのパッチをスロットごとに盤の上に描く。各スロットは自分のマス(と飛び上がりの見た目・区画)が
+    /// 変わった時、または他のベーゴマが自分のパッチの範囲に出入りした時だけ作り直す。
     /// 作り直す時は前回のマスも含めて切り出し、前の位置のベーゴマを端末に残さない
-    fn render_patch(&self, frame: &mut Frame, picker: &Picker, base: &BaseCache, top: &TopView) {
-        let top_rect = base.area.top_rect(top.pos);
-        let key = (top_rect, top.airborne);
-        let mut patch = self.patch.borrow_mut();
-        let same = matches!(patch.as_ref(), Some(cached) if cached.key == key);
-        if !same {
+    fn render_patches(
+        &self,
+        frame: &mut Frame,
+        picker: &Picker,
+        base: &BaseCache,
+        tops: &[TopView],
+    ) {
+        let rects: Vec<Rect> = tops.iter().map(|top| base.area.top_rect(top.pos)).collect();
+        let lanes = lanes_by(tops, &rects);
+        let marks: Vec<TopMark> = tops
+            .iter()
+            .zip(rects.iter().zip(lanes))
+            .map(|(top, (&rect, lane))| TopMark {
+                rect,
+                airborne: top.airborne,
+                lane,
+            })
+            .collect();
+        let mut patches = self.patch.borrow_mut();
+        // ベーゴマの数が変わった(ROUND1→ROUND2)時はスロットの数を合わせる
+        patches.resize_with(marks.len(), || None);
+        for (slot, (patch, &mark)) in patches.iter_mut().zip(&marks).enumerate() {
             let rect = match patch.as_ref() {
-                Some(cached) => cached.key.0.union(top_rect),
-                None => top_rect,
+                Some(cached) if cached.key == mark => cached.rect,
+                Some(cached) => cached.key.rect.union(mark.rect),
+                None => mark.rect,
             };
+            let drawn = marks_within(&marks, rect);
+            let fresh = matches!(patch.as_ref(), Some(cached) if cached.key == mark && cached.drawn == drawn);
+            if fresh {
+                continue;
+            }
             let image = patch_image(
                 base,
                 picker.font_size(),
                 rect,
-                top_rect,
-                top.airborne,
+                &drawn,
                 self.top_image.as_ref(),
             );
             let protocol = picker.new_resize_protocol(DynamicImage::ImageRgba8(image));
             *patch = Some(PatchCache {
                 rect,
-                key,
+                key: mark,
+                drawn,
                 protocol,
             });
-            #[cfg(test)]
-            self.patch_encodes.set(self.patch_encodes.get() + 1);
+            self.note_patch_encode(slot);
         }
-        if let Some(cached) = patch.as_mut() {
+        for cached in patches.iter_mut().flatten() {
             // 盤の画像は起点以外の全セルをskip(ratatuiの差分出力の対象外)にしており、そのままでは
             // パッチが端末へ出力されないので、パッチの範囲のskipを先に外す(circle_image.rsと同じ)
             let buffer = frame.buffer_mut();
@@ -531,38 +631,46 @@ const GOAL_HOLE_PIXEL: Rgba<u8> = Rgba([30, 30, 30, 255]);
 const TOP_EDGE_PIXEL: Rgba<u8> = Rgba([90, 100, 115, 255]);
 const TOP_FACE_PIXEL: Rgba<u8> = Rgba([200, 210, 225, 255]);
 
-/// 盤の合成画像からrectを切り出し、top_rectにベーゴマを重ねたパッチ
+/// 盤の合成画像からrectを切り出し、marksの各ベーゴマを重ねたパッチ。
+/// 同じマスに複数いるベーゴマは、マスを横に区画の数で等分した自分の区画に描く
 fn patch_image(
     base: &BaseCache,
     font_size: (u16, u16),
     rect: Rect,
-    top_rect: Rect,
-    airborne: bool,
+    marks: &[TopMark],
     top_image: Option<&RgbaImage>,
 ) -> RgbaImage {
     let origin = (base.area.rect.x, base.area.rect.y);
     let (px, py, pw, ph) = pixel_rect(rect, origin, font_size);
     let mut patch = imageops::crop_imm(&base.composed, px, py, pw.max(1), ph.max(1)).to_image();
-    let (tx, ty, tw, th) = pixel_rect(top_rect, (rect.x, rect.y), font_size);
-    // 飛び上がっている間は小さく描き、浮いているように見せる。
-    // 通常時はマスいっぱいに近い大きさにして豆粒にならないようにする
-    let scale = if airborne { 0.7 } else { 0.95 };
-    let size = (f64::from(tw.min(th)) * scale).max(1.0) as u32;
-    let center = (
-        f64::from(tx) + f64::from(tw) / 2.0,
-        f64::from(ty) + f64::from(th) / 2.0,
-    );
-    match top_image {
-        Some(image) => {
-            let scaled = imageops::resize(image, size, size, FilterType::Triangle);
-            let x = (center.0 - f64::from(size) / 2.0) as i64;
-            let y = (center.1 - f64::from(size) / 2.0) as i64;
-            imageops::overlay(&mut patch, &scaled, x, y);
-        }
-        None => {
-            let radius = f64::from(size) / 2.0;
-            fill_circle(&mut patch, center, radius, TOP_EDGE_PIXEL);
-            fill_circle(&mut patch, center, radius * 0.7, TOP_FACE_PIXEL);
+    let (fw, fh) = cell_pixels(font_size);
+    for mark in marks {
+        // パッチの左上からのピクセル位置(パッチの外にはみ出す分は描かれない)
+        let tx = (f64::from(mark.rect.x) - f64::from(rect.x)) * f64::from(fw);
+        let ty = (f64::from(mark.rect.y) - f64::from(rect.y)) * f64::from(fh);
+        let tw = f64::from(mark.rect.width) * f64::from(fw);
+        let th = f64::from(mark.rect.height) * f64::from(fh);
+        let lane_width = tw / mark.lane.count.max(1) as f64;
+        // 飛び上がっている間は小さく描き、浮いているように見せる。
+        // 通常時はマスいっぱいに近い大きさにして豆粒にならないようにする
+        let scale = if mark.airborne { 0.7 } else { 0.95 };
+        let size = (lane_width.min(th) * scale).max(1.0) as u32;
+        let center = (
+            tx + lane_width * (mark.lane.index as f64 + 0.5),
+            ty + th / 2.0,
+        );
+        match top_image {
+            Some(image) => {
+                let scaled = imageops::resize(image, size, size, FilterType::Triangle);
+                let x = (center.0 - f64::from(size) / 2.0) as i64;
+                let y = (center.1 - f64::from(size) / 2.0) as i64;
+                imageops::overlay(&mut patch, &scaled, x, y);
+            }
+            None => {
+                let radius = f64::from(size) / 2.0;
+                fill_circle(&mut patch, center, radius, TOP_EDGE_PIXEL);
+                fill_circle(&mut patch, center, radius * 0.7, TOP_FACE_PIXEL);
+            }
         }
     }
     patch
@@ -675,13 +783,14 @@ fn cell_style(cell: Cell, mass: (usize, usize), frac: (f64, f64)) -> Style {
 }
 
 /// テキスト表示の盤面。マスごとに背景色で塗り(平坦なマスは市松、凹凸は左上から光を当てた陰影)、
-/// 凸・凹・ゴール・ベーゴマは記号で示す(凸は明るい色の▲、凹は暗い色の▽)。傾き(tilt)に応じて盤を疑似3Dで台形に変形して描く
+/// 凸・凹・ゴール・ベーゴマは記号で示す(凸は明るい色の▲、凹は暗い色の▽)。傾き(tilt)に応じて盤を疑似3Dで台形に変形して描く。
+/// ベーゴマが同じ場所に複数いる時は、右隣のセルへ1つずつずらして並べる
 fn render_board_text(
     frame: &mut Frame,
     area: Rect,
     layout: BoardArea,
     board: &Board,
-    top: &TopView,
+    tops: &[TopView],
     tilt: &Tilt,
 ) {
     let projection = BoardProjection::new(&layout, tilt);
@@ -715,24 +824,40 @@ fn render_board_text(
             put_glyph_at(buffer, glyph_cell(center), area, glyph, Style::default());
         }
     }
-    let glyph = if let Some(frame) = top.star_frame {
+    // 背景色はマスのものを残し、記号と文字色だけ変える
+    let style = Style::default().fg(TOP_FG).add_modifier(Modifier::BOLD);
+    let panel = layout.panel;
+    let (left, right) = (i32::from(panel.left()), i32::from(panel.right()) - 1);
+    // 位置を含むマスの中心を順変換する。場外に出た時は盤の外側の位置になり、panelの範囲に収める
+    let cells: Vec<(i32, i32)> = tops
+        .iter()
+        .map(|top| {
+            let center = projection.project((top.pos.0.floor() + 0.5, top.pos.1.floor() + 0.5));
+            let (x, y) = glyph_cell(center);
+            (
+                x.clamp(left, right),
+                y.clamp(i32::from(panel.top()), i32::from(panel.bottom()) - 1),
+            )
+        })
+        .collect();
+    // 同じセルになったベーゴマは、左から順に右隣のセルへずらす(panelの右端を越えないよう左へ寄せる)
+    let lanes = lanes_by(tops, &cells);
+    for ((top, &(x, y)), lane) in tops.iter().zip(&cells).zip(lanes) {
+        let first = x.min(right - (lane.count as i32 - 1)).max(left);
+        let cell = ((first + lane.index as i32).min(right), y);
+        put_glyph_at(buffer, cell, area, top_glyph(top), style);
+    }
+}
+
+/// ベーゴマの記号。星の演出中はそのコマ、飛び上がっている間は専用の記号、それ以外は回転のコマ
+fn top_glyph(top: &TopView) -> &'static str {
+    if let Some(frame) = top.star_frame {
         STAR_ANIM_GLYPHS[frame.min(STAR_ANIM_GLYPHS.len() - 1)]
     } else if top.airborne {
         TOP_AIRBORNE_GLYPH
     } else {
         TOP_SPIN_GLYPHS[top.spin_frame % TOP_SPIN_GLYPHS.len()]
-    };
-    // 背景色はマスのものを残し、記号と文字色だけ変える
-    let style = Style::default().fg(TOP_FG).add_modifier(Modifier::BOLD);
-    // 位置を含むマスの中心を順変換する。場外に出た時は盤の外側の位置になり、panelの範囲に収める
-    let center = projection.project((top.pos.0.floor() + 0.5, top.pos.1.floor() + 0.5));
-    let (x, y) = glyph_cell(center);
-    let panel = layout.panel;
-    let cell = (
-        x.clamp(i32::from(panel.left()), i32::from(panel.right()) - 1),
-        y.clamp(i32::from(panel.top()), i32::from(panel.bottom()) - 1),
-    );
-    put_glyph_at(buffer, cell, area, glyph, style);
+    }
 }
 
 impl Default for BoardRenderer {
@@ -1020,6 +1145,7 @@ mod tests {
         draw_board_with_tilt(renderer, board, top, area, &Tilt::default())
     }
 
+    /// ベーゴマ1個を描く(ROUND1と同じく要素数1のスライスで渡す)
     fn draw_board_with_tilt(
         renderer: &BoardRenderer,
         board: &Board,
@@ -1027,11 +1153,43 @@ mod tests {
         area: Rect,
         tilt: &Tilt,
     ) -> Buffer {
+        draw_tops_with_tilt(renderer, board, std::slice::from_ref(top), area, tilt)
+    }
+
+    fn draw_tops(renderer: &BoardRenderer, board: &Board, tops: &[TopView], area: Rect) -> Buffer {
+        draw_tops_with_tilt(renderer, board, tops, area, &Tilt::default())
+    }
+
+    fn draw_tops_with_tilt(
+        renderer: &BoardRenderer,
+        board: &Board,
+        tops: &[TopView],
+        area: Rect,
+        tilt: &Tilt,
+    ) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(area.right(), area.bottom())).unwrap();
         terminal
-            .draw(|frame| renderer.render(frame, area, board, top, tilt))
+            .draw(|frame| renderer.render(frame, area, board, tops, tilt))
             .unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    fn spinning_at(pos: (f64, f64), spin_frame: usize) -> TopView {
+        TopView {
+            spin_frame,
+            ..top_at(pos)
+        }
+    }
+
+    /// symbolが描かれたセルの位置の一覧
+    fn positions_of(buffer: &Buffer, symbol: &str) -> Vec<(u16, u16)> {
+        buffer
+            .content()
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| cell.symbol() == symbol)
+            .map(|(i, _)| buffer.pos_of(i))
+            .collect()
     }
 
     fn draw_truck(renderer: &TruckViewRenderer, info: &TruckViewInfo, area: Rect) -> String {
@@ -2414,12 +2572,239 @@ mod tests {
         let layout = board_area(area).unwrap();
         draw_board(&renderer, &board, &top_at((1.5, 10.5)), area);
         draw_board(&renderer, &board, &top_at((2.5, 10.5)), area);
-        let patch = renderer.patch.borrow().as_ref().map(|p| p.rect).unwrap();
+        let patch = renderer.patch.borrow()[0].as_ref().map(|p| p.rect).unwrap();
         // 前の位置のベーゴマを消すため、前回と今回のマスを両方含む(盤全体ではない)
         assert_eq!(
             patch,
             layout.cell_rect(1, 10).union(layout.cell_rect(2, 10))
         );
+    }
+
+    // --- 複数のベーゴマ(ROUND2) ---
+
+    #[test]
+    fn a_single_top_is_drawn_once() {
+        let board = Board::standard();
+        let area = Rect::new(0, 0, 40, 12);
+        let renderer = BoardRenderer::from_parts(None, None, None);
+        let buffer = draw_board(&renderer, &board, &top_at(board.start_position()), area);
+        assert_eq!(count_symbol(&buffer, TOP_SPIN_GLYPHS[0]), 1);
+    }
+
+    #[test]
+    fn two_tops_in_the_same_cell_are_drawn_side_by_side() {
+        let board = Board::standard();
+        let renderer = BoardRenderer::from_parts(None, None, None);
+        let (sx, sy) = board.start_position();
+        // 左のベーゴマは0コマ目、右のベーゴマは1コマ目の記号にして見分ける
+        let left = spinning_at((sx - 0.15, sy), 0);
+        let right = spinning_at((sx + 0.15, sy), 1);
+        for area in [Rect::new(0, 0, 40, 12), Rect::new(0, 0, 90, 26)] {
+            let layout = board_area(area).unwrap();
+            let mass = layout.top_rect((sx, sy));
+            // スライスの並び順によらず、位置が左の方を左に描く
+            for tops in [[left, right], [right, left]] {
+                let buffer = draw_tops(&renderer, &board, &tops, area);
+                let l = positions_of(&buffer, TOP_SPIN_GLYPHS[0]);
+                let r = positions_of(&buffer, TOP_SPIN_GLYPHS[1]);
+                assert_eq!((l.len(), r.len()), (1, 1), "2個とも描く: {area:?}");
+                assert_eq!(l[0].1, r[0].1, "同じ行");
+                assert!(l[0].0 < r[0].0, "左右にずらして重ねない: {l:?} {r:?}");
+                for (x, y) in [l[0], r[0]] {
+                    assert!(
+                        mass.contains(Position::new(x, y)),
+                        "どちらも自分のマスの中: ({x}, {y}) {mass:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn two_tops_in_different_cells_are_drawn_at_their_own_cells() {
+        let board = Board::standard();
+        let area = Rect::new(0, 0, 40, 12);
+        let layout = board_area(area).unwrap();
+        let renderer = BoardRenderer::from_parts(None, None, None);
+        let a = spinning_at((5.5, 3.5), 0);
+        let b = spinning_at((12.3, 8.9), 1);
+        let buffer = draw_tops(&renderer, &board, &[a, b], area);
+        for top in [a, b] {
+            let rect = layout.top_rect(top.pos);
+            assert_eq!(
+                buffer[(rect.x, rect.y)].symbol(),
+                TOP_SPIN_GLYPHS[top.spin_frame],
+                "位置を含むマスに描く: {:?}",
+                top.pos
+            );
+        }
+    }
+
+    #[test]
+    fn two_tops_far_off_the_board_stay_inside_the_panel_and_apart() {
+        let board = Board::standard();
+        let area = Rect::new(5, 3, 60, 20);
+        let renderer = BoardRenderer::from_parts(None, None, None);
+        for far in [(-1000.0, -1000.0), (1000.0, 1000.0), (1000.0, -1000.0)] {
+            let tops = [spinning_at(far, 0), spinning_at((far.0 + 1.0, far.1), 1)];
+            let buffer = draw_tops(&renderer, &board, &tops, area);
+            let a = positions_of(&buffer, TOP_SPIN_GLYPHS[0]);
+            let b = positions_of(&buffer, TOP_SPIN_GLYPHS[1]);
+            assert_eq!((a.len(), b.len()), (1, 1), "{far:?}");
+            assert_ne!(a[0], b[0], "パネルの端に寄せても重ねない: {far:?}");
+            for (x, y) in [a[0], b[0]] {
+                assert!(area.contains(Position::new(x, y)), "{far:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_star_on_any_top_switches_the_image_board_to_text() {
+        let board = Board::standard();
+        let area = Rect::new(0, 0, 40, 12);
+        let renderer = BoardRenderer::with_images(test_picker(), plain_board_image(), None);
+        let star = TopView {
+            star_frame: Some(0),
+            ..top_at((5.5, 5.5))
+        };
+        let buffer = draw_tops(&renderer, &board, &[top_at((1.5, 10.5)), star], area);
+        assert_eq!(count_symbol(&buffer, STAR_ANIM_GLYPHS[0]), 1);
+        assert_eq!(count_symbol(&buffer, TOP_SPIN_GLYPHS[0]), 1);
+    }
+
+    #[test]
+    fn each_top_has_its_own_patch_on_the_image_board() {
+        let board = Board::standard();
+        let renderer = BoardRenderer::with_images(test_picker(), plain_board_image(), None);
+        let area = Rect::new(0, 0, 40, 12);
+        let (a, b) = (top_at((1.5, 10.5)), top_at((15.5, 3.5)));
+        draw_tops(&renderer, &board, &[a, b], area);
+        assert_eq!(
+            (
+                renderer.slot_patch_encode_count(0),
+                renderer.slot_patch_encode_count(1)
+            ),
+            (1, 1)
+        );
+        // 片方だけがマスを移ったら、そのスロットのパッチだけを作り直す
+        let a2 = top_at((2.5, 10.5));
+        draw_tops(&renderer, &board, &[a2, b], area);
+        draw_tops(&renderer, &board, &[a2, b], area);
+        assert_eq!(
+            (
+                renderer.slot_patch_encode_count(0),
+                renderer.slot_patch_encode_count(1)
+            ),
+            (2, 1)
+        );
+        let b2 = top_at((16.5, 3.5));
+        draw_tops(&renderer, &board, &[a2, b2], area);
+        assert_eq!(
+            (
+                renderer.slot_patch_encode_count(0),
+                renderer.slot_patch_encode_count(1)
+            ),
+            (2, 2)
+        );
+        assert_eq!(renderer.patch_encode_count(), 4, "合計");
+        assert_eq!(renderer.base_encode_count(), 1, "盤は作り直さない");
+    }
+
+    #[test]
+    fn a_patch_is_rebuilt_when_another_top_enters_or_leaves_it() {
+        // 他のベーゴマが自分のパッチの範囲に出入りした時だけは、自分のパッチにも描き直す
+        // (そうしないと、後から描いたパッチがもう片方のベーゴマを消してしまう)
+        let board = Board::standard();
+        let renderer = BoardRenderer::with_images(test_picker(), plain_board_image(), None);
+        let area = Rect::new(0, 0, 40, 12);
+        let a = top_at((5.5, 5.5));
+        let counts = || {
+            (
+                renderer.slot_patch_encode_count(0),
+                renderer.slot_patch_encode_count(1),
+            )
+        };
+        draw_tops(&renderer, &board, &[a, top_at((8.5, 5.5))], area);
+        draw_tops(&renderer, &board, &[a, top_at((6.5, 5.5))], area);
+        assert_eq!(counts(), (1, 2), "範囲の外で動いても作り直さない");
+        draw_tops(&renderer, &board, &[a, top_at((5.5, 5.5))], area);
+        assert_eq!(counts(), (2, 3), "同じマスに入ってきたら両方描き直す");
+        draw_tops(&renderer, &board, &[a, top_at((6.5, 5.5))], area);
+        assert_eq!(counts(), (3, 4), "出ていったら描き直す");
+    }
+
+    #[test]
+    fn the_image_board_handles_the_top_count_changing_from_one_to_two() {
+        let board = Board::standard();
+        let renderer = BoardRenderer::with_images(test_picker(), plain_board_image(), None);
+        let area = Rect::new(0, 0, 40, 12);
+        let (sx, sy) = board.start_position();
+        draw_board(&renderer, &board, &top_at((5.5, 5.5)), area);
+        assert_eq!(renderer.patch.borrow().len(), 1);
+        let pair = [top_at((sx - 0.15, sy)), top_at((sx + 0.15, sy))];
+        draw_tops(&renderer, &board, &pair, area);
+        let patches = renderer.patch.borrow();
+        assert_eq!(patches.len(), 2, "スロットごとにパッチを持つ");
+        assert!(patches.iter().all(Option::is_some), "両方とも描く");
+    }
+
+    #[test]
+    fn the_image_patch_draws_two_tops_in_the_same_cell_apart() {
+        let board = Board::standard();
+        let picker = test_picker();
+        let area = Rect::new(0, 0, 40, 12);
+        let layout = board_area(area).unwrap();
+        let composed = compose_base(&plain_board_image(), &board, layout, picker.font_size());
+        let base = BaseCache {
+            area: layout,
+            protocol: picker.new_resize_protocol(DynamicImage::ImageRgba8(composed.clone())),
+            composed,
+        };
+        // 平坦なマス(5,5)に2個。1マスは2×1セル=20×20ピクセル
+        let rect = layout.cell_rect(5, 5);
+        let marks: Vec<TopMark> = (0..2)
+            .map(|index| TopMark {
+                rect,
+                airborne: false,
+                lane: Lane { index, count: 2 },
+            })
+            .collect();
+        let patch = patch_image(&base, picker.font_size(), rect, &marks, None);
+        assert_eq!(patch.dimensions(), (20, 20));
+        assert_eq!(*patch.get_pixel(5, 10), TOP_FACE_PIXEL, "左の区画に描く");
+        assert_eq!(*patch.get_pixel(15, 10), TOP_FACE_PIXEL, "右の区画に描く");
+        let between = *patch.get_pixel(10, 10);
+        assert!(
+            between != TOP_FACE_PIXEL && between != TOP_EDGE_PIXEL,
+            "2個の間は盤のまま(重ならない): {between:?}"
+        );
+        // 1個だけならマスの中央に描く(従来どおり)
+        let sole = [TopMark {
+            rect,
+            airborne: false,
+            lane: Lane { index: 0, count: 1 },
+        }];
+        let patch = patch_image(&base, picker.font_size(), rect, &sole, None);
+        assert_eq!(*patch.get_pixel(10, 10), TOP_FACE_PIXEL);
+    }
+
+    #[test]
+    fn two_tops_do_not_panic_in_tiny_areas() {
+        let board = Board::standard();
+        let renderer = BoardRenderer::new();
+        let image_renderer = BoardRenderer::with_images(test_picker(), plain_board_image(), None);
+        for tilt in [Tilt::default(), max_tilt(1, 1), max_tilt(-1, -1)] {
+            for (w, h) in [(1, 1), (3, 2), (10, 4), (39, 11)] {
+                let area = Rect::new(0, 0, w, h);
+                for pair in [
+                    [top_at((1.35, 10.5)), top_at((1.65, 10.5))],
+                    [top_at((19.9, 11.9)), top_at((-1000.0, -1000.0))],
+                ] {
+                    draw_tops_with_tilt(&renderer, &board, &pair, area, &tilt);
+                    draw_tops_with_tilt(&image_renderer, &board, &pair, area, &tilt);
+                }
+            }
+        }
     }
 
     // --- 軽トラ視点 ---
