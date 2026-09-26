@@ -644,8 +644,16 @@ impl App {
                 );
             }
             Screen::SelectSong(selected) => {
-                // TTRスプラッシュ画像を全画面に描いてから、その上に曲リストのパネルを重ねる
-                self.ttr_splash_renderer.render(frame, area);
+                // TTRスプラッシュ画像を全画面に描いてから、その上に曲リストのパネルを重ねる。
+                // Fallback表示(画像プロトコル非対応)は文言が画面中央に来るとパネルの裏に
+                // 完全に隠れてしまうので、パネルより上の領域だけに表示する
+                let bg_area = if self.ttr_splash_renderer.is_fallback() {
+                    let panel_top = song_panel_rect(area).y;
+                    Rect::new(area.x, area.y, area.width, panel_top.saturating_sub(area.y))
+                } else {
+                    area
+                };
+                self.ttr_splash_renderer.render(frame, bg_area);
                 render_song_select(frame, area, *selected)
             }
             Screen::SelectDifficulty(item, song) => {

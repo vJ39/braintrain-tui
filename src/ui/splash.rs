@@ -88,6 +88,13 @@ impl SplashRenderer {
         Some((picker.new_resize_protocol(dyn_img), size))
     }
 
+    /// 画像プロトコル非対応環境でテキスト表示(Fallback)になっているか。
+    /// 曲選択画面のように背景の上に別のパネルを重ねる場合、Fallbackの文言が
+    /// パネルの裏に完全に隠れないよう表示領域を分けるために使う
+    pub fn is_fallback(&self) -> bool {
+        matches!(self, SplashRenderer::Fallback(_))
+    }
+
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         match self {
             SplashRenderer::Image { protocol, size } => {
@@ -125,6 +132,17 @@ fn centered_image_rect(area: Rect, size: (u32, u32), font_size: (u16, u16)) -> R
     )
 }
 
+/// 高さがheight(areaに収まる範囲)で、幅はareaのまま上下中央に配置したRect
+fn centered_rect_vertically(area: Rect, height: u16) -> Rect {
+    let height = height.min(area.height);
+    Rect::new(
+        area.x,
+        area.y + (area.height - height) / 2,
+        area.width,
+        height,
+    )
+}
+
 fn render_fallback(frame: &mut Frame, area: Rect, fallback: FallbackText) {
     let lines = vec![
         Line::from(""),
@@ -136,11 +154,14 @@ fn render_fallback(frame: &mut Frame, area: Rect, fallback: FallbackText) {
         Line::from(fallback.subtitle),
         Line::from(""),
         Line::from("PRESS [ENTER] TO START"),
+        Line::from(""),
     ];
-    let paragraph = Paragraph::new(lines)
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(paragraph, area);
+    let block = Block::default().borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let target = centered_rect_vertically(inner, lines.len() as u16);
+    let paragraph = Paragraph::new(lines).alignment(Alignment::Center);
+    frame.render_widget(paragraph, target);
 }
 
 #[cfg(test)]
@@ -196,6 +217,36 @@ mod tests {
     fn render_fallback_does_not_panic() {
         rendered_fallback_text(TITLE_FALLBACK);
         rendered_fallback_text(TTR_FALLBACK);
+    }
+
+    #[test]
+    fn render_fallback_is_vertically_centered_in_a_tall_area() {
+        // 画像プロトコル非対応環境ではフォールバック文言が画面上部に張り付き、
+        // 下にある曲選択パネル等との間に大きな空白ができてレイアウトがズレて見えていた。
+        // 縦に余裕がある画面では上下の余白がほぼ均等になること
+        let backend = TestBackend::new(80, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_fallback(frame, frame.area(), TTR_FALLBACK))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        // 枠(Borders::ALL)自体は常にarea全体を覆うので、判定対象は中身のテキストの行
+        let text_rows: Vec<u16> = (0..buffer.area.height)
+            .filter(|&y| {
+                let line: String = (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                line.contains("TTR") || line.contains("REVOLUTION") || line.contains("PRESS")
+            })
+            .collect();
+        let top = *text_rows.iter().min().expect("文言が描画されていること");
+        let bottom = *text_rows.iter().max().expect("文言が描画されていること");
+        let top_margin = top;
+        let bottom_margin = buffer.area.height - 1 - bottom;
+        assert!(
+            top_margin.abs_diff(bottom_margin) <= 1,
+            "上下の余白がほぼ均等: top={top_margin} bottom={bottom_margin}"
+        );
     }
 
     #[test]
