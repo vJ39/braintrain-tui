@@ -114,7 +114,7 @@ impl SeKind {
             SeKind::Correct => Some("se_correct.wav"),
             SeKind::Incorrect => None,
             SeKind::Transition => Some("se_transition.wav"),
-            SeKind::Confirm => Some("se_confirm.wav"),
+            SeKind::Confirm => Some("se_confirm.mp3"),
             SeKind::Star => None,
         }
     }
