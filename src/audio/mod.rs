@@ -57,6 +57,10 @@ pub enum SeKind {
     ColorStackClear,
     /// 「シタケシ」で間違えて消えなかった時の音
     ColorStackMiss,
+    /// 「やっほー」で相手が「やっほー」と言う時の音声(複数候補からランダムに1つ)
+    LookAwayYahho,
+    /// 「やっほー」で相手が「ヤー!」と叫ぶ時の音声(複数候補からランダムに1つ)
+    LookAwayShout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,8 +137,23 @@ pub fn random_bgm_track(category: BgmCategory) -> Option<String> {
     Some(tracks[index].clone())
 }
 
+/// 「やっほー」で相手が「やっほー」と言う時の音声の候補(1つをランダムに再生)
+const LOOK_AWAY_YAHHO_VOICES: [&str; 4] = [
+    "voice_look_away_yahho_1.mp3",
+    "voice_look_away_yahho_2.mp3",
+    "voice_look_away_yahho_3.mp3",
+    "voice_look_away_yahho_4.mp3",
+];
+
+/// 「やっほー」で相手が「ヤー!」と叫ぶ時の音声の候補(1つをランダムに再生)
+const LOOK_AWAY_SHOUT_VOICES: [&str; 2] = [
+    "voice_look_away_shout_1.mp3",
+    "voice_look_away_shout_2.mp3",
+];
+
 impl SeKind {
-    /// 音源ファイルのパス。合成音(Incorrect・Star)はファイルを使わないのでNone
+    /// 音源ファイルのパス。合成音(Incorrect・Star)と、複数候補からランダムに選ぶ音声
+    /// (LookAwayYahho・LookAwayShout)はここでは決まらないのでNone
     fn asset_path(self) -> Option<&'static str> {
         match self {
             SeKind::Correct => Some("se_correct.wav"),
@@ -155,6 +174,16 @@ impl SeKind {
             SeKind::CursorMove => Some("se_cursor_move.mp3"),
             SeKind::ColorStackClear => Some("se_color_stack_clear.mp3"),
             SeKind::ColorStackMiss => Some("se_color_stack_miss.mp3"),
+            SeKind::LookAwayYahho | SeKind::LookAwayShout => None,
+        }
+    }
+
+    /// 複数候補からランダムに1つ選んで鳴らす音声の候補一覧(対象外はNone)
+    fn voice_candidates(self) -> Option<&'static [&'static str]> {
+        match self {
+            SeKind::LookAwayYahho => Some(&LOOK_AWAY_YAHHO_VOICES),
+            SeKind::LookAwayShout => Some(&LOOK_AWAY_SHOUT_VOICES),
+            _ => None,
         }
     }
 }
@@ -331,6 +360,17 @@ impl RodioPlayer {
         let Ok(sink) = Sink::try_new(stream_handle) else {
             return;
         };
+        // 複数候補からランダムに1つ選んで鳴らす音声
+        if let Some(candidates) = se.voice_candidates() {
+            let index = rand::thread_rng().gen_range(0..candidates.len());
+            if let Some(file) = Assets::get(candidates[index]) {
+                if let Ok(source) = rodio::Decoder::new(Cursor::new(file.data.into_owned())) {
+                    sink.append(source);
+                    sink.detach();
+                }
+            }
+            return;
+        }
         // 合成音(音源ファイルを使わない)は種類ごとの生成関数で鳴らす
         let Some(path) = se.asset_path() else {
             match se {
@@ -481,7 +521,7 @@ pub fn playing_typewriter_kind() -> Option<TypewriterSeKind> {
 mod tests {
     use super::*;
 
-    const ALL_SE_KINDS: [SeKind; 18] = [
+    const ALL_SE_KINDS: [SeKind; 20] = [
         SeKind::Correct,
         SeKind::Incorrect,
         SeKind::Transition,
@@ -500,6 +540,8 @@ mod tests {
         SeKind::CursorMove,
         SeKind::ColorStackClear,
         SeKind::ColorStackMiss,
+        SeKind::LookAwayYahho,
+        SeKind::LookAwayShout,
     ];
 
     #[test]
@@ -521,12 +563,33 @@ mod tests {
     fn every_se_asset_is_embedded() {
         for se in ALL_SE_KINDS {
             let Some(path) = se.asset_path() else {
-                continue; // 合成音はファイルを持たない
+                continue; // 合成音・複数候補からランダムに選ぶ音声はファイルを持たない
             };
             assert!(
                 Assets::get(path).is_some(),
                 "{se:?}のasset({path})が埋め込まれていること"
             );
+        }
+    }
+
+    #[test]
+    fn every_voice_candidate_is_embedded_and_distinct() {
+        let mut all_paths = Vec::new();
+        for se in [SeKind::LookAwayYahho, SeKind::LookAwayShout] {
+            let candidates = se.voice_candidates().expect("候補一覧を持つこと");
+            assert!(candidates.len() >= 2, "{se:?}: ランダムに選ぶ意味がある数の候補");
+            for &path in candidates {
+                assert!(
+                    Assets::get(path).is_some(),
+                    "{se:?}のasset({path})が埋め込まれていること"
+                );
+                all_paths.push(path);
+            }
+        }
+        for i in 0..all_paths.len() {
+            for j in (i + 1)..all_paths.len() {
+                assert_ne!(all_paths[i], all_paths[j], "候補ファイルが重複していないこと");
+            }
         }
     }
 

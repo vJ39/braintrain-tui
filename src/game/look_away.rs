@@ -344,13 +344,19 @@ impl LookAwayGame {
     /// 待機が終わった時に、次のイベントを始める
     fn begin_event(&mut self, event: Event) {
         self.phase = match event {
-            Event::Yahho => Phase::Yahho {
-                remaining: YAHHO_WINDOW,
-            },
-            Event::Shout(side) => Phase::Shout {
-                side,
-                remaining: SHOUT_WINDOW,
-            },
+            Event::Yahho => {
+                audio::play_se(SeKind::LookAwayYahho);
+                Phase::Yahho {
+                    remaining: YAHHO_WINDOW,
+                }
+            }
+            Event::Shout(side) => {
+                audio::play_se(SeKind::LookAwayShout);
+                Phase::Shout {
+                    side,
+                    remaining: SHOUT_WINDOW,
+                }
+            }
             Event::Feint { side, then } => {
                 self.feints_in_round += 1;
                 Phase::Feint {
