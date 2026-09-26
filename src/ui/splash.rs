@@ -17,6 +17,8 @@ struct ImageAssets;
 pub const TITLE_IMAGE_PATH: &str = "title.jpeg";
 /// TTR(リズムゲーム)の曲選択前に挟むスプラッシュ画面の画像
 pub const TTR_SPLASH_IMAGE_PATH: &str = "ttr_splash.jpeg";
+/// 「べー」の動画スプラッシュの後、本編開始前に挟むキャラクター静止画スプラッシュ画面の画像
+pub const BEIGOMA_CHARACTER_SPLASH_IMAGE_PATH: &str = "beigoma_character_splash.jpeg";
 
 /// 画像プロトコル非対応端末で画像の代わりに出すテキスト
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +45,12 @@ pub const TTR_FALLBACK: FallbackText = FallbackText {
 pub const BEIGOMA_FALLBACK: FallbackText = FallbackText {
     title: "B E - !",
     subtitle: "軽トラの荷台からベーゴマをゴールへ導け",
+};
+
+/// 「べー」キャラクター静止画スプラッシュ画面のフォールバック表示
+pub const BEIGOMA_CHARACTER_FALLBACK: FallbackText = FallbackText {
+    title: "B E - !",
+    subtitle: "準備はいいか?",
 };
 
 /// 端末の画像プロトコル検出結果。検出は応答待ちのタイムアウトがあり得るため、
@@ -193,8 +201,28 @@ mod tests {
     }
 
     #[test]
+    fn beigoma_character_splash_image_asset_is_embedded() {
+        assert!(
+            ImageAssets::get(BEIGOMA_CHARACTER_SPLASH_IMAGE_PATH).is_some(),
+            "assets/image/beigoma_character_splash.jpegが埋め込まれていること"
+        );
+    }
+
+    #[test]
+    fn beigoma_character_splash_image_is_square() {
+        // 用意した画像は1024x1024。縦横比を保って中央に配置されることを前提にしている
+        let img =
+            load_embedded_image(BEIGOMA_CHARACTER_SPLASH_IMAGE_PATH).expect("デコードできること");
+        assert_eq!((img.width(), img.height()), (1024, 1024));
+    }
+
+    #[test]
     fn embedded_splash_images_can_be_decoded() {
-        for path in [TITLE_IMAGE_PATH, TTR_SPLASH_IMAGE_PATH] {
+        for path in [
+            TITLE_IMAGE_PATH,
+            TTR_SPLASH_IMAGE_PATH,
+            BEIGOMA_CHARACTER_SPLASH_IMAGE_PATH,
+        ] {
             let file = ImageAssets::get(path).expect("埋め込まれていること");
             assert!(
                 image::load_from_memory(&file.data).is_ok(),
@@ -275,6 +303,21 @@ mod tests {
         assert_ne!(TITLE_FALLBACK.title, TTR_FALLBACK.title);
     }
 
+    #[test]
+    fn beigoma_character_fallback_draws_its_own_subtitle() {
+        let text = rendered_fallback_text(BEIGOMA_CHARACTER_FALLBACK);
+        assert!(text.contains(BEIGOMA_CHARACTER_FALLBACK.title));
+        // 全角文字の2セル目は空白で埋まるため、空白を除いて比較する
+        assert!(text
+            .replace(' ', "")
+            .contains(&BEIGOMA_CHARACTER_FALLBACK.subtitle.replace(' ', "")));
+        // 直前の動画スプラッシュとは別の画面だと分かるよう、一文は変える
+        assert_ne!(
+            BEIGOMA_CHARACTER_FALLBACK.subtitle,
+            BEIGOMA_FALLBACK.subtitle
+        );
+    }
+
     // --- センタリング配置(centered_image_rect) ---
 
     #[test]
@@ -334,6 +377,10 @@ mod tests {
         for (path, fallback) in [
             (TITLE_IMAGE_PATH, TITLE_FALLBACK),
             (TTR_SPLASH_IMAGE_PATH, TTR_FALLBACK),
+            (
+                BEIGOMA_CHARACTER_SPLASH_IMAGE_PATH,
+                BEIGOMA_CHARACTER_FALLBACK,
+            ),
         ] {
             let mut renderer = SplashRenderer::new(path, fallback);
             let backend = TestBackend::new(80, 24);

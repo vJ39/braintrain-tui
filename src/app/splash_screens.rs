@@ -1,5 +1,6 @@
-//! Enter/クリックで次へ進む全画面スプラッシュ2種。起動直後のタイトル画面(Screen::Splash)と、
-//! 「べー」開始前の専用スプラッシュ画面(Screen::BeigomaSplash)
+//! Enter/クリックで次へ進む全画面スプラッシュ3種。起動直後のタイトル画面(Screen::Splash)と、
+//! 「べー」開始前の専用スプラッシュ画面(Screen::BeigomaSplash、コマ送りアニメーション)、
+//! その後べー本編開始前に挟むキャラクター静止画スプラッシュ画面(Screen::BeigomaCharacterSplash)
 
 use ratatui::layout::Rect;
 use ratatui::Frame;
@@ -18,8 +19,15 @@ impl App {
         self.enter_menu();
     }
 
-    /// べースプラッシュ画面からべーを開始する(Enter/クリック共通)
+    /// べースプラッシュ画面(動画)からキャラクター静止画スプラッシュ画面へ進む(Enter/クリック共通)。
+    /// BGMはべー専用のものをそのまま流し続ける
     pub(super) fn leave_beigoma_splash(&mut self) {
+        audio::play_se(SeKind::Confirm);
+        self.screen = Screen::BeigomaCharacterSplash;
+    }
+
+    /// キャラクター静止画スプラッシュ画面からべーを開始する(Enter/クリック共通)
+    pub(super) fn leave_beigoma_character_splash(&mut self) {
         audio::play_se(SeKind::Confirm);
         self.start_beigoma();
     }
@@ -38,8 +46,9 @@ impl App {
     }
 }
 
-/// タイトル画面。メニューと同じ色・角丸の枠を画面いっぱいに描き、内側の中央にロゴを配置する
-pub(super) fn render_title(frame: &mut Frame, area: Rect, renderer: &mut SplashRenderer) {
+/// 静止画1枚のスプラッシュ画面(タイトル画面・べーのキャラクター静止画スプラッシュ画面)。
+/// メニューと同じ色・角丸の枠を画面いっぱいに描き、内側の中央に画像を配置する
+pub(super) fn render_still(frame: &mut Frame, area: Rect, renderer: &mut SplashRenderer) {
     let block = theme::panel("");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -127,5 +136,45 @@ mod tests {
     fn splash_renders_without_panicking() {
         let mut app = App::new();
         rendered_text(&mut app);
+    }
+
+    // --- べーのキャラクター静止画スプラッシュ(Screen::BeigomaCharacterSplash) ---
+
+    #[test]
+    fn character_splash_renderer_uses_its_own_fallback() {
+        // 画像を出せる環境ならImage、出せない環境なら専用のフォールバック文言になる
+        let app = App::new();
+        match &app.beigoma_character_splash_renderer {
+            SplashRenderer::Image { size, .. } => assert_eq!(*size, (1024, 1024)),
+            SplashRenderer::Fallback(fallback) => {
+                assert_eq!(*fallback, crate::ui::splash::BEIGOMA_CHARACTER_FALLBACK)
+            }
+        }
+    }
+
+    #[test]
+    fn character_splash_is_framed_like_the_title_screen() {
+        let mut app = App::new();
+        app.screen = Screen::BeigomaCharacterSplash;
+        let buffer = {
+            let backend = ratatui::backend::TestBackend::new(80, 30);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let screen = screen_rect(rect(0, 0, 80, 30));
+        assert_eq!(buffer[(screen.x, screen.y)].symbol(), "╭");
+        assert_eq!(buffer[(screen.x, screen.y)].fg, theme::ACCENT);
+    }
+
+    #[test]
+    fn character_splash_renders_without_panicking_on_tiny_terminals() {
+        let mut app = App::new();
+        app.screen = Screen::BeigomaCharacterSplash;
+        for (w, h) in [(1, 1), (10, 4), (200, 60)] {
+            let backend = ratatui::backend::TestBackend::new(w, h);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+        }
     }
 }

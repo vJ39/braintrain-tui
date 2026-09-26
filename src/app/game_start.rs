@@ -34,8 +34,9 @@ impl App {
             // ハヤウチは難易度選択に加え、ラウンドごとに自前の「3.2.1.GO!!」を持つため、
             // 画面遷移側のカウントダウンも挟まない(挟むと演出が2回連続してしまう)
             QUICK_DRAW_ITEM_INDEX => self.start_quick_draw(),
-            // べーは難易度選択の代わりに専用スプラッシュ画面を挟む(TTRと同じ仕組み)。
-            // Enter/クリックでstart_beigoma()が呼ばれ、ROUND1のカウントダウンから始まる
+            // べーは難易度選択の代わりに専用スプラッシュ画面(動画→キャラクター静止画)を挟む
+            // (TTRと同じ仕組み)。静止画側のEnter/クリックでstart_beigoma()が呼ばれ、
+            // ROUND1のカウントダウンから始まる
             BEIGOMA_ITEM_INDEX => self.enter_beigoma_splash(),
             // 記憶は3問→4問→3問で手数が自動で増えるため、難易度選択を挟まない
             MEMORY_ITEM_INDEX => self.start_playing(item, crate::game::memory::SESSION_DIFFICULTY),
@@ -431,10 +432,119 @@ mod tests {
         assert_eq!(app.current_bgm, started_bgm);
     }
 
-    #[test]
-    fn starting_beigoma_switches_from_the_splash_bgm_to_playing_bgm() {
+    /// べーの動画スプラッシュでEnterを押し、キャラクター静止画スプラッシュまで進めたAppを作る
+    fn app_on_beigoma_character_splash() -> App {
         let mut app = App::new();
         app.select_menu_item(BEIGOMA_ITEM_INDEX);
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(app.screen, Screen::BeigomaCharacterSplash),
+            "動画スプラッシュの次はキャラクター静止画スプラッシュ"
+        );
+        app
+    }
+
+    #[test]
+    fn enter_on_beigoma_splash_goes_to_the_character_splash_not_the_game() {
+        let mut app = App::new();
+        app.select_menu_item(BEIGOMA_ITEM_INDEX);
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(app.screen, Screen::BeigomaCharacterSplash),
+            "動画スプラッシュのEnterではまだべー本編を始めない"
+        );
+    }
+
+    #[test]
+    fn clicking_beigoma_splash_goes_to_the_character_splash() {
+        let mut app = App::new();
+        app.select_menu_item(BEIGOMA_ITEM_INDEX);
+        app.last_area = rect(0, 0, 40, 12);
+        app.handle_mouse(left_click_at(5, 5));
+        assert!(matches!(app.screen, Screen::BeigomaCharacterSplash));
+    }
+
+    #[test]
+    fn other_keys_on_the_character_splash_stay_there() {
+        let mut app = app_on_beigoma_character_splash();
+        for code in [
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Char(' '),
+            KeyCode::Esc,
+        ] {
+            app.handle_key(KeyEvent::from(code));
+            assert!(
+                matches!(app.screen, Screen::BeigomaCharacterSplash),
+                "{code:?}では進まない"
+            );
+        }
+        // 時間が経っても勝手には進まない
+        app.update(Duration::from_secs(20));
+        assert!(matches!(app.screen, Screen::BeigomaCharacterSplash));
+    }
+
+    #[test]
+    fn non_left_mouse_events_on_the_character_splash_are_ignored() {
+        let mut app = app_on_beigoma_character_splash();
+        app.last_area = rect(0, 0, 40, 12);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 5,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(matches!(app.screen, Screen::BeigomaCharacterSplash));
+    }
+
+    #[test]
+    fn beigoma_splash_bgm_keeps_playing_on_the_character_splash() {
+        let mut app = App::new();
+        app.select_menu_item(BEIGOMA_ITEM_INDEX);
+        let started_bgm = app.current_bgm.clone();
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.screen, Screen::BeigomaCharacterSplash));
+        rendered_text(&mut app);
+        assert_eq!(
+            app.current_bgm, started_bgm,
+            "べー本編が始まるまではべー専用BGMを流し続ける"
+        );
+    }
+
+    #[test]
+    fn q_on_the_character_splash_returns_to_menu_with_menu_bgm() {
+        let mut app = app_on_beigoma_character_splash();
+        press(&mut app, KeyCode::Char('q'));
+        assert!(matches!(app.screen, Screen::Menu));
+        assert!(!app.should_quit());
+        let menu = audio::bgm_tracks_in(BgmCategory::Menu);
+        assert!(
+            app.current_bgm
+                .as_ref()
+                .is_some_and(|name| menu.contains(name)),
+            "静止画スプラッシュから戻ったらメニュー用BGMに戻る: {:?}",
+            app.current_bgm
+        );
+    }
+
+    #[test]
+    fn enter_on_the_character_splash_starts_beigoma_round1_countdown() {
+        let mut app = app_on_beigoma_character_splash();
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_beigoma_round1_countdown_in_game(&mut app);
+    }
+
+    #[test]
+    fn clicking_the_character_splash_starts_beigoma_round1_countdown() {
+        let mut app = app_on_beigoma_character_splash();
+        app.last_area = rect(0, 0, 40, 12);
+        app.handle_mouse(left_click_at(5, 5));
+        assert_beigoma_round1_countdown_in_game(&mut app);
+    }
+
+    #[test]
+    fn starting_beigoma_switches_from_the_splash_bgm_to_playing_bgm() {
+        let mut app = app_on_beigoma_character_splash();
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         assert!(matches!(app.screen, Screen::Playing(_)));
         let playing = audio::bgm_tracks_in(BgmCategory::Playing);
@@ -464,36 +574,36 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_beigoma_splash_skips_difficulty_and_the_outer_countdown() {
-        let mut app = App::new();
-        app.select_menu_item(BEIGOMA_ITEM_INDEX);
-        app.handle_key(KeyEvent::from(KeyCode::Enter));
-        assert_beigoma_round1_countdown_in_game(&mut app);
-    }
-
-    #[test]
-    fn clicking_beigoma_splash_also_starts_the_game() {
+    fn clicking_both_beigoma_splashes_starts_the_game() {
         let mut app = App::new();
         app.select_menu_item(BEIGOMA_ITEM_INDEX);
         app.last_area = rect(0, 0, 40, 12);
-        app.handle_mouse(MouseEvent {
+        let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 5,
             row: 5,
             modifiers: crossterm::event::KeyModifiers::NONE,
-        });
+        };
+        app.handle_mouse(click);
+        assert!(matches!(app.screen, Screen::BeigomaCharacterSplash));
+        app.handle_mouse(click);
         assert_beigoma_round1_countdown_in_game(&mut app);
     }
 
     #[test]
-    fn enter_on_beigoma_in_menu_goes_straight_to_playing() {
+    fn enter_on_beigoma_in_menu_goes_through_both_splashes_to_playing() {
         let mut app = App::new();
         app.screen = Screen::Menu;
         app.menu_state.select(BEIGOMA_ITEM_INDEX);
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         assert!(
             matches!(app.screen, Screen::BeigomaSplash),
-            "メニューからのEnterはまずスプラッシュ画面を挟む"
+            "メニューからのEnterはまず動画スプラッシュ画面を挟む"
+        );
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(app.screen, Screen::BeigomaCharacterSplash),
+            "続いてキャラクター静止画スプラッシュ画面を挟む"
         );
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         assert_beigoma_round1_countdown_in_game(&mut app);
