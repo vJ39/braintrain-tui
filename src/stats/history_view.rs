@@ -147,7 +147,7 @@ mod tests {
         );
         assert!(
             GAME_IDS.contains(&COLOR_STACK_ID),
-            "ソコヌキも履歴に出す"
+            "シタケシも履歴に出す"
         );
     }
 

@@ -41,7 +41,7 @@ const MENU_ITEMS: [&str; 15] = [
     "数列予測",
     "組み合わせパズル",
     "カウントメニア",
-    "ソコヌキ",
+    "シタケシ",
     "TTR",
     "ハヤウチ",
     "べー",
@@ -55,7 +55,7 @@ const REACTION_ITEM_INDEX: usize = 2;
 const MEMORY_ITEM_INDEX: usize = 5;
 /// カウントメニア(マウス専用)
 const COUNT_MANIA_ITEM_INDEX: usize = 8;
-/// ソコヌキ
+/// シタケシ
 const COLOR_STACK_ITEM_INDEX: usize = 9;
 /// リズムゲーム(TTR)は難易度選択の代わりに曲選択を挟む(難易度は常に上級)
 const RHYTHM_ITEM_INDEX: usize = 10;
@@ -368,7 +368,7 @@ impl App {
     /// Menu画面での項目決定(キー/クリック共通)。ゲーム/ジュークボックス/履歴へ振り分ける
     fn select_menu_item(&mut self, selected: usize) {
         if selected == COLOR_STACK_ITEM_INDEX {
-            // ソコヌキは難易度選択を挟まず、すぐにカウントダウンへ進む
+            // シタケシは難易度選択を挟まず、すぐにカウントダウンへ進む
             // (カウントダウン最初の「3」の音が画面遷移の音を兼ねる)
             self.start_playing(
                 COLOR_STACK_ITEM_INDEX,
@@ -781,7 +781,7 @@ fn new_game(item: usize, difficulty: Difficulty) -> Box<dyn Game> {
         7 => Box::new(PuzzleConnectGame::new(difficulty)),
         // カウントメニアは難易度を選ばず、ROUND1=初級・ROUND2=中級・ROUND3=上級と進む
         COUNT_MANIA_ITEM_INDEX => Box::new(CountManiaGame::new()),
-        // ソコヌキは難易度を持たず、ROUND1〜3が固定の内容で進む
+        // シタケシは難易度を持たず、ROUND1〜3が固定の内容で進む
         COLOR_STACK_ITEM_INDEX => Box::new(ColorStackGame::new()),
         RHYTHM_ITEM_INDEX => unreachable!("rhythm is started via start_rhythm with a song"),
         // ハヤウチは難易度を持たず、10問固定で進む
@@ -1556,17 +1556,17 @@ mod tests {
         assert_count_mania_round1_is_playing(&mut app);
     }
 
-    // --- ソコヌキ ---
+    // --- シタケシ ---
 
     #[test]
     fn color_stack_is_the_last_game_before_rhythm() {
-        assert_eq!(MENU_ITEMS[COLOR_STACK_ITEM_INDEX], "ソコヌキ");
+        assert_eq!(MENU_ITEMS[COLOR_STACK_ITEM_INDEX], "シタケシ");
         assert_eq!(COLOR_STACK_ITEM_INDEX + 1, RHYTHM_ITEM_INDEX);
     }
 
     #[test]
     fn new_game_for_color_stack_item_creates_color_stack() {
-        // ソコヌキは難易度を持たないので、渡した難易度によらず固定の記録になる
+        // シタケシは難易度を持たないので、渡した難易度によらず固定の記録になる
         for difficulty in [
             Difficulty::Beginner,
             Difficulty::Intermediate,
@@ -1582,7 +1582,7 @@ mod tests {
         }
     }
 
-    /// ソコヌキが始まり、ROUND1(4列)が表示されていることを確かめる
+    /// シタケシが始まり、ROUND1(4列)が表示されていることを確かめる
     fn assert_color_stack_round1_is_playing(app: &mut App) {
         finish_countdown(app);
         let Screen::Playing(game) = &app.screen else {
@@ -1592,7 +1592,7 @@ mod tests {
         assert!(!game.is_finished());
         // 全角文字の2セル目は空白で埋まるため、空白を除いて比較する
         let text = rendered_text(app).replace(' ', "");
-        assert!(text.contains("ソコヌキ"));
+        assert!(text.contains("シタケシ"));
         assert!(text.contains("ROUND1/3"), "ROUND1から始まる");
     }
 
@@ -1635,7 +1635,7 @@ mod tests {
         let mut app = App::new();
         app.screen = Screen::Menu;
         let (x, y) = drawn_position_of(&mut app, MENU_ITEMS[COLOR_STACK_ITEM_INDEX], 200, 60)
-            .expect("ソコヌキが描かれていること");
+            .expect("シタケシが描かれていること");
         app.handle_mouse(left_click_at(x, y));
         assert!(matches!(
             app.screen,
@@ -1989,7 +1989,7 @@ mod tests {
         assert_eq!(QUICK_DRAW_ITEM_INDEX + 1, BEIGOMA_ITEM_INDEX);
         // 先頭側の既存インデックスはずれない
         assert_eq!(MENU_ITEMS[COUNT_MANIA_ITEM_INDEX], "カウントメニア");
-        assert_eq!(MENU_ITEMS[COLOR_STACK_ITEM_INDEX], "ソコヌキ");
+        assert_eq!(MENU_ITEMS[COLOR_STACK_ITEM_INDEX], "シタケシ");
     }
 
     #[test]
@@ -2965,7 +2965,7 @@ mod tests {
     }
 
     /// 難易度選択画面を経由するゲームのメニュー項目一覧
-    /// (DDR・ソコヌキ・カウントメニア・ハヤウチ・べー・記憶・イロピッタン以外)
+    /// (DDR・シタケシ・カウントメニア・ハヤウチ・べー・記憶・イロピッタン以外)
     fn difficulty_select_game_items() -> impl Iterator<Item = usize> {
         non_rhythm_game_items().filter(|&item| {
             item != COLOR_STACK_ITEM_INDEX
@@ -2993,7 +2993,7 @@ mod tests {
 
     #[test]
     fn starting_any_non_rhythm_game_goes_through_countdown() {
-        // ソコヌキ・カウントメニア・ハヤウチは難易度選択を経由しないので別のテストで確認する
+        // シタケシ・カウントメニア・ハヤウチは難易度選択を経由しないので別のテストで確認する
         for item in difficulty_select_game_items() {
             let mut app = App::new();
             app.screen = Screen::SelectDifficulty(item, None);
@@ -3070,7 +3070,7 @@ mod tests {
 
     #[test]
     fn countdown_finishes_into_the_selected_game_for_every_item() {
-        // ソコヌキ・カウントメニア・ハヤウチは難易度選択を経由しないので別のテストで確認する
+        // シタケシ・カウントメニア・ハヤウチは難易度選択を経由しないので別のテストで確認する
         for item in difficulty_select_game_items() {
             let mut app = App::new();
             app.screen = Screen::SelectDifficulty(item, None);
