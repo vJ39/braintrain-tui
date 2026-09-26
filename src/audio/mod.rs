@@ -584,16 +584,15 @@ mod tests {
     }
 
     #[test]
-    fn bgm_tracks_in_playing_has_seven_tracks() {
+    fn bgm_tracks_in_playing_has_six_tracks() {
         let names = bgm_tracks_in(BgmCategory::Playing);
         assert!(names.iter().any(|n| n == "Method_of_Thought"));
-        assert!(names.iter().any(|n| n == "The_Quiet_Calculation"));
         assert!(names.iter().any(|n| n == "Zenith_Pursuit"));
         assert!(names.iter().any(|n| n == "Apex_Calculation"));
         assert!(names.iter().any(|n| n == "Kinetic_Ascent"));
         assert!(names.iter().any(|n| n == "Ten_Thousand_Strikes"));
         assert!(names.iter().any(|n| n == "Beyond_the_Finish_Line"));
-        assert_eq!(names.len(), 7);
+        assert_eq!(names.len(), 6);
     }
 
     #[test]
@@ -603,9 +602,9 @@ mod tests {
     }
 
     #[test]
-    fn bgm_tracks_in_result_failure_has_pondus_mundi_only() {
+    fn bgm_tracks_in_result_failure_has_apex_pursuit_only() {
         let names = bgm_tracks_in(BgmCategory::ResultFailure);
-        assert_eq!(names, vec!["Pondus_Mundi".to_string()]);
+        assert_eq!(names, vec!["Apex_Pursuit".to_string()]);
     }
 
     #[test]
@@ -686,6 +685,6 @@ mod tests {
                 seen.insert(name);
             }
         }
-        assert_eq!(seen.len(), 7, "100回試行して全曲が出現するはず: {seen:?}");
+        assert_eq!(seen.len(), 6, "100回試行して全曲が出現するはず: {seen:?}");
     }
 }

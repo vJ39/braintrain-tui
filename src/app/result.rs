@@ -457,7 +457,7 @@ mod tests {
     fn game_over_switches_bgm_to_result_failure_category() {
         let mut app = App::new();
         app.enter_result(game_over_result());
-        assert_eq!(app.current_bgm.as_deref(), Some("Pondus_Mundi"));
+        assert_eq!(app.current_bgm.as_deref(), Some("Apex_Pursuit"));
     }
 
     #[test]
