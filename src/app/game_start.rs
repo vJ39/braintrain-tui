@@ -98,9 +98,9 @@ impl App {
     }
 
     /// ヤッホーを開始する。問題ごとの「3.2.1.GO!!」を自前で持つため、
-    /// 画面遷移側のカウントダウン(start_playing)は経由しない
+    /// 画面遷移側のカウントダウン(start_playing)は経由しない。BGMは専用の演歌
     fn start_look_away(&mut self) {
-        if let Some(name) = audio::random_bgm_track(BgmCategory::Playing) {
+        if let Some(name) = audio::random_bgm_track(BgmCategory::LookAway) {
             audio::play_bgm_track(&name);
             self.current_bgm = Some(name);
         }
@@ -416,15 +416,15 @@ mod tests {
     }
 
     #[test]
-    fn selecting_look_away_plays_the_common_playing_bgm() {
+    fn selecting_look_away_plays_the_look_away_bgm() {
         let mut app = App::new();
         app.select_menu_item(LOOK_AWAY_ITEM_INDEX);
-        let playing = audio::bgm_tracks_in(BgmCategory::Playing);
+        let look_away = audio::bgm_tracks_in(BgmCategory::LookAway);
         assert!(
             app.current_bgm
                 .as_ref()
-                .is_some_and(|name| playing.contains(name)),
-            "共通のPlaying用BGMを流す: {:?}",
+                .is_some_and(|name| look_away.contains(name)),
+            "専用の演歌BGMを流す: {:?}",
             app.current_bgm
         );
     }

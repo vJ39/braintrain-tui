@@ -85,6 +85,8 @@ pub enum BgmCategory {
     BeigomaSplash,
     /// 「べー」のゲーム本編中に流す専用BGM
     BeigomaPlaying,
+    /// 「ヤッホー」のゲーム本編中に流す専用BGM(演歌)
+    LookAway,
 }
 
 impl BgmCategory {
@@ -98,6 +100,7 @@ impl BgmCategory {
             BgmCategory::RhythmSplash => "rhythm_splash/",
             BgmCategory::BeigomaSplash => "beigoma_splash/",
             BgmCategory::BeigomaPlaying => "beigoma_playing/",
+            BgmCategory::LookAway => "look_away/",
         }
     }
 }
@@ -1091,6 +1094,57 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..100 {
             if let Some(name) = random_bgm_track(BgmCategory::BeigomaPlaying) {
+                seen.insert(name);
+            }
+        }
+        assert_eq!(seen.len(), 2, "100回試行して両曲が出現するはず: {seen:?}");
+    }
+
+    #[test]
+    fn look_away_dir_prefix_is_look_away() {
+        assert_eq!(BgmCategory::LookAway.dir_prefix(), "look_away/");
+    }
+
+    #[test]
+    fn bgm_tracks_in_look_away_has_two_tracks() {
+        let names = bgm_tracks_in(BgmCategory::LookAway);
+        assert!(names.iter().any(|n| n == "Paper_Lanterns_at_Midnight"));
+        assert!(names.iter().any(|n| n == "The_Last_Lantern_Glow"));
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn look_away_bgm_assets_are_embedded_and_decodable() {
+        for name in ["Paper_Lanterns_at_Midnight", "The_Last_Lantern_Glow"] {
+            let file = BgmAssets::get(&format!("look_away/{name}.mp3"))
+                .unwrap_or_else(|| panic!("bgm/look_away/{name}.mp3が埋め込まれていること"));
+            assert!(
+                rodio::Decoder::new(Cursor::new(file.data.into_owned())).is_ok(),
+                "{name}: mp3としてデコードできること"
+            );
+        }
+    }
+
+    #[test]
+    fn look_away_bgm_is_not_mixed_into_playing_or_menu() {
+        for category in [BgmCategory::Menu, BgmCategory::Playing] {
+            let names = bgm_tracks_in(category);
+            assert!(
+                !names.iter().any(|n| n == "Paper_Lanterns_at_Midnight"),
+                "{category:?}"
+            );
+            assert!(
+                !names.iter().any(|n| n == "The_Last_Lantern_Glow"),
+                "{category:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn random_bgm_track_for_look_away_eventually_picks_both_tracks() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            if let Some(name) = random_bgm_track(BgmCategory::LookAway) {
                 seen.insert(name);
             }
         }
