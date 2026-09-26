@@ -55,13 +55,15 @@ pub const RICE_DRAIN_PER_SEC: f32 = 0.1;
 /// 最低でも5秒は待たせ、「来るか来るか」という緊張感を持続させる
 pub const IDLE_WAIT_MS: (u64, u64) = (5000, 9000);
 /// これ以内に正しい入力ができれば正解(♥は減らない)
-pub const RESPONSE_SAFE_WINDOW: Duration = Duration::from_millis(800);
+pub const RESPONSE_SAFE_WINDOW: Duration = Duration::from_millis(500);
 /// RESPONSE_SAFE_WINDOWを超えた経過時間をこの単位で区切り、超過1区分ごとに♥をもう1つ失う
 pub const PENALTY_STEP: Duration = Duration::from_millis(80);
 /// 入力を受け付ける最大時間。これを過ぎても入力が無ければ自動的に不正解確定(経過時間はこの値として計算する)
-pub const MAX_RESPONSE_WINDOW: Duration = Duration::from_millis(1200);
+pub const MAX_RESPONSE_WINDOW: Duration = Duration::from_millis(900);
 /// 正誤の結果(◯/✗)を表示し続ける時間。この間は次の問題へ進まず、入力も受け付けない
 pub const RESULT_HOLD: Duration = Duration::from_millis(1000);
+/// セッション全体の制限時間。これを過ぎても完食できていなければGAME OVER
+pub const TIME_LIMIT: Duration = Duration::from_secs(60);
 
 /// 待機の後に「やっほー」イベントになる確率(やっほー5割・ヤー5割)
 pub const YAHHO_RATE: f64 = 0.5;
@@ -87,12 +89,18 @@ pub const CLEAR_TEXT: &str = "CLEAR!";
 /// 「やっほー」に失敗し、ごはんがおかわりされた時の表示
 pub const RICE_REFILLED_TEXT: &str = "ごはんをおかわりされた!";
 
-/// 待機中の背景(暗いグレー)
+/// 待機中(食べていない)の背景(暗いグレー)
 pub const IDLE_BG: Color = Color::Rgb(48, 48, 48);
+/// 食事中の背景(食欲をそそる暖色)
+pub const EATING_BG: Color = Color::Rgb(90, 60, 10);
 /// 「ヤー!!」と叫んでいる時の背景(オレンジ)
 pub const SHOUT_BG: Color = Color::Rgb(255, 140, 0);
 /// 「やっほー」と言っている時の背景(空色)
 pub const YAHHO_BG: Color = Color::Rgb(0, 170, 230);
+/// 食事中に表示する演出テキスト
+pub const EATING_TEXT: &str = "むしゃむしゃ...";
+/// 待機中(食べていない)に表示する演出テキスト
+pub const WATCHING_TEXT: &str = "様子を見ている";
 
 /// 画像アセット(assets/image/からの相対パス)。無ければテキストで描く
 pub const STAGE_NORMAL_IMAGE: &str = "look_away/normal.png";
@@ -249,14 +257,15 @@ impl Verdict {
         }
     }
 
-    /// 食事中に「ヤー」で襲われた時。防御操作を受け付けず、問答無用で♥を1つ失う
+    /// 食事中に「ヤー」で襲われた時。防御操作を受け付けず、問答無用で♥を1つ失い、
+    /// 喉に詰まらせてお茶漬けもおかわりになる
     fn caught_eating() -> Self {
         Self {
             is_correct: false,
             detail: "食事を邪魔された".to_string(),
             latency_ms: 0.0,
             penalty: 1,
-            message: None,
+            message: Some(ResultMessage::RiceRefilled),
             is_guard_success: false,
         }
     }
@@ -337,6 +346,8 @@ pub struct LookAwayGame {
     lives: u32,
     /// ごはんゲージ。0以下になったらクリア
     rice: f32,
+    /// セッション開始からの経過時間。TIME_LIMITを超えても完食できていなければGAME OVER
+    elapsed_total: Duration,
     /// 最後の結果表示が終わってセッションを終えたか
     finished: bool,
     /// 直前の問題の結果表示(HUD用の小さい表示)
@@ -390,6 +401,7 @@ impl LookAwayGame {
             },
             lives: MAX_LIVES,
             rice: RICE_FULL,
+            elapsed_total: Duration::ZERO,
             finished: false,
             feedback: AnswerFeedback::new(),
             mark_renderer: MarkRenderer::new(),
@@ -401,9 +413,9 @@ impl LookAwayGame {
         game
     }
 
-    /// ライフが尽きたか
+    /// ライフが尽きたか、制限時間内に完食できなかったか
     pub fn is_game_over(&self) -> bool {
-        self.lives == 0
+        self.lives == 0 || (self.elapsed_total >= TIME_LIMIT && self.rice > 0.0)
     }
 
     /// ごはんを完食したか(勝利)。ライフが尽きていた場合はGAME OVER優先でfalse
@@ -469,9 +481,18 @@ impl LookAwayGame {
     fn finish_question(&mut self, verdict: Verdict) {
         self.tracker.record(verdict.is_correct, verdict.latency_ms);
         self.lives = self.lives.saturating_sub(verdict.penalty);
-        if verdict.message == Some(ResultMessage::RiceRefilled) {
+        // 既に満タンなら実際にはおかわりされていないので、メッセージも出さない
+        let was_already_full = self.rice >= RICE_FULL;
+        let message = if verdict.message == Some(ResultMessage::RiceRefilled) {
             self.rice = RICE_FULL;
-        }
+            if was_already_full {
+                None
+            } else {
+                verdict.message
+            }
+        } else {
+            verdict.message
+        };
         self.feedback.record(verdict.is_correct, verdict.detail);
         audio::play_se(if verdict.is_correct {
             SeKind::Correct
@@ -484,12 +505,24 @@ impl LookAwayGame {
         self.phase = Phase::Result {
             is_correct: verdict.is_correct,
             elapsed: Duration::ZERO,
-            message: verdict.message,
+            message,
         };
     }
 
     /// 時間経過で状態を進める。制限時間を過ぎた問題は不正解にする
     fn tick_phase(&mut self, dt: Duration) {
+        // カウントダウン演出中はプレイヤーが操作できないので、制限時間には含めない
+        if !matches!(self.phase, Phase::Countdown { .. }) {
+            self.elapsed_total += dt;
+        }
+        if self.is_game_over() && !matches!(self.phase, Phase::Result { .. }) {
+            self.phase = Phase::Result {
+                is_correct: false,
+                elapsed: Duration::ZERO,
+                message: None,
+            };
+            return;
+        }
         match &mut self.phase {
             Phase::Countdown { state } => {
                 if let Some(phase) = state.tick(dt) {
@@ -566,14 +599,21 @@ impl LookAwayGame {
                 message,
                 ..
             } => self.render_result(frame, area, *is_correct, *message),
-            Phase::Idle { .. } => self.render_scene(
-                frame,
-                area,
-                IDLE_BG,
-                theme::TEXT,
-                StageKind::Normal,
-                vec![pointing_line(None)],
-            ),
+            Phase::Idle { is_eating, .. } => {
+                let (background, status_text) = if *is_eating {
+                    (EATING_BG, EATING_TEXT)
+                } else {
+                    (IDLE_BG, WATCHING_TEXT)
+                };
+                self.render_scene(
+                    frame,
+                    area,
+                    background,
+                    theme::TEXT,
+                    StageKind::Normal,
+                    vec![pointing_line(None), String::new(), status_text.to_string()],
+                )
+            }
             Phase::Shout { side, variant, .. } => {
                 let kind = if *side == Side::Left {
                     StageKind::ShoutLeft(*variant)
@@ -688,7 +728,11 @@ impl LookAwayGame {
         frame.render_widget(block, area);
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ])
             .split(inner);
         let hearts_bg = Color::Rgb(40, 0, 0);
         let hearts_line = Line::from(vec![
@@ -706,18 +750,33 @@ impl LookAwayGame {
                     .bg(hearts_bg)
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::styled(
+                format!("  残り{}秒", TIME_LIMIT.saturating_sub(self.elapsed_total).as_secs()),
+                Style::default().fg(theme::TEXT),
+            ),
         ]);
         frame.render_widget(
             Paragraph::new(hearts_line).alignment(Alignment::Center),
             rows[0],
         );
         let help_line = Line::from(Span::styled(
-            "← → で「ヤー!!」の指された方を向く / Space で「やっほー」を返す / Enter で食べる",
+            "←→:ヤーを防御 / Space:やっほー",
             Style::default().fg(theme::MUTED),
         ));
         frame.render_widget(
             Paragraph::new(help_line).alignment(Alignment::Center),
             rows[1],
+        );
+        let is_eating = matches!(self.phase, Phase::Idle { is_eating: true, .. });
+        let eat_hint = if is_eating {
+            "Enterで食べるのをやめる"
+        } else {
+            "Enterで食べ始める"
+        };
+        let eat_line = Line::from(Span::styled(eat_hint, Style::default().fg(theme::MUTED)));
+        frame.render_widget(
+            Paragraph::new(eat_line).alignment(Alignment::Center),
+            rows[2],
         );
     }
 }
@@ -903,7 +962,7 @@ impl Game for LookAwayGame {
         );
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(4)])
+            .constraints([Constraint::Min(3), Constraint::Length(5)])
             .split(body);
         self.render_stage(frame, rows[0]);
         self.render_footer(frame, rows[1]);
@@ -1059,6 +1118,35 @@ mod tests {
         let game = LookAwayGame::new();
         assert_eq!(game.lives, MAX_LIVES);
         assert_eq!(game.rice, RICE_FULL);
+    }
+
+    #[test]
+    fn time_limit_expiry_without_finishing_the_meal_is_game_over() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        assert!(!game.is_game_over());
+        game.update(TIME_LIMIT - ms(1));
+        assert!(!game.is_game_over(), "制限時間ぴったり手前ではまだGAME OVERにしない");
+        game.update(ms(1));
+        assert!(
+            game.is_game_over(),
+            "60秒経っても完食できていなければGAME OVER"
+        );
+        assert!(!game.is_cleared());
+    }
+
+    #[test]
+    fn finishing_the_meal_before_time_limit_is_not_affected_by_it() {
+        let mut game = LookAwayGame::new();
+        game.phase = Phase::Idle {
+            remaining: Duration::from_secs(3600),
+            is_eating: true,
+        };
+        game.update(Duration::from_secs_f32(RICE_FULL / RICE_DRAIN_PER_SEC) + ms(1));
+        finish_result(&mut game);
+        assert!(game.is_finished());
+        assert!(game.is_cleared());
+        assert!(!game.is_game_over());
     }
 
     #[test]
@@ -1333,6 +1421,26 @@ mod tests {
         assert!(is_result(&game, false), "800msを1msでも過ぎたら不正解");
         assert_eq!(game.lives, MAX_LIVES, "やっほー失敗では♥は減らない");
         assert_eq!(game.rice, RICE_FULL, "やっほー失敗でごはんがおかわりされる");
+        assert!(
+            text_of(&rendered(&game)).contains(&compact(RICE_REFILLED_TEXT)),
+            "実際におかわりされた時はメッセージを出す"
+        );
+    }
+
+    #[test]
+    fn yahho_failure_while_rice_is_already_full_shows_no_refill_message() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        // riceは初期値のまま満タン
+        yahho(&mut game);
+        game.update(RESPONSE_SAFE_WINDOW + ms(1));
+        press(&mut game, KeyCode::Char(' '));
+        assert!(is_result(&game, false));
+        assert_eq!(game.rice, RICE_FULL);
+        assert!(
+            !text_of(&rendered(&game)).contains(&compact(RICE_REFILLED_TEXT)),
+            "既に満タンならおかわりされていないのでメッセージを出さない"
+        );
     }
 
     #[test]
@@ -1552,6 +1660,18 @@ mod tests {
     }
 
     #[test]
+    fn caught_eating_also_refills_rice() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        game.rice = 0.3;
+        game.begin_event(Event::Shout(Side::Left), true);
+        assert!(is_result(&game, false));
+        assert_eq!(game.lives, MAX_LIVES - 1, "食事を邪魔されると♥を1つ失う");
+        assert_eq!(game.rice, RICE_FULL, "食事を邪魔されるとお茶漬けはおかわりになる");
+        assert!(text_of(&rendered(&game)).contains(&compact(RICE_REFILLED_TEXT)));
+    }
+
+    #[test]
     fn input_and_updates_after_finish_are_ignored() {
         let mut game = LookAwayGame::new();
         for _ in 0..MAX_LIVES {
@@ -1574,6 +1694,21 @@ mod tests {
         let text = text_of(&rendered(&LookAwayGame::new()));
         assert!(text.contains(&compact(DISPLAY_NAME)), "{text}");
         assert!(text.contains(&compact("ごはん")), "{text}");
+    }
+
+    #[test]
+    fn footer_shows_remaining_time_that_counts_down() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        assert!(
+            text_of(&rendered(&game)).contains(&compact("残り60秒")),
+            "開始直後は残り60秒"
+        );
+        game.update(ms(30_000));
+        assert!(
+            text_of(&rendered(&game)).contains(&compact("残り30秒")),
+            "30秒経過したら残り30秒"
+        );
     }
 
     #[test]
@@ -1624,6 +1759,62 @@ mod tests {
         assert!(!text.contains('◀') && !text.contains('▶'));
         assert!(!stage_text(&buffer).contains(&compact(SHOUT_TEXT)));
         assert_eq!(stage_bg(&buffer), IDLE_BG);
+    }
+
+    #[test]
+    fn idle_while_not_eating_shows_watching_text() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        assert!(matches!(
+            game.phase,
+            Phase::Idle {
+                is_eating: false,
+                ..
+            }
+        ));
+        let buffer = rendered(&game);
+        assert!(
+            stage_text(&buffer).contains(&compact(WATCHING_TEXT)),
+            "食べていない間は「様子を見ている」ことが分かる表示にする"
+        );
+        assert!(!stage_text(&buffer).contains(&compact(EATING_TEXT)));
+        assert_eq!(stage_bg(&buffer), IDLE_BG);
+    }
+
+    #[test]
+    fn footer_hint_switches_between_start_and_stop_eating() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        assert!(
+            text_of(&rendered(&game)).contains(&compact("Enterで食べ始める")),
+            "食べていない時は「食べ始める」と案内する"
+        );
+        press(&mut game, KeyCode::Enter);
+        assert!(
+            text_of(&rendered(&game)).contains(&compact("Enterで食べるのをやめる")),
+            "食べている時は「やめる」と案内する"
+        );
+    }
+
+    #[test]
+    fn idle_while_eating_shows_eating_text_and_background() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        press(&mut game, KeyCode::Enter);
+        assert!(matches!(
+            game.phase,
+            Phase::Idle {
+                is_eating: true,
+                ..
+            }
+        ));
+        let buffer = rendered(&game);
+        assert!(
+            stage_text(&buffer).contains(&compact(EATING_TEXT)),
+            "食べている間は状態が見えるようにする"
+        );
+        assert!(!stage_text(&buffer).contains(&compact(WATCHING_TEXT)));
+        assert_eq!(stage_bg(&buffer), EATING_BG, "食事中は背景色も変える");
     }
 
     #[test]
