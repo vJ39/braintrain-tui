@@ -2,6 +2,7 @@ pub mod beigoma;
 pub mod color_stack;
 pub mod count_mania;
 pub mod feedback;
+pub mod look_away;
 pub mod mark_display;
 pub mod memory;
 pub mod mental_calc;

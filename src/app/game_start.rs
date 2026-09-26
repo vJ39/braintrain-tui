@@ -6,6 +6,7 @@ use std::time::Duration;
 use crate::audio::{self, BgmCategory, SeKind};
 use crate::game::beigoma::BeigomaGame;
 use crate::game::count_mania::CountManiaGame;
+use crate::game::look_away::LookAwayGame;
 use crate::game::quick_draw::QuickDrawGame;
 use crate::game::rhythm::RhythmGame;
 use crate::game::Difficulty;
@@ -13,7 +14,8 @@ use crate::ui::countdown::CountdownState;
 
 use super::menu_items::{
     new_game, BEIGOMA_ITEM_INDEX, COLOR_STACK_ITEM_INDEX, COUNT_MANIA_ITEM_INDEX,
-    MEMORY_ITEM_INDEX, QUICK_DRAW_ITEM_INDEX, REACTION_ITEM_INDEX, RHYTHM_ITEM_INDEX,
+    LOOK_AWAY_ITEM_INDEX, MEMORY_ITEM_INDEX, QUICK_DRAW_ITEM_INDEX, REACTION_ITEM_INDEX,
+    RHYTHM_ITEM_INDEX,
 };
 use super::{App, Screen};
 
@@ -34,6 +36,9 @@ impl App {
             // ハヤウチは難易度選択に加え、ラウンドごとに自前の「3.2.1.GO!!」を持つため、
             // 画面遷移側のカウントダウンも挟まない(挟むと演出が2回連続してしまう)
             QUICK_DRAW_ITEM_INDEX => self.start_quick_draw(),
+            // ヤッホーもハヤウチと同じく難易度選択を挟まず、問題ごとに自前の「3.2.1.GO!!」を持つため
+            // 画面遷移側のカウントダウンも挟まない
+            LOOK_AWAY_ITEM_INDEX => self.start_look_away(),
             // べーは難易度選択の代わりに専用スプラッシュ画面(動画→キャラクター静止画)を挟む
             // (TTRと同じ仕組み)。静止画側のEnter/クリックでstart_beigoma()が呼ばれ、
             // ROUND1のカウントダウンから始まる
@@ -90,6 +95,16 @@ impl App {
             self.current_bgm = Some(name);
         }
         self.screen = Screen::Playing(Box::new(QuickDrawGame::new()));
+    }
+
+    /// ヤッホーを開始する。問題ごとの「3.2.1.GO!!」を自前で持つため、
+    /// 画面遷移側のカウントダウン(start_playing)は経由しない
+    fn start_look_away(&mut self) {
+        if let Some(name) = audio::random_bgm_track(BgmCategory::Playing) {
+            audio::play_bgm_track(&name);
+            self.current_bgm = Some(name);
+        }
+        self.screen = Screen::Playing(Box::new(LookAwayGame::new()));
     }
 
     /// べーを開始する。ROUNDごとの「3.2.1.GO!!」を自前で持つため、
@@ -352,6 +367,66 @@ mod tests {
         app.menu_state.select(QUICK_DRAW_ITEM_INDEX);
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         assert_quick_draw_round1_is_playing(&mut app);
+    }
+
+    // --- ヤッホー ---
+
+    /// ヤッホーが始まり、1問目(10問中)のゲーム内カウントダウンが表示されていることを確かめる。
+    /// 問題ごとに自前のカウントダウンを持つため、画面遷移側のカウントダウン(Screen::Countdown)は経由しない
+    fn assert_look_away_round1_is_playing(app: &mut App) {
+        let Screen::Playing(game) = &app.screen else {
+            panic!("外側のカウントダウンを挟まず直接Playing画面になるはず");
+        };
+        assert_eq!(game.result().game_id, crate::game::look_away::GAME_ID);
+        assert!(!game.is_finished());
+        // 全角文字の2セル目は空白で埋まるため、空白を除いて比較する
+        let text = rendered_text(app).replace(' ', "");
+        assert!(
+            text.contains(crate::game::look_away::DISPLAY_NAME),
+            "{text}"
+        );
+        assert!(text.contains("Q1/10"), "10問制の1問目から始まる: {text}");
+        assert!(
+            text.contains('█'),
+            "ゲーム内のカウントダウンを大きな文字で出す"
+        );
+        // カウントダウン中のキーは記録されない
+        app.handle_key(KeyEvent::from(KeyCode::Left));
+        app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        let Screen::Playing(game) = &app.screen else {
+            panic!("Playing画面のまま");
+        };
+        assert_eq!(game.result().total, 0);
+    }
+
+    #[test]
+    fn selecting_look_away_skips_difficulty_and_the_outer_countdown() {
+        let mut app = App::new();
+        app.select_menu_item(LOOK_AWAY_ITEM_INDEX);
+        assert_look_away_round1_is_playing(&mut app);
+    }
+
+    #[test]
+    fn enter_on_look_away_in_menu_goes_straight_to_playing() {
+        let mut app = App::new();
+        app.screen = Screen::Menu;
+        app.menu_state.select(LOOK_AWAY_ITEM_INDEX);
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_look_away_round1_is_playing(&mut app);
+    }
+
+    #[test]
+    fn selecting_look_away_plays_the_common_playing_bgm() {
+        let mut app = App::new();
+        app.select_menu_item(LOOK_AWAY_ITEM_INDEX);
+        let playing = audio::bgm_tracks_in(BgmCategory::Playing);
+        assert!(
+            app.current_bgm
+                .as_ref()
+                .is_some_and(|name| playing.contains(name)),
+            "共通のPlaying用BGMを流す: {:?}",
+            app.current_bgm
+        );
     }
 
     // --- べー ---
@@ -617,13 +692,14 @@ mod tests {
     }
 
     /// 難易度選択画面を経由するゲームのメニュー項目一覧
-    /// (DDR・シタケシ・カウントメニア・ハヤウチ・べー・記憶・イロピッタン以外)
+    /// (DDR・シタケシ・カウントメニア・ハヤウチ・べー・ヤッホー・記憶・イロピッタン以外)
     fn difficulty_select_game_items() -> impl Iterator<Item = usize> {
         non_rhythm_game_items().filter(|&item| {
             item != COLOR_STACK_ITEM_INDEX
                 && item != COUNT_MANIA_ITEM_INDEX
                 && item != QUICK_DRAW_ITEM_INDEX
                 && item != BEIGOMA_ITEM_INDEX
+                && item != LOOK_AWAY_ITEM_INDEX
                 && item != MEMORY_ITEM_INDEX
                 && item != REACTION_ITEM_INDEX
         })

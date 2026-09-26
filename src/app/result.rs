@@ -14,8 +14,8 @@ use crate::ui::result_sprite::ResultSprite;
 use crate::ui::typewriter::{self, Typewriter};
 
 use super::menu_items::{
-    BEIGOMA_ITEM_INDEX, COLOR_STACK_ITEM_INDEX, COUNT_MANIA_ITEM_INDEX, MENU_ITEMS,
-    QUICK_DRAW_ITEM_INDEX, RHYTHM_ITEM_INDEX,
+    BEIGOMA_ITEM_INDEX, COLOR_STACK_ITEM_INDEX, COUNT_MANIA_ITEM_INDEX, LOOK_AWAY_ITEM_INDEX,
+    MENU_ITEMS, QUICK_DRAW_ITEM_INDEX, RHYTHM_ITEM_INDEX,
 };
 use super::screen_layout::centered_rect;
 use super::{App, Screen};
@@ -63,6 +63,7 @@ fn result_lines(result: &GameResult) -> Vec<Line<'static>> {
         (crate::game::rhythm::GAME_ID, RHYTHM_ITEM_INDEX),
         (crate::game::quick_draw::GAME_ID, QUICK_DRAW_ITEM_INDEX),
         (crate::game::beigoma::GAME_ID, BEIGOMA_ITEM_INDEX),
+        (crate::game::look_away::GAME_ID, LOOK_AWAY_ITEM_INDEX),
     ];
     let game_name = game_names
         .iter()
@@ -208,6 +209,24 @@ mod tests {
         let text = rendered_text(&mut app).replace(' ', "");
         assert!(text.contains("ハヤウチ"));
         assert!(!text.contains("反射神経"));
+    }
+
+    #[test]
+    fn result_screen_shows_look_away_menu_name() {
+        let mut app = App::new();
+        app.screen = Screen::Result(
+            new_game(LOOK_AWAY_ITEM_INDEX, Difficulty::Beginner).result(),
+            None,
+        );
+        let text = rendered_text(&mut app).replace(' ', "");
+        assert!(
+            text.contains(crate::game::look_away::DISPLAY_NAME),
+            "{text}"
+        );
+        assert!(
+            !text.contains(crate::game::look_away::GAME_ID),
+            "内部識別子ではなく表示名を出す: {text}"
+        );
     }
 
     #[test]

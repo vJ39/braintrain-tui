@@ -485,7 +485,9 @@ mod tests {
 
     #[test]
     fn grid_move_left_right_wraps_within_the_row() {
-        let len = MENU_ITEMS.len(); // 15項目・4列 → 最終行は12,13,14の3枚
+        // 最終行が欠ける場合を確かめるため、メニューの項目数に依存させず15項目で試す
+        // (15項目・4列 → 最終行は12,13,14の3枚)
+        let len = 15;
         assert_eq!(grid_move(0, GridMove::Right, 4, len), 1);
         assert_eq!(
             grid_move(3, GridMove::Right, 4, len),
@@ -508,7 +510,8 @@ mod tests {
 
     #[test]
     fn grid_move_up_down_wraps_within_the_column() {
-        let len = MENU_ITEMS.len();
+        // 最終行が欠ける場合を確かめるため、メニューの項目数に依存させず15項目で試す
+        let len = 15;
         assert_eq!(grid_move(0, GridMove::Down, 4, len), 4);
         assert_eq!(
             grid_move(12, GridMove::Down, 4, len),

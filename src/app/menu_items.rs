@@ -5,6 +5,7 @@
 use crate::game::beigoma::BeigomaGame;
 use crate::game::color_stack::ColorStackGame;
 use crate::game::count_mania::CountManiaGame;
+use crate::game::look_away::{self, LookAwayGame};
 use crate::game::memory::MemoryGame;
 use crate::game::mental_calc::MentalCalcGame;
 use crate::game::mirror_match::MirrorMatchGame;
@@ -16,7 +17,7 @@ use crate::game::sequence::SequenceGame;
 use crate::game::shape_rotate::ShapeRotateGame;
 use crate::game::{Difficulty, Game};
 
-pub(super) const MENU_ITEMS: [&str; 15] = [
+pub(super) const MENU_ITEMS: [&str; 16] = [
     "図形回転判定",
     "鏡像判定",
     "イロピッタン",
@@ -30,6 +31,8 @@ pub(super) const MENU_ITEMS: [&str; 15] = [
     "TTR",
     "ハヤウチ",
     "べー",
+    // 仮名称。表示名はゲーム側のDISPLAY_NAMEで一元管理する
+    look_away::DISPLAY_NAME,
     "ジュークボックス",
     "履歴",
 ];
@@ -48,6 +51,8 @@ pub(super) const RHYTHM_ITEM_INDEX: usize = 10;
 pub(super) const QUICK_DRAW_ITEM_INDEX: usize = 11;
 /// べー
 pub(super) const BEIGOMA_ITEM_INDEX: usize = 12;
+/// ヤッホー(表示名は仮名称。look_away::DISPLAY_NAMEを参照)
+pub(super) const LOOK_AWAY_ITEM_INDEX: usize = 13;
 pub(super) const JUKEBOX_ITEM_INDEX: usize = MENU_ITEMS.len() - 2;
 pub(super) const HISTORY_ITEM_INDEX: usize = MENU_ITEMS.len() - 1;
 
@@ -66,6 +71,7 @@ pub(super) const MENU_DESCRIPTIONS: [&str; MENU_ITEMS.len()] = [
     "矢印キーで曲に合わせてステップする",
     "合図が出たら即座に反応する",
     "軽トラの揺れに耐えてベーゴマをゴールへ運ぶ",
+    "指さして「ヤー!!」と叫んだ方の逆を向く",
     "BGMを選んで聴く",
     "ゲームごとの反応時間の推移を見る",
 ];
@@ -85,6 +91,7 @@ pub(super) const MENU_ICON_PATHS: [&str; MENU_ITEMS.len()] = [
     "menu_icons/rhythm.png",
     "menu_icons/quick_draw.png",
     "menu_icons/beigoma.png",
+    "menu_icons/look_away.png",
     "menu_icons/jukebox.png",
     "menu_icons/history.png",
 ];
@@ -109,6 +116,8 @@ pub(super) fn new_game(item: usize, difficulty: Difficulty) -> Box<dyn Game> {
         QUICK_DRAW_ITEM_INDEX => Box::new(QuickDrawGame::new()),
         // べーは難易度を持たず、ROUND1・ROUND2が固定の内容で進む
         BEIGOMA_ITEM_INDEX => Box::new(BeigomaGame::new()),
+        // ヤッホーは難易度を持たず、10問固定(ライフ制)で進む
+        LOOK_AWAY_ITEM_INDEX => Box::new(LookAwayGame::new()),
         _ => unreachable!("history is handled without creating a game"),
     }
 }
@@ -226,6 +235,7 @@ mod tests {
             "rhythm.png",
             "quick_draw.png",
             "beigoma.png",
+            "look_away.png",
             "jukebox.png",
             "history.png",
         ];
@@ -288,10 +298,10 @@ mod tests {
     }
 
     #[test]
-    fn beigoma_comes_right_after_quick_draw_and_before_jukebox() {
+    fn beigoma_comes_right_after_quick_draw_and_before_look_away() {
         assert_eq!(MENU_ITEMS[BEIGOMA_ITEM_INDEX], "べー");
         assert_eq!(QUICK_DRAW_ITEM_INDEX + 1, BEIGOMA_ITEM_INDEX);
-        assert_eq!(BEIGOMA_ITEM_INDEX + 1, JUKEBOX_ITEM_INDEX);
+        assert_eq!(BEIGOMA_ITEM_INDEX + 1, LOOK_AWAY_ITEM_INDEX);
         assert_eq!(
             MENU_ICON_PATHS[BEIGOMA_ITEM_INDEX],
             "menu_icons/beigoma.png"
@@ -309,6 +319,47 @@ mod tests {
             let result = new_game(BEIGOMA_ITEM_INDEX, difficulty).result();
             assert_eq!(result.game_id, crate::game::beigoma::GAME_ID);
             assert_eq!(result.difficulty, crate::game::beigoma::SESSION_DIFFICULTY);
+        }
+    }
+
+    #[test]
+    fn look_away_comes_right_after_beigoma_and_before_jukebox() {
+        // 表示名は仮名称なので、文字列を直書きせずゲーム側の定数で確かめる
+        assert_eq!(
+            MENU_ITEMS[LOOK_AWAY_ITEM_INDEX],
+            crate::game::look_away::DISPLAY_NAME
+        );
+        assert_eq!(BEIGOMA_ITEM_INDEX + 1, LOOK_AWAY_ITEM_INDEX);
+        assert_eq!(LOOK_AWAY_ITEM_INDEX + 1, JUKEBOX_ITEM_INDEX);
+        assert_eq!(
+            MENU_ICON_PATHS[LOOK_AWAY_ITEM_INDEX],
+            "menu_icons/look_away.png"
+        );
+    }
+
+    #[test]
+    fn look_away_description_does_not_repeat_the_tentative_name() {
+        // 改名時に説明文まで直さずに済むよう、説明文に表示名を入れない
+        assert!(
+            !MENU_DESCRIPTIONS[LOOK_AWAY_ITEM_INDEX].contains(crate::game::look_away::DISPLAY_NAME)
+        );
+        assert!(!MENU_DESCRIPTIONS[LOOK_AWAY_ITEM_INDEX].is_empty());
+    }
+
+    #[test]
+    fn new_game_for_look_away_item_creates_look_away() {
+        // 難易度を選ばないので、渡した難易度によらず代表値の難易度で記録する
+        for difficulty in [
+            Difficulty::Beginner,
+            Difficulty::Intermediate,
+            Difficulty::Advanced,
+        ] {
+            let result = new_game(LOOK_AWAY_ITEM_INDEX, difficulty).result();
+            assert_eq!(result.game_id, crate::game::look_away::GAME_ID);
+            assert_eq!(
+                result.difficulty,
+                crate::game::look_away::SESSION_DIFFICULTY
+            );
         }
     }
 }

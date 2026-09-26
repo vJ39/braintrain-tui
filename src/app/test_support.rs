@@ -252,7 +252,7 @@ pub(super) fn finish_countdown(app: &mut App) {
 pub(super) const LONG_ENOUGH: Duration = Duration::from_secs(60);
 
 /// 画像がまだ生成されていないアイコン(読めない間はカードのアイコン部分が空白になる)
-pub(super) const PENDING_MENU_ICONS: [&str; 0] = [];
+pub(super) const PENDING_MENU_ICONS: [&str; 1] = ["menu_icons/look_away.png"];
 
 // --- 画像 ---
 
