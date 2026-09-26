@@ -36,8 +36,10 @@ pub enum SeKind {
 pub enum BgmCategory {
     Menu,
     Playing,
-    /// ゲーム終了後のリザルト画面
+    /// ゲーム終了後のリザルト画面(成功・GAME OVER以外)
     Result,
+    /// ゲーム終了後のリザルト画面(GAME OVER、1問も正解できずに終わった時)
+    ResultFailure,
     /// リズムゲームの楽曲。再生は譜面と対応する曲をトラック名で直接指定するため
     /// ランダム選曲には使わず、曲データとassetsの対応確認(テスト)で参照する
     #[cfg_attr(not(test), allow(dead_code))]
@@ -52,6 +54,7 @@ impl BgmCategory {
             BgmCategory::Menu => "menu/",
             BgmCategory::Playing => "playing/",
             BgmCategory::Result => "result/",
+            BgmCategory::ResultFailure => "result_failure/",
             BgmCategory::Rhythm => "rhythm/",
             BgmCategory::RhythmSplash => "rhythm_splash/",
         }
@@ -593,6 +596,12 @@ mod tests {
     fn bgm_tracks_in_result_has_new_personal_best_only() {
         let names = bgm_tracks_in(BgmCategory::Result);
         assert_eq!(names, vec!["New_Personal_Best".to_string()]);
+    }
+
+    #[test]
+    fn bgm_tracks_in_result_failure_has_pondus_mundi_only() {
+        let names = bgm_tracks_in(BgmCategory::ResultFailure);
+        assert_eq!(names, vec!["Pondus_Mundi".to_string()]);
     }
 
     #[test]

@@ -371,7 +371,12 @@ impl App {
     /// ゲーム終了後、リザルト画面へ進む(キー/クリック共通)。リザルト用BGMに切り替える。
     /// 履歴への保存はここで1回だけ行う(描画のたびに保存し直さない)
     fn enter_result(&mut self, result: GameResult) {
-        if let Some(name) = audio::random_bgm_track(BgmCategory::Result) {
+        let category = if result.is_game_over() {
+            BgmCategory::ResultFailure
+        } else {
+            BgmCategory::Result
+        };
+        if let Some(name) = audio::random_bgm_track(category) {
             audio::play_bgm_track(&name);
             self.current_bgm = Some(name);
         }
@@ -1391,8 +1396,11 @@ fn render_result(
     let text = typewriter::truncate_lines_keep_width(&lines, typing.visible_chars());
     let content_height = text.len() as u16;
     let card = result_card_rect(inner, content_height);
-    // キャラクターはカードの左側の余白に描く(余白が狭ければsprite側で省略する)
-    sprite.render(frame, inner, card);
+    // キャラクターはカードの左側の余白に描く(余白が狭ければsprite側で省略する)。
+    // GAME OVERの時は踊っているように見えてしまうため描かない
+    if !result.is_game_over() {
+        sprite.render(frame, inner, card);
+    }
     let paragraph = Paragraph::new(text)
         .alignment(Alignment::Center)
         .block(theme::sub_panel());
@@ -4204,6 +4212,43 @@ mod tests {
         app.show_result(sample_result(), None);
         assert_eq!(app.result_sprite.elapsed(), Duration::ZERO, "入るたびに最初のコマから");
         assert_eq!(app.result_sprite.current_frame(), 0);
+    }
+
+    /// 1問以上あって全問不正解(GAME OVER)なGameResult
+    fn game_over_result() -> GameResult {
+        let mut result = sample_result();
+        result.total = 5;
+        result.correct = 0;
+        result
+    }
+
+    #[test]
+    fn game_over_result_does_not_draw_the_sprite() {
+        let (width, height) = (120u16, 40u16);
+        let mut app = App::new();
+        app.show_result(game_over_result(), None);
+        app.update(LONG_ENOUGH);
+        let without_sprite = rendered_buffer(&mut app, width, height);
+        app.result_sprite = halfblocks_sprite();
+        let with_sprite_configured = rendered_buffer(&mut app, width, height);
+        assert_eq!(
+            without_sprite, with_sprite_configured,
+            "GAME OVERでは、キャラクターを描けるsprite構成でも描画結果が変わらない(描かれない)"
+        );
+    }
+
+    #[test]
+    fn game_over_switches_bgm_to_result_failure_category() {
+        let mut app = App::new();
+        app.enter_result(game_over_result());
+        assert_eq!(app.current_bgm.as_deref(), Some("Pondus_Mundi"));
+    }
+
+    #[test]
+    fn non_game_over_result_still_uses_the_regular_result_bgm() {
+        let mut app = App::new();
+        app.enter_result(sample_result());
+        assert_eq!(app.current_bgm.as_deref(), Some("New_Personal_Best"));
     }
 
     #[test]

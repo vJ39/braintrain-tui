@@ -104,6 +104,14 @@ pub struct GameResult {
     pub played_at: DateTime<Utc>,
 }
 
+impl GameResult {
+    /// GAME OVER(1問も正解できずに終わった)かどうか。プレイ前のダミー結果(total==0)は
+    /// GAME OVER扱いにしない
+    pub fn is_game_over(&self) -> bool {
+        self.total > 0 && self.correct == 0
+    }
+}
+
 /// 正誤とレイテンシの記録を積み上げ、GameResultにまとめる共通ヘルパー
 #[derive(Debug)]
 pub struct ScoreTracker {
@@ -176,6 +184,21 @@ impl ScoreTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_game_over_is_true_only_when_played_and_scored_zero() {
+        let mut tracker = ScoreTracker::new();
+        let untouched = tracker.to_result("test_game", Difficulty::Beginner);
+        assert!(!untouched.is_game_over(), "プレイ前(total==0)はGAME OVERではない");
+
+        tracker.record(false, 100.0);
+        let all_wrong = tracker.to_result("test_game", Difficulty::Beginner);
+        assert!(all_wrong.is_game_over(), "1問以上あって全問不正解ならGAME OVER");
+
+        tracker.record(true, 50.0);
+        let some_correct = tracker.to_result("test_game", Difficulty::Beginner);
+        assert!(!some_correct.is_game_over(), "1問でも正解していればGAME OVERではない");
+    }
 
     #[test]
     fn tracker_computes_average_latency() {
