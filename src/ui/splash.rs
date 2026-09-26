@@ -17,8 +17,6 @@ struct ImageAssets;
 pub const TITLE_IMAGE_PATH: &str = "title.jpeg";
 /// TTR(リズムゲーム)の曲選択前に挟むスプラッシュ画面の画像
 pub const TTR_SPLASH_IMAGE_PATH: &str = "ttr_splash.jpeg";
-/// 「べー」開始前に挟むスプラッシュ画面の画像
-pub const BEIGOMA_SPLASH_IMAGE_PATH: &str = "beigoma_splash.jpeg";
 
 /// 画像プロトコル非対応端末で画像の代わりに出すテキスト
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +116,7 @@ impl SplashRenderer {
 
 /// 画像(size, px)をareaの中央に、縦横比を保って収まる最大の大きさで配置するRect。
 /// areaが空なら空のRectを返す
-fn centered_image_rect(area: Rect, size: (u32, u32), font_size: (u16, u16)) -> Rect {
+pub(crate) fn centered_image_rect(area: Rect, size: (u32, u32), font_size: (u16, u16)) -> Rect {
     if area.width == 0 || area.height == 0 {
         return Rect::new(area.x, area.y, 0, 0);
     }
@@ -151,7 +149,7 @@ fn centered_rect_vertically(area: Rect, height: u16) -> Rect {
     )
 }
 
-fn render_fallback(frame: &mut Frame, area: Rect, fallback: FallbackText) {
+pub(crate) fn render_fallback(frame: &mut Frame, area: Rect, fallback: FallbackText) {
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -195,16 +193,8 @@ mod tests {
     }
 
     #[test]
-    fn beigoma_splash_image_asset_is_embedded() {
-        assert!(
-            ImageAssets::get(BEIGOMA_SPLASH_IMAGE_PATH).is_some(),
-            "assets/image/beigoma_splash.jpegが埋め込まれていること"
-        );
-    }
-
-    #[test]
     fn embedded_splash_images_can_be_decoded() {
-        for path in [TITLE_IMAGE_PATH, TTR_SPLASH_IMAGE_PATH, BEIGOMA_SPLASH_IMAGE_PATH] {
+        for path in [TITLE_IMAGE_PATH, TTR_SPLASH_IMAGE_PATH] {
             let file = ImageAssets::get(path).expect("埋め込まれていること");
             assert!(
                 image::load_from_memory(&file.data).is_ok(),
@@ -344,7 +334,6 @@ mod tests {
         for (path, fallback) in [
             (TITLE_IMAGE_PATH, TITLE_FALLBACK),
             (TTR_SPLASH_IMAGE_PATH, TTR_FALLBACK),
-            (BEIGOMA_SPLASH_IMAGE_PATH, BEIGOMA_FALLBACK),
         ] {
             let mut renderer = SplashRenderer::new(path, fallback);
             let backend = TestBackend::new(80, 24);

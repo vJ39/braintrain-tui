@@ -27,6 +27,7 @@ use crate::stats::store;
 use crate::ui::background::BackgroundRenderer;
 use crate::ui::countdown::{self, CountdownState};
 use crate::ui::menu_icons::MenuIcons;
+use crate::ui::beigoma_splash_anim::AnimatedSplash;
 use crate::ui::result_sprite::ResultSprite;
 use crate::ui::splash::{self, SplashRenderer};
 use crate::ui::typewriter::{self, Typewriter};
@@ -150,8 +151,8 @@ pub struct App {
     splash_renderer: SplashRenderer,
     /// 曲選択画面(Screen::SelectSong)の背景に描くTTRスプラッシュ画像用
     ttr_splash_renderer: SplashRenderer,
-    /// 「べー」開始前のスプラッシュ画面(Screen::BeigomaSplash)用
-    beigoma_splash_renderer: SplashRenderer,
+    /// 「べー」開始前のスプラッシュ画面(Screen::BeigomaSplash)用のコマ送りアニメーション
+    beigoma_splash_renderer: AnimatedSplash,
     /// メニューへ戻った直後にtrueになる。main.rsがtake_pending_scrollback_clear()で
     /// 検知して端末のスクロールバッファをクリアする(画像プロトコルの残留対策)
     pending_scrollback_clear: bool,
@@ -185,10 +186,7 @@ impl App {
                 splash::TTR_SPLASH_IMAGE_PATH,
                 splash::TTR_FALLBACK,
             ),
-            beigoma_splash_renderer: SplashRenderer::new(
-                splash::BEIGOMA_SPLASH_IMAGE_PATH,
-                splash::BEIGOMA_FALLBACK,
-            ),
+            beigoma_splash_renderer: AnimatedSplash::new(splash::BEIGOMA_FALLBACK),
             pending_scrollback_clear: false,
             // 画面に入る時(enter_menu/show_result)にリセットするので、それまでは表示済みにしておく
             menu_typewriter: Typewriter::completed(MENU_CHAR_INTERVAL),
@@ -421,6 +419,7 @@ impl App {
             // べーは難易度選択の代わりに専用スプラッシュ画面を挟む(TTRと同じ仕組み)。
             // Enter/クリックでstart_beigoma()が呼ばれ、ROUND1のカウントダウンから始まる
             audio::play_se(SeKind::Transition);
+            self.beigoma_splash_renderer.reset();
             self.screen = Screen::BeigomaSplash;
             return;
         }
@@ -652,6 +651,7 @@ impl App {
                 self.result_typewriter.tick(dt);
                 self.result_sprite.tick(dt);
             }
+            Screen::BeigomaSplash => self.beigoma_splash_renderer.tick(dt),
             _ => {}
         }
     }
