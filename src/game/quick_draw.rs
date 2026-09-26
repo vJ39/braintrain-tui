@@ -21,7 +21,7 @@ use crate::game::feedback::AnswerFeedback;
 use crate::game::mark_display::{compose_glyph_image, glyph_area, MarkRenderer};
 use crate::game::theme;
 use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
-use crate::ui::countdown::{self, CountdownState};
+use crate::ui::countdown::{self, CountdownState, GoSeOnce};
 
 pub const GAME_ID: &str = "quick_draw";
 
@@ -309,6 +309,8 @@ pub struct QuickDrawGame {
     /// テスト用: 鳴らしたSEの記録(音は端末で確かめられないため)
     #[cfg(test)]
     se_log: Vec<SeKind>,
+    /// カウントダウンの「GO!!」の音を1問目だけ鳴らすためのゲート
+    go_se: GoSeOnce,
 }
 
 impl QuickDrawGame {
@@ -325,6 +327,7 @@ impl QuickDrawGame {
             feint_renderer: SignalRenderer::new(FEINT_PNG),
             #[cfg(test)]
             se_log: Vec::new(),
+            go_se: GoSeOnce::new(),
         };
         game.start_round();
         game
@@ -343,7 +346,9 @@ impl QuickDrawGame {
         let state = CountdownState::new();
         // 最初のフェーズ「3」の音
         if let Some(phase) = state.phase() {
-            self.play_se(phase.se());
+            if let Some(se) = self.go_se.se_for(phase) {
+                self.play_se(se);
+            }
         }
         self.phase = Phase::Countdown { state };
     }
@@ -510,7 +515,9 @@ impl Game for QuickDrawGame {
         match &mut self.phase {
             Phase::Countdown { state } => {
                 if let Some(phase) = state.tick(dt) {
-                    ses_to_play.push(phase.se());
+                    if let Some(se) = self.go_se.se_for(phase) {
+                        ses_to_play.push(se);
+                    }
                 }
                 if state.is_finished() {
                     let mut rng = rand::thread_rng();
@@ -643,10 +650,14 @@ mod tests {
         game.phase = Phase::Signal { shown_at };
     }
 
-    /// ラウンド冒頭のカウントダウンを最後まで進め、合図待ちにする
+    /// ラウンド冒頭のカウントダウンを最後まで進め、合図待ちにする。フェーズ(PHASE_DURATION)
+    /// ごとに分けて進める(実機のフレームループと同じく、一度に全部進めるとGO!!への遷移自体を
+    /// 検出できずSEが鳴らないため)
     fn finish_countdown(game: &mut QuickDrawGame) {
         assert!(is_countdown(game), "カウントダウン中のはず");
-        game.update(COUNTDOWN_TOTAL);
+        for _ in 0..(COUNTDOWN_TOTAL.as_millis() / countdown_ui::PHASE_DURATION.as_millis()) {
+            game.update(countdown_ui::PHASE_DURATION);
+        }
         assert!(
             matches!(game.phase, Phase::Waiting { .. }),
             "カウントダウンが終わったら合図待ち"
@@ -1615,10 +1626,38 @@ mod tests {
         clear_se_log(&mut game);
         finish_countdown(&mut game);
         assert_eq!(
-            game.se_log,
-            vec![SeKind::QuickDrawReady],
-            "「まだ撃つな」に入る瞬間の構えの音"
+            game.se_log.last(),
+            Some(&SeKind::QuickDrawReady),
+            "「まだ撃つな」に入る瞬間の構えの音: {:?}",
+            game.se_log
         );
+    }
+
+    #[test]
+    fn go_se_plays_on_the_first_countdown_only() {
+        let mut game = QuickDrawGame::new();
+        clear_se_log(&mut game);
+        finish_countdown(&mut game);
+        assert_eq!(
+            game.se_log.iter().filter(|&&se| se == SeKind::CountdownGo).count(),
+            1,
+            "1問目のGO!!では鳴らす: {:?}",
+            game.se_log
+        );
+        // 2問目以降はGO!!の音を鳴らさない
+        for _ in 0..3 {
+            show_signal_since(&mut game, ms(200));
+            game.handle_key(key(KeyCode::Enter));
+            finish_result(&mut game);
+            clear_se_log(&mut game);
+            finish_countdown(&mut game);
+            assert_eq!(
+                game.se_log.iter().filter(|&&se| se == SeKind::CountdownGo).count(),
+                0,
+                "2問目以降のGO!!は鳴らさない: {:?}",
+                game.se_log
+            );
+        }
     }
 
     #[test]

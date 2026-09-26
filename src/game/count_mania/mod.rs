@@ -28,7 +28,7 @@ use crate::audio::{self, SeKind};
 use crate::game::feedback::AnswerFeedback;
 use crate::game::theme;
 use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
-use crate::ui::countdown::{self, CountdownState};
+use crate::ui::countdown::{self, CountdownState, GoSeOnce};
 
 use circle_image::{BoardCircle, BoardFish, CircleRenderer};
 use fish::Fish;
@@ -500,6 +500,8 @@ pub struct CountManiaGame {
     fish_board: Option<Rect>,
     /// 直前に描いた盤面。update(dt)は描画エリアを受け取らないので、魚を泳がせる範囲をここから取る
     last_board: Cell<Option<Rect>>,
+    /// カウントダウンの「GO!!」の音をROUND1だけ鳴らすためのゲート
+    go_se: GoSeOnce,
 }
 
 /// ゲームの描画エリアのうち、円を並べるボード(枠の内側)。renderとhandle_mouseで共有する
@@ -528,6 +530,7 @@ impl CountManiaGame {
             fish: Vec::new(),
             fish_board: None,
             last_board: Cell::new(None),
+            go_se: GoSeOnce::new(),
         };
         // ROUND1もカウントダウンから始める
         game.start_countdown();
@@ -539,7 +542,9 @@ impl CountManiaGame {
         let state = CountdownState::new();
         // 最初のフェーズ「3」の音
         if let Some(phase) = state.phase() {
-            audio::play_se(phase.se());
+            if let Some(se) = self.go_se.se_for(phase) {
+                audio::play_se(se);
+            }
         }
         self.countdown = Some(state);
     }
@@ -979,7 +984,9 @@ impl Game for CountManiaGame {
         // カウントダウン中はラウンドの時間を数えない。GO!!が終わったらプレイに入る
         if let Some(state) = self.countdown.as_mut() {
             if let Some(phase) = state.tick(dt) {
-                audio::play_se(phase.se());
+                if let Some(se) = self.go_se.se_for(phase) {
+                    audio::play_se(se);
+                }
             }
             if state.is_finished() {
                 self.countdown = None;
@@ -1109,10 +1116,14 @@ mod tests {
             .phase()
     }
 
-    /// ラウンド冒頭のカウントダウンを最後まで進め、プレイ中にする
+    /// ラウンド冒頭のカウントダウンを最後まで進め、プレイ中にする。フェーズ(PHASE_DURATION)
+    /// ごとに分けて進める(実機のフレームループと同じく、一度に全部進めるとGO!!への遷移自体を
+    /// 検出できずSEが鳴らないため)
     fn finish_countdown(game: &mut CountManiaGame) {
         assert!(is_countdown(game), "カウントダウン中のはず");
-        game.update(COUNTDOWN_TOTAL);
+        for _ in 0..(COUNTDOWN_TOTAL.as_millis() / PHASE_DURATION.as_millis()) {
+            game.update(PHASE_DURATION);
+        }
         assert!(!is_countdown(game), "カウントダウンが終わったらプレイ中");
     }
 

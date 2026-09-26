@@ -94,6 +94,32 @@ impl CountdownState {
     }
 }
 
+/// カウントダウンの「GO!!」の音(SeKind::CountdownGo)を、ラウンド・問題ごとに自前のカウントダウンを
+/// 持つゲームで、セッション中の最初の1回だけ鳴らすためのゲート。2回目以降のカウントダウンでは
+/// 「3」「2」「1」の音は毎回鳴らし、「GO!!」の音だけ鳴らさない
+pub struct GoSeOnce {
+    played: bool,
+}
+
+impl GoSeOnce {
+    pub fn new() -> Self {
+        Self { played: false }
+    }
+
+    /// このフェーズに入った時に鳴らすべきSE。「GO!!」は最初の1回のみSomeで、以降はNone
+    pub fn se_for(&mut self, phase: Phase) -> Option<SeKind> {
+        if phase != Phase::Go {
+            return Some(phase.se());
+        }
+        if self.played {
+            None
+        } else {
+            self.played = true;
+            Some(phase.se())
+        }
+    }
+}
+
 /// 大きな文字の1ドットを横に何セルで描くか。端末のセルは縦長なので2セルで正方形に近づける
 const DOT_WIDTH: u16 = 2;
 /// グリフ1文字の縦・横のドット数
@@ -211,6 +237,16 @@ mod tests {
         assert_eq!(Phase::Two.se(), SeKind::Transition);
         assert_eq!(Phase::One.se(), SeKind::Transition);
         assert_eq!(Phase::Go.se(), SeKind::CountdownGo);
+    }
+
+    #[test]
+    fn go_se_once_plays_go_the_first_time_then_suppresses_it() {
+        let mut gate = GoSeOnce::new();
+        assert_eq!(gate.se_for(Phase::Three), Some(SeKind::Transition));
+        assert_eq!(gate.se_for(Phase::Go), Some(SeKind::CountdownGo), "1回目は鳴らす");
+        assert_eq!(gate.se_for(Phase::Three), Some(SeKind::Transition), "3.2.1は毎回鳴らす");
+        assert_eq!(gate.se_for(Phase::Go), None, "2回目以降は鳴らさない");
+        assert_eq!(gate.se_for(Phase::Go), None, "3回目以降も鳴らさない");
     }
 
     #[test]

@@ -22,7 +22,7 @@ use crate::game::feedback::AnswerFeedback;
 use crate::game::mark_display::MarkRenderer;
 use crate::game::theme;
 use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
-use crate::ui::countdown::{self, CountdownState};
+use crate::ui::countdown::{self, CountdownState, GoSeOnce};
 
 /// メニュー・HUD・リザルトに出す表示名(仮名称)。改名する時はここだけを変える
 pub const DISPLAY_NAME: &str = "ヤッホー";
@@ -265,6 +265,8 @@ pub struct LookAwayGame {
     feedback: AnswerFeedback,
     /// 結果表示(◯/✗の大表示)の描画器
     mark_renderer: MarkRenderer,
+    /// カウントダウンの「GO!!」の音を1問目だけ鳴らすためのゲート
+    go_se: GoSeOnce,
 }
 
 /// 結果表示(◯/✗)のエリアを塗る色。画像表示の時は画像の背景と周りのセルを同じ色で塗れる
@@ -305,6 +307,7 @@ impl LookAwayGame {
             finished: false,
             feedback: AnswerFeedback::new(),
             mark_renderer: MarkRenderer::new(),
+            go_se: GoSeOnce::new(),
         };
         game.start_round();
         game
@@ -331,7 +334,9 @@ impl LookAwayGame {
         let state = CountdownState::new();
         // 最初のフェーズ「3」の音
         if let Some(phase) = state.phase() {
-            audio::play_se(phase.se());
+            if let Some(se) = self.go_se.se_for(phase) {
+                audio::play_se(se);
+            }
         }
         self.phase = Phase::Countdown { state };
     }
@@ -380,7 +385,9 @@ impl LookAwayGame {
         match &mut self.phase {
             Phase::Countdown { state } => {
                 if let Some(phase) = state.tick(dt) {
-                    audio::play_se(phase.se());
+                    if let Some(se) = self.go_se.se_for(phase) {
+                        audio::play_se(se);
+                    }
                 }
                 if state.is_finished() {
                     self.phase = Phase::Idle {
@@ -656,10 +663,14 @@ mod tests {
         matches!(game.phase, Phase::Result { is_correct, .. } if is_correct == correct)
     }
 
-    /// 問題冒頭のカウントダウンを最後まで進め、待機にする
+    /// 問題冒頭のカウントダウンを最後まで進め、待機にする。フェーズ(PHASE_DURATION)ごとに
+    /// 分けて進める(実機のフレームループと同じく、一度に全部進めるとGO!!への遷移自体を
+    /// 検出できずSEが鳴らないため)
     fn finish_countdown(game: &mut LookAwayGame) {
         assert!(is_countdown(game), "カウントダウン中のはず");
-        game.update(COUNTDOWN_TOTAL);
+        for _ in 0..(COUNTDOWN_TOTAL.as_millis() / PHASE_DURATION.as_millis()) {
+            game.update(PHASE_DURATION);
+        }
         assert!(
             matches!(game.phase, Phase::Idle { .. }),
             "カウントダウンが終わったら待機"

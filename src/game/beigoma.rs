@@ -34,7 +34,7 @@ use ratatui::Frame;
 use crate::audio::{self, SeKind};
 use crate::game::theme;
 use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
-use crate::ui::countdown::{self, CountdownState};
+use crate::ui::countdown::{self, CountdownState, GoSeOnce};
 
 use board::{
     round_params, Board, Landing, RoundParams, StepEvent, Tilt, TiltKey, Top, ROUNDS_PER_SESSION,
@@ -294,6 +294,8 @@ pub struct BeigomaGame {
     /// テスト用: 鳴らしたSEの記録(音は端末で確かめられないため)
     #[cfg(test)]
     se_log: Vec<SeKind>,
+    /// カウントダウンの「GO!!」の音をROUND1だけ鳴らすためのゲート
+    go_se: GoSeOnce,
 }
 
 impl BeigomaGame {
@@ -322,6 +324,7 @@ impl BeigomaGame {
             truck_view: TruckViewRenderer::new(),
             #[cfg(test)]
             se_log: Vec::new(),
+            go_se: GoSeOnce::new(),
         };
         game.start_round(0);
         game
@@ -356,7 +359,9 @@ impl BeigomaGame {
         let state = CountdownState::new();
         // 最初のフェーズ「3」の音
         if let Some(phase) = state.phase() {
-            self.play_se(phase.se());
+            if let Some(se) = self.go_se.se_for(phase) {
+                self.play_se(se);
+            }
         }
         self.status = Status::Countdown { state };
     }
@@ -619,7 +624,9 @@ impl Game for BeigomaGame {
                 let phase = state.tick(dt);
                 let finished = state.is_finished();
                 if let Some(phase) = phase {
-                    self.play_se(phase.se());
+                    if let Some(se) = self.go_se.se_for(phase) {
+                        self.play_se(se);
+                    }
                 }
                 if finished {
                     self.drop_top();
@@ -749,10 +756,14 @@ mod tests {
         }
     }
 
-    /// カウントダウンを最後まで進めて、ベーゴマを投入させる
+    /// カウントダウンを最後まで進めて、ベーゴマを投入させる。フェーズ(PHASE_DURATION)ごとに
+    /// 分けて進める(実機のフレームループと同じく、一度に全部進めるとGO!!への遷移自体を
+    /// 検出できずSEが鳴らないため)
     fn finish_countdown(game: &mut BeigomaGame) {
         assert!(is_countdown(game), "カウントダウン中のはず");
-        game.update(COUNTDOWN_TOTAL);
+        for _ in 0..(COUNTDOWN_TOTAL.as_millis() / PHASE_DURATION.as_millis()) {
+            game.update(PHASE_DURATION);
+        }
         assert!(is_playing(game), "GO!!の後はプレイ中のはず");
     }
 
@@ -2158,6 +2169,32 @@ mod tests {
         game.on_step_event(StepEvent::Landed(Landing::Bounce));
         assert_eq!(game.se_log, vec![SeKind::Incorrect]);
         assert_eq!(game.outcome(), None);
+    }
+
+    #[test]
+    fn go_se_plays_on_round1_countdown() {
+        let mut game = calm_game_before_go();
+        clear_se_log(&mut game);
+        finish_countdown(&mut game);
+        assert_eq!(
+            count_se(&game, SeKind::CountdownGo),
+            1,
+            "ROUND1のGO!!では鳴らす"
+        );
+    }
+
+    #[test]
+    fn go_se_does_not_play_again_on_round2_countdown() {
+        let mut game = calm_game();
+        clear_se_log(&mut game);
+        clear_round(&mut game);
+        game.update(END_HOLD);
+        finish_countdown(&mut game);
+        assert_eq!(
+            count_se(&game, SeKind::CountdownGo),
+            0,
+            "2回目以降のROUNDのGO!!は鳴らさない"
+        );
     }
 
     #[test]
