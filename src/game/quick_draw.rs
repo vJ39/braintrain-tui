@@ -34,6 +34,16 @@ pub const SESSION_DIFFICULTY: Difficulty = Difficulty::Advanced;
 /// 各ラウンドで超短時間パターンを選ぶ確率
 pub const VERY_SHORT_RATE: f64 = 0.2;
 
+/// フェイントを入れる対象になるのは、この番目(0始まり)以降のラウンド(後半のみ)
+pub const FEINT_MIN_ROUND_INDEX: u32 = ROUNDS_PER_SESSION / 2;
+/// 対象ラウンドでフェイントを入れる確率
+pub const FEINT_RATE: f64 = 0.5;
+/// フェイント表示の持続時間
+pub const FEINT_DURATION: Duration = Duration::from_millis(300);
+/// フェイントの背景色。本物の合図(SIGNAL_BG、明るい緑)と紛らわしいが、
+/// 見比べれば分かる程度にくすんだ黄緑にする
+pub const FEINT_BG: Color = Color::Rgb(150, 180, 40);
+
 /// 待機中の背景(暗いグレー)
 pub const WAITING_BG: Color = Color::Rgb(48, 48, 48);
 /// 合図の背景(明るい緑)
@@ -222,12 +232,39 @@ fn random_wait(rng: &mut impl Rng, pattern: WaitPattern) -> Duration {
     Duration::from_millis(rng.gen_range(min.as_millis() as u64..=max.as_millis() as u64))
 }
 
+/// この待機時間remainingのラウンドにフェイントを入れるか決める。
+/// 後半(round_index >= FEINT_MIN_ROUND_INDEX)のラウンドのみ対象で、フェイント表示
+/// (FEINT_DURATION)を挟んでも合図までまだ間が残る(remaining >= FEINT_DURATION * 2)ことが条件
+fn should_feint(round_index: u32, remaining: Duration, rng: &mut impl Rng) -> bool {
+    round_index >= FEINT_MIN_ROUND_INDEX
+        && remaining >= FEINT_DURATION * 2
+        && rng.gen_bool(FEINT_RATE)
+}
+
+/// 待機時間remainingの中で、フェイントを始めるまでの残り時間(合図までの残り時間基準)を決める。
+/// 待機の30%が過ぎた頃から、フェイントが終わってもまだ合図まで間がある範囲でランダムに選ぶ
+fn feint_delay(rng: &mut impl Rng, remaining: Duration) -> Duration {
+    let low = remaining.mul_f64(0.3).as_millis() as u64;
+    let high = (remaining - FEINT_DURATION).as_millis() as u64;
+    Duration::from_millis(rng.gen_range(low..=high.max(low)))
+}
+
 /// ラウンド内の状態
 enum Phase {
     /// ラウンド冒頭の「3.2.1.GO!!」。終わると合図待ちへ進む
     Countdown { state: CountdownState },
-    /// 合図待ち。残りの待機時間
-    Waiting { remaining: Duration },
+    /// 合図待ち。残りの待機時間と、フェイントを始めるまでの残り時間
+    /// (Noneならこのラウンドはフェイント無し)
+    Waiting {
+        remaining: Duration,
+        feint_at: Option<Duration>,
+    },
+    /// フェイント表示中。本物の合図と同じ見出しを紛らわしい色で一瞬出し、フライングを誘う。
+    /// 終わったらresume_waitingの残り時間でWaitingへ戻る(1ラウンドにつき最大1回)
+    Feint {
+        remaining: Duration,
+        resume_waiting: Duration,
+    },
     /// 合図が出ている。合図が出た時刻
     Signal { shown_at: Instant },
     /// 押した後の結果表示。成功時のみ反応時間(ms)を持つ。
@@ -287,7 +324,7 @@ impl QuickDrawGame {
             return;
         }
         let (is_correct, latency_ms) = match &self.phase {
-            Phase::Countdown { .. } | Phase::Waiting { .. } => {
+            Phase::Countdown { .. } | Phase::Waiting { .. } | Phase::Feint { .. } => {
                 self.tracker.record(false, self.pattern.fail_latency_ms());
                 self.feedback.record(false, "フライング");
                 audio::play_se(SeKind::Incorrect);
@@ -327,6 +364,8 @@ impl QuickDrawGame {
             Phase::Waiting { .. } => (WAITING_BG, WAITING_TEXT.to_string(), theme::TEXT, true),
             // 合図は文字間を広げて単独表示し、操作説明を消して見出しだけに注目を集める
             Phase::Signal { .. } => (SIGNAL_BG, signal_headline(), Color::Black, false),
+            // フェイントは本物の合図と同じ見出しだが、色を変えて紛らわしくする
+            Phase::Feint { .. } => (FEINT_BG, signal_headline(), Color::Black, false),
             Phase::Countdown { .. } | Phase::Result { .. } => unreachable!("上で処理済み"),
         };
         let block = Block::default()
@@ -337,7 +376,7 @@ impl QuickDrawGame {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        if matches!(self.phase, Phase::Signal { .. })
+        if matches!(self.phase, Phase::Signal { .. } | Phase::Feint { .. })
             && self.signal_renderer.render(frame, inner, background)
         {
             return;
@@ -429,20 +468,51 @@ impl Game for QuickDrawGame {
                     audio::play_se(phase.se());
                 }
                 if state.is_finished() {
-                    self.phase = Phase::Waiting {
-                        remaining: random_wait(&mut rand::thread_rng(), self.pattern),
+                    let mut rng = rand::thread_rng();
+                    let remaining = random_wait(&mut rng, self.pattern);
+                    let feint_at = should_feint(self.tracker.total(), remaining, &mut rng)
+                        .then(|| feint_delay(&mut rng, remaining));
+                    self.phase = Phase::Waiting { remaining, feint_at };
+                }
+            }
+            Phase::Waiting { remaining, feint_at } => {
+                let feint_triggers = matches!(feint_at, Some(t) if t.saturating_sub(dt).is_zero());
+                if feint_triggers {
+                    self.phase = Phase::Feint {
+                        remaining: FEINT_DURATION,
+                        resume_waiting: remaining.saturating_sub(dt),
+                    };
+                } else {
+                    let new_feint_at = feint_at.map(|t| t.saturating_sub(dt));
+                    let new_remaining = remaining.saturating_sub(dt);
+                    self.phase = if new_remaining.is_zero() {
+                        // 反応時間は合図が画面に出た時刻から測る
+                        Phase::Signal {
+                            shown_at: Instant::now(),
+                        }
+                    } else {
+                        Phase::Waiting {
+                            remaining: new_remaining,
+                            feint_at: new_feint_at,
+                        }
                     };
                 }
             }
-            Phase::Waiting { remaining } => {
+            Phase::Feint {
+                remaining,
+                resume_waiting,
+            } => {
                 let remaining = remaining.saturating_sub(dt);
                 self.phase = if remaining.is_zero() {
-                    // 反応時間は合図が画面に出た時刻から測る
-                    Phase::Signal {
-                        shown_at: Instant::now(),
+                    Phase::Waiting {
+                        remaining: *resume_waiting,
+                        feint_at: None,
                     }
                 } else {
-                    Phase::Waiting { remaining }
+                    Phase::Feint {
+                        remaining,
+                        resume_waiting: *resume_waiting,
+                    }
                 };
             }
             Phase::Signal { .. } => {}
@@ -557,7 +627,7 @@ mod tests {
     fn assert_waiting_within_range(game: &QuickDrawGame) {
         let (min, max) = game.pattern.wait_range();
         match game.phase {
-            Phase::Waiting { remaining } => assert!(
+            Phase::Waiting { remaining, .. } => assert!(
                 (min..=max).contains(&remaining),
                 "待機時間{remaining:?}が範囲{min:?}〜{max:?}に入っていない"
             ),
@@ -688,10 +758,13 @@ mod tests {
     #[test]
     fn update_switches_to_signal_after_wait_elapses() {
         let mut game = QuickDrawGame::new();
-        game.phase = Phase::Waiting { remaining: ms(100) };
+        game.phase = Phase::Waiting {
+            remaining: ms(100),
+            feint_at: None,
+        };
         game.update(ms(60));
         assert!(
-            matches!(game.phase, Phase::Waiting { remaining } if remaining == ms(40)),
+            matches!(game.phase, Phase::Waiting { remaining, .. } if remaining == ms(40)),
             "待機時間が経過分だけ減る"
         );
         game.update(ms(60));
@@ -863,6 +936,115 @@ mod tests {
         assert_eq!(countdown_phase(&game), Some(countdown_ui::Phase::Three));
         finish_countdown(&mut game);
         assert_waiting_within_range(&game);
+    }
+
+    // --- フェイント ---
+
+    #[test]
+    fn feint_is_never_scheduled_in_the_first_half() {
+        let mut rng = rand::thread_rng();
+        for round in 0..FEINT_MIN_ROUND_INDEX {
+            for _ in 0..50 {
+                assert!(
+                    !should_feint(round, WaitPattern::Normal.wait_range().1, &mut rng),
+                    "{round}問目(前半)はフェイントを入れない"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn feint_can_be_scheduled_in_the_second_half() {
+        let mut rng = rand::thread_rng();
+        let remaining = WaitPattern::Normal.wait_range().1;
+        let scheduled = (0..200).any(|_| should_feint(FEINT_MIN_ROUND_INDEX, remaining, &mut rng));
+        assert!(scheduled, "後半のラウンドではフェイントが入ることがある");
+    }
+
+    #[test]
+    fn feint_is_not_scheduled_when_the_wait_is_too_short_to_fit_it() {
+        let mut rng = rand::thread_rng();
+        let too_short = FEINT_DURATION * 2 - Duration::from_millis(1);
+        for _ in 0..50 {
+            assert!(
+                !should_feint(FEINT_MIN_ROUND_INDEX, too_short, &mut rng),
+                "フェイントを挟む余地が無い待機時間では入れない"
+            );
+        }
+    }
+
+    #[test]
+    fn feint_delay_stays_within_the_waiting_window() {
+        let mut rng = rand::thread_rng();
+        let remaining = ms(2000);
+        for _ in 0..100 {
+            let delay = feint_delay(&mut rng, remaining);
+            assert!(delay <= remaining - FEINT_DURATION, "{delay:?}");
+            assert!(delay >= remaining.mul_f64(0.3) - ms(1), "{delay:?}");
+        }
+    }
+
+    #[test]
+    fn pressing_during_feint_is_a_false_start() {
+        let mut game = QuickDrawGame::new();
+        game.phase = Phase::Feint {
+            remaining: ms(100),
+            resume_waiting: ms(500),
+        };
+        game.handle_key(key(KeyCode::Enter));
+        let result = game.result();
+        assert_eq!(result.total, 1);
+        assert_eq!(result.correct, 0, "フェイントに引っかかるとフライング扱い");
+        assert!(matches!(game.phase, Phase::Result { is_correct: false, .. }));
+    }
+
+    #[test]
+    fn feint_ends_and_resumes_waiting_then_reaches_signal() {
+        let mut game = QuickDrawGame::new();
+        game.phase = Phase::Feint {
+            remaining: ms(50),
+            resume_waiting: ms(80),
+        };
+        game.update(ms(50));
+        assert!(
+            matches!(game.phase, Phase::Waiting { remaining, feint_at: None } if remaining == ms(80)),
+            "フェイントが終わったら残りの待機時間でWaitingへ戻る"
+        );
+        game.update(ms(80));
+        assert!(
+            matches!(game.phase, Phase::Signal { .. }),
+            "戻った待機を過ぎたら合図が出る"
+        );
+    }
+
+    #[test]
+    fn feint_background_differs_from_the_real_signal() {
+        assert_ne!(FEINT_BG, SIGNAL_BG);
+        let mut game = QuickDrawGame::new();
+        game.phase = Phase::Feint {
+            remaining: ms(100),
+            resume_waiting: ms(500),
+        };
+        assert_eq!(body_center_bg(&rendered(&game)), FEINT_BG);
+    }
+
+    #[test]
+    fn late_round_can_transition_from_waiting_into_feint() {
+        // 後半のラウンドまで進めた上で、フェイントが予定された状態を直接作り、
+        // 時間経過でFeintフェーズへ切り替わることを確認する
+        let mut game = QuickDrawGame::new();
+        for _ in 0..FEINT_MIN_ROUND_INDEX {
+            game.tracker.record(true, 0.0);
+        }
+        game.phase = Phase::Waiting {
+            remaining: ms(1000),
+            feint_at: Some(ms(50)),
+        };
+        game.update(ms(60));
+        assert!(
+            matches!(game.phase, Phase::Feint { .. }),
+            "フェイントの予定時刻を過ぎたらFeintへ切り替わる"
+        );
     }
 
     #[test]
@@ -1275,7 +1457,10 @@ mod tests {
     #[test]
     fn render_switches_when_wait_elapses() {
         let mut game = QuickDrawGame::new();
-        game.phase = Phase::Waiting { remaining: ms(50) };
+        game.phase = Phase::Waiting {
+            remaining: ms(50),
+            feint_at: None,
+        };
         assert_eq!(body_center_bg(&rendered(&game)), WAITING_BG);
         game.update(ms(50));
         let buffer = rendered(&game);
