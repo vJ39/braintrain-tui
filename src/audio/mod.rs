@@ -49,6 +49,8 @@ pub enum BgmCategory {
     RhythmSplash,
     /// 「べー」開始前のスプラッシュ画面(Screen::BeigomaSplash)に流す専用BGM
     BeigomaSplash,
+    /// 「べー」のゲーム本編中に流す専用BGM
+    BeigomaPlaying,
 }
 
 impl BgmCategory {
@@ -61,6 +63,7 @@ impl BgmCategory {
             BgmCategory::Rhythm => "rhythm/",
             BgmCategory::RhythmSplash => "rhythm_splash/",
             BgmCategory::BeigomaSplash => "beigoma_splash/",
+            BgmCategory::BeigomaPlaying => "beigoma_playing/",
         }
     }
 }
@@ -664,6 +667,57 @@ mod tests {
             random_bgm_track(BgmCategory::BeigomaSplash).as_deref(),
             Some("Circuit_Storm")
         );
+    }
+
+    #[test]
+    fn beigoma_playing_dir_prefix_is_beigoma_playing() {
+        assert_eq!(
+            BgmCategory::BeigomaPlaying.dir_prefix(),
+            "beigoma_playing/"
+        );
+    }
+
+    #[test]
+    fn bgm_tracks_in_beigoma_playing_has_two_tracks() {
+        let names = bgm_tracks_in(BgmCategory::BeigomaPlaying);
+        assert!(names.iter().any(|n| n == "Apex_Velocity"));
+        assert!(names.iter().any(|n| n == "Midnight_Tarmac"));
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn beigoma_playing_bgm_assets_are_embedded_and_decodable() {
+        for name in ["Apex_Velocity", "Midnight_Tarmac"] {
+            let file = BgmAssets::get(&format!("beigoma_playing/{name}.mp3"))
+                .unwrap_or_else(|| panic!("bgm/beigoma_playing/{name}.mp3が埋め込まれていること"));
+            assert!(
+                rodio::Decoder::new(Cursor::new(file.data.into_owned())).is_ok(),
+                "{name}: mp3としてデコードできること"
+            );
+        }
+    }
+
+    #[test]
+    fn beigoma_playing_bgm_is_not_mixed_into_playing_or_menu() {
+        for category in [BgmCategory::Menu, BgmCategory::Playing] {
+            let names = bgm_tracks_in(category);
+            assert!(!names.iter().any(|n| n == "Apex_Velocity"), "{category:?}");
+            assert!(
+                !names.iter().any(|n| n == "Midnight_Tarmac"),
+                "{category:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn random_bgm_track_for_beigoma_playing_eventually_picks_both_tracks() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            if let Some(name) = random_bgm_track(BgmCategory::BeigomaPlaying) {
+                seen.insert(name);
+            }
+        }
+        assert_eq!(seen.len(), 2, "100回試行して両曲が出現するはず: {seen:?}");
     }
 
     #[test]

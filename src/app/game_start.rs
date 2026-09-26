@@ -95,7 +95,7 @@ impl App {
     /// べーを開始する。ROUNDごとの「3.2.1.GO!!」を自前で持つため、
     /// 画面遷移側のカウントダウン(start_playing)は経由しない
     pub(super) fn start_beigoma(&mut self) {
-        if let Some(name) = audio::random_bgm_track(BgmCategory::Playing) {
+        if let Some(name) = audio::random_bgm_track(BgmCategory::BeigomaPlaying) {
             audio::play_bgm_track(&name);
             self.current_bgm = Some(name);
         }
@@ -543,16 +543,16 @@ mod tests {
     }
 
     #[test]
-    fn starting_beigoma_switches_from_the_splash_bgm_to_playing_bgm() {
+    fn starting_beigoma_switches_from_the_splash_bgm_to_beigoma_playing_bgm() {
         let mut app = app_on_beigoma_character_splash();
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         assert!(matches!(app.screen, Screen::Playing(_)));
-        let playing = audio::bgm_tracks_in(BgmCategory::Playing);
+        let playing = audio::bgm_tracks_in(BgmCategory::BeigomaPlaying);
         assert!(
             app.current_bgm
                 .as_ref()
                 .is_some_and(|name| playing.contains(name)),
-            "べー本編が始まったら通常のPlaying用BGMに切り替わる: {:?}",
+            "べー本編が始まったら専用のBeigomaPlaying用BGMに切り替わる: {:?}",
             app.current_bgm
         );
     }
