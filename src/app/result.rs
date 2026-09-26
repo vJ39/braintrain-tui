@@ -38,9 +38,10 @@ impl App {
     }
 
     /// リザルト画面を表示し、結果の本文のタイプライターとキャラクターのアニメーションを
-    /// 最初から始める(履歴への保存はしない)
+    /// 最初から始める(履歴への保存はしない)。本文が流れている間はタイプライターSEを鳴らす
     pub(super) fn show_result(&mut self, result: GameResult, save_error: Option<String>) {
         self.result_typewriter = Typewriter::new(typewriter::char_count(&result_lines(&result)));
+        self.result_typewriter.start_loop_se();
         self.result_sprite.reset();
         self.screen = Screen::Result(result, save_error);
     }
@@ -377,6 +378,101 @@ mod tests {
         app.last_area = rect(0, 0, 80, 30);
         app.handle_mouse(left_click(5));
         assert!(matches!(app.screen, Screen::Menu));
+    }
+
+    // --- タイプライターSE(文字が流れている間のループ再生) ---
+
+    #[test]
+    fn showing_a_result_starts_the_typewriter_loop_until_typing_finishes() {
+        let mut app = app_showing_result();
+        assert!(
+            audio::is_typewriter_loop_playing(),
+            "リザルト画面で文字が流れ始めたら鳴らす"
+        );
+        app.update(CHAR_INTERVAL * 3);
+        assert!(!app.result_typewriter.is_finished());
+        assert!(
+            audio::is_typewriter_loop_playing(),
+            "流れている間は鳴り続ける"
+        );
+        app.update(LONG_ENOUGH);
+        assert!(app.result_typewriter.is_finished());
+        assert!(!audio::is_typewriter_loop_playing(), "流れ終わったら止まる");
+    }
+
+    #[test]
+    fn result_typewriter_loop_stops_exactly_when_the_last_char_appears() {
+        let mut app = app_showing_result();
+        let total = app.result_typewriter.total_chars() as u32;
+        app.update(CHAR_INTERVAL * (total - 1));
+        assert!(
+            audio::is_typewriter_loop_playing(),
+            "最後の1文字の手前では鳴っている"
+        );
+        app.update(CHAR_INTERVAL);
+        assert!(app.result_typewriter.is_finished());
+        assert!(!audio::is_typewriter_loop_playing());
+    }
+
+    #[test]
+    fn other_key_while_result_is_typing_stops_the_typewriter_loop() {
+        let mut app = app_showing_result();
+        press(&mut app, KeyCode::Char(' '));
+        assert!(matches!(app.screen, Screen::Result(..)));
+        assert!(!audio::is_typewriter_loop_playing());
+    }
+
+    #[test]
+    fn leaving_the_result_while_typing_does_not_leave_the_loop_playing() {
+        // Enter/Esc/q/クリックでメニューへ戻ると、メニューの文字が流れる間は鳴り、
+        // 流れ終わったら止まる(リザルト側の再生が残って鳴りっぱなしにならない)
+        type LeaveAction = (&'static str, fn(&mut App));
+        let leave: [LeaveAction; 4] = [
+            ("Enter", |app| press(app, KeyCode::Enter)),
+            ("Esc", |app| press(app, KeyCode::Esc)),
+            ("q", |app| press(app, KeyCode::Char('q'))),
+            ("クリック", |app| {
+                app.last_area = rect(0, 0, 80, 30);
+                app.handle_mouse(left_click(5));
+            }),
+        ];
+        for (name, leave) in leave {
+            let mut app = app_showing_result();
+            leave(&mut app);
+            assert!(matches!(app.screen, Screen::Menu), "{name}");
+            assert!(
+                !app.result_typewriter.plays_loop_se(),
+                "{name}: リザルト側は止めている"
+            );
+            app.update(LONG_ENOUGH);
+            assert!(!audio::is_typewriter_loop_playing(), "{name}");
+        }
+    }
+
+    #[test]
+    fn showing_a_result_again_restarts_the_typewriter_loop() {
+        let mut app = app_showing_result();
+        app.update(LONG_ENOUGH);
+        assert!(!audio::is_typewriter_loop_playing());
+        app.show_result(sample_result(), None);
+        assert!(audio::is_typewriter_loop_playing());
+    }
+
+    #[test]
+    fn result_typewriter_loop_is_independent_of_the_result_bgm() {
+        // リザルト用BGMへの切り替えでタイプライターSEが止まらず、SEが止まってもBGMは変わらない
+        let mut app = App::new();
+        app.enter_result(sample_result());
+        assert!(audio::is_typewriter_loop_playing());
+        assert_eq!(app.current_bgm.as_deref(), Some("New_Personal_Best"));
+        audio::stop_bgm();
+        assert!(
+            audio::is_typewriter_loop_playing(),
+            "BGMを止めても鳴り続ける"
+        );
+        app.update(LONG_ENOUGH);
+        assert!(!audio::is_typewriter_loop_playing());
+        assert_eq!(app.current_bgm.as_deref(), Some("New_Personal_Best"));
     }
 
     // --- キャラクターのコマ送りアニメーション ---

@@ -44,7 +44,7 @@ impl Phase {
     pub fn se(self) -> SeKind {
         match self {
             Phase::Three | Phase::Two | Phase::One => SeKind::Transition,
-            Phase::Go => SeKind::Confirm,
+            Phase::Go => SeKind::CountdownGo,
         }
     }
 }
@@ -210,7 +210,7 @@ mod tests {
         assert_eq!(Phase::Three.se(), SeKind::Transition);
         assert_eq!(Phase::Two.se(), SeKind::Transition);
         assert_eq!(Phase::One.se(), SeKind::Transition);
-        assert_eq!(Phase::Go.se(), SeKind::Confirm);
+        assert_eq!(Phase::Go.se(), SeKind::CountdownGo);
     }
 
     #[test]

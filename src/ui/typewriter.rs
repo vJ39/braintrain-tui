@@ -1,12 +1,16 @@
 //! パソコン通信(BBS)風に、テキストを1文字ずつ流れるように表示するタイプライター演出。
 //!
 //! 経過時間から「今何文字まで見せるか」を求める状態(Typewriter)と、装飾付きの
-//! テキスト(Line/Span)を文字数で切り詰めるヘルパーだけを持つ。どの画面に使うか、
-//! いつリセットするかは呼び出し側(app.rs)が受け持つ。
+//! テキスト(Line/Span)を文字数で切り詰めるヘルパーを持つ。start_loop_seを呼んだ
+//! Typewriterは、文字が流れている間タイプライターSEをループ再生し、流れ終わった
+//! (tick/skip等でis_finishedになった)時点で止める。どの画面に使うか、いつリセットして
+//! SEを鳴らし始めるかは呼び出し側(app/menu.rs・app/result.rs)が受け持つ。
 
 use std::time::Duration;
 
 use ratatui::text::{Line, Span};
+
+use crate::audio;
 
 /// 1文字あたりの表示間隔(標準)。約33msごとの画面更新で1フレームに1文字前後進む速さ
 pub const CHAR_INTERVAL: Duration = Duration::from_millis(30);
@@ -20,6 +24,9 @@ pub struct Typewriter {
     elapsed: Duration,
     /// skip()等で全文字表示済みにされたか
     skipped: bool,
+    /// タイプライターSEのループ再生を受け持っている(鳴らしている)か。start_loop_seでtrueにし、
+    /// 流れ終わってSEを止めた時にfalseに戻す
+    loop_se: bool,
 }
 
 impl Typewriter {
@@ -35,6 +42,7 @@ impl Typewriter {
             interval,
             elapsed: Duration::ZERO,
             skipped: false,
+            loop_se: false,
         }
     }
 
@@ -45,9 +53,36 @@ impl Typewriter {
         typewriter
     }
 
-    /// 経過時間を進める
+    /// 文字が流れている間、タイプライターSEのループ再生を始める(画面に入って流し始める時に呼ぶ)。
+    /// 既に流れ終わっていれば鳴らさない
+    pub fn start_loop_se(&mut self) {
+        if self.is_finished() {
+            audio::stop_typewriter_loop();
+            self.loop_se = false;
+        } else {
+            audio::play_typewriter_loop();
+            self.loop_se = true;
+        }
+    }
+
+    /// タイプライターSEを鳴らしているか(テストでの確認用)
+    #[cfg(test)]
+    pub fn plays_loop_se(&self) -> bool {
+        self.loop_se
+    }
+
+    /// 流れ終わった時点で、鳴らしていたタイプライターSEを止める
+    fn stop_loop_se_if_finished(&mut self) {
+        if self.loop_se && self.is_finished() {
+            audio::stop_typewriter_loop();
+            self.loop_se = false;
+        }
+    }
+
+    /// 経過時間を進める。最後の文字まで表示したらタイプライターSEを止める
     pub fn tick(&mut self, dt: Duration) {
         self.elapsed = self.elapsed.saturating_add(dt);
+        self.stop_loop_se_if_finished();
     }
 
     /// 表示する全文字数(テストでの確認用)
@@ -63,6 +98,8 @@ impl Typewriter {
             self.skipped = true;
         }
         self.total_chars = total_chars;
+        // 文字数が減って表示済みの文字数に届いた場合も、流れ終わりとしてSEを止める
+        self.stop_loop_se_if_finished();
     }
 
     /// 経過時間から求めた文字数(全文字数で頭打ちにしない)
@@ -88,9 +125,10 @@ impl Typewriter {
         self.skipped || self.elapsed_chars() >= self.total_chars
     }
 
-    /// すぐに全文字表示済みにする(キー入力・クリックでのスキップ用)
+    /// すぐに全文字表示済みにする(キー入力・クリックでのスキップ用)。タイプライターSEも止める
     pub fn skip(&mut self) {
         self.skipped = true;
+        self.stop_loop_se_if_finished();
     }
 }
 
@@ -152,6 +190,7 @@ fn cut_lines<'a>(lines: &[Line<'a>], max_chars: usize, keep_width: bool) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio;
     use ratatui::layout::Alignment;
     use ratatui::style::{Color, Modifier, Style};
 
@@ -257,6 +296,78 @@ mod tests {
         let t = Typewriter::with_interval(7, Duration::ZERO);
         assert_eq!(t.visible_chars(), 7);
         assert!(t.is_finished());
+    }
+
+    // --- タイプライターSE(文字が流れている間のループ再生) ---
+
+    #[test]
+    fn typewriter_without_start_loop_se_never_plays_the_loop() {
+        let mut t = Typewriter::with_interval(3, ms(10));
+        t.tick(ms(10));
+        assert!(!t.plays_loop_se());
+        assert!(!audio::is_typewriter_loop_playing());
+        t.tick(ms(20));
+        assert!(!audio::is_typewriter_loop_playing());
+    }
+
+    #[test]
+    fn start_loop_se_plays_the_loop_while_typing() {
+        let mut t = Typewriter::with_interval(3, ms(10));
+        t.start_loop_se();
+        assert!(t.plays_loop_se());
+        assert!(audio::is_typewriter_loop_playing(), "流れ始めたら鳴らす");
+        t.tick(ms(20));
+        assert!(
+            audio::is_typewriter_loop_playing(),
+            "流れている間は鳴り続ける"
+        );
+    }
+
+    #[test]
+    fn loop_se_stops_the_moment_typing_finishes() {
+        let mut t = Typewriter::with_interval(3, ms(10));
+        t.start_loop_se();
+        t.tick(ms(29));
+        assert!(audio::is_typewriter_loop_playing(), "最後の1文字の手前");
+        t.tick(ms(1));
+        assert!(t.is_finished());
+        assert!(!audio::is_typewriter_loop_playing(), "流れ終わったら止める");
+        assert!(!t.plays_loop_se());
+        t.tick(ms(100));
+        assert!(
+            !audio::is_typewriter_loop_playing(),
+            "止めた後に鳴り直さない"
+        );
+    }
+
+    #[test]
+    fn skip_stops_the_loop_se() {
+        let mut t = Typewriter::new(50);
+        t.start_loop_se();
+        t.skip();
+        assert!(!audio::is_typewriter_loop_playing());
+        assert!(!t.plays_loop_se());
+    }
+
+    #[test]
+    fn start_loop_se_on_already_finished_text_does_not_play() {
+        for mut t in [Typewriter::new(0), Typewriter::completed(CHAR_INTERVAL)] {
+            t.start_loop_se();
+            assert!(!audio::is_typewriter_loop_playing());
+            assert!(!t.plays_loop_se());
+        }
+    }
+
+    #[test]
+    fn shrinking_total_to_finished_stops_the_loop_se() {
+        // 画面サイズの変化で全文字数が減り、表示済み文字数に届いた時も止める
+        let mut t = Typewriter::with_interval(10, ms(10));
+        t.start_loop_se();
+        t.tick(ms(50));
+        assert!(audio::is_typewriter_loop_playing());
+        t.set_total_chars(5);
+        assert!(t.is_finished());
+        assert!(!audio::is_typewriter_loop_playing());
     }
 
     // --- 装飾付きテキストの切り詰め ---

@@ -26,12 +26,13 @@ pub(super) const MENU_CHAR_INTERVAL: Duration = Duration::from_millis(10);
 impl App {
     /// メニュー画面へ遷移する。既存の`self.screen = Screen::Menu`は全てこれに統一し、
     /// メニューに戻るたびに端末側でのスクロールバッファのクリアを要求する。
-    /// 項目の名前・説明文はここから改めてタイプライターで流す
+    /// 項目の名前・説明文はここから改めてタイプライターで流す(流れている間はタイプライターSEを鳴らす)
     pub(super) fn enter_menu(&mut self) {
         self.screen = Screen::Menu;
         self.pending_scrollback_clear = true;
         let total = typewriter::char_count(&menu_item_lines(screen_rect(self.last_area)));
         self.menu_typewriter = Typewriter::with_interval(total, MENU_CHAR_INTERVAL);
+        self.menu_typewriter.start_loop_se();
     }
 
     /// メニュー以外の画面で[q]を押した時にメニューへ戻る。既にメニュー用BGMが
@@ -52,6 +53,8 @@ impl App {
 
     /// Menu画面での項目決定(キー/クリック共通)。ゲーム/ジュークボックス/履歴へ振り分ける
     pub(super) fn select_menu_item(&mut self, selected: usize) {
+        // メニューを離れるので、流している途中でも全文字表示済みにしてタイプライターSEを止める
+        self.menu_typewriter.skip();
         if selected == HISTORY_ITEM_INDEX {
             audio::play_se(SeKind::Transition);
             self.screen = Screen::History;
@@ -1137,6 +1140,135 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(matches!(app.screen, Screen::Menu));
         assert_eq!(app.menu_typewriter.visible_chars(), 0);
+    }
+
+    // --- タイプライターSE(文字が流れている間のループ再生) ---
+
+    #[test]
+    fn splash_does_not_play_the_typewriter_loop() {
+        let _app = App::new();
+        assert!(
+            !audio::is_typewriter_loop_playing(),
+            "タイトル画面では鳴らさない"
+        );
+    }
+
+    #[test]
+    fn entering_menu_starts_the_typewriter_loop_until_typing_finishes() {
+        let mut app = app_entering_menu();
+        assert!(
+            audio::is_typewriter_loop_playing(),
+            "メニューに入って文字が流れ始めたら鳴らす"
+        );
+        app.update(MENU_CHAR_INTERVAL * 5);
+        assert!(!app.menu_typewriter.is_finished());
+        assert!(
+            audio::is_typewriter_loop_playing(),
+            "流れている間は鳴り続ける"
+        );
+        app.update(LONG_ENOUGH);
+        assert!(app.menu_typewriter.is_finished());
+        assert!(!audio::is_typewriter_loop_playing(), "流れ終わったら止まる");
+    }
+
+    #[test]
+    fn menu_typewriter_loop_stops_exactly_when_the_last_char_appears() {
+        let mut app = app_entering_menu();
+        let total = app.menu_typewriter.total_chars() as u32;
+        app.update(MENU_CHAR_INTERVAL * (total - 1));
+        assert!(!app.menu_typewriter.is_finished());
+        assert!(
+            audio::is_typewriter_loop_playing(),
+            "最後の1文字の手前では鳴っている"
+        );
+        app.update(MENU_CHAR_INTERVAL);
+        assert!(app.menu_typewriter.is_finished());
+        assert!(!audio::is_typewriter_loop_playing());
+    }
+
+    #[test]
+    fn key_while_menu_is_typing_stops_the_typewriter_loop() {
+        let mut app = app_entering_menu();
+        press(&mut app, KeyCode::Down);
+        assert!(matches!(app.screen, Screen::Menu));
+        assert!(
+            !audio::is_typewriter_loop_playing(),
+            "全文字表示済みにしたら止まる"
+        );
+    }
+
+    #[test]
+    fn leaving_the_menu_while_typing_stops_the_typewriter_loop() {
+        // 難易度選択へ(Enter)・終了確認へ(q)・履歴へ(クリック)
+        let mut app = app_entering_menu();
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.screen, Screen::SelectDifficulty(..)));
+        assert!(!audio::is_typewriter_loop_playing(), "難易度選択へ");
+
+        let mut app = app_entering_menu();
+        press(&mut app, KeyCode::Char('q'));
+        assert!(matches!(app.screen, Screen::ConfirmQuit));
+        assert!(!audio::is_typewriter_loop_playing(), "終了確認へ");
+        app.update(LONG_ENOUGH);
+        assert!(!audio::is_typewriter_loop_playing(), "終了確認中も鳴らない");
+
+        let mut app = app_entering_menu();
+        app.last_area = rect(0, 0, 200, 60);
+        let card = menu_grid(screen_rect(app.last_area))
+            .card_rect(HISTORY_ITEM_INDEX, 0)
+            .unwrap();
+        app.handle_mouse(left_click_at(card.x + 1, card.y + 1));
+        assert!(matches!(app.screen, Screen::History));
+        assert!(!audio::is_typewriter_loop_playing(), "履歴へ");
+    }
+
+    #[test]
+    fn selecting_a_menu_item_while_typing_stops_the_typewriter_loop() {
+        // キー/クリックを経由せず項目決定を呼んでも、メニューを離れる時に止める
+        for index in [0, HISTORY_ITEM_INDEX, JUKEBOX_ITEM_INDEX] {
+            let mut app = app_entering_menu();
+            assert!(audio::is_typewriter_loop_playing());
+            app.select_menu_item(index);
+            assert!(!matches!(app.screen, Screen::Menu), "index={index}");
+            assert!(!audio::is_typewriter_loop_playing(), "index={index}");
+        }
+    }
+
+    #[test]
+    fn returning_to_menu_restarts_the_typewriter_loop() {
+        let mut app = app_entering_menu();
+        app.update(LONG_ENOUGH);
+        assert!(!audio::is_typewriter_loop_playing());
+        app.select_menu_item(HISTORY_ITEM_INDEX);
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::Menu));
+        assert!(
+            audio::is_typewriter_loop_playing(),
+            "戻ったら流れ直すので鳴らし直す"
+        );
+        app.update(LONG_ENOUGH);
+        assert!(!audio::is_typewriter_loop_playing());
+    }
+
+    #[test]
+    fn menu_typewriter_loop_is_independent_of_the_bgm() {
+        // メニューへ戻る時のBGM切り替えや、BGMの停止ではタイプライターSEは止まらない
+        let mut app = app_entering_menu();
+        app.update(LONG_ENOUGH);
+        app.select_menu_item(HISTORY_ITEM_INDEX);
+        app.return_to_menu(); // メニュー用BGMへ切り替えてからメニューへ入る
+        assert!(audio::is_typewriter_loop_playing());
+        audio::stop_bgm();
+        assert!(
+            audio::is_typewriter_loop_playing(),
+            "BGMを止めても鳴り続ける"
+        );
+        // タイプライターSEが止まってもBGMの再生状態(current_bgm)は変わらない
+        let mut app = app_entering_menu();
+        let bgm = app.current_bgm.clone();
+        app.update(LONG_ENOUGH);
+        assert!(!audio::is_typewriter_loop_playing());
+        assert_eq!(app.current_bgm, bgm);
     }
 
     #[test]
