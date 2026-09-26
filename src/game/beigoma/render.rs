@@ -24,7 +24,7 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::{Resize, StatefulImage};
 
-use super::board::{Board, Cell, BOARD_HEIGHT, BOARD_WIDTH};
+use super::board::{Board, Cell, Tilt, BOARD_HEIGHT, BOARD_WIDTH, TILT_MAX};
 use super::truck::{GForce, Side, SignalLight, Upcoming, UpcomingKind};
 use crate::game::theme;
 use crate::ui::splash;
@@ -141,6 +141,34 @@ impl BoardArea {
         let y = raw_y.clamp(min_y, max_y.max(min_y));
         Rect::new(x as u16, y as u16, self.cell_width, self.cell_height)
     }
+
+    /// rectをdx,dyだけずらす(panelの範囲内でクランプし、バッファ範囲外アクセスを防ぐ)
+    fn offset_rect(&self, rect: Rect, dx: i32, dy: i32) -> Rect {
+        let min_x = i32::from(self.panel.x);
+        let min_y = i32::from(self.panel.y);
+        let max_x = min_x + i32::from(self.panel.width) - i32::from(rect.width);
+        let max_y = min_y + i32::from(self.panel.height) - i32::from(rect.height);
+        let x = (i32::from(rect.x) + dx).clamp(min_x, max_x.max(min_x));
+        let y = (i32::from(rect.y) + dy).clamp(min_y, max_y.max(min_y));
+        Rect::new(x as u16, y as u16, rect.width, rect.height)
+    }
+}
+
+/// 傾き1レベル・盤の中心から1マス分あたりの、疑似3D変形によるずれ量(セル単位)
+const TILT_SHIFT_PER_LEVEL: f64 = 0.12;
+
+/// 傾き(pitch/roll)に応じた、盤の行位置row(連続値)でのセルのずれ(x, y。セル単位の小数)。
+/// 盤の中心の行(row)からの距離に比例させ、板が回転しているように見せる。
+/// rollは左右に傾いて見えるようx方向、pitchは奥行きが傾いて見えるようy方向にずらす
+fn tilt_shift(row: f64, tilt: &Tilt) -> (f64, f64) {
+    let center = (BOARD_HEIGHT as f64 - 1.0) / 2.0;
+    let row_offset = row - center;
+    let roll = tilt.roll() / TILT_MAX;
+    let pitch = tilt.pitch() / TILT_MAX;
+    (
+        roll * row_offset * TILT_SHIFT_PER_LEVEL,
+        pitch * row_offset * TILT_SHIFT_PER_LEVEL,
+    )
 }
 
 /// 直前に作った盤の画像(障害物・ゴールまで重ねたもの)
@@ -231,8 +259,9 @@ impl BoardRenderer {
         self.patch_encodes.get()
     }
 
-    /// area(盤面パネルの内側)に盤とベーゴマを描く
-    pub fn render(&self, frame: &mut Frame, area: Rect, board: &Board, top: &TopView) {
+    /// area(盤面パネルの内側)に盤とベーゴマを描く。傾き(tilt)による疑似3D変形はテキスト表示のみで、
+    /// 画像表示(render_image)には適用しない
+    pub fn render(&self, frame: &mut Frame, area: Rect, board: &Board, top: &TopView, tilt: &Tilt) {
         let area = area.intersection(frame.area());
         let Some(layout) = board_area(area) else {
             return;
@@ -241,7 +270,7 @@ impl BoardRenderer {
         if top.star_frame.is_none() && self.render_image(frame, area, layout, board, top) {
             return;
         }
-        render_board_text(frame, area, layout, board, top);
+        render_board_text(frame, area, layout, board, top, tilt);
     }
 
     /// 画像で描く。画像を使えない・盤全体がエリアに収まらない時はfalse(テキストで描く)
@@ -484,9 +513,13 @@ fn render_board_text(
     layout: BoardArea,
     board: &Board,
     top: &TopView,
+    tilt: &Tilt,
 ) {
     let buffer = frame.buffer_mut();
     for y in 0..BOARD_HEIGHT {
+        let (shift_x, shift_y) = tilt_shift(y as f64, tilt);
+        let dx = (shift_x * f64::from(layout.cell_width)).round() as i32;
+        let dy = (shift_y * f64::from(layout.cell_height)).round() as i32;
         for x in 0..BOARD_WIDTH {
             let (glyph, style) = match board.cell(x, y) {
                 Cell::Flat => (" ", Style::default().bg(FLAT_BG)),
@@ -506,7 +539,7 @@ fn render_board_text(
                         .add_modifier(Modifier::BOLD),
                 ),
             };
-            let rect = layout.cell_rect(x, y);
+            let rect = layout.offset_rect(layout.cell_rect(x, y), dx, dy);
             // 幅0の範囲でもpositions()は1点返すので、見えないマスは飛ばす
             let visible = rect.intersection(area);
             if !visible.is_empty() {
@@ -526,7 +559,11 @@ fn render_board_text(
     };
     // 背景色はマスのものを残し、記号と文字色だけ変える
     let style = Style::default().fg(TOP_FG).add_modifier(Modifier::BOLD);
-    put_glyph(buffer, layout.top_rect(top.pos), area, glyph, style);
+    let (top_shift_x, top_shift_y) = tilt_shift(top.pos.1, tilt);
+    let top_dx = (top_shift_x * f64::from(layout.cell_width)).round() as i32;
+    let top_dy = (top_shift_y * f64::from(layout.cell_height)).round() as i32;
+    let top_rect = layout.offset_rect(layout.top_rect(top.pos), top_dx, top_dy);
+    put_glyph(buffer, top_rect, area, glyph, style);
 }
 
 /// マスの中央付近(横は左寄りの1セル)に記号を置く。記号の右のセルは空白のままにする
@@ -750,6 +787,7 @@ impl Default for TruckViewRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::board::TiltKey;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::Terminal;
@@ -774,9 +812,19 @@ mod tests {
     }
 
     fn draw_board(renderer: &BoardRenderer, board: &Board, top: &TopView, area: Rect) -> Buffer {
+        draw_board_with_tilt(renderer, board, top, area, &Tilt::default())
+    }
+
+    fn draw_board_with_tilt(
+        renderer: &BoardRenderer,
+        board: &Board,
+        top: &TopView,
+        area: Rect,
+        tilt: &Tilt,
+    ) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(area.right(), area.bottom())).unwrap();
         terminal
-            .draw(|frame| renderer.render(frame, area, board, top))
+            .draw(|frame| renderer.render(frame, area, board, top, tilt))
             .unwrap();
         terminal.backend().buffer().clone()
     }
@@ -866,6 +914,69 @@ mod tests {
         assert!(layout.panel.contains(Position::new(rect.x, rect.y)));
         let rect = layout.top_rect((1000.0, 1000.0));
         assert!(layout.panel.contains(Position::new(rect.x, rect.y)));
+    }
+
+    // --- 傾きによる疑似3D変形(tilt_shift) ---
+
+    #[test]
+    fn tilt_shift_is_zero_when_the_board_is_flat() {
+        let tilt = Tilt::default();
+        for row in [0.0, 3.0, (BOARD_HEIGHT - 1) as f64] {
+            assert_eq!(tilt_shift(row, &tilt), (0.0, 0.0));
+        }
+    }
+
+    /// テスト用: press()を繰り返して指定レベルまで傾ける
+    fn tilted(pitch_presses: i32, roll_presses: i32) -> Tilt {
+        let mut tilt = Tilt::new();
+        for _ in 0..pitch_presses.unsigned_abs() {
+            tilt.press(if pitch_presses > 0 {
+                TiltKey::Forward
+            } else {
+                TiltKey::Back
+            });
+        }
+        for _ in 0..roll_presses.unsigned_abs() {
+            tilt.press(if roll_presses > 0 {
+                TiltKey::Right
+            } else {
+                TiltKey::Left
+            });
+        }
+        tilt
+    }
+
+    #[test]
+    fn tilt_shift_is_zero_at_the_center_row_even_when_tilted() {
+        let tilt = tilted(3, 3);
+        let center = (BOARD_HEIGHT as f64 - 1.0) / 2.0;
+        let (x, y) = tilt_shift(center, &tilt);
+        assert!(x.abs() < 1e-9, "roll分の横ずれは中心の行では0: {x}");
+        assert!(y.abs() < 1e-9, "pitch分の縦ずれは中心の行では0: {y}");
+    }
+
+    #[test]
+    fn tilt_shift_is_mirrored_across_the_top_and_bottom_rows() {
+        let tilt = tilted(2, 2);
+        let top = tilt_shift(0.0, &tilt);
+        let bottom = tilt_shift((BOARD_HEIGHT - 1) as f64, &tilt);
+        assert!((top.0 + bottom.0).abs() < 1e-9, "上端と下端で横ずれが逆向き");
+        assert!((top.1 + bottom.1).abs() < 1e-9, "上端と下端で縦ずれが逆向き");
+        assert!(top.0 != 0.0, "傾いていれば横ずれが出る");
+    }
+
+    #[test]
+    fn tilting_the_board_shifts_where_the_top_is_drawn_in_text_mode() {
+        let board = Board::standard();
+        let top = top_at((5.5, 3.5));
+        let area = Rect::new(0, 0, 60, 20);
+        let renderer = BoardRenderer::from_parts(None, None, None);
+        let flat = draw_board_with_tilt(&renderer, &board, &top, area, &Tilt::default());
+        let tilted_board = draw_board_with_tilt(&renderer, &board, &top, area, &tilted(0, 4));
+        assert_ne!(
+            flat, tilted_board,
+            "傾けると盤面の描画内容(セルの位置)が変わる"
+        );
     }
 
     // --- テキスト表示の盤面 ---

@@ -427,7 +427,7 @@ impl Game for BeigomaGame {
             star_frame: self.star_frame(),
         };
         self.board_renderer
-            .render(frame, board_inner, &self.board, &top);
+            .render(frame, board_inner, &self.board, &top, &self.tilt);
         if let Status::Countdown { state } = &self.status {
             countdown::render(frame, board_inner, state);
         }
