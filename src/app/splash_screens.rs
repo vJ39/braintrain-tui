@@ -4,7 +4,7 @@
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
-use crate::audio::{self, SeKind};
+use crate::audio::{self, BgmCategory, SeKind};
 use crate::game::theme;
 use crate::ui::beigoma_splash_anim::AnimatedSplash;
 use crate::ui::splash::SplashRenderer;
@@ -25,9 +25,14 @@ impl App {
     }
 
     /// メニューで「べー」を選んだ時に、べー開始前のスプラッシュ画面へ進む。
-    /// コマ送りアニメーションは最初のコマから始める
+    /// コマ送りアニメーションは最初のコマから始める。BGMもべー専用のものに切り替え、
+    /// べー本編が始まるまで(start_beigomaでPlaying用BGMに切り替わるまで)流し続ける
     pub(super) fn enter_beigoma_splash(&mut self) {
         audio::play_se(SeKind::Transition);
+        if let Some(name) = audio::random_bgm_track(BgmCategory::BeigomaSplash) {
+            audio::play_bgm_track(&name);
+            self.current_bgm = Some(name);
+        }
         self.beigoma_splash_renderer.reset();
         self.screen = Screen::BeigomaSplash;
     }

@@ -16,7 +16,7 @@ use ratatui_image::{Resize, StatefulImage};
 use super::splash::{self, FallbackText};
 
 /// アニメーションの各コマの画像(assets/image/からの相対パス)。この順にループする
-pub const FRAME_PATHS: [&str; 25] = [
+pub const FRAME_PATHS: [&str; 89] = [
     "beigoma_splash/frame_001.jpg",
     "beigoma_splash/frame_002.jpg",
     "beigoma_splash/frame_003.jpg",
@@ -42,10 +42,74 @@ pub const FRAME_PATHS: [&str; 25] = [
     "beigoma_splash/frame_023.jpg",
     "beigoma_splash/frame_024.jpg",
     "beigoma_splash/frame_025.jpg",
+    "beigoma_splash/frame_026.jpg",
+    "beigoma_splash/frame_027.jpg",
+    "beigoma_splash/frame_028.jpg",
+    "beigoma_splash/frame_029.jpg",
+    "beigoma_splash/frame_030.jpg",
+    "beigoma_splash/frame_031.jpg",
+    "beigoma_splash/frame_032.jpg",
+    "beigoma_splash/frame_033.jpg",
+    "beigoma_splash/frame_034.jpg",
+    "beigoma_splash/frame_035.jpg",
+    "beigoma_splash/frame_036.jpg",
+    "beigoma_splash/frame_037.jpg",
+    "beigoma_splash/frame_038.jpg",
+    "beigoma_splash/frame_039.jpg",
+    "beigoma_splash/frame_040.jpg",
+    "beigoma_splash/frame_041.jpg",
+    "beigoma_splash/frame_042.jpg",
+    "beigoma_splash/frame_043.jpg",
+    "beigoma_splash/frame_044.jpg",
+    "beigoma_splash/frame_045.jpg",
+    "beigoma_splash/frame_046.jpg",
+    "beigoma_splash/frame_047.jpg",
+    "beigoma_splash/frame_048.jpg",
+    "beigoma_splash/frame_049.jpg",
+    "beigoma_splash/frame_050.jpg",
+    "beigoma_splash/frame_051.jpg",
+    "beigoma_splash/frame_052.jpg",
+    "beigoma_splash/frame_053.jpg",
+    "beigoma_splash/frame_054.jpg",
+    "beigoma_splash/frame_055.jpg",
+    "beigoma_splash/frame_056.jpg",
+    "beigoma_splash/frame_057.jpg",
+    "beigoma_splash/frame_058.jpg",
+    "beigoma_splash/frame_059.jpg",
+    "beigoma_splash/frame_060.jpg",
+    "beigoma_splash/frame_061.jpg",
+    "beigoma_splash/frame_062.jpg",
+    "beigoma_splash/frame_063.jpg",
+    "beigoma_splash/frame_064.jpg",
+    "beigoma_splash/frame_065.jpg",
+    "beigoma_splash/frame_066.jpg",
+    "beigoma_splash/frame_067.jpg",
+    "beigoma_splash/frame_068.jpg",
+    "beigoma_splash/frame_069.jpg",
+    "beigoma_splash/frame_070.jpg",
+    "beigoma_splash/frame_071.jpg",
+    "beigoma_splash/frame_072.jpg",
+    "beigoma_splash/frame_073.jpg",
+    "beigoma_splash/frame_074.jpg",
+    "beigoma_splash/frame_075.jpg",
+    "beigoma_splash/frame_076.jpg",
+    "beigoma_splash/frame_077.jpg",
+    "beigoma_splash/frame_078.jpg",
+    "beigoma_splash/frame_079.jpg",
+    "beigoma_splash/frame_080.jpg",
+    "beigoma_splash/frame_081.jpg",
+    "beigoma_splash/frame_082.jpg",
+    "beigoma_splash/frame_083.jpg",
+    "beigoma_splash/frame_084.jpg",
+    "beigoma_splash/frame_085.jpg",
+    "beigoma_splash/frame_086.jpg",
+    "beigoma_splash/frame_087.jpg",
+    "beigoma_splash/frame_088.jpg",
+    "beigoma_splash/frame_089.jpg",
 ];
 
-/// 1コマあたりの表示時間(result_sprite.rsと同じ)
-pub const FRAME_DURATION: Duration = Duration::from_millis(350);
+/// 1コマあたりの表示時間(10fps。元動画から100ms間隔でフレームを切り出している)
+pub const FRAME_DURATION: Duration = Duration::from_millis(100);
 
 /// 経過時間から表示するコマ番号を求める。最後のコマの次は最初に戻る(ループ)
 pub fn frame_index(elapsed: Duration) -> usize {
@@ -149,6 +213,34 @@ mod tests {
         let mut picker = Picker::from_fontsize((10, 20));
         picker.set_protocol_type(ProtocolType::Halfblocks);
         picker
+    }
+
+    #[test]
+    fn frames_are_89_images_from_frame_001_to_frame_089_in_order() {
+        assert_eq!(FRAME_PATHS.len(), 89);
+        for (i, path) in FRAME_PATHS.iter().enumerate() {
+            assert_eq!(
+                *path,
+                format!("beigoma_splash/frame_{:03}.jpg", i + 1),
+                "{i}番目のコマはframe_{:03}.jpg",
+                i + 1
+            );
+        }
+    }
+
+    #[test]
+    fn frame_duration_is_100ms_for_10fps() {
+        assert_eq!(FRAME_DURATION, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn one_loop_takes_89_frames_of_100ms() {
+        // 8.9秒で1周し、最初のコマに戻る
+        assert_eq!(frame_index(Duration::from_millis(8_899)), 88);
+        assert_eq!(frame_index(Duration::from_millis(8_900)), 0);
+        // コマの途中(1コマ目の表示中)はまだ次のコマへ進まない
+        assert_eq!(frame_index(Duration::from_millis(99)), 0);
+        assert_eq!(frame_index(Duration::from_millis(100)), 1);
     }
 
     #[test]

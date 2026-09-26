@@ -402,6 +402,68 @@ mod tests {
     }
 
     #[test]
+    fn selecting_beigoma_starts_the_beigoma_splash_bgm() {
+        let mut app = App::new();
+        app.select_menu_item(BEIGOMA_ITEM_INDEX);
+        let tracks = audio::bgm_tracks_in(BgmCategory::BeigomaSplash);
+        assert!(
+            !tracks.is_empty(),
+            "べースプラッシュ用BGMが用意されていること"
+        );
+        assert!(
+            app.current_bgm
+                .as_ref()
+                .is_some_and(|name| tracks.contains(name)),
+            "べースプラッシュ画面に入るとべー専用BGMに切り替わる: {:?}",
+            app.current_bgm
+        );
+    }
+
+    #[test]
+    fn beigoma_splash_bgm_keeps_playing_while_the_splash_animates() {
+        let mut app = App::new();
+        app.select_menu_item(BEIGOMA_ITEM_INDEX);
+        let started_bgm = app.current_bgm.clone();
+        // アニメーションが何周しても、Enterを押すまではべー専用BGMのまま
+        app.update(Duration::from_secs(20));
+        rendered_text(&mut app);
+        assert!(matches!(app.screen, Screen::BeigomaSplash));
+        assert_eq!(app.current_bgm, started_bgm);
+    }
+
+    #[test]
+    fn starting_beigoma_switches_from_the_splash_bgm_to_playing_bgm() {
+        let mut app = App::new();
+        app.select_menu_item(BEIGOMA_ITEM_INDEX);
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.screen, Screen::Playing(_)));
+        let playing = audio::bgm_tracks_in(BgmCategory::Playing);
+        assert!(
+            app.current_bgm
+                .as_ref()
+                .is_some_and(|name| playing.contains(name)),
+            "べー本編が始まったら通常のPlaying用BGMに切り替わる: {:?}",
+            app.current_bgm
+        );
+    }
+
+    #[test]
+    fn q_on_beigoma_splash_returns_to_menu_with_menu_bgm() {
+        let mut app = App::new();
+        app.select_menu_item(BEIGOMA_ITEM_INDEX);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(matches!(app.screen, Screen::Menu));
+        let menu = audio::bgm_tracks_in(BgmCategory::Menu);
+        assert!(
+            app.current_bgm
+                .as_ref()
+                .is_some_and(|name| menu.contains(name)),
+            "スプラッシュから戻ったらメニュー用BGMに戻る: {:?}",
+            app.current_bgm
+        );
+    }
+
+    #[test]
     fn enter_on_beigoma_splash_skips_difficulty_and_the_outer_countdown() {
         let mut app = App::new();
         app.select_menu_item(BEIGOMA_ITEM_INDEX);

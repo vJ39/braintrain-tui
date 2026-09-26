@@ -16,6 +16,7 @@ struct Assets;
 /// (menu/ = 起動画面・Playing以外、playing/ = ゲームプレイ中、
 ///  rhythm/ = リズムゲームの楽曲。譜面と同期させるため曲ごとに選んで再生する、
 ///  rhythm_splash/ = TTR専用スプラッシュ画面〜曲選択画面、
+///  beigoma_splash/ = 「べー」開始前のスプラッシュ画面、
 ///  result/ = ゲーム終了後のリザルト画面)
 #[derive(RustEmbed)]
 #[folder = "assets/audio/bgm/"]
@@ -46,6 +47,8 @@ pub enum BgmCategory {
     Rhythm,
     /// TTR専用スプラッシュ画面〜曲選択画面の間に流す専用BGM
     RhythmSplash,
+    /// 「べー」開始前のスプラッシュ画面(Screen::BeigomaSplash)に流す専用BGM
+    BeigomaSplash,
 }
 
 impl BgmCategory {
@@ -57,6 +60,7 @@ impl BgmCategory {
             BgmCategory::ResultFailure => "result_failure/",
             BgmCategory::Rhythm => "rhythm/",
             BgmCategory::RhythmSplash => "rhythm_splash/",
+            BgmCategory::BeigomaSplash => "beigoma_splash/",
         }
     }
 }
@@ -624,6 +628,43 @@ mod tests {
         assert!(names.iter().any(|n| n == "Overclocked_Tempo"));
         assert!(names.iter().any(|n| n == "Under_the_Floodlights"));
         assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn beigoma_splash_dir_prefix_is_beigoma_splash() {
+        assert_eq!(BgmCategory::BeigomaSplash.dir_prefix(), "beigoma_splash/");
+    }
+
+    #[test]
+    fn bgm_tracks_in_beigoma_splash_has_circuit_storm_only() {
+        let names = bgm_tracks_in(BgmCategory::BeigomaSplash);
+        assert_eq!(names, vec!["Circuit_Storm".to_string()]);
+    }
+
+    #[test]
+    fn beigoma_splash_bgm_asset_is_embedded_and_decodable() {
+        let file = BgmAssets::get("beigoma_splash/Circuit_Storm.mp3")
+            .expect("bgm/beigoma_splash/Circuit_Storm.mp3が埋め込まれていること");
+        assert!(
+            rodio::Decoder::new(Cursor::new(file.data.into_owned())).is_ok(),
+            "mp3としてデコードできること"
+        );
+    }
+
+    #[test]
+    fn beigoma_splash_bgm_is_not_mixed_into_playing_or_menu() {
+        for category in [BgmCategory::Menu, BgmCategory::Playing] {
+            let names = bgm_tracks_in(category);
+            assert!(!names.iter().any(|n| n == "Circuit_Storm"), "{category:?}");
+        }
+    }
+
+    #[test]
+    fn random_bgm_track_for_beigoma_splash_picks_circuit_storm() {
+        assert_eq!(
+            random_bgm_track(BgmCategory::BeigomaSplash).as_deref(),
+            Some("Circuit_Storm")
+        );
     }
 
     #[test]
