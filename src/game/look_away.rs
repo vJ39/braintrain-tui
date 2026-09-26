@@ -130,6 +130,9 @@ pub const PLAYER_GUARD_RIGHT_IMAGE: &str = "look_away/player_guard_right.png";
 pub const PLAYER_YAHHO_REPLY_IMAGE: &str = "look_away/player_yahho_reply.png";
 pub const PLAYER_DAMAGED_EATING_IMAGE: &str = "look_away/player_damaged_eating.png";
 pub const PLAYER_DAMAGED_WATCHING_IMAGE: &str = "look_away/player_damaged_watching.png";
+/// 判定結果を強調する書道風テキスト画像(通常の✗マークの代わりに出す)
+pub const JUDGE_LATE_IMAGE: &str = "look_away/judge_late.png";
+pub const JUDGE_FALSE_START_IMAGE: &str = "look_away/judge_false_start.png";
 
 /// プレイヤー自身の絵(画像プロトコル非対応環境のフォールバック表示)
 pub const PLAYER_EATING_TEXT: &str = "がつがつ食べる自分";
@@ -178,6 +181,18 @@ fn player_fallback_text(kind: PlayerStageKind) -> &'static str {
         PlayerStageKind::DamagedEating => PLAYER_DAMAGED_EATING_TEXT,
         PlayerStageKind::DamagedWatching => PLAYER_DAMAGED_WATCHING_TEXT,
     }
+}
+
+/// 不正解の判定結果を強調する演出。通常はDefault(✗マーク)だが、フライング・
+/// 「ヤー」への反応遅れは専用の書道風テキスト画像に置き換える
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JudgeStamp {
+    /// 通常の✗マーク(TIMEOUT_TEXT・逆方向・Yahho押した・やっほー失敗等)
+    Default,
+    /// 「ヤー」への反応が0.5秒(RESPONSE_SAFE_WINDOW)を超えた
+    Late,
+    /// 待機中のフライング
+    FalseStart,
 }
 
 impl Side {
@@ -286,6 +301,8 @@ struct Verdict {
     is_guard_success: bool,
     /// 結果表示中に見せる、プレイヤー自身の絵
     player_stage: PlayerStageKind,
+    /// 結果表示中に見せる、判定結果を強調する書道風テキスト画像
+    judge_stamp: JudgeStamp,
 }
 
 impl Verdict {
@@ -301,6 +318,7 @@ impl Verdict {
             message: None,
             is_guard_success: false,
             player_stage: PlayerStageKind::YahhoReply,
+            judge_stamp: JudgeStamp::Default,
         }
     }
 
@@ -319,8 +337,14 @@ impl Verdict {
 
     /// 不正解。elapsedはその判定が確定した時点での経過時間(誤入力ならその瞬間、
     /// 無反応ならMAX_RESPONSE_WINDOW)で、これがそのままpenalty個数の計算に使われる。
-    /// player_stageは呼び出し元(フライングか、ヤーへの反応失敗か)ごとに指定する
-    fn incorrect(detail: &str, elapsed: Duration, player_stage: PlayerStageKind) -> Self {
+    /// player_stage/judge_stampは呼び出し元(フライングか、ヤーへの反応失敗か)
+    /// ごとに指定する
+    fn incorrect(
+        detail: &str,
+        elapsed: Duration,
+        player_stage: PlayerStageKind,
+        judge_stamp: JudgeStamp,
+    ) -> Self {
         Self {
             is_correct: false,
             detail: detail.to_string(),
@@ -329,11 +353,12 @@ impl Verdict {
             message: None,
             is_guard_success: false,
             player_stage,
+            judge_stamp,
         }
     }
 
     /// 「やっほー」に失敗した時。♥は減らさず、ごはんがおかわりされて満タンに戻る。
-    /// プレイヤー側の絵は専用のものが無いため変化させない(様子を見ている顔のまま)
+    /// プレイヤー側の絵・判定演出は専用のものが無いため変化させない
     fn yahho_failed(detail: &str, elapsed: Duration) -> Self {
         Self {
             is_correct: false,
@@ -343,6 +368,7 @@ impl Verdict {
             message: Some(ResultMessage::RiceRefilled),
             is_guard_success: false,
             player_stage: PlayerStageKind::Watching,
+            judge_stamp: JudgeStamp::Default,
         }
     }
 
@@ -357,6 +383,7 @@ impl Verdict {
             message: Some(ResultMessage::RiceRefilled),
             is_guard_success: false,
             player_stage: PlayerStageKind::DamagedEating,
+            judge_stamp: JudgeStamp::Default,
         }
     }
 }
@@ -371,6 +398,7 @@ fn judge(phase: &Phase, input: Input) -> Option<Verdict> {
             FALSE_START_TEXT,
             Duration::ZERO,
             PlayerStageKind::Watching,
+            JudgeStamp::FalseStart,
         )),
         (Phase::Shout { side, remaining, .. }, Input::Turn(turned)) if turned == *side => {
             let elapsed = MAX_RESPONSE_WINDOW.saturating_sub(*remaining);
@@ -381,6 +409,7 @@ fn judge(phase: &Phase, input: Input) -> Option<Verdict> {
                     "反応が遅い",
                     elapsed,
                     PlayerStageKind::DamagedWatching,
+                    JudgeStamp::Late,
                 ))
             }
         }
@@ -388,11 +417,13 @@ fn judge(phase: &Phase, input: Input) -> Option<Verdict> {
             "指された方を向く",
             MAX_RESPONSE_WINDOW.saturating_sub(*remaining),
             PlayerStageKind::DamagedWatching,
+            JudgeStamp::Default,
         )),
         (Phase::Shout { remaining, .. }, Input::Yahho) => Some(Verdict::incorrect(
             "向きで答える",
             MAX_RESPONSE_WINDOW.saturating_sub(*remaining),
             PlayerStageKind::DamagedWatching,
+            JudgeStamp::Default,
         )),
         (Phase::Yahho { remaining }, Input::Yahho) => {
             let elapsed = MAX_RESPONSE_WINDOW.saturating_sub(*remaining);
@@ -438,12 +469,14 @@ enum Phase {
     /// 「やっほー」と言っている。残りの入力受付時間
     Yahho { remaining: Duration },
     /// 正誤の結果表示。この表示が終わるまで次の問題へは進まず、入力も受け付けない。
-    /// player_stageはこの結果に応じてプレイヤー側に見せる絵
+    /// player_stageはこの結果に応じてプレイヤー側に見せる絵、judge_stampは
+    /// 判定結果を強調する書道風テキスト画像
     Result {
         is_correct: bool,
         elapsed: Duration,
         message: Option<ResultMessage>,
         player_stage: PlayerStageKind,
+        judge_stamp: JudgeStamp,
     },
 }
 
@@ -607,11 +640,15 @@ impl LookAwayGame {
         if verdict.is_guard_success {
             audio::play_se(SeKind::LookAwayGuardSuccess);
         }
+        if verdict.judge_stamp == JudgeStamp::Late {
+            audio::play_se(SeKind::LookAwayBoo);
+        }
         self.phase = Phase::Result {
             is_correct: verdict.is_correct,
             elapsed: Duration::ZERO,
             message,
             player_stage: verdict.player_stage,
+            judge_stamp: verdict.judge_stamp,
         };
     }
 
@@ -627,6 +664,7 @@ impl LookAwayGame {
                 elapsed: Duration::ZERO,
                 message: None,
                 player_stage: PlayerStageKind::Watching,
+                judge_stamp: JudgeStamp::Default,
             };
             return;
         }
@@ -658,6 +696,7 @@ impl LookAwayGame {
                             elapsed: Duration::ZERO,
                             message: None,
                             player_stage: PlayerStageKind::Eating,
+                            judge_stamp: JudgeStamp::Default,
                         };
                         return;
                     }
@@ -686,6 +725,7 @@ impl LookAwayGame {
                         TIMEOUT_TEXT,
                         MAX_RESPONSE_WINDOW,
                         PlayerStageKind::DamagedWatching,
+                        JudgeStamp::Default,
                     ));
                 }
             }
@@ -729,8 +769,9 @@ impl LookAwayGame {
             Phase::Result {
                 is_correct,
                 message,
+                judge_stamp,
                 ..
-            } => self.render_result(frame, area, *is_correct, *message),
+            } => self.render_result(frame, area, *is_correct, *message, *judge_stamp),
             Phase::Idle {
                 is_eating,
                 normal_variant,
@@ -833,6 +874,7 @@ impl LookAwayGame {
         area: Rect,
         is_correct: bool,
         message: Option<ResultMessage>,
+        judge_stamp: JudgeStamp,
     ) {
         let background = result_background(is_correct, self.mark_renderer.uses_image());
         let ending = if self.is_game_over() {
@@ -845,14 +887,14 @@ impl LookAwayGame {
             None
         };
         let Some(ending) = ending else {
-            self.render_mark_or_background(frame, area, is_correct, background);
+            self.render_mark_or_background(frame, area, is_correct, judge_stamp, background);
             return;
         };
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(3), Constraint::Length(3)])
             .split(area);
-        self.render_mark_or_background(frame, rows[0], is_correct, background);
+        self.render_mark_or_background(frame, rows[0], is_correct, judge_stamp, background);
         let footer = Block::default().style(Style::default().bg(background));
         let inner = footer.inner(rows[1]);
         frame.render_widget(footer, rows[1]);
@@ -868,16 +910,21 @@ impl LookAwayGame {
         );
     }
 
-    /// 正解時は緑の◯を出さず背景色だけ塗る。不正解時は従来通り✗を大きく出す
+    /// 正解時は緑の◯を出さず背景色だけ塗る。不正解時はjudge_stampに応じた書道風
+    /// テキスト画像(遅い/フライング)を出し、専用画像が無ければ従来通り✗を大きく出す
     fn render_mark_or_background(
         &self,
         frame: &mut Frame,
         area: Rect,
         is_correct: bool,
+        judge_stamp: JudgeStamp,
         background: Color,
     ) {
         if is_correct {
             frame.render_widget(Block::default().style(Style::default().bg(background)), area);
+            return;
+        }
+        if self.stage_renderer.render_judge_stamp(frame, area, judge_stamp) {
             return;
         }
         self.mark_renderer.render(frame, area, is_correct, background);
@@ -1019,11 +1066,19 @@ struct PlayerImages {
     damaged_watching: StatefulProtocol,
 }
 
+/// 判定結果を強調する書道風テキスト画像(遅い/フライング)。JudgeStamp::Defaultには
+/// 対応する画像が無いので持たない
+struct JudgeStampImages {
+    late: StatefulProtocol,
+    false_start: StatefulProtocol,
+}
+
 /// カウンター越しの親父とプレイヤー自身の描画器。それぞれ静止画が全て読めた
 /// グループだけ画像で描き、そうでなければテキストの絵にフォールバックする
 struct StageRenderer {
     images: Option<RefCell<StageImages>>,
     player_images: Option<RefCell<PlayerImages>>,
+    judge_stamp_images: Option<RefCell<JudgeStampImages>>,
 }
 
 impl StageRenderer {
@@ -1062,7 +1117,7 @@ impl StageRenderer {
                 yahho: picker.new_resize_protocol(yahho),
             }))
         });
-        let player_images = picker.and_then(|picker| {
+        let player_images = picker.clone().and_then(|picker| {
             let eating = splash::load_embedded_image(PLAYER_EATING_IMAGE)?;
             let watching = splash::load_embedded_image(PLAYER_WATCHING_IMAGE)?;
             let guard_left = splash::load_embedded_image(PLAYER_GUARD_LEFT_IMAGE)?;
@@ -1080,9 +1135,18 @@ impl StageRenderer {
                 damaged_watching: picker.new_resize_protocol(damaged_watching),
             }))
         });
+        let judge_stamp_images = picker.and_then(|picker| {
+            let late = splash::load_embedded_image(JUDGE_LATE_IMAGE)?;
+            let false_start = splash::load_embedded_image(JUDGE_FALSE_START_IMAGE)?;
+            Some(RefCell::new(JudgeStampImages {
+                late: picker.new_resize_protocol(late),
+                false_start: picker.new_resize_protocol(false_start),
+            }))
+        });
         Self {
             images,
             player_images,
+            judge_stamp_images,
         }
     }
 
@@ -1096,6 +1160,12 @@ impl StageRenderer {
     #[cfg(test)]
     fn uses_player_image(&self) -> bool {
         self.player_images.is_some()
+    }
+
+    /// 判定結果の書道風テキスト画像を持っているか。テストでの確認用
+    #[cfg(test)]
+    fn uses_judge_stamp_image(&self) -> bool {
+        self.judge_stamp_images.is_some()
     }
 
     /// areaに画像を描いたか(true=描いた、false=画像が無いので呼び出し元がテキストで描く)
@@ -1136,6 +1206,26 @@ impl StageRenderer {
             PlayerStageKind::YahhoReply => &mut images.yahho_reply,
             PlayerStageKind::DamagedEating => &mut images.damaged_eating,
             PlayerStageKind::DamagedWatching => &mut images.damaged_watching,
+        };
+        let widget = StatefulImage::default().resize(Resize::Fit(Some(FilterType::Triangle)));
+        frame.render_stateful_widget(widget, area, protocol);
+        true
+    }
+
+    /// areaに判定結果の書道風テキスト画像を描いたか(true=描いた、false=画像が無い
+    /// かJudgeStamp::Defaultなので呼び出し元が従来の✗マークで描く)
+    fn render_judge_stamp(&self, frame: &mut Frame, area: Rect, kind: JudgeStamp) -> bool {
+        let Some(images) = &self.judge_stamp_images else {
+            return false;
+        };
+        if area.is_empty() {
+            return true;
+        }
+        let mut images = images.borrow_mut();
+        let protocol = match kind {
+            JudgeStamp::Late => &mut images.late,
+            JudgeStamp::FalseStart => &mut images.false_start,
+            JudgeStamp::Default => return false,
         };
         let widget = StatefulImage::default().resize(Resize::Fit(Some(FilterType::Triangle)));
         frame.render_stateful_widget(widget, area, protocol);
@@ -1251,6 +1341,14 @@ mod tests {
     fn result_player_stage(game: &LookAwayGame) -> PlayerStageKind {
         match game.phase {
             Phase::Result { player_stage, .. } => player_stage,
+            _ => panic!("結果表示中のはず"),
+        }
+    }
+
+    /// 結果表示中の判定演出(JudgeStamp)を取り出す(結果表示中でなければpanic)
+    fn result_judge_stamp(game: &LookAwayGame) -> JudgeStamp {
+        match game.phase {
+            Phase::Result { judge_stamp, .. } => judge_stamp,
             _ => panic!("結果表示中のはず"),
         }
     }
@@ -1619,6 +1717,11 @@ mod tests {
         press(&mut game, Side::Left.key());
         assert!(is_result(&game, false), "遅れれば正しい方向でも不正解");
         assert_eq!(game.lives, MAX_LIVES - 3);
+        assert_eq!(
+            result_judge_stamp(&game),
+            JudgeStamp::Late,
+            "反応が遅い判定は専用の書道画像を出す"
+        );
     }
 
     /// テストでの逆方向計算専用(本体コードは同方向のみを扱うのでopposite()を持たない)
@@ -2009,6 +2112,7 @@ mod tests {
         let renderer = StageRenderer::new();
         assert!(!renderer.uses_image());
         assert!(!renderer.uses_player_image());
+        assert!(!renderer.uses_judge_stamp_image());
     }
 
     #[test]
@@ -2036,6 +2140,17 @@ mod tests {
             PLAYER_DAMAGED_EATING_IMAGE,
             PLAYER_DAMAGED_WATCHING_IMAGE,
         ];
+        for path in paths {
+            assert!(
+                splash::load_embedded_image(path).is_some(),
+                "{path}が埋め込まれデコードできること"
+            );
+        }
+    }
+
+    #[test]
+    fn judge_stamp_images_are_embedded_and_decodable() {
+        let paths = [JUDGE_LATE_IMAGE, JUDGE_FALSE_START_IMAGE];
         for path in paths {
             assert!(
                 splash::load_embedded_image(path).is_some(),
@@ -2147,6 +2262,7 @@ mod tests {
                 Side::Right => PlayerStageKind::GuardRight,
             };
             assert_eq!(result_player_stage(&game), expected);
+            assert_eq!(result_judge_stamp(&game), JudgeStamp::Default);
             let text = if side == Side::Left {
                 PLAYER_GUARD_LEFT_TEXT
             } else {
@@ -2174,6 +2290,7 @@ mod tests {
         game.begin_event(Event::Shout(Side::Left), true);
         assert!(is_result(&game, false));
         assert_eq!(result_player_stage(&game), PlayerStageKind::DamagedEating);
+        assert_eq!(result_judge_stamp(&game), JudgeStamp::Default);
         assert!(player_stage_text(&rendered(&game)).contains(&compact(PLAYER_DAMAGED_EATING_TEXT)));
     }
 
@@ -2185,6 +2302,11 @@ mod tests {
         press(&mut game, KeyCode::Right); // 逆方向を押して不正解にする
         assert!(is_result(&game, false));
         assert_eq!(result_player_stage(&game), PlayerStageKind::DamagedWatching);
+        assert_eq!(
+            result_judge_stamp(&game),
+            JudgeStamp::Default,
+            "逆方向は「遅い」ではないので通常の✗マーク"
+        );
         assert!(
             player_stage_text(&rendered(&game)).contains(&compact(PLAYER_DAMAGED_WATCHING_TEXT))
         );
@@ -2198,6 +2320,7 @@ mod tests {
         game.update(MAX_RESPONSE_WINDOW);
         assert!(is_result(&game, false));
         assert_eq!(result_player_stage(&game), PlayerStageKind::DamagedWatching);
+        assert_eq!(result_judge_stamp(&game), JudgeStamp::Default);
     }
 
     #[test]
@@ -2207,6 +2330,11 @@ mod tests {
         press(&mut game, KeyCode::Left);
         assert!(is_result(&game, false));
         assert_eq!(result_player_stage(&game), PlayerStageKind::Watching);
+        assert_eq!(
+            result_judge_stamp(&game),
+            JudgeStamp::FalseStart,
+            "フライングは専用の書道画像を出す"
+        );
     }
 
     #[test]
@@ -2219,6 +2347,7 @@ mod tests {
         press(&mut game, KeyCode::Char(' '));
         assert!(is_result(&game, false));
         assert_eq!(result_player_stage(&game), PlayerStageKind::Watching);
+        assert_eq!(result_judge_stamp(&game), JudgeStamp::Default);
     }
 
     #[test]

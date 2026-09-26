@@ -185,6 +185,13 @@ pub(super) fn apps_on_every_non_menu_screen() -> Vec<(&'static str, App)> {
     let mut app = App::new();
     app.screen = Screen::SelectSong(0);
     press(&mut app, KeyCode::Enter);
+    assert!(matches!(app.screen, Screen::RhythmCountIn(..)));
+    apps.push(("RhythmCountIn", app));
+
+    let mut app = App::new();
+    app.screen = Screen::SelectSong(0);
+    press(&mut app, KeyCode::Enter);
+    app.update(super::game_start::RHYTHM_COUNT_IN_DURATION);
     assert!(matches!(app.screen, Screen::Playing(_)));
     apps.push(("Playing(リズム)", app));
 

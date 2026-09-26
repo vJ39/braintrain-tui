@@ -46,6 +46,10 @@ pub enum Screen {
     /// リズムゲームの曲選択(選択中の曲 = SONGSのインデックス)。
     /// TTRスプラッシュ画像を背景に、その上へ曲リストのパネルを重ねて描く
     SelectSong(usize),
+    /// 曲を決定してからプレイ開始までの間(RHYTHM_COUNT_IN_DURATION)。
+    /// BGM再生開始とゲーム内時計のズレ(オーディオ出力の立ち上がり遅延)を
+    /// 吸収するための猶予で、見た目は曲選択画面のまま待つ
+    RhythmCountIn(usize, Duration),
     /// (メニュー項目, リズムゲームの場合は選んだ曲)
     SelectDifficulty(usize, Option<usize>),
     /// ゲーム開始前のカウントダウン(リズムゲーム以外)。終わるとitemのゲームを
@@ -182,8 +186,8 @@ impl App {
                 let (item, song) = (*item, *song);
                 self.handle_difficulty_key(key, item, song);
             }
-            // カウントダウン中はスキップ不可なので入力を無視する
-            Screen::Countdown { .. } => {}
+            // カウントダウン中・曲決定後の待機中はスキップ不可なので入力を無視する
+            Screen::Countdown { .. } | Screen::RhythmCountIn(..) => {}
             Screen::Playing(game) => {
                 game.handle_key(key);
                 if game.is_finished() {
@@ -222,7 +226,7 @@ impl App {
                 let item = *item;
                 self.handle_difficulty_mouse(mouse, item);
             }
-            Screen::Countdown { .. } => {}
+            Screen::Countdown { .. } | Screen::RhythmCountIn(..) => {}
             Screen::Playing(game) => {
                 game.handle_mouse(mouse, area);
                 if game.is_finished() {
@@ -250,6 +254,7 @@ impl App {
                 }
             }
             Screen::Countdown { .. } => self.tick_countdown(dt),
+            Screen::RhythmCountIn(..) => self.tick_rhythm_count_in(dt),
             Screen::Menu => self.menu_typewriter.tick(dt),
             Screen::Result(..) => {
                 self.result_typewriter.tick(dt);
@@ -287,6 +292,10 @@ impl App {
                 );
             }
             Screen::SelectSong(selected) => {
+                select_song::render(frame, area, *selected, &mut self.ttr_splash_renderer)
+            }
+            // 見た目は曲選択画面のまま(選んだ曲を選択中の状態で)待つ
+            Screen::RhythmCountIn(selected, _) => {
                 select_song::render(frame, area, *selected, &mut self.ttr_splash_renderer)
             }
             Screen::SelectDifficulty(item, song) => {

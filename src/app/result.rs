@@ -7,8 +7,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::audio::{self, BgmCategory};
-use crate::game::{theme, GameResult};
+use crate::audio::{self, BgmCategory, SeKind};
+use crate::game::{rhythm, theme, GameResult};
 use crate::stats::store;
 use crate::ui::result_sprite::ResultSprite;
 use crate::ui::typewriter::{self, Typewriter};
@@ -32,6 +32,10 @@ impl App {
         if let Some(name) = audio::random_bgm_track(category) {
             audio::play_bgm_track(&name);
             self.current_bgm = Some(name);
+        }
+        // TTRはプレイ後の結果表示でも観客の歓声を鳴らす(選曲時と共通のSE)
+        if result.game_id == rhythm::GAME_ID {
+            audio::play_se(SeKind::Cheer);
         }
         let save_error = store::append_result(&result).err().map(|e| e.to_string());
         self.show_result(result, save_error);

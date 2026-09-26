@@ -28,10 +28,12 @@ impl App {
         self.screen = Screen::SelectSong(0);
     }
 
-    /// 曲選択画面での曲決定(キー/クリック共通)。難易度選択を挟まず、その曲のプレイを始める
+    /// 曲選択画面での曲決定(キー/クリック共通)。難易度選択を挟まず、RHYTHM_COUNT_IN_DURATION
+    /// の間だけ曲選択画面のまま待ってからその曲のプレイを始める(tick_rhythm_count_in参照)
     pub(super) fn select_song(&mut self, song: usize) {
         audio::play_se(SeKind::TtrSongSelect);
-        self.start_rhythm(song);
+        audio::play_se(SeKind::Cheer);
+        self.screen = Screen::RhythmCountIn(song, super::game_start::RHYTHM_COUNT_IN_DURATION);
     }
 
     pub(super) fn handle_song_key(&mut self, key: KeyEvent, selected: usize) {
@@ -168,8 +170,18 @@ fn song_at_row(area: Rect, mouse_row: u16) -> Option<usize> {
 mod tests {
     use crate::game::Difficulty;
 
+    use super::super::game_start::RHYTHM_COUNT_IN_DURATION;
     use super::super::test_support::*;
     use super::*;
+
+    /// 曲決定後の待機(Screen::RhythmCountIn)を最後まで進め、プレイ画面にする
+    fn finish_rhythm_count_in(app: &mut App) {
+        assert!(
+            matches!(app.screen, Screen::RhythmCountIn(..)),
+            "曲決定直後は待機画面のはず"
+        );
+        app.update(RHYTHM_COUNT_IN_DURATION);
+    }
 
     #[test]
     fn selecting_rhythm_menu_item_goes_straight_to_song_select() {
@@ -219,6 +231,7 @@ mod tests {
         assert!(matches!(app.screen, Screen::SelectSong(1)));
         assert_eq!(app.current_bgm, started_bgm);
         app.handle_key(KeyEvent::from(KeyCode::Enter));
+        finish_rhythm_count_in(&mut app);
         assert!(matches!(app.screen, Screen::Playing(_)));
         assert_eq!(app.current_bgm.as_deref(), Some(SONGS[1].track_name));
     }
@@ -228,6 +241,7 @@ mod tests {
         let mut app = App::new();
         app.select_menu_item(RHYTHM_ITEM_INDEX);
         app.select_song(1);
+        finish_rhythm_count_in(&mut app);
         assert!(matches!(app.screen, Screen::Playing(_)));
         assert_eq!(app.current_bgm.as_deref(), Some(SONGS[1].track_name));
     }
@@ -341,6 +355,7 @@ mod tests {
         let mut app = App::new();
         app.screen = Screen::SelectSong(1);
         app.handle_key(KeyEvent::from(KeyCode::Enter));
+        finish_rhythm_count_in(&mut app);
         assert_rhythm_playing_song(&app, 1);
     }
 
@@ -349,6 +364,7 @@ mod tests {
         let mut app = App::new();
         app.screen = Screen::SelectSong(0);
         app.handle_key(KeyEvent::from(KeyCode::Char('2')));
+        finish_rhythm_count_in(&mut app);
         assert_rhythm_playing_song(&app, 1);
     }
 
@@ -360,6 +376,7 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Up));
         assert!(matches!(app.screen, Screen::SelectSong(i) if i == last));
         app.handle_key(KeyEvent::from(KeyCode::Enter));
+        finish_rhythm_count_in(&mut app);
         assert_rhythm_playing_song(&app, last);
         assert_eq!(SONGS[last].track_name, "Overclocked_Tempo");
     }
@@ -386,6 +403,7 @@ mod tests {
         app.select_menu_item(RHYTHM_ITEM_INDEX); // TTR -> (TTR画像を背景にした)曲選択
         app.handle_key(KeyEvent::from(KeyCode::Down));
         app.handle_key(KeyEvent::from(KeyCode::Enter)); // 難易度選択を挟まずプレイ開始
+        finish_rhythm_count_in(&mut app);
         let Screen::Playing(game) = &app.screen else {
             panic!("Playing画面のはず");
         };
@@ -441,6 +459,7 @@ mod tests {
             .inner(song_panel_rect(app.last_area))
             .y;
         app.handle_mouse(left_click(inner_top + SONG_ROWS_OFFSET + 1));
+        finish_rhythm_count_in(&mut app);
         assert_rhythm_playing_song(&app, 1);
     }
 
@@ -472,12 +491,19 @@ mod tests {
     }
 
     #[test]
-    fn starting_rhythm_goes_straight_to_playing_without_countdown() {
+    fn starting_rhythm_goes_through_count_in_without_the_go_countdown() {
+        // TTRは「3.2.1.GO!!」の演出(Screen::Countdown)は挟まないが、
+        // 曲決定後にRHYTHM_COUNT_IN_DURATIONだけ待ってからプレイが始まる
         let mut app = App::new();
         app.screen = Screen::SelectSong(0);
         app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(app.screen, Screen::RhythmCountIn(0, _)),
+            "「3.2.1.GO!!」は挟まないが、曲決定後の待機画面になるはず"
+        );
+        finish_rhythm_count_in(&mut app);
         let Screen::Playing(game) = &app.screen else {
-            panic!("DDRはカウントダウンを挟まずPlaying画面になるはず");
+            panic!("待機後はPlaying画面になるはず");
         };
         assert_eq!(game.result().game_id, crate::game::rhythm::GAME_ID);
     }

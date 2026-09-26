@@ -19,6 +19,10 @@ use super::menu_items::{
 };
 use super::{App, Screen};
 
+/// 曲を決定してから実際にプレイが始まるまでの待機時間。BGM再生開始の指示と
+/// 実際にスピーカーから音が出るまでのオーディオ出力の立ち上がり遅延を吸収するための猶予
+pub(super) const RHYTHM_COUNT_IN_DURATION: Duration = Duration::from_secs(2);
+
 impl App {
     /// メニューでゲームの項目を決定した時に、そのゲームの開始経路へ振り分ける
     /// (難易度選択を挟むか・カウントダウンを挟むか・スプラッシュや曲選択を挟むか)
@@ -117,9 +121,23 @@ impl App {
         self.screen = Screen::Playing(Box::new(BeigomaGame::new()));
     }
 
+    /// 曲決定後の待機(Screen::RhythmCountIn)の時間経過。RHYTHM_COUNT_IN_DURATION
+    /// が経過したら実際にプレイを始める
+    pub(super) fn tick_rhythm_count_in(&mut self, dt: Duration) {
+        let Screen::RhythmCountIn(song, remaining) = &mut self.screen else {
+            return;
+        };
+        *remaining = remaining.saturating_sub(dt);
+        if !remaining.is_zero() {
+            return;
+        }
+        let song = *song;
+        self.start_rhythm(song);
+    }
+
     /// リズムゲームを開始する(常に上級の譜面・判定)。譜面生成を先に済ませ、選んだ曲のBGM再生を
     /// 始めた直後にゲーム内時計を合わせることで、曲と譜面(実測ビート時刻)の時間基準を揃える
-    pub(super) fn start_rhythm(&mut self, song: usize) {
+    fn start_rhythm(&mut self, song: usize) {
         let mut game = RhythmGame::new(song);
         let track_name = game.song().track_name;
         audio::play_bgm_track(track_name);
@@ -788,5 +806,50 @@ mod tests {
             "中断後にゲームが始まらないこと"
         );
         assert!(!app.should_quit());
+    }
+
+    // --- TTR曲決定後の待機(Screen::RhythmCountIn) ---
+
+    #[test]
+    fn rhythm_count_in_does_not_start_playing_before_the_duration_passes() {
+        let mut app = App::new();
+        app.screen = Screen::SelectSong(0);
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.screen, Screen::RhythmCountIn(0, _)));
+        app.update(RHYTHM_COUNT_IN_DURATION - Duration::from_millis(1));
+        assert!(
+            matches!(app.screen, Screen::RhythmCountIn(0, _)),
+            "待機時間を過ぎるまではPlayingにならない"
+        );
+    }
+
+    #[test]
+    fn rhythm_count_in_starts_playing_the_selected_song_after_the_duration() {
+        let mut app = App::new();
+        app.screen = Screen::SelectSong(1);
+        press(&mut app, KeyCode::Enter);
+        app.update(RHYTHM_COUNT_IN_DURATION);
+        let Screen::Playing(game) = &app.screen else {
+            panic!("待機時間を過ぎたらPlaying画面になるはず");
+        };
+        assert_eq!(game.result().game_id, crate::game::rhythm::GAME_ID);
+        assert_eq!(
+            app.current_bgm.as_deref(),
+            Some(crate::game::rhythm::SONGS[1].track_name)
+        );
+    }
+
+    #[test]
+    fn keys_during_rhythm_count_in_are_ignored() {
+        let mut app = App::new();
+        app.screen = Screen::SelectSong(0);
+        press(&mut app, KeyCode::Enter);
+        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Enter, KeyCode::Esc] {
+            press(&mut app, code);
+            assert!(
+                matches!(app.screen, Screen::RhythmCountIn(0, _)),
+                "{code:?}: 待機中は入力を無視する"
+            );
+        }
     }
 }
