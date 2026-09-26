@@ -57,8 +57,8 @@ const MESSAGE_HOLD: Duration = Duration::from_millis(900);
 /// 物理を進める1ステップの上限。大きなdtはこの長さに分けて進める(マスの飛び越し防止)
 const MAX_STEP: Duration = Duration::from_millis(10);
 
-/// ベーゴマの回転の見た目が1コマ進む間隔
-const SPIN_FRAME_INTERVAL: Duration = Duration::from_millis(70);
+/// ベーゴマの回転の見た目が1コマ進む間隔。8コマで1周280ms(従来の4コマ×70msと同じ速さ)
+const SPIN_FRAME_INTERVAL: Duration = Duration::from_millis(35);
 
 /// 画面左の軽トラ視点の幅(%)。残りを盤面に使う
 const TRUCK_VIEW_PERCENT: u16 = 40;
@@ -208,7 +208,7 @@ impl BeigomaGame {
             StepEvent::Landed(Landing::Light) | StepEvent::Grazed(Landing::Light) => {
                 self.message = Some(("セーフ", Duration::ZERO));
             }
-            // 凹の側面をこすって弾かれた時も、凸で弾かれた時と同じ演出
+            // 凹凸の側面をこすって弾かれた時も、凸で弾かれた時と同じ演出
             StepEvent::Landed(Landing::Bounce) | StepEvent::Grazed(Landing::Bounce) => {
                 audio::play_se(SeKind::Incorrect);
                 self.message = Some(("ぴよーん!! ああっ!!", Duration::ZERO));
@@ -648,8 +648,28 @@ mod tests {
 
     #[test]
     fn spin_frame_interval_is_fast_enough_to_look_energetic() {
-        // 回転をもっと激しく見せるため、コマ送りの間隔は短くする(#129)
-        assert_eq!(SPIN_FRAME_INTERVAL, Duration::from_millis(70));
+        // 回転をもっと激しく見せるため、1周の長さは4コマ×70ms(#129)のまま、コマ数を増やして滑らかにする
+        assert_eq!(SPIN_FRAME_INTERVAL, Duration::from_millis(35));
+        assert_eq!(
+            SPIN_FRAME_INTERVAL * render::TOP_SPIN_GLYPHS.len() as u32,
+            Duration::from_millis(280),
+            "1周の長さは変えない"
+        );
+    }
+
+    #[test]
+    fn spin_frame_steps_through_every_glyph_and_wraps() {
+        let mut game = calm_game();
+        let start = game.spin_frame();
+        let len = render::TOP_SPIN_GLYPHS.len();
+        for step in 1..=len {
+            game.update(SPIN_FRAME_INTERVAL);
+            assert_eq!(
+                game.spin_frame(),
+                (start + step) % len,
+                "1間隔ごとに1コマずつ進み、1周で元に戻る"
+            );
+        }
     }
 
     // --- 操作 ---
@@ -1147,7 +1167,7 @@ mod tests {
         game.on_step_event(StepEvent::FellOff);
         game.update(render::STAR_ANIM_FRAME);
         assert_eq!(game.star_frame(), Some(1), "時間が経つとコマが進む");
-        game.update(render::STAR_ANIM_FRAME * 10);
+        game.update(render::STAR_ANIM_FRAME * render::STAR_ANIM_GLYPHS.len() as u32 * 2);
         assert_eq!(
             game.star_frame(),
             Some(render::STAR_ANIM_GLYPHS.len() - 1),

@@ -10,7 +10,8 @@
 //! - 平坦な場所の摩擦はGによらず一定。障害物は凸(でっぱり)と凹(くぼみ)の2種類で、
 //!   どちらも「マスに入った瞬間」に判定する
 //!   - 凸: 踏むと一度飛び上がり、着地の瞬間の摩擦が踏んだ時のGに応じて増える。
-//!     その大きさで 軽い着地/弾かれる/吹っ飛ぶ の3段階になる
+//!     その大きさで 軽い着地/弾かれる/吹っ飛ぶ の3段階になる。
+//!     斜めから速く当たると飛び上がらず側面をこすり、速さとGで弾かれ/吹っ飛びになる
 //!   - 凹: 正面から入るとハマり、強い摩擦で速さを奪われてマスの中に留まる(十分な速さで抜け出せる)。
 //!     斜めに入ると側面をこすり、凸の着地と同じ3段階(ただし摩擦が上乗せされる)で弾かれる
 //! - 盤の縁に壁は無い。ベーゴマの中心が縁を越えたら盤から落ちる(場外)
@@ -123,14 +124,16 @@ pub const G_ACCEL_PER_G: f64 = 8.0;
 /// 平坦な場所の転がり摩擦(1秒あたりの速度の減衰率)。Gによらず一定
 pub const ROLLING_FRICTION: f64 = 0.8;
 /// 着地の瞬間の摩擦が、踏んだ時のG1あたりに増える量
-pub const FRICTION_PER_G: f64 = 2.0;
-/// 摩擦増加の閾値の目安にするG(低=弾かれ始める、高=吹っ飛ぶ)
-pub const LOW_G_THRESHOLD: f64 = 0.3;
-pub const HIGH_G_THRESHOLD: f64 = 0.8;
-/// 着地の摩擦の閾値。これ以下なら軽い着地、これを超えると弾かれる
-pub const LOW_FRICTION_THRESHOLD: f64 = ROLLING_FRICTION + FRICTION_PER_G * LOW_G_THRESHOLD;
-/// 着地の摩擦の閾値。これを超えると吹っ飛ぶ
-pub const HIGH_FRICTION_THRESHOLD: f64 = ROLLING_FRICTION + FRICTION_PER_G * HIGH_G_THRESHOLD;
+pub const FRICTION_PER_G: f64 = 3.0;
+/// 着地の摩擦の閾値(摩擦の値で固定)。これ以下なら軽い着地、これを超えると弾かれる
+pub const LOW_FRICTION_THRESHOLD: f64 = 1.4;
+/// 着地の摩擦の閾値(摩擦の値で固定)。これを超えると吹っ飛ぶ
+pub const HIGH_FRICTION_THRESHOLD: f64 = 2.4;
+/// 閾値のG相当(凸を正面から踏んだ時)。0.2G / 0.533G
+#[cfg_attr(not(test), allow(dead_code))]
+pub const LOW_G_THRESHOLD: f64 = (LOW_FRICTION_THRESHOLD - ROLLING_FRICTION) / FRICTION_PER_G;
+#[cfg_attr(not(test), allow(dead_code))]
+pub const HIGH_G_THRESHOLD: f64 = (HIGH_FRICTION_THRESHOLD - ROLLING_FRICTION) / FRICTION_PER_G;
 /// 障害物を踏んで飛び上がってから着地するまでの時間
 pub const HOP_DURATION: Duration = Duration::from_millis(250);
 /// 弾かれた時の速さ(マス/秒)と、弾かれた瞬間に位置が飛ぶ量(マス)。
@@ -141,14 +144,19 @@ pub const BOUNCE_KICK: f64 = 0.5;
 /// ベーゴマの速さの上限(マス/秒)。1ステップでマスを飛び越さないようにする
 pub const MAX_SPEED: f64 = 15.0;
 /// 凹にハマっている間の摩擦(1秒あたりの速度の減衰率)。平坦の0.8に対して大きく、抜け出しにくい
-pub const HOLLOW_FRICTION: f64 = 3.0;
-/// 凹から抜け出すのに必要な速さ(マス/秒)。終端速度は 加速度/HOLLOW_FRICTION なので、
-/// 傾き最大(6マス/s^2)なら約2.0に届いて約0.5秒で抜け、それより弱い傾きだけでは届かない
-pub const HOLLOW_EXIT_SPEED: f64 = 1.5;
-/// 凹に入る向きと、跨いだ縁の法線のなす角のcos。これ未満(60°より浅い角度)なら側面をこすって弾かれる
-pub const HOLLOW_GRAZE_COS: f64 = 0.5;
-/// 凹の側面をこすった時に、着地の摩擦へ上乗せする分。G=0でも弾かれ、G>0.45で吹っ飛ぶ
-pub const HOLLOW_GRAZE_FRICTION: f64 = 0.7;
+pub const HOLLOW_FRICTION: f64 = 4.5;
+/// 凹から抜け出すのに必要な速さ(マス/秒)。抜けられる条件は 加速度 ≥ HOLLOW_FRICTION × HOLLOW_EXIT_SPEED = 4.5マス/秒²。
+/// 傾き最大(6マス/s^2)なら終端速度約1.3で約0.6秒で抜け、4回押しまでの傾きだけでは届かない
+pub const HOLLOW_EXIT_SPEED: f64 = 1.0;
+/// 凹凸のマスに入る向きと、跨いだ縁の法線のなす角のcos。これ未満(60°より浅い角度)なら斜め(側面接触)
+pub const GRAZE_COS: f64 = 0.5;
+/// 凹の側面をこすった時に、着地の摩擦へ上乗せする分。G=0でも弾かれ、G>0.2で吹っ飛ぶ
+pub const HOLLOW_GRAZE_FRICTION: f64 = 1.0;
+/// 凸に斜めから当たった時に側面接触とみなす最低の速さ(マス/秒)。これ未満なら正面と同じく飛び上がる
+pub const BUMP_GRAZE_SPEED: f64 = 3.0;
+/// 凸の側面をこすった時に、着地の摩擦へ上乗せする分の速さ1(マス/秒)あたりの量。
+/// G=0なら速さ3.0で1.55(弾かれ)、6.4を超えると吹っ飛ぶ
+pub const BUMP_GRAZE_FRICTION_PER_SPEED: f64 = 0.25;
 
 /// 盤の1マス
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,18 +398,19 @@ pub fn surface_friction(cell: Cell, state: TopState, g: f64) -> f64 {
     }
 }
 
-/// 凹への入り方
+/// 凹凸のマスに入った時の当たり方(凸・凹共通)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HollowContact {
-    /// 正面から入った: ハマる
-    Sink,
-    /// 斜めに入った: 側面をこする
+pub enum EdgeContact {
+    /// 正面から入った。凸なら飛び上がり、凹ならハマる
+    HeadOn,
+    /// 斜めに入った。側面をこする
     Graze,
 }
 
-/// 凹に入った向きの判定。prevからcurへ跨いだ縁の法線(curへ向かう向き)と速度のなす角で、
-/// 正面(Sink)か斜め(Graze)かを決める。角を斜めに跨いだ時は対角の向きを法線とみなす
-pub fn hollow_contact(vel: (f64, f64), prev: (usize, usize), cur: (usize, usize)) -> HollowContact {
+/// 凹凸のマスに入った向きの判定。prevからcurへ跨いだ縁の法線(curへ向かう向き)と速度のなす角で
+/// 正面(HeadOn)か斜め(Graze)かを決める。角を斜めに跨いだ時は対角の向きを法線とみなす。
+/// 縁を跨いでいない・止まっている時は正面扱い
+pub fn edge_contact(vel: (f64, f64), prev: (usize, usize), cur: (usize, usize)) -> EdgeContact {
     let normal = (
         (cur.0 as i64 - prev.0 as i64).signum() as f64,
         (cur.1 as i64 - prev.1 as i64).signum() as f64,
@@ -410,19 +419,29 @@ pub fn hollow_contact(vel: (f64, f64), prev: (usize, usize), cur: (usize, usize)
     let speed = vel.0.hypot(vel.1);
     if normal_len == 0.0 || speed < 1e-9 {
         // 縁を跨いでいない・止まっている(通常は起きない)時は正面扱いにする
-        return HollowContact::Sink;
+        return EdgeContact::HeadOn;
     }
     let cos = (vel.0 * normal.0 + vel.1 * normal.1) / (speed * normal_len);
-    hollow_contact_from_cos(cos)
+    edge_contact_from_cos(cos)
 }
 
-/// 入る向きと縁の法線のなす角のcosから入り方を決める。HOLLOW_GRAZE_COSちょうどはハマる
-pub fn hollow_contact_from_cos(cos: f64) -> HollowContact {
-    if cos >= HOLLOW_GRAZE_COS {
-        HollowContact::Sink
+/// 入る向きと縁の法線のなす角のcosから当たり方を決める。GRAZE_COSちょうどは正面
+pub fn edge_contact_from_cos(cos: f64) -> EdgeContact {
+    if cos >= GRAZE_COS {
+        EdgeContact::HeadOn
     } else {
-        HollowContact::Graze
+        EdgeContact::Graze
     }
+}
+
+/// 凸に入った時に側面接触になるか。斜め、かつ速さがBUMP_GRAZE_SPEED以上(ちょうどを含む)
+pub fn is_bump_graze(contact: EdgeContact, speed: f64) -> bool {
+    contact == EdgeContact::Graze && speed >= BUMP_GRAZE_SPEED
+}
+
+/// 凸の側面をこすった時に着地の摩擦へ上乗せする分。速さに比例する
+pub fn bump_graze_friction(speed: f64) -> f64 {
+    BUMP_GRAZE_FRICTION_PER_SPEED * speed
 }
 
 /// 障害物から着地する瞬間の摩擦。踏んだ時のGが大きいほど増える
@@ -472,7 +491,7 @@ pub enum StepEvent {
     Landed(Landing),
     /// 凹に正面から入ってハマった
     Sank,
-    /// 凹の側面をこすって弾かれた/吹っ飛んだ
+    /// 凹凸の側面をこすって弾かれた/吹っ飛んだ
     Grazed(Landing),
     /// 凹から抜け出した
     Escaped,
@@ -555,36 +574,53 @@ impl Top {
             return None;
         }
         match cell {
-            Cell::Bump => {
-                // 凸を踏んだ瞬間: 一度飛び上がり、このときのGで着地の摩擦が決まる
-                let contact_g = g.magnitude();
-                self.state = TopState::Airborne {
-                    remaining: HOP_DURATION,
-                    contact_g,
-                };
-                Some(StepEvent::Hopped { contact_g })
-            }
+            Cell::Bump => Some(self.enter_bump(prev, cur, g.magnitude())),
             Cell::Hollow => Some(self.enter_hollow(prev, cur, g.magnitude())),
             Cell::Flat | Cell::Goal => None,
         }
     }
 
-    /// 凹のマスに入った瞬間。正面ならハマり、斜めなら側面をこすって凸の着地と同じ3段階で判定する
+    /// 速さ(マス/秒)
+    fn speed(&self) -> f64 {
+        self.vel.0.hypot(self.vel.1)
+    }
+
+    /// 凸のマスに入った瞬間。側面接触なら飛び上がらずその場で判定し、それ以外は飛び上がる
+    fn enter_bump(&mut self, prev: (usize, usize), cur: (usize, usize), g: f64) -> StepEvent {
+        let speed = self.speed();
+        let contact = edge_contact(self.vel, prev, cur);
+        if is_bump_graze(contact, speed) {
+            // 斜めから速く当たった: 側面をこすり、速さとGで弾かれ/吹っ飛びが決まる
+            return self.graze(landing_friction(g) + bump_graze_friction(speed));
+        }
+        // 正面から、またはゆっくり斜めに乗り上げた: 一度飛び上がり、このときのGで着地の摩擦が決まる
+        self.state = TopState::Airborne {
+            remaining: HOP_DURATION,
+            contact_g: g,
+        };
+        StepEvent::Hopped { contact_g: g }
+    }
+
+    /// 凹のマスに入った瞬間。正面ならハマり、斜めなら側面をこする
     fn enter_hollow(&mut self, prev: (usize, usize), cur: (usize, usize), g: f64) -> StepEvent {
-        match hollow_contact(self.vel, prev, cur) {
-            HollowContact::Sink => {
+        match edge_contact(self.vel, prev, cur) {
+            EdgeContact::HeadOn => {
                 self.state = TopState::Sunk;
                 StepEvent::Sank
             }
-            HollowContact::Graze => {
-                let landing = classify_landing(landing_friction(g) + HOLLOW_GRAZE_FRICTION);
-                if landing == Landing::Bounce {
-                    self.bounce();
-                    self.prev_cell = cell_index(self.pos);
-                }
-                StepEvent::Grazed(landing)
-            }
+            EdgeContact::Graze => self.graze(landing_friction(g) + HOLLOW_GRAZE_FRICTION),
         }
+    }
+
+    /// 側面をこすった(凸・凹共通)。frictionから弾かれ/吹っ飛びを決め、弾かれるならbounce()して
+    /// 弾かれた先のマスに入った扱いにする。Grazed(landing)を返す
+    fn graze(&mut self, friction: f64) -> StepEvent {
+        let landing = classify_landing(friction);
+        if landing == Landing::Bounce {
+            self.bounce();
+            self.prev_cell = cell_index(self.pos);
+        }
+        StepEvent::Grazed(landing)
     }
 
     /// 凹にハマっている間: 摩擦はHOLLOW_FRICTIONで、凹のマスから出る位置まで進んでも
@@ -1307,7 +1343,7 @@ mod tests {
     #[test]
     fn classify_landing_has_three_levels() {
         assert_eq!(classify_landing(landing_friction(0.0)), Landing::Light);
-        assert_eq!(classify_landing(landing_friction(0.2)), Landing::Light);
+        assert_eq!(classify_landing(landing_friction(0.1)), Landing::Light);
         assert_eq!(
             classify_landing(LOW_FRICTION_THRESHOLD),
             Landing::Light,
@@ -1328,6 +1364,77 @@ mod tests {
             Landing::Flown
         );
         assert_eq!(classify_landing(landing_friction(1.2)), Landing::Flown);
+    }
+
+    #[test]
+    fn friction_constants_have_the_designed_values() {
+        assert_eq!(FRICTION_PER_G, 3.0);
+        assert_eq!(HOLLOW_FRICTION, 4.5);
+        assert_eq!(HOLLOW_GRAZE_FRICTION, 1.0);
+        assert_eq!(HOLLOW_EXIT_SPEED, 1.0);
+        assert_eq!(BUMP_GRAZE_SPEED, 3.0);
+        assert_eq!(BUMP_GRAZE_FRICTION_PER_SPEED, 0.25);
+        // 閾値は摩擦の値で固定(FRICTION_PER_Gを変えても一緒に動かない)
+        assert_eq!(LOW_FRICTION_THRESHOLD, 1.4);
+        assert_eq!(HIGH_FRICTION_THRESHOLD, 2.4);
+        assert!(approx(LOW_G_THRESHOLD, 0.2), "{LOW_G_THRESHOLD}");
+        assert!(
+            (HIGH_G_THRESHOLD - 1.6 / 3.0).abs() < 1e-9,
+            "{HIGH_G_THRESHOLD}"
+        );
+    }
+
+    #[test]
+    fn friction_constants_keep_their_relations() {
+        use super::super::truck::CRUISE_VIBRATION_G;
+        const { assert!(LOW_FRICTION_THRESHOLD < HIGH_FRICTION_THRESHOLD) };
+        // 凹の側面接触はG=0でも弾かれる
+        const { assert!(ROLLING_FRICTION + HOLLOW_GRAZE_FRICTION > LOW_FRICTION_THRESHOLD) };
+        // 凸の側面接触は軽い着地にならない
+        const {
+            assert!(
+                ROLLING_FRICTION + BUMP_GRAZE_FRICTION_PER_SPEED * BUMP_GRAZE_SPEED
+                    > LOW_FRICTION_THRESHOLD
+            )
+        };
+        // 傾き最大なら凹から抜けられる
+        const { assert!(HOLLOW_FRICTION * HOLLOW_EXIT_SPEED < TILT_MAX * TILT_ACCEL_PER_LEVEL) };
+        // 4回押しまでの傾きだけでは抜けられない
+        const { assert!(HOLLOW_FRICTION * HOLLOW_EXIT_SPEED > 4.0 * TILT_STEP * TILT_ACCEL_PER_LEVEL) };
+        // 巡航の揺れだけでは凸で弾かれない
+        const {
+            assert!(
+                ROLLING_FRICTION + FRICTION_PER_G * CRUISE_VIBRATION_G <= LOW_FRICTION_THRESHOLD
+            )
+        };
+        // 巡航の揺れだけでは凹の側面で吹っ飛ばない
+        const {
+            assert!(
+                ROLLING_FRICTION + FRICTION_PER_G * CRUISE_VIBRATION_G + HOLLOW_GRAZE_FRICTION
+                    <= HIGH_FRICTION_THRESHOLD
+            )
+        };
+    }
+
+    #[test]
+    fn classify_landing_splits_at_the_new_g_thresholds() {
+        // 閾値の境目(0.2G・0.533G)を避けた値で確かめる
+        assert_eq!(classify_landing(landing_friction(0.1)), Landing::Light);
+        assert_eq!(classify_landing(landing_friction(0.4)), Landing::Bounce);
+        assert_eq!(classify_landing(landing_friction(1.0)), Landing::Flown);
+    }
+
+    #[test]
+    fn cruise_vibration_alone_is_light_on_a_bump_and_bounces_on_a_hollow_side() {
+        use super::super::truck::CRUISE_VIBRATION_G;
+        assert_eq!(
+            classify_landing(landing_friction(CRUISE_VIBRATION_G)),
+            Landing::Light
+        );
+        assert_eq!(
+            classify_landing(landing_friction(CRUISE_VIBRATION_G) + HOLLOW_GRAZE_FRICTION),
+            Landing::Bounce
+        );
     }
 
     // --- ベーゴマの物理 ---
@@ -1601,7 +1708,7 @@ mod tests {
 
     #[test]
     fn low_g_contact_gives_a_light_landing() {
-        let (top, landing) = land_after_contact(lateral(-0.2), NO_G);
+        let (top, landing) = land_after_contact(lateral(-0.1), NO_G);
         assert_eq!(landing, Landing::Light);
         assert!(!top.is_airborne());
         assert!(speed(&top) < BOUNCE_SPEED, "弾かれない");
@@ -1817,42 +1924,38 @@ mod tests {
         };
         assert_eq!(graze(0.6), Some(StepEvent::Grazed(Landing::Flown)));
         assert_eq!(
-            graze(0.4),
+            graze(0.1),
             Some(StepEvent::Grazed(Landing::Bounce)),
-            "G=0.45以下なら弾かれるだけ"
+            "G=0.2以下なら弾かれるだけ"
         );
     }
 
     #[test]
-    fn hollow_contact_threshold_is_exact() {
+    fn edge_contact_threshold_is_exact() {
         assert_eq!(
-            hollow_contact_from_cos(HOLLOW_GRAZE_COS),
-            HollowContact::Sink,
-            "しきい値ちょうどはハマる"
+            edge_contact_from_cos(GRAZE_COS),
+            EdgeContact::HeadOn,
+            "しきい値ちょうどは正面"
         );
-        assert_eq!(
-            hollow_contact_from_cos(HOLLOW_GRAZE_COS - 1e-6),
-            HollowContact::Graze
-        );
-        assert_eq!(hollow_contact_from_cos(1.0), HollowContact::Sink);
+        assert_eq!(edge_contact_from_cos(GRAZE_COS - 1e-6), EdgeContact::Graze);
+        assert_eq!(edge_contact_from_cos(1.0), EdgeContact::HeadOn);
         // 左の縁(法線は右向き)・上の縁(法線は下向き)とも、法線から60°の前後で分かれる
-        let edge_angle = HOLLOW_GRAZE_COS.acos();
+        let edge_angle = GRAZE_COS.acos();
         let (left, right) = ((9, 6), (10, 6));
         let (above, below) = ((10, 5), (10, 6));
         for (delta, expected) in [
-            (-0.1_f64.to_radians(), HollowContact::Sink),
-            (0.1_f64.to_radians(), HollowContact::Graze),
+            (-0.1_f64.to_radians(), EdgeContact::HeadOn),
+            (0.1_f64.to_radians(), EdgeContact::Graze),
         ] {
             let angle = edge_angle + delta;
             let from_left = (2.0 * angle.cos(), 2.0 * angle.sin());
-            assert_eq!(hollow_contact(from_left, left, right), expected, "{delta}");
+            assert_eq!(edge_contact(from_left, left, right), expected, "{delta}");
             let from_above = (2.0 * angle.sin(), 2.0 * angle.cos());
-            assert_eq!(
-                hollow_contact(from_above, above, below),
-                expected,
-                "{delta}"
-            );
+            assert_eq!(edge_contact(from_above, above, below), expected, "{delta}");
         }
+        // 縁を跨いでいない・止まっている時は正面扱い
+        assert_eq!(edge_contact((3.0, 1.0), below, below), EdgeContact::HeadOn);
+        assert_eq!(edge_contact((0.0, 0.0), above, below), EdgeContact::HeadOn);
     }
 
     #[test]
@@ -1932,8 +2035,33 @@ mod tests {
             }
         }
         assert!(clamped_steps > 30, "縁で留められていた: {clamped_steps}");
-        assert!(top.vel.0 > 0.8, "速度は殺されていない: {:?}", top.vel);
+        assert!(top.vel.0 > 0.6, "速度は殺されていない: {:?}", top.vel);
         assert_eq!(top.state, TopState::Sunk);
+    }
+
+    #[test]
+    fn sunk_top_stays_slow_even_with_full_tilt() {
+        // 傾けた向きと反対側の縁から始めて、60ステップの間はハマったまま動かせる。
+        // 摩擦4.5の終端速度は約1.3なので1.4に届かない(摩擦3.0なら約1.9まで届く)
+        let board = hollow_board();
+        for (key, pos) in [
+            (TiltKey::Right, (0.001, 0.5)),
+            (TiltKey::Left, (0.999, 0.5)),
+            (TiltKey::Forward, (0.5, 0.999)),
+            (TiltKey::Back, (0.5, 0.001)),
+        ] {
+            let tilt = tilt_toward(key, 20);
+            let mut top = sunk_top((HOLLOW_AT.0 as f64 + pos.0, HOLLOW_AT.1 as f64 + pos.1));
+            for i in 0..60 {
+                assert_eq!(top.step(&board, STEP, &tilt, NO_G), None, "{key:?} i={i}");
+                assert_eq!(top.state, TopState::Sunk, "{key:?} i={i}");
+            }
+            assert!(speed(&top) < 1.4, "{key:?}: {}", speed(&top));
+            assert!(
+                speed(&top) > HOLLOW_EXIT_SPEED,
+                "{key:?}: 抜けられる速さには届く"
+            );
+        }
     }
 
     #[test]
@@ -1985,5 +2113,211 @@ mod tests {
             }
             assert_eq!(top.state, TopState::Rolling);
         }
+    }
+
+    // --- 凸の側面接触 ---
+
+    /// 凸の側面接触のテストで使う凸のマス(盤の中央付近)
+    const BUMP_AT: (usize, usize) = (10, 6);
+
+    fn bump_board() -> Board {
+        board_with(&[(BUMP_AT, Cell::Bump)])
+    }
+
+    /// 凸の上の縁のすぐ外側(ここから下向きの成分を持つ速度で入ると上の縁を跨ぐ)
+    fn above_bump() -> (f64, f64) {
+        (BUMP_AT.0 as f64 + 0.5, BUMP_AT.1 as f64 - 0.005)
+    }
+
+    /// posからvelで転がし、最初の出来事が起きるまで進める
+    fn first_event(board: &Board, pos: (f64, f64), vel: (f64, f64), g: GForce) -> (Top, StepEvent) {
+        let mut top = Top::new(pos);
+        top.vel = vel;
+        for _ in 0..100 {
+            if let Some(event) = top.step(board, STEP, &Tilt::new(), g) {
+                return (top, event);
+            }
+        }
+        panic!("{pos:?} {vel:?}: 出来事が起きなかった");
+    }
+
+    #[test]
+    fn entering_a_bump_head_on_hops_regardless_of_speed() {
+        let board = bump_board();
+        let pos = (BUMP_AT.0 as f64 - 0.02, BUMP_AT.1 as f64 + 0.5);
+        for vel in [(3.0, 0.0), (10.0, 0.0)] {
+            let (top, event) = first_event(&board, pos, vel, NO_G);
+            assert!(
+                matches!(event, StepEvent::Hopped { .. }),
+                "{vel:?}: 正面は速さによらず飛び上がる: {event:?}"
+            );
+            assert!(top.is_airborne(), "{vel:?}");
+        }
+    }
+
+    #[test]
+    fn grazing_a_bump_fast_bounces_without_hopping() {
+        // 上の縁(法線は下向き)に、横へ流れながら浅い角度(cos≈0.32)・速さ約3.16で入る
+        let board = bump_board();
+        let incoming = (3.0, 1.0);
+        let mut top = Top::new(above_bump());
+        top.vel = incoming;
+        assert_eq!(
+            top.step(&board, STEP, &Tilt::new(), NO_G),
+            Some(StepEvent::Grazed(Landing::Bounce)),
+            "側面をこすって弾かれる(G=0でも弾かれる)"
+        );
+        assert!(!top.is_airborne(), "飛び上がらない");
+        assert_eq!(top.state, TopState::Rolling);
+        assert!(approx(speed(&top), BOUNCE_SPEED), "勢いよく弾かれる");
+        let dot = top.vel.0 * incoming.0 + top.vel.1 * incoming.1;
+        assert!(
+            approx(dot, -BOUNCE_SPEED * incoming.0.hypot(incoming.1)),
+            "来た方向の真逆へ弾かれる: {:?}",
+            top.vel
+        );
+        assert_ne!(cell_containing(top.pos), BUMP_AT, "凸の外へ弾き出される");
+        // 弾かれた後は同じ凸へ入り直さず、盤の中央付近なので場外へも出ない
+        for i in 0..1000 {
+            assert_eq!(top.step(&board, STEP, &Tilt::new(), NO_G), None, "i={i}");
+            assert!(Board::contains(top.pos), "i={i}: {:?}", top.pos);
+        }
+    }
+
+    #[test]
+    fn grazing_a_bump_slowly_hops_like_head_on() {
+        // 斜めでも速さが足りなければ、正面と同じく飛び上がる(ゆっくり乗り上げる)
+        let board = bump_board();
+        let (top, event) = first_event(&board, above_bump(), (1.5, 0.5), NO_G);
+        assert!(
+            matches!(event, StepEvent::Hopped { .. }),
+            "遅い斜めは飛び上がる: {event:?}"
+        );
+        assert!(top.is_airborne());
+        assert_eq!(cell_containing(top.pos), BUMP_AT);
+    }
+
+    #[test]
+    fn grazing_a_bump_very_fast_flies_the_top_off() {
+        // 速さ約7.28なら摩擦約2.62で、G=0でも吹っ飛ぶ
+        let board = bump_board();
+        let (_, event) = first_event(&board, above_bump(), (7.0, 2.0), NO_G);
+        assert_eq!(event, StepEvent::Grazed(Landing::Flown));
+    }
+
+    #[test]
+    fn grazing_a_bump_under_g_adds_the_landing_friction() {
+        let board = bump_board();
+        let graze = |g: f64| first_event(&board, above_bump(), (3.0, 1.0), lateral(g)).1;
+        assert_eq!(
+            graze(0.4),
+            StepEvent::Grazed(Landing::Flown),
+            "摩擦約2.79で吹っ飛ぶ"
+        );
+        assert_eq!(
+            graze(0.1),
+            StepEvent::Grazed(Landing::Bounce),
+            "摩擦約1.89で弾かれる"
+        );
+    }
+
+    #[test]
+    fn grazing_a_bump_from_every_side_bounces() {
+        let board = bump_board();
+        let (bx, by) = (BUMP_AT.0 as f64, BUMP_AT.1 as f64);
+        let cases = [
+            // 上の縁・下の縁: 横方向の成分が大きい
+            ((bx + 0.5, by - 0.005), (3.0, 1.0)),
+            ((bx + 0.5, by + 1.005), (3.0, -1.0)),
+            // 左の縁・右の縁: 縦方向の成分が大きい
+            ((bx - 0.005, by + 0.5), (1.0, 3.0)),
+            ((bx + 1.005, by + 0.5), (-1.0, 3.0)),
+        ];
+        for (pos, vel) in cases {
+            let mut top = Top::new(pos);
+            top.vel = vel;
+            assert_eq!(
+                top.step(&board, STEP, &Tilt::new(), NO_G),
+                Some(StepEvent::Grazed(Landing::Bounce)),
+                "{pos:?} {vel:?}"
+            );
+            assert!(!top.is_airborne(), "{pos:?}");
+            assert_ne!(cell_containing(top.pos), BUMP_AT, "{pos:?}");
+        }
+    }
+
+    #[test]
+    fn is_bump_graze_needs_both_a_graze_and_enough_speed() {
+        assert!(is_bump_graze(EdgeContact::Graze, BUMP_GRAZE_SPEED));
+        assert!(is_bump_graze(EdgeContact::Graze, 3.0), "ちょうどを含む");
+        assert!(!is_bump_graze(EdgeContact::Graze, 3.0 - 1e-6));
+        assert!(
+            !is_bump_graze(EdgeContact::HeadOn, 100.0),
+            "正面は速くても飛び上がる"
+        );
+        assert!(is_bump_graze(EdgeContact::Graze, MAX_SPEED));
+    }
+
+    #[test]
+    fn bump_graze_friction_grows_with_speed() {
+        assert_eq!(bump_graze_friction(0.0), 0.0);
+        assert!(approx(bump_graze_friction(3.0), 0.75));
+        let mut previous = bump_graze_friction(0.0);
+        for i in 1..=30 {
+            let f = bump_graze_friction(i as f64 * 0.5);
+            assert!(f > previous, "速さについて単調増加: {i}");
+            previous = f;
+        }
+        let at = |speed: f64| classify_landing(landing_friction(0.0) + bump_graze_friction(speed));
+        assert_eq!(
+            at(BUMP_GRAZE_SPEED),
+            Landing::Bounce,
+            "最低の速さでも弾かれる"
+        );
+        assert_eq!(at(6.0), Landing::Bounce);
+        assert_eq!(at(7.0), Landing::Flown);
+    }
+
+    #[test]
+    fn edge_contact_splits_bumps_and_hollows_the_same_way() {
+        // 同じ入り方なら、凸でも凹でも正面/斜めの分かれ方が一致する(速さはBUMP_GRAZE_SPEED以上)
+        let (bx, by) = (BUMP_AT.0 as f64, BUMP_AT.1 as f64);
+        let above = (bx + 0.5, by - 0.005);
+        let left = (bx - 0.005, by + 0.5);
+        let cases = [
+            (above, (3.0, 1.0)),
+            (above, (1.0, 3.0)),
+            (above, (2.4, 2.4)),
+            (left, (3.0, 1.0)),
+            (left, (1.0, 3.0)),
+        ];
+        let bump = bump_board();
+        let hollow = board_with(&[(BUMP_AT, Cell::Hollow)]);
+        let mut seen = std::collections::HashSet::new();
+        for (pos, vel) in cases {
+            let mut top = Top::new(pos);
+            top.vel = vel;
+            let bump_contact = match top.step(&bump, STEP, &Tilt::new(), NO_G) {
+                Some(StepEvent::Hopped { .. }) => EdgeContact::HeadOn,
+                Some(StepEvent::Grazed(_)) => EdgeContact::Graze,
+                other => panic!("{pos:?} {vel:?}: 凸で想定外: {other:?}"),
+            };
+            let mut top = Top::new(pos);
+            top.vel = vel;
+            let hollow_contact = match top.step(&hollow, STEP, &Tilt::new(), NO_G) {
+                Some(StepEvent::Sank) => EdgeContact::HeadOn,
+                Some(StepEvent::Grazed(_)) => EdgeContact::Graze,
+                other => panic!("{pos:?} {vel:?}: 凹で想定外: {other:?}"),
+            };
+            assert_eq!(bump_contact, hollow_contact, "{pos:?} {vel:?}");
+            let prev = cell_containing(pos);
+            assert_eq!(
+                bump_contact,
+                edge_contact(vel, prev, BUMP_AT),
+                "{pos:?} {vel:?}: edge_contactの判定と同じ"
+            );
+            seen.insert(format!("{bump_contact:?}"));
+        }
+        assert_eq!(seen.len(), 2, "正面・斜めの両方を確かめている");
     }
 }

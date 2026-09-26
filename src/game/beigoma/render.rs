@@ -47,8 +47,10 @@ const MAX_CELL_SCALE: u16 = 5;
 pub const BUMP_GLYPH: &str = "▲";
 pub const HOLLOW_GLYPH: &str = "▽";
 pub const GOAL_GLYPH: &str = "◎";
-/// 転がっている間の回転の見た目(順に切り替える)
-pub const TOP_SPIN_GLYPHS: [&str; 4] = ["◐", "◓", "◑", "◒"];
+/// 転がっている間の回転の見た目(順に切り替える)。
+/// 点字の2×4の点の外周8つのうち1つを欠けさせ、欠けた点を時計回りに1つずつ進める(8等分の回転)。
+/// どのコマも1セル幅で、欠けた点の位置だけが変わる
+pub const TOP_SPIN_GLYPHS: [&str; 8] = ["⣾", "⣷", "⣯", "⣟", "⡿", "⢿", "⣻", "⣽"];
 /// 飛び上がっている間の見た目
 pub const TOP_AIRBORNE_GLYPH: &str = "○";
 
@@ -83,10 +85,10 @@ pub struct TopView {
     pub star_frame: Option<usize>,
 }
 
-/// 星の演出のコマ(だんだん小さくなり、最後は消える)
-pub const STAR_ANIM_GLYPHS: [&str; 4] = ["★", "☆", "✦", "･"];
-/// 星の演出の1コマの表示時間
-pub const STAR_ANIM_FRAME: Duration = Duration::from_millis(180);
+/// 星の演出のコマ(だんだん暗く・小さくなり、最後は消える)
+pub const STAR_ANIM_GLYPHS: [&str; 8] = ["★", "☆", "✦", "✧", "∗", "⋆", "‥", "･"];
+/// 星の演出の1コマの表示時間。最後のコマに達するまで(7コマ分)を従来(4コマ×180ms)の540ms並みにする
+pub const STAR_ANIM_FRAME: Duration = Duration::from_millis(77);
 
 /// 盤を描く範囲とマスの大きさ(セル)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1865,6 +1867,60 @@ mod tests {
                 "star_frame={frame}では通常の回転記号ではなく星の演出を描く"
             );
         }
+    }
+
+    /// 点字の2×4の点の外周を時計回りに並べたビット(左上から右へ、右列を下へ、下段を左へ、左列を上へ)
+    const BRAILLE_RING_CLOCKWISE: [u32; 8] = [0x01, 0x08, 0x10, 0x20, 0x80, 0x40, 0x04, 0x02];
+
+    #[test]
+    fn spin_glyphs_rotate_clockwise_one_step_at_a_time() {
+        // 回転を滑らかに見せるため8コマにし、欠けた点が外周を1つずつ時計回りに進む(等間隔の回転)
+        assert_eq!(TOP_SPIN_GLYPHS.len(), BRAILLE_RING_CLOCKWISE.len());
+        for (frame, glyph) in TOP_SPIN_GLYPHS.iter().enumerate() {
+            let mut chars = glyph.chars();
+            let c = chars.next().unwrap();
+            assert!(chars.next().is_none(), "1文字: {glyph}");
+            let bits = u32::from(c)
+                .checked_sub(0x2800)
+                .filter(|b| *b <= 0xFF)
+                .unwrap_or_else(|| panic!("点字の記号: {glyph}"));
+            assert_eq!(
+                0xFF ^ bits,
+                BRAILLE_RING_CLOCKWISE[frame],
+                "frame={frame}では外周の{frame}番目の点だけが欠ける: {glyph}"
+            );
+        }
+    }
+
+    #[test]
+    fn animation_glyphs_are_one_cell_wide() {
+        // 幅が変わると隣のマスがずれて見えるため、どのコマも1セル幅にする
+        for glyph in TOP_SPIN_GLYPHS.iter().chain(STAR_ANIM_GLYPHS.iter()) {
+            assert_eq!(Span::raw(*glyph).width(), 1, "1セル幅: {glyph}");
+        }
+    }
+
+    #[test]
+    fn star_glyphs_fade_out_over_more_frames() {
+        // 星の演出を滑らかにするため8コマにする。大きな星から始まり、小さな点で終わる
+        assert_eq!(STAR_ANIM_GLYPHS.len(), 8);
+        assert_eq!(STAR_ANIM_GLYPHS[0], "★");
+        assert_eq!(STAR_ANIM_GLYPHS[STAR_ANIM_GLYPHS.len() - 1], "･");
+        for (i, a) in STAR_ANIM_GLYPHS.iter().enumerate() {
+            for b in &STAR_ANIM_GLYPHS[i + 1..] {
+                assert_ne!(a, b, "同じ記号を繰り返さない");
+            }
+        }
+    }
+
+    #[test]
+    fn star_animation_takes_as_long_as_before_to_fade_out() {
+        // コマ数を増やしても、最後のコマに達するまでの長さは従来(4コマ×180ms → 540ms)並みにする
+        let to_last = STAR_ANIM_FRAME * (STAR_ANIM_GLYPHS.len() as u32 - 1);
+        assert!(
+            (Duration::from_millis(530)..=Duration::from_millis(550)).contains(&to_last),
+            "最後のコマまで{to_last:?}"
+        );
     }
 
     #[test]
