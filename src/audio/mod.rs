@@ -120,6 +120,31 @@ fn tick_source() -> impl Source<Item = f32> {
         .amplify(TICK_VOLUME)
 }
 
+/// 不正解ブザー音の周波数。低めにして耳障りな「ブー」という音にする
+const BUZZ_FREQUENCY_HZ: f32 = 180.0;
+/// 不正解ブザー音の長さ
+const BUZZ_DURATION: Duration = Duration::from_millis(350);
+/// 不正解ブザー音の音量(1.0=最大振幅)
+const BUZZ_VOLUME: f32 = 0.25;
+/// 不正解ブザー音のサンプリングレート
+const BUZZ_SAMPLE_RATE: u32 = 44100;
+
+/// 不正解ブザー音の波形。サイン波ではなく矩形波(方形波)にすることで、
+/// 元のse_incorrect.wav(ブブー)よりもブザーらしい耳障りな音にする。
+/// rodioには矩形波のSourceが用意されていないため、波形を直接計算してSamplesBufferにする
+fn buzz_source() -> impl Source<Item = f32> {
+    let total_samples =
+        (BUZZ_SAMPLE_RATE as f64 * BUZZ_DURATION.as_secs_f64()).round() as usize;
+    let samples: Vec<f32> = (0..total_samples)
+        .map(|i| {
+            let phase = (i as f32 / BUZZ_SAMPLE_RATE as f32 * BUZZ_FREQUENCY_HZ).fract();
+            let square = if phase < 0.5 { 1.0 } else { -1.0 };
+            square * BUZZ_VOLUME
+        })
+        .collect();
+    rodio::buffer::SamplesBuffer::new(1, BUZZ_SAMPLE_RATE, samples)
+}
+
 /// 実際にrodioで音声デバイスへ再生するプレイヤー。
 /// 音声デバイスが無い/取得できない環境では初期化時にNoneとなり、以後は何もしない。
 pub struct RodioPlayer {
@@ -141,10 +166,16 @@ impl RodioPlayer {
         let Some((_, stream_handle)) = &self.handle else {
             return;
         };
-        let Some(file) = Assets::get(se.asset_path()) else {
+        let Ok(sink) = Sink::try_new(stream_handle) else {
             return;
         };
-        let Ok(sink) = Sink::try_new(stream_handle) else {
+        // 不正解音は音源ファイルを使わず、耳障りな矩形波のブザー音を生成して鳴らす
+        if se == SeKind::Incorrect {
+            sink.append(buzz_source());
+            sink.detach();
+            return;
+        }
+        let Some(file) = Assets::get(se.asset_path()) else {
             return;
         };
         if let Ok(source) = rodio::Decoder::new(Cursor::new(file.data.into_owned())) {
@@ -284,6 +315,61 @@ mod tests {
             bgm_sink: RefCell::new(None),
         };
         player.play_tick();
+    }
+
+    // --- 生成音(不正解ブザー音) ---
+
+    #[test]
+    fn buzz_source_is_mono_at_expected_sample_rate() {
+        let source = buzz_source();
+        assert_eq!(source.channels(), 1);
+        assert_eq!(source.sample_rate(), BUZZ_SAMPLE_RATE);
+    }
+
+    #[test]
+    fn buzz_source_duration_matches_buzz_duration() {
+        let source = buzz_source();
+        let rate = source.sample_rate() as u128;
+        let expected = rate * BUZZ_DURATION.as_micros() / 1_000_000;
+        let count = source.count() as u128;
+        assert!(
+            count + 1 >= expected && count <= expected + 1,
+            "サンプル数{count}(期待値{expected})"
+        );
+    }
+
+    #[test]
+    fn buzz_source_is_a_square_wave_not_a_smooth_sine() {
+        // 矩形波は振幅がほぼ+振幅/-振幅の2値のみを取り、サイン波のような中間値がほとんど無い
+        let samples: Vec<f32> = buzz_source().collect();
+        assert!(!samples.is_empty());
+        let peak = samples.iter().cloned().map(f32::abs).fold(0.0_f32, f32::max);
+        assert!(peak > 0.0, "無音ではないこと");
+        let near_extreme = samples
+            .iter()
+            .filter(|&&s| s.abs() > peak * 0.9)
+            .count();
+        assert!(
+            near_extreme as f64 > samples.len() as f64 * 0.9,
+            "ほとんどのサンプルが振幅の頂点付近(矩形波)にあること: {near_extreme}/{}",
+            samples.len()
+        );
+    }
+
+    #[test]
+    fn buzz_source_is_quieter_than_full_volume_se() {
+        let peak = buzz_source().map(f32::abs).fold(0.0_f32, f32::max);
+        assert!(peak < 1.0, "振幅{peak}が元の振幅(1.0)より小さいこと");
+        assert!(peak <= BUZZ_VOLUME + 1e-6, "振幅{peak}が音量{BUZZ_VOLUME}以下");
+    }
+
+    #[test]
+    fn play_se_incorrect_without_audio_device_does_not_panic() {
+        let player = RodioPlayer {
+            handle: None,
+            bgm_sink: RefCell::new(None),
+        };
+        player.play_se(SeKind::Incorrect);
     }
 
     #[test]
