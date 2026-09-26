@@ -306,6 +306,9 @@ pub struct QuickDrawGame {
     signal_renderer: SignalRenderer,
     /// フェイント(「撃つな」)の描画器
     feint_renderer: SignalRenderer,
+    /// テスト用: 鳴らしたSEの記録(音は端末で確かめられないため)
+    #[cfg(test)]
+    se_log: Vec<SeKind>,
 }
 
 impl QuickDrawGame {
@@ -320,9 +323,18 @@ impl QuickDrawGame {
             mark_renderer: MarkRenderer::new(),
             signal_renderer: SignalRenderer::new(SIGNAL_PNG),
             feint_renderer: SignalRenderer::new(FEINT_PNG),
+            #[cfg(test)]
+            se_log: Vec::new(),
         };
         game.start_round();
         game
+    }
+
+    /// SEを鳴らす(テストでは鳴らしたSEを記録する)
+    fn play_se(&mut self, se: SeKind) {
+        #[cfg(test)]
+        self.se_log.push(se);
+        audio::play_se(se);
     }
 
     /// 新しいラウンドを始める。待機時間パターンを選び直し、カウントダウンから始める
@@ -331,7 +343,7 @@ impl QuickDrawGame {
         let state = CountdownState::new();
         // 最初のフェーズ「3」の音
         if let Some(phase) = state.phase() {
-            audio::play_se(phase.se());
+            self.play_se(phase.se());
         }
         self.phase = Phase::Countdown { state };
     }
@@ -343,19 +355,25 @@ impl QuickDrawGame {
         if self.is_finished() {
             return;
         }
+        let is_feint = matches!(self.phase, Phase::Feint { .. });
         let (is_correct, latency_ms) = match &self.phase {
             Phase::Countdown { .. } | Phase::Result { .. } => return,
             Phase::Waiting { .. } | Phase::Feint { .. } => {
                 self.tracker.record(false, self.pattern.fail_latency_ms());
                 self.feedback.record(false, "フライング");
-                audio::play_se(SeKind::Incorrect);
+                // フェイント(「撃つな」)にひっかかった時だけ専用の音、それ以外は従来のブザー
+                self.play_se(if is_feint {
+                    SeKind::QuickDrawMiss
+                } else {
+                    SeKind::Incorrect
+                });
                 (false, None)
             }
             Phase::Signal { shown_at } => {
                 let latency_ms = shown_at.elapsed().as_millis() as f64;
                 self.tracker.record(true, latency_ms);
                 self.feedback.record(true, format!("{latency_ms:.0}ms"));
-                audio::play_se(SeKind::Correct);
+                self.play_se(SeKind::QuickDrawShoot);
                 (true, Some(latency_ms))
             }
         };
@@ -488,16 +506,19 @@ impl Game for QuickDrawGame {
             return;
         }
         self.feedback.tick(dt);
+        let mut ses_to_play: Vec<SeKind> = Vec::new();
         match &mut self.phase {
             Phase::Countdown { state } => {
                 if let Some(phase) = state.tick(dt) {
-                    audio::play_se(phase.se());
+                    ses_to_play.push(phase.se());
                 }
                 if state.is_finished() {
                     let mut rng = rand::thread_rng();
                     let remaining = random_wait(&mut rng, self.pattern);
                     let feint_at = should_feint(self.tracker.total(), remaining, &mut rng)
                         .then(|| feint_delay(&mut rng, remaining));
+                    // カウントダウンが終わって「まだ撃つな」の待機に入る瞬間の構え(準備)の音
+                    ses_to_play.push(SeKind::QuickDrawReady);
                     self.phase = Phase::Waiting { remaining, feint_at };
                 }
             }
@@ -548,6 +569,9 @@ impl Game for QuickDrawGame {
                     self.start_round();
                 }
             }
+        }
+        for se in ses_to_play {
+            self.play_se(se);
         }
     }
 
@@ -1577,5 +1601,61 @@ mod tests {
                 show_signal_since(&mut game, ms(0));
             }
         }
+    }
+
+    // --- SE ---
+
+    fn clear_se_log(game: &mut QuickDrawGame) {
+        game.se_log.clear();
+    }
+
+    #[test]
+    fn finishing_the_countdown_plays_the_ready_se() {
+        let mut game = QuickDrawGame::new();
+        clear_se_log(&mut game);
+        finish_countdown(&mut game);
+        assert_eq!(
+            game.se_log,
+            vec![SeKind::QuickDrawReady],
+            "「まだ撃つな」に入る瞬間の構えの音"
+        );
+    }
+
+    #[test]
+    fn reacting_to_the_signal_plays_the_shoot_se() {
+        let mut game = QuickDrawGame::new();
+        show_signal_since(&mut game, ms(200));
+        clear_se_log(&mut game);
+        game.handle_key(key(KeyCode::Enter));
+        assert_eq!(game.se_log, vec![SeKind::QuickDrawShoot]);
+    }
+
+    #[test]
+    fn false_start_while_waiting_plays_the_ordinary_buzzer_not_the_miss_se() {
+        let mut game = QuickDrawGame::new();
+        finish_countdown(&mut game);
+        clear_se_log(&mut game);
+        game.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            game.se_log,
+            vec![SeKind::Incorrect],
+            "フェイントではない通常のフライングは従来のブザーのまま"
+        );
+    }
+
+    #[test]
+    fn getting_caught_by_the_feint_plays_the_miss_se() {
+        let mut game = QuickDrawGame::new();
+        game.phase = Phase::Feint {
+            remaining: ms(100),
+            resume_waiting: ms(500),
+        };
+        clear_se_log(&mut game);
+        game.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            game.se_log,
+            vec![SeKind::QuickDrawMiss],
+            "「撃つな」にひっかかった時は専用の音"
+        );
     }
 }
