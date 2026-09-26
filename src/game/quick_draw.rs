@@ -597,6 +597,13 @@ impl Game for QuickDrawGame {
     }
 
     fn is_finished(&self) -> bool {
+        // 最終問題の結果表示(◯/✗・SE)が終わるまでは、記録上は最終問題でも終了扱いにしない
+        // (即座にリザルト画面へ切り替わって演出が見えなくなるのを防ぐ)
+        if let Phase::Result { elapsed, .. } = self.phase {
+            if elapsed < RESULT_HOLD {
+                return false;
+            }
+        }
         self.tracker.is_session_finished()
     }
 
@@ -1131,9 +1138,7 @@ mod tests {
             game.handle_key(key(KeyCode::Enter));
             assert_eq!(game.tracker.total(), round + 1);
             assert_eq!(game.result().correct, 0, "フライングでは正答数が増えない");
-            if round + 1 < ROUNDS_PER_SESSION {
-                finish_result(&mut game);
-            }
+            finish_result(&mut game);
         }
         assert!(game.is_finished());
         let result = game.result();
@@ -1222,9 +1227,11 @@ mod tests {
             finish_countdown(&mut game);
             show_signal_since(&mut game, ms(200));
             game.handle_key(key(KeyCode::Enter));
-            if round + 1 < ROUNDS_PER_SESSION {
-                finish_result(&mut game);
-            }
+            assert!(
+                !game.is_finished(),
+                "{round}ラウンド目: 結果表示が終わるまでは終了扱いにしない"
+            );
+            finish_result(&mut game);
         }
         assert!(game.is_finished());
         let result = game.result();
@@ -1258,12 +1265,10 @@ mod tests {
     #[test]
     fn input_after_session_finished_is_ignored() {
         let mut game = QuickDrawGame::new();
-        for round in 0..ROUNDS_PER_SESSION {
+        for _ in 0..ROUNDS_PER_SESSION {
             finish_countdown(&mut game);
             game.handle_key(key(KeyCode::Enter));
-            if round + 1 < ROUNDS_PER_SESSION {
-                finish_result(&mut game);
-            }
+            finish_result(&mut game);
         }
         assert!(game.is_finished());
         game.handle_key(key(KeyCode::Enter));
@@ -1696,5 +1701,39 @@ mod tests {
             vec![SeKind::QuickDrawMiss],
             "「撃つな」にひっかかった時は専用の音"
         );
+    }
+
+    #[test]
+    fn the_final_round_still_plays_its_se_and_shows_the_result_before_finishing() {
+        // 最終問題も、結果表示(SE・◯/✗)を出し切ってからでないと終了扱いにしない
+        // (即座にリザルト画面へ切り替わって演出が見えなくなるのを防ぐ)
+        let mut game = QuickDrawGame::new();
+        for _ in 0..ROUNDS_PER_SESSION - 1 {
+            finish_countdown(&mut game);
+            game.handle_key(key(KeyCode::Enter));
+            finish_result(&mut game);
+        }
+        finish_countdown(&mut game);
+        show_signal_since(&mut game, ms(200));
+        clear_se_log(&mut game);
+        game.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            game.se_log,
+            vec![SeKind::QuickDrawShoot],
+            "最終問題でも撃った音が鳴る"
+        );
+        assert!(
+            matches!(
+                game.phase,
+                Phase::Result {
+                    is_correct: true,
+                    ..
+                }
+            ),
+            "最終問題でも結果表示(◯)に入る"
+        );
+        assert!(!game.is_finished(), "結果表示中はまだ終了しない");
+        game.update(RESULT_HOLD);
+        assert!(game.is_finished(), "結果表示が終わったら終了");
     }
 }
