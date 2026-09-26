@@ -6,6 +6,7 @@
 //!   (ブレーキ=後方向のGで、ベーゴマは前(画面の上)へ押される)
 //! - 平坦な場所の摩擦はGによらず一定。障害物を踏むと一度飛び上がり、着地の瞬間の摩擦が
 //!   踏んだ時のGに応じて増える。その大きさで 軽い着地/弾かれる/吹っ飛ぶ の3段階になる
+//! - 盤の縁に壁は無い。ベーゴマの中心が縁を越えたら盤から落ちる(場外)
 
 use std::time::Duration;
 
@@ -58,11 +59,11 @@ pub const LOW_FRICTION_THRESHOLD: f64 = ROLLING_FRICTION + FRICTION_PER_G * LOW_
 pub const HIGH_FRICTION_THRESHOLD: f64 = ROLLING_FRICTION + FRICTION_PER_G * HIGH_G_THRESHOLD;
 /// 障害物を踏んで飛び上がってから着地するまでの時間
 pub const HOP_DURATION: Duration = Duration::from_millis(250);
-/// 弾かれた時の速さ(マス/秒)と、弾かれた瞬間に位置が飛ぶ量(マス)
-pub const BOUNCE_SPEED: f64 = 10.0;
-pub const BOUNCE_KICK: f64 = 1.0;
-/// 盤の縁に当たった時の跳ね返りの係数
-pub const WALL_RESTITUTION: f64 = 0.5;
+/// 弾かれた時の速さ(マス/秒)と、弾かれた瞬間に位置が飛ぶ量(マス)。
+/// 盤の縁には壁が無いので、盤の中央で弾かれても縁まで届かない強さにする
+/// (平坦な場所での減速距離 BOUNCE_SPEED/ROLLING_FRICTION + BOUNCE_KICK ≒ 5.5マス、中央から縦の縁まで6マス)
+pub const BOUNCE_SPEED: f64 = 4.0;
+pub const BOUNCE_KICK: f64 = 0.5;
 /// ベーゴマの速さの上限(マス/秒)。1ステップでマスを飛び越さないようにする
 pub const MAX_SPEED: f64 = 15.0;
 
@@ -102,7 +103,12 @@ impl Board {
         Self { cells, start }
     }
 
-    /// マス(x, y)。盤の外は平坦として扱う(縁で止まるので実際には来ない)
+    /// 位置が盤の上にあるか。ベーゴマの中心が縁を越えたら場外(落ちる)
+    pub fn contains(pos: (f64, f64)) -> bool {
+        (0.0..BOARD_WIDTH as f64).contains(&pos.0) && (0.0..BOARD_HEIGHT as f64).contains(&pos.1)
+    }
+
+    /// マス(x, y)。盤の外は平坦として扱う(場外に出た時点でゲームは終わる)
     pub fn cell(&self, x: usize, y: usize) -> Cell {
         if x >= BOARD_WIDTH || y >= BOARD_HEIGHT {
             return Cell::Flat;
@@ -258,6 +264,8 @@ pub enum StepEvent {
     Hopped { contact_g: f64 },
     /// 着地した
     Landed(Landing),
+    /// 盤から落ちた(場外)
+    FellOff,
     /// ゴールに入った
     Goal,
 }
@@ -287,7 +295,8 @@ impl Top {
         matches!(self.state, TopState::Airborne { .. })
     }
 
-    /// dtだけ物理を進める。傾きとGを加速度として加え、摩擦で減速し、縁で跳ね返る
+    /// dtだけ物理を進める。傾きとGを加速度として加え、摩擦で減速する。
+    /// 盤の縁に壁は無く、中心が縁を越えたら他の判定より先にFellOffを返す
     pub fn step(
         &mut self,
         board: &Board,
@@ -315,6 +324,9 @@ impl Top {
         self.vel.1 *= damping;
         self.cap_speed();
         self.advance(secs);
+        if !Board::contains(self.pos) {
+            return Some(StepEvent::FellOff);
+        }
         match board.cell_at(self.pos) {
             Cell::Bump if !self.on_bump => {
                 // 障害物を踏んだ瞬間: 一度飛び上がり、このときのGで着地の摩擦が決まる
@@ -339,7 +351,8 @@ impl Top {
     }
 
     /// 飛び上がっている間: 盤に触れていないので傾き・G・摩擦は効かず、そのままの速度で進む。
-    /// 着地したら、踏んだ時のGから決まる摩擦で結果を判定する
+    /// 着地したら、踏んだ時のGから決まる摩擦で結果を判定する。
+    /// 飛び上がっている間に中心が縁を越えたら、着地を待たずに落ちる
     fn fly(
         &mut self,
         board: &Board,
@@ -348,6 +361,9 @@ impl Top {
         contact_g: f64,
     ) -> Option<StepEvent> {
         self.advance(dt.as_secs_f64());
+        if !Board::contains(self.pos) {
+            return Some(StepEvent::FellOff);
+        }
         let remaining = remaining.saturating_sub(dt);
         if !remaining.is_zero() {
             self.state = TopState::Airborne {
@@ -365,7 +381,8 @@ impl Top {
         Some(StepEvent::Landed(landing))
     }
 
-    /// 弾かれる: 来た方向へ勢いよく弾き返し、位置も一気に戻す
+    /// 弾かれる: 来た方向へ勢いよく弾き返し、位置も一気に戻す(盤の外へ出てもよい。
+    /// その場合は次のステップでFellOffになる)
     fn bounce(&mut self) {
         let speed = self.vel.0.hypot(self.vel.1);
         let dir = if speed > 1e-9 {
@@ -379,10 +396,6 @@ impl Top {
             self.pos.0 + dir.0 * BOUNCE_KICK,
             self.pos.1 + dir.1 * BOUNCE_KICK,
         );
-        self.pos = (
-            self.pos.0.clamp(MIN_POS, BOARD_WIDTH as f64 - MIN_POS),
-            self.pos.1.clamp(MIN_POS, BOARD_HEIGHT as f64 - MIN_POS),
-        );
     }
 
     fn cap_speed(&mut self) {
@@ -393,28 +406,10 @@ impl Top {
         }
     }
 
-    /// 速度のぶん進め、盤の縁に当たったら跳ね返る
+    /// 速度のぶん進める(盤の縁で跳ね返らない)
     fn advance(&mut self, secs: f64) {
         self.pos.0 += self.vel.0 * secs;
         self.pos.1 += self.vel.1 * secs;
-        let (x, vx) = reflect(self.pos.0, self.vel.0, BOARD_WIDTH as f64);
-        let (y, vy) = reflect(self.pos.1, self.vel.1, BOARD_HEIGHT as f64);
-        self.pos = (x, y);
-        self.vel = (vx, vy);
-    }
-}
-
-/// ベーゴマの中心が盤の縁からこれ以上近づかない距離(マス)。ベーゴマの半径
-const MIN_POS: f64 = 0.5;
-
-/// 1軸ぶんの縁での跳ね返り。0〜sizeの盤の中にベーゴマの中心(半径MIN_POS)を収める
-fn reflect(pos: f64, vel: f64, size: f64) -> (f64, f64) {
-    if pos < MIN_POS {
-        (MIN_POS, vel.abs() * WALL_RESTITUTION)
-    } else if pos > size - MIN_POS {
-        (size - MIN_POS, -vel.abs() * WALL_RESTITUTION)
-    } else {
-        (pos, vel)
     }
 }
 
@@ -795,27 +790,149 @@ mod tests {
         }
     }
 
+    // --- 場外(盤の縁に壁は無い) ---
+
     #[test]
-    fn top_stays_inside_the_board_and_bounces_off_the_rim() {
+    fn board_contains_only_positions_on_the_board() {
+        let (w, h) = (BOARD_WIDTH as f64, BOARD_HEIGHT as f64);
+        assert!(Board::contains((0.0, 0.0)), "左上の角は盤の上");
+        assert!(
+            Board::contains((w - 0.01, h - 0.01)),
+            "右下の角の手前も盤の上"
+        );
+        assert!(Board::contains((10.5, 5.5)));
+        assert!(!Board::contains((-0.01, 5.5)), "左の縁を越えた");
+        assert!(!Board::contains((w, 5.5)), "右の縁ちょうどは盤の外");
+        assert!(!Board::contains((10.5, -0.01)), "上の縁を越えた");
+        assert!(!Board::contains((10.5, h)), "下の縁ちょうどは盤の外");
+    }
+
+    /// 転がしてFellOffが返るまで進め、その時の位置を返す(FellOff以外の出来事は起きない前提)
+    fn roll_until_fell_off(top: &mut Top) -> (f64, f64) {
         let board = Board::standard();
-        let mut top = Top::new((1.0, 0.5));
-        top.vel = (-10.0, 0.0);
-        for _ in 0..20 {
-            top.step(&board, STEP, &Tilt::new(), NO_G);
-            assert!(top.pos.0 >= 0.0 && top.pos.0 <= BOARD_WIDTH as f64);
+        for i in 0..200 {
+            let before = top.pos;
+            match top.step(&board, STEP, &Tilt::new(), NO_G) {
+                Some(StepEvent::FellOff) => {
+                    assert!(Board::contains(before), "直前までは盤の上");
+                    return top.pos;
+                }
+                None => assert!(Board::contains(top.pos), "i={i}: 落ちるまでは盤の上"),
+                other => panic!("i={i}: 場外より先に別の出来事: {other:?}"),
+            }
         }
-        assert!(top.vel.0 > 0.0, "縁で跳ね返る");
-        // 強く傾け続けても盤から出ない
+        panic!("盤から落ちなかった: {:?}", top.pos);
+    }
+
+    #[test]
+    fn top_falls_off_when_its_center_crosses_the_rim() {
+        // 4辺とも、縁の近くの平坦なマスから外へ向かって転がすと落ちる(跳ね返らない)
+        let (w, h) = (BOARD_WIDTH as f64, BOARD_HEIGHT as f64);
+        let cases = [
+            ((0.6, 5.5), (-3.0, 0.0)),
+            ((w - 0.6, 5.5), (3.0, 0.0)),
+            ((10.5, 0.6), (0.0, -3.0)),
+            ((10.5, h - 0.6), (0.0, 3.0)),
+        ];
+        for (pos, vel) in cases {
+            let mut top = Top::new(pos);
+            top.vel = vel;
+            let fell = roll_until_fell_off(&mut top);
+            assert!(!Board::contains(fell), "{pos:?}: 中心が縁を越えたら場外");
+            assert!(
+                fell.0 * vel.0.signum() > pos.0 * vel.0.signum()
+                    || fell.1 * vel.1.signum() > pos.1 * vel.1.signum(),
+                "{pos:?}: 進んでいた向きのまま外へ出る(縁で押し戻されない)"
+            );
+            assert!(
+                top.vel.0 * vel.0 >= 0.0 && top.vel.1 * vel.1 >= 0.0,
+                "{pos:?}: 縁で跳ね返らない: {:?}",
+                top.vel
+            );
+        }
+    }
+
+    #[test]
+    fn strong_tilt_rolls_the_top_off_the_board() {
+        // 強く傾け続けると、縁で止まらずに盤から落ちる
+        let board = Board::standard();
         let mut tilt = Tilt::new();
         for _ in 0..10 {
             tilt.press(TiltKey::Forward);
-            tilt.press(TiltKey::Left);
         }
         let mut top = Top::new((0.5, 0.5));
-        for _ in 0..500 {
-            top.step(&board, STEP, &tilt, NO_G);
-            assert!(top.pos.0 >= 0.0 && top.pos.0 < BOARD_WIDTH as f64);
-            assert!(top.pos.1 >= 0.0 && top.pos.1 < BOARD_HEIGHT as f64);
+        let fell =
+            (0..500).any(|_| top.step(&board, STEP, &tilt, NO_G) == Some(StepEvent::FellOff));
+        assert!(fell, "{:?}", top.pos);
+    }
+
+    #[test]
+    fn airborne_top_also_falls_off_the_rim() {
+        // 飛び上がっている最中でも、中心が縁を越えたら着地を待たずに落ちる
+        let board = Board::standard();
+        let mut top = Top::new((0.6, 5.5));
+        top.vel = (-5.0, 0.0);
+        top.state = TopState::Airborne {
+            remaining: HOP_DURATION,
+            contact_g: 0.0,
+        };
+        let mut event = None;
+        for _ in 0..100 {
+            assert!(top.is_airborne(), "落ちる前に着地してしまった");
+            event = top.step(&board, STEP, &Tilt::new(), NO_G);
+            if event.is_some() {
+                break;
+            }
+        }
+        assert_eq!(event, Some(StepEvent::FellOff));
+        assert!(!Board::contains(top.pos));
+    }
+
+    /// posで着地して弾かれる状態を作り、1ステップ進めて弾かせる。incomingは弾かれる前の向きの速度
+    fn bounce_at(board: &Board, pos: (f64, f64), incoming: (f64, f64)) -> Top {
+        let mut top = Top::new(pos);
+        top.vel = incoming;
+        top.state = TopState::Airborne {
+            remaining: STEP,
+            contact_g: 0.5,
+        };
+        assert_eq!(
+            top.step(board, STEP, &Tilt::new(), NO_G),
+            Some(StepEvent::Landed(Landing::Bounce))
+        );
+        assert!(approx(speed(&top), BOUNCE_SPEED));
+        top
+    }
+
+    #[test]
+    fn bounce_from_the_center_stays_on_the_board() {
+        // 盤の中央付近で弾かれても、縁まで飛ばずに盤の上で止まる。
+        // 縁まで一番近いのは縦方向(中央から6マス)。13列目は障害物が無い列なので、途中で飛び上がらない
+        let board = Board::standard();
+        let cy = BOARD_HEIGHT as f64 / 2.0;
+        let cx = BOARD_WIDTH as f64 / 2.0;
+        let cases = [
+            ((13.5, cy), (0.0, 3.0)),
+            ((13.5, cy), (0.0, -3.0)),
+            ((cx, 0.5), (3.0, 0.0)),
+            ((cx, 0.5), (-3.0, 0.0)),
+        ];
+        for (pos, incoming) in cases {
+            let mut top = bounce_at(&board, pos, incoming);
+            for i in 0..1000 {
+                let event = top.step(&board, STEP, &Tilt::new(), NO_G);
+                assert_ne!(
+                    event,
+                    Some(StepEvent::FellOff),
+                    "{pos:?} {incoming:?} i={i}"
+                );
+                assert!(
+                    Board::contains(top.pos),
+                    "{pos:?} {incoming:?}: {:?}",
+                    top.pos
+                );
+            }
+            assert!(speed(&top) < 0.01, "{pos:?} {incoming:?}: 盤の上で止まる");
         }
     }
 
@@ -839,14 +956,31 @@ mod tests {
 
     #[test]
     fn middle_g_contact_bounces_the_top_away() {
-        let board = Board::standard();
-        let before = top_just_left_of_bump(&board).pos;
         let (top, landing) = land_after_contact(lateral(-0.5), NO_G);
         assert_eq!(landing, Landing::Bounce);
         assert!(!top.is_airborne());
         assert!(approx(speed(&top), BOUNCE_SPEED), "勢いよく弾かれる");
         assert!(top.vel.0 < 0.0, "来た方向へ弾き返される");
-        assert!(top.pos.0 < before.0, "位置も急に戻される");
+        // 着地の直前の位置から、BOUNCE_KICKだけ来た方向へ一気に戻される
+        // (着地のステップで進む分はBOUNCE_KICKより十分小さい)
+        let board = Board::standard();
+        let mut before_landing = top_just_left_of_bump(&board);
+        let tilt = Tilt::new();
+        let previous = loop {
+            let pos = before_landing.pos;
+            if let Some(StepEvent::Landed(_)) =
+                before_landing.step(&board, STEP, &tilt, lateral(-0.5))
+            {
+                break pos;
+            }
+        };
+        assert_eq!(before_landing.pos, top.pos);
+        assert!(
+            top.pos.0 < previous.0 - BOUNCE_KICK / 2.0,
+            "位置も急に戻される: {:?} → {:?}",
+            previous,
+            top.pos
+        );
     }
 
     #[test]

@@ -4,7 +4,8 @@
 //! - 盤の傾きは前後・左右の2軸で、矢印キーを押すたびに一定量動く連打式(board.rs)
 //! - 軽トラは自動で走り、段差・信号・障害物回避のたびに運動方程式から求めたGが盤にかかる(truck.rs)
 //! - 障害物を踏んだ瞬間のGが大きいと弾かれ、さらに大きいと吹っ飛んで即GAME OVER
-//! - 制限時間60秒。ゴールで成功、吹っ飛び・時間切れで失敗。難易度選択は無い
+//! - 盤の縁に壁は無く、盤から落ちても(場外)即GAME OVER
+//! - 制限時間60秒。ゴールで成功、吹っ飛び・場外・時間切れで失敗。難易度選択は無い
 //! - 開始前の「3.2.1.GO!!」はapp.rsのカウントダウンで行い、終わってからゲームを作る(=ベーゴマを投入する)
 
 mod board;
@@ -39,6 +40,10 @@ pub const TIME_LIMIT: Duration = Duration::from_secs(60);
 /// 終了(ゴール・GAME OVER・時間切れ)の表示を出し続けてからリザルトへ進むまでの時間
 pub const END_HOLD: Duration = Duration::from_millis(1500);
 
+/// 女の子のセリフ(弾かれ・吹っ飛び・場外のGAME OVERで共通)。吹き出しへの表示は#129で行う
+#[cfg_attr(not(test), allow(dead_code))]
+pub const GASP_LINE: &str = "ああっ!!";
+
 /// 弾かれた・着地した等の一言を出し続ける時間
 const MESSAGE_HOLD: Duration = Duration::from_millis(900);
 
@@ -56,7 +61,7 @@ const TRUCK_VIEW_PERCENT: u16 = 40;
 pub enum Outcome {
     /// 制限時間内にゴールした。timeはクリアタイム
     Cleared { time: Duration },
-    /// 吹っ飛んだ(GAME OVER)
+    /// 吹っ飛んだ・盤から落ちた(どちらも同じ演出のGAME OVER)
     Flown,
     /// 制限時間を過ぎた
     TimeUp,
@@ -134,7 +139,7 @@ impl BeigomaGame {
         }
     }
 
-    /// 盤上の出来事を反映する(弾かれたらSE、吹っ飛んだら即GAME OVER、ゴールなら成功)
+    /// 盤上の出来事を反映する(弾かれたらSE、吹っ飛んだ・盤から落ちたら即GAME OVER、ゴールなら成功)
     fn on_step_event(&mut self, event: StepEvent) {
         if self.status != Status::Playing {
             return;
@@ -146,7 +151,7 @@ impl BeigomaGame {
                 audio::play_se(SeKind::Incorrect);
                 self.message = Some(("ピューン!", Duration::ZERO));
             }
-            StepEvent::Landed(Landing::Flown) => self.finish(Outcome::Flown),
+            StepEvent::Landed(Landing::Flown) | StepEvent::FellOff => self.finish(Outcome::Flown),
             StepEvent::Goal => self.finish(Outcome::Cleared { time: self.elapsed }),
         }
     }
@@ -203,7 +208,7 @@ impl BeigomaGame {
 
         let center = match self.outcome() {
             Some(Outcome::Cleared { time }) => Some(format!("GOAL!! {:.1}秒", time.as_secs_f64())),
-            Some(Outcome::Flown) => Some("GAME OVER 吹っ飛んだ!".to_string()),
+            Some(Outcome::Flown) => Some("GAME OVER".to_string()),
             Some(Outcome::TimeUp) => Some("TIME UP".to_string()),
             None => self.message.map(|(text, _)| text.to_string()),
         };
@@ -520,6 +525,31 @@ mod tests {
     }
 
     #[test]
+    fn falling_off_is_an_immediate_game_over_with_the_gasp() {
+        let mut game = calm_game();
+        game.on_step_event(StepEvent::FellOff);
+        assert_eq!(
+            game.outcome(),
+            Some(Outcome::Flown),
+            "盤から落ちたら吹っ飛びと同じく即GAME OVER"
+        );
+        let result = game.result();
+        assert_eq!((result.correct, result.total), (0, 1));
+        assert_eq!(GASP_LINE, "ああっ!!", "GAME OVER共通の女の子のセリフ");
+    }
+
+    #[test]
+    fn rolling_off_the_rim_during_play_is_a_game_over() {
+        // 盤の縁には壁が無いので、左端から左へ転がると落ちてGAME OVERになる
+        let mut game = calm_game();
+        game.top = Top::new((0.6, 0.5));
+        game.top.vel = (-3.0, 0.0);
+        game.update(Duration::from_millis(500));
+        assert_eq!(game.outcome(), Some(Outcome::Flown));
+        assert_eq!(game.result().correct, 0);
+    }
+
+    #[test]
     fn hard_braking_throws_the_top_into_a_bump_and_it_flies_off() {
         // 気づくのが大きく遅れた信号: 下限の距離でブレーキを踏み、約3Gの制動Gがかかる
         let truck = Truck::with_course(
@@ -629,6 +659,24 @@ mod tests {
             let text = rendered_text(&game, AREA);
             assert!(text.contains(label), "{outcome:?}: {text}");
         }
+    }
+
+    #[test]
+    fn flying_off_and_falling_off_show_the_same_game_over() {
+        let mut flown = calm_game();
+        flown.on_step_event(StepEvent::Landed(Landing::Flown));
+        let mut fell = calm_game();
+        fell.on_step_event(StepEvent::FellOff);
+        let flown_text = rendered_text(&flown, AREA);
+        let fell_text = rendered_text(&fell, AREA);
+        for text in [&flown_text, &fell_text] {
+            assert!(text.contains("GAMEOVER"), "{text}");
+            assert!(
+                !text.contains("吹っ飛んだ"),
+                "吹っ飛び専用の文言は出さない: {text}"
+            );
+        }
+        assert_eq!(flown_text, fell_text, "吹っ飛び・場外で同じ表示");
     }
 
     #[test]
