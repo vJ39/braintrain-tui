@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use rand::Rng;
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
@@ -13,6 +13,7 @@ use ratatui::Frame;
 
 use crate::audio::{self, SeKind};
 use crate::game::feedback::AnswerFeedback;
+use crate::game::mark_display::MarkRenderer;
 use crate::game::theme;
 use crate::game::{Difficulty, Game, GameResult, ScoreTracker};
 use crate::ui::countdown::{self, CountdownState};
@@ -47,6 +48,21 @@ fn signal_headline() -> String {
         .map(|c| c.to_string())
         .collect::<Vec<_>>()
         .join(SIGNAL_TEXT_GAP)
+}
+
+/// 押した後の結果(◯/✗)を表示し続ける時間。この間は次のラウンドへ進まない
+const RESULT_HOLD: Duration = Duration::from_millis(1000);
+
+/// 結果表示(◯/✗)のエリアを塗る色。画像表示の時は画像の背景と周りのセルを同じ色で塗れる
+/// ようRGBにし、テキスト表示の時は端末の名前付き色にする。記号は黒なので、黒が読みやすい
+/// 明るさの緑(成功)/赤(フライング)にする
+fn result_background(is_correct: bool, uses_image: bool) -> Color {
+    match (is_correct, uses_image) {
+        (true, true) => Color::Rgb(40, 190, 70),
+        (false, true) => Color::Rgb(230, 50, 50),
+        (true, false) => Color::Green,
+        (false, false) => Color::Red,
+    }
 }
 
 /// 合図までの待機時間のパターン。ラウンドごとにランダムで選ぶ
@@ -99,6 +115,13 @@ enum Phase {
     Waiting { remaining: Duration },
     /// 合図が出ている。合図が出た時刻
     Signal { shown_at: Instant },
+    /// 押した後の結果表示。成功時のみ反応時間(ms)を持つ。
+    /// この表示が終わるまで次のラウンドへは進まず、入力も受け付けない
+    Result {
+        is_correct: bool,
+        latency_ms: Option<f64>,
+        elapsed: Duration,
+    },
 }
 
 pub struct QuickDrawGame {
@@ -106,8 +129,10 @@ pub struct QuickDrawGame {
     phase: Phase,
     /// 現在のラウンドの待機時間パターン(ラウンド開始時に選ぶ)
     pattern: WaitPattern,
-    /// 直前のラウンドの結果表示(描画専用)
+    /// 直前のラウンドの結果表示(HUD用の小さい表示)
     feedback: AnswerFeedback,
+    /// 結果表示(◯/✗の大表示)の描画器
+    mark_renderer: MarkRenderer,
 }
 
 impl QuickDrawGame {
@@ -119,6 +144,7 @@ impl QuickDrawGame {
             },
             pattern: WaitPattern::Normal,
             feedback: AnswerFeedback::new(),
+            mark_renderer: MarkRenderer::new(),
         };
         game.start_round();
         game
@@ -136,37 +162,54 @@ impl QuickDrawGame {
     }
 
     /// キー/クリックで押された時の処理。合図前(カウントダウン中・待機中)ならフライング、
-    /// 合図後なら反応時間を記録する
+    /// 合図後なら反応時間を記録する。押した後はまず結果表示(◯/✗)に入り、
+    /// 結果表示中の入力は無視する(次のラウンドへの誤入力を防ぐ)
     fn press(&mut self) {
         if self.is_finished() {
             return;
         }
-        match &self.phase {
+        let (is_correct, latency_ms) = match &self.phase {
             Phase::Countdown { .. } | Phase::Waiting { .. } => {
                 self.tracker.record(false, self.pattern.fail_latency_ms());
                 self.feedback.record(false, "フライング");
                 audio::play_se(SeKind::Incorrect);
+                (false, None)
             }
             Phase::Signal { shown_at } => {
                 let latency_ms = shown_at.elapsed().as_millis() as f64;
                 self.tracker.record(true, latency_ms);
                 self.feedback.record(true, format!("{latency_ms:.0}ms"));
                 audio::play_se(SeKind::Correct);
+                (true, Some(latency_ms))
             }
-        }
-        // 最終ラウンドの後も次のラウンドの状態にしておく(is_finishedで入力と時間経過は止まる)
-        self.start_round();
+            Phase::Result { .. } => return,
+        };
+        self.phase = Phase::Result {
+            is_correct,
+            latency_ms,
+            elapsed: Duration::ZERO,
+        };
     }
 
     fn render_board(&self, frame: &mut Frame, area: Rect) {
+        if let Phase::Countdown { state } = &self.phase {
+            countdown::render(frame, area, state);
+            return;
+        }
+        if let Phase::Result {
+            is_correct,
+            latency_ms,
+            ..
+        } = &self.phase
+        {
+            self.render_result(frame, area, *is_correct, *latency_ms);
+            return;
+        }
         let (background, headline, text_color, show_hint) = match &self.phase {
-            Phase::Countdown { state } => {
-                countdown::render(frame, area, state);
-                return;
-            }
             Phase::Waiting { .. } => (WAITING_BG, WAITING_TEXT.to_string(), theme::TEXT, true),
             // 合図は文字間を広げて単独表示し、操作説明を消して見出しだけに注目を集める
             Phase::Signal { .. } => (SIGNAL_BG, signal_headline(), Color::Black, false),
+            Phase::Countdown { .. } | Phase::Result { .. } => unreachable!("上で処理済み"),
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -191,6 +234,32 @@ impl QuickDrawGame {
         frame.render_widget(
             Paragraph::new(lines).alignment(Alignment::Center),
             text_area,
+        );
+    }
+
+    /// 押した後の結果表示。成功時は大きな◯の下に反応時間(ms)を表示し、
+    /// フライング時は大きな✗を単独で表示する
+    fn render_result(&self, frame: &mut Frame, area: Rect, is_correct: bool, latency_ms: Option<f64>) {
+        let background = result_background(is_correct, self.mark_renderer.uses_image());
+        let Some(latency_ms) = latency_ms else {
+            self.mark_renderer.render(frame, area, is_correct, background);
+            return;
+        };
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(3)])
+            .split(area);
+        self.mark_renderer.render(frame, rows[0], is_correct, background);
+        let footer = Block::default().style(Style::default().bg(background));
+        let inner = footer.inner(rows[1]);
+        frame.render_widget(footer, rows[1]);
+        let line = Line::from(Span::styled(
+            format!("{latency_ms:.0}ms"),
+            Style::default().fg(Color::Black).add_modifier(Modifier::BOLD),
+        ));
+        frame.render_widget(
+            Paragraph::new(line).alignment(Alignment::Center),
+            theme::vertical_center(inner, 1),
         );
     }
 }
@@ -243,6 +312,12 @@ impl Game for QuickDrawGame {
                 };
             }
             Phase::Signal { .. } => {}
+            Phase::Result { elapsed, .. } => {
+                *elapsed += dt;
+                if *elapsed >= RESULT_HOLD && !self.tracker.is_session_finished() {
+                    self.start_round();
+                }
+            }
         }
     }
 
@@ -326,6 +401,16 @@ mod tests {
 
     fn is_countdown(game: &QuickDrawGame) -> bool {
         matches!(game.phase, Phase::Countdown { .. })
+    }
+
+    /// 押した直後の結果表示(◯/✗)を最後まで進め、次のラウンドのカウントダウンにする。
+    /// セッションが最終ラウンドで終わっている場合は結果表示のまま(次には進まない)
+    fn finish_result(game: &mut QuickDrawGame) {
+        assert!(
+            matches!(game.phase, Phase::Result { .. }),
+            "結果表示中のはず"
+        );
+        game.update(RESULT_HOLD);
     }
 
     fn countdown_phase(game: &QuickDrawGame) -> Option<countdown_ui::Phase> {
@@ -522,6 +607,11 @@ mod tests {
         let mut game = QuickDrawGame::new();
         show_signal_since(&mut game, ms(250));
         game.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(game.phase, Phase::Result { is_correct: true, .. }),
+            "反応直後はまず結果表示"
+        );
+        finish_result(&mut game);
         assert!(is_countdown(&game), "次のラウンドもカウントダウンから");
         assert_eq!(countdown_phase(&game), Some(countdown_ui::Phase::Three));
         finish_countdown(&mut game);
@@ -610,16 +700,21 @@ mod tests {
         finish_countdown(&mut game);
         game.handle_key(key(KeyCode::Char(' ')));
         assert!(
-            is_countdown(&game),
-            "フライング後も次のラウンドのカウントダウンへ進む"
+            matches!(game.phase, Phase::Result { is_correct: false, .. }),
+            "フライング直後はまず結果表示(✗)"
         );
-        assert_eq!(countdown_phase(&game), Some(countdown_ui::Phase::Three));
         let flash = game
             .feedback
             .current()
             .expect("フライング直後は結果を表示する");
         assert_eq!(flash.verdict, crate::game::feedback::Verdict::Incorrect);
         assert!(flash.detail.contains("フライング"), "{}", flash.detail);
+        finish_result(&mut game);
+        assert!(
+            is_countdown(&game),
+            "フライング後も次のラウンドのカウントダウンへ進む"
+        );
+        assert_eq!(countdown_phase(&game), Some(countdown_ui::Phase::Three));
         finish_countdown(&mut game);
         assert_waiting_within_range(&game);
     }
@@ -634,6 +729,9 @@ mod tests {
             game.handle_key(key(KeyCode::Enter));
             assert_eq!(game.tracker.total(), round + 1);
             assert_eq!(game.result().correct, 0, "フライングでは正答数が増えない");
+            if round + 1 < ROUNDS_PER_SESSION {
+                finish_result(&mut game);
+            }
         }
         assert!(game.is_finished());
         let result = game.result();
@@ -722,6 +820,9 @@ mod tests {
             finish_countdown(&mut game);
             show_signal_since(&mut game, ms(200));
             game.handle_key(key(KeyCode::Enter));
+            if round + 1 < ROUNDS_PER_SESSION {
+                finish_result(&mut game);
+            }
         }
         assert!(game.is_finished());
         let result = game.result();
@@ -754,14 +855,125 @@ mod tests {
     #[test]
     fn input_after_session_finished_is_ignored() {
         let mut game = QuickDrawGame::new();
-        for _ in 0..ROUNDS_PER_SESSION {
+        for round in 0..ROUNDS_PER_SESSION {
             game.handle_key(key(KeyCode::Enter));
+            if round + 1 < ROUNDS_PER_SESSION {
+                finish_result(&mut game);
+            }
         }
         assert!(game.is_finished());
         game.handle_key(key(KeyCode::Enter));
         game.handle_mouse(left_click(1, 1), AREA);
         game.update(Duration::from_secs(10));
         assert_eq!(game.result().total, ROUNDS_PER_SESSION);
+    }
+
+    // --- 結果表示(押した後) ---
+
+    #[test]
+    fn pressing_after_signal_shows_result_with_correct_and_latency() {
+        let mut game = QuickDrawGame::new();
+        show_signal_since(&mut game, ms(250));
+        game.handle_key(key(KeyCode::Enter));
+        match game.phase {
+            Phase::Result {
+                is_correct: true,
+                latency_ms: Some(ms),
+                ..
+            } => {
+                assert!((250.0..350.0).contains(&ms), "反応時間を記録する: {ms}");
+            }
+            _ => panic!("成功後は結果表示(◯・反応時間あり)のはず"),
+        }
+    }
+
+    #[test]
+    fn pressing_before_signal_shows_result_with_incorrect_and_no_latency() {
+        let mut game = QuickDrawGame::new();
+        finish_countdown(&mut game);
+        game.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(
+                game.phase,
+                Phase::Result {
+                    is_correct: false,
+                    latency_ms: None,
+                    ..
+                }
+            ),
+            "フライング後は結果表示(✗・反応時間なし)のはず"
+        );
+    }
+
+    #[test]
+    fn result_phase_holds_before_result_hold_elapses() {
+        let mut game = QuickDrawGame::new();
+        show_signal_since(&mut game, ms(0));
+        game.handle_key(key(KeyCode::Enter));
+        game.update(RESULT_HOLD - ms(1));
+        assert!(
+            matches!(game.phase, Phase::Result { .. }),
+            "表示時間が経つまでは結果表示のまま"
+        );
+    }
+
+    #[test]
+    fn result_phase_advances_to_next_countdown_after_result_hold() {
+        let mut game = QuickDrawGame::new();
+        show_signal_since(&mut game, ms(0));
+        game.handle_key(key(KeyCode::Enter));
+        game.update(RESULT_HOLD);
+        assert!(is_countdown(&game), "表示時間が経つと次のラウンドへ進む");
+    }
+
+    #[test]
+    fn press_during_result_phase_is_ignored() {
+        let mut game = QuickDrawGame::new();
+        show_signal_since(&mut game, ms(0));
+        game.handle_key(key(KeyCode::Enter));
+        assert_eq!(game.tracker.total(), 1);
+        // 結果表示中に押しても、次の入力としては扱わない(記録が増えない)
+        game.handle_key(key(KeyCode::Enter));
+        game.handle_mouse(left_click(1, 1), AREA);
+        assert_eq!(game.tracker.total(), 1);
+        assert!(matches!(game.phase, Phase::Result { .. }));
+    }
+
+    #[test]
+    fn render_shows_big_correct_mark_and_latency_ms_text() {
+        use crate::game::mark_display::CORRECT_MARK;
+        let mut game = QuickDrawGame::new();
+        show_signal_since(&mut game, ms(250));
+        game.handle_key(key(KeyCode::Enter));
+        let buffer = rendered(&game);
+        let text = text_of(&buffer);
+        assert!(text.contains(CORRECT_MARK), "成功時は大きな◯: {text}");
+        assert!(text.contains("ms"), "反応時間(ms)を表示する: {text}");
+    }
+
+    #[test]
+    fn render_shows_big_incorrect_mark_without_latency_text() {
+        use crate::game::mark_display::INCORRECT_MARK;
+        let mut game = QuickDrawGame::new();
+        finish_countdown(&mut game);
+        game.handle_key(key(KeyCode::Enter));
+        let buffer = rendered(&game);
+        let text = text_of(&buffer);
+        assert!(text.contains(INCORRECT_MARK), "フライング時は大きな✗: {text}");
+        assert!(!text.contains("ms"), "反応時間は表示しない: {text}");
+    }
+
+    #[test]
+    fn render_does_not_panic_during_result_in_tiny_area() {
+        let mut game = QuickDrawGame::new();
+        show_signal_since(&mut game, ms(0));
+        game.handle_key(key(KeyCode::Enter));
+        for (width, height) in [(1, 1), (5, 2), (10, 4)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| game.render(frame, Rect::new(0, 0, width, height)))
+                .unwrap();
+        }
     }
 
     // --- 描画 ---

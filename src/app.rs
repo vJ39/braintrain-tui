@@ -379,11 +379,9 @@ impl App {
             return;
         }
         if selected == QUICK_DRAW_ITEM_INDEX {
-            // ハヤウチも難易度を持たず10問固定で進むため、難易度選択を挟まない
-            self.start_playing(
-                QUICK_DRAW_ITEM_INDEX,
-                crate::game::quick_draw::SESSION_DIFFICULTY,
-            );
+            // ハヤウチは難易度選択に加え、ラウンドごとに自前の「3.2.1.GO!!」を持つため、
+            // 画面遷移側のカウントダウンも挟まない(挟むと演出が2回連続してしまう)
+            self.start_quick_draw();
             return;
         }
         if selected == MEMORY_ITEM_INDEX {
@@ -437,6 +435,16 @@ impl App {
             difficulty,
             state,
         };
+    }
+
+    /// ハヤウチを開始する。ラウンドごとの「3.2.1.GO!!」を自前で持つため、
+    /// 画面遷移側のカウントダウン(start_playing)は経由しない
+    fn start_quick_draw(&mut self) {
+        if let Some(name) = audio::random_bgm_track(BgmCategory::Playing) {
+            audio::play_bgm_track(&name);
+            self.current_bgm = Some(name);
+        }
+        self.screen = Screen::Playing(Box::new(QuickDrawGame::new()));
     }
 
     /// リズムゲームを開始する(常に上級の譜面・判定)。譜面生成を先に済ませ、選んだ曲のBGM再生を
@@ -1979,11 +1987,12 @@ mod tests {
         }
     }
 
-    /// ハヤウチが始まり、1問目(10問中)が表示されていることを確かめる
+    /// ハヤウチが始まり、1問目(10問中)が表示されていることを確かめる。
+    /// ハヤウチはラウンドごとに自前のカウントダウンを持つため、
+    /// 画面遷移側のカウントダウン(Screen::Countdown)は経由しない
     fn assert_quick_draw_round1_is_playing(app: &mut App) {
-        finish_countdown(app);
         let Screen::Playing(game) = &app.screen else {
-            panic!("Playing画面のはず");
+            panic!("外側のカウントダウンを挟まず直接Playing画面になるはず");
         };
         assert_eq!(game.result().game_id, crate::game::quick_draw::GAME_ID);
         assert!(!game.is_finished());
@@ -1994,36 +2003,18 @@ mod tests {
     }
 
     #[test]
-    fn selecting_quick_draw_skips_difficulty_and_starts_after_countdown() {
+    fn selecting_quick_draw_skips_difficulty_and_the_outer_countdown() {
         let mut app = App::new();
         app.select_menu_item(QUICK_DRAW_ITEM_INDEX);
-        let Screen::Countdown {
-            item,
-            difficulty,
-            state,
-        } = &app.screen
-        else {
-            panic!("難易度選択を挟まずカウントダウンになるはず");
-        };
-        assert_eq!(*item, QUICK_DRAW_ITEM_INDEX);
-        assert_eq!(*difficulty, crate::game::quick_draw::SESSION_DIFFICULTY);
-        assert_eq!(state.phase(), Some(Phase::Three), "3から始まる");
         assert_quick_draw_round1_is_playing(&mut app);
     }
 
     #[test]
-    fn enter_on_quick_draw_in_menu_goes_straight_to_countdown() {
+    fn enter_on_quick_draw_in_menu_goes_straight_to_playing() {
         let mut app = App::new();
         app.screen = Screen::Menu;
         app.menu_state.select(QUICK_DRAW_ITEM_INDEX);
         app.handle_key(KeyEvent::from(KeyCode::Enter));
-        assert!(matches!(
-            app.screen,
-            Screen::Countdown {
-                item: QUICK_DRAW_ITEM_INDEX,
-                ..
-            }
-        ));
         assert_quick_draw_round1_is_playing(&mut app);
     }
 
