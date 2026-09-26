@@ -85,9 +85,10 @@ struct TopSlot {
 }
 
 impl TopSlot {
-    fn new(pos: (f64, f64)) -> Self {
+    /// boardのposに置く(置いた位置で触れている凹凸には既に触れている扱い)
+    fn new(board: &Board, pos: (f64, f64)) -> Self {
         Self {
-            top: Top::new(pos),
+            top: Top::new(board, pos),
             settled: false,
         }
     }
@@ -235,7 +236,7 @@ impl BeigomaGame {
         board
             .start_positions(count)
             .into_iter()
-            .map(TopSlot::new)
+            .map(|pos| TopSlot::new(board, pos))
             .collect()
     }
 
@@ -583,8 +584,8 @@ impl Game for BeigomaGame {
 #[cfg(test)]
 mod tests {
     use super::board::{
-        round_params, Cell, TopState, BOARD_HEIGHT, BOARD_WIDTH, HIGH_G_THRESHOLD,
-        ROUNDS_PER_SESSION, TILT_STEP, TOP_PAIR_OFFSET_X,
+        round_params, Cell, TopState, BOARD_HEIGHT, BOARD_WIDTH, HIGH_G_THRESHOLD, MAX_SPEED,
+        ROUNDS_PER_SESSION, TILT_STEP, TOP_PAIR_OFFSET_X, TOP_RADIUS,
     };
     use super::truck::RoadEvent;
     use super::*;
@@ -658,7 +659,7 @@ mod tests {
     /// ゴールの左隣から、右へ転がってゴールに入る直前に置く
     fn place_just_before_goal(game: &mut BeigomaGame) {
         let (gx, gy) = game.board.goal();
-        game.tops[0].top = Top::new((gx as f64 - 0.02, gy as f64 + 0.5));
+        game.tops[0].top = Top::new(&game.board, (gx as f64 - 0.02, gy as f64 + 0.5));
         game.tops[0].top.vel = (3.0, 0.0);
     }
 
@@ -676,6 +677,12 @@ mod tests {
     #[test]
     fn countdown_total_is_four_phases() {
         assert_eq!(PHASE_DURATION * 4, COUNTDOWN_TOTAL);
+    }
+
+    #[test]
+    fn one_physics_step_is_shorter_than_the_top_radius() {
+        // 1ステップの移動量が半径より小さいので、凹凸に触れ始める瞬間を飛び越さない
+        const { assert!(MAX_SPEED * (MAX_STEP.as_millis() as f64 / 1000.0) < TOP_RADIUS) };
     }
 
     #[test]
@@ -926,7 +933,7 @@ mod tests {
     fn rolling_off_the_rim_during_play_is_a_game_over() {
         // 盤の縁には壁が無いので、左端から左へ転がると落ちてGAME OVERになる
         let mut game = calm_game();
-        game.tops[0].top = Top::new((0.6, 0.5));
+        game.tops[0].top = Top::new(&game.board, (0.6, 0.5));
         game.tops[0].top.vel = (-3.0, 0.0);
         game.update(Duration::from_millis(500));
         assert_eq!(game.outcome(), Some(Outcome::Flown));
@@ -953,7 +960,7 @@ mod tests {
         }
         // 障害物のすぐ下に置くと、ブレーキのGで前(上)へ押されて障害物を踏む
         let (x, y) = flat_below_a_bump(&game.board);
-        game.tops[0].top = Top::new((x as f64 + 0.5, y as f64 + 0.1));
+        game.tops[0].top = Top::new(&game.board, (x as f64 + 0.5, y as f64 + TOP_RADIUS + 0.1));
         for _ in 0..100 {
             game.update(STEP);
             if game.outcome().is_some() {
@@ -1021,10 +1028,13 @@ mod tests {
                 game.board.cell(x, y) == Cell::Hollow && game.board.cell(x - 1, y) == Cell::Flat
             })
             .expect("左隣が平坦な凹がある");
-        game.tops[0].top = Top::new((hx as f64 - 0.02, hy as f64 + 0.5));
+        game.tops[0].top = Top::new(
+            &game.board,
+            (hx as f64 - TOP_RADIUS - 0.02, hy as f64 + 0.5),
+        );
         game.tops[0].top.vel = (3.0, 0.0);
         game.update(STEP);
-        assert_eq!(game.tops[0].top.state, TopState::Sunk);
+        assert!(matches!(game.tops[0].top.state, TopState::Sunk { .. }));
         assert_eq!(message_text(&game), Some("ズボッ"));
         game.update(Duration::from_secs(2));
         assert_eq!(game.outcome(), None, "ハマっても続く");
@@ -1066,7 +1076,7 @@ mod tests {
     /// i番目のベーゴマを、ゴールの左隣から右へ転がってゴールに入る直前に置く
     fn place_slot_just_before_goal(game: &mut BeigomaGame, i: usize) {
         let (gx, gy) = game.board.goal();
-        game.tops[i].top = Top::new((gx as f64 - 0.02, gy as f64 + 0.5));
+        game.tops[i].top = Top::new(&game.board, (gx as f64 - 0.02, gy as f64 + 0.5));
         game.tops[i].top.vel = (3.0, 0.0);
     }
 
@@ -1313,7 +1323,7 @@ mod tests {
         // 片方だけ凸の手前に置くと、その片方だけが飛び上がる
         let mut game = calm_round2();
         let (x, y) = flat_below_a_bump(&game.board);
-        game.tops[0].top = Top::new((x as f64 + 0.5, y as f64 + 0.02));
+        game.tops[0].top = Top::new(&game.board, (x as f64 + 0.5, y as f64 + TOP_RADIUS + 0.02));
         game.tops[0].top.vel = (0.0, -3.0);
         game.update(STEP);
         assert!(game.tops[0].top.is_airborne(), "凸を踏んだ方は飛び上がる");
@@ -1345,7 +1355,7 @@ mod tests {
     #[test]
     fn one_top_rolling_off_the_rim_ends_round2() {
         let mut game = calm_round2();
-        game.tops[1].top = Top::new((0.6, 5.5));
+        game.tops[1].top = Top::new(&game.board, (0.6, 5.5));
         game.tops[1].top.vel = (-3.0, 0.0);
         game.update(Duration::from_millis(500));
         assert_eq!(game.outcome(), Some(Outcome::Flown));

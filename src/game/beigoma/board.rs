@@ -10,7 +10,8 @@
 //! - 軽トラのG(軽トラの加速度の向き)は、ベーゴマには慣性として逆向きにかかる
 //!   (ブレーキ=後方向のGで、ベーゴマは前(画面の上)へ押される)
 //! - 平坦な場所の摩擦はGによらず一定。障害物は凸(でっぱり)と凹(くぼみ)の2種類で、
-//!   どちらも「マスに入った瞬間」に判定する
+//!   どちらもベーゴマ(半径TOP_RADIUS)の円盤がマスに触れた瞬間に判定する。
+//!   正面か斜めかは、中心からマスの最も近い点への向き(接触の法線)と速度のなす角で決める
 //!   - 凸: 踏むと一度飛び上がり、着地の瞬間の摩擦が踏んだ時のGに応じて増える。
 //!     その大きさで 軽い着地/弾かれる/吹っ飛ぶ の3段階になる。
 //!     斜めから速く当たると飛び上がらず側面をこすり、速さとGで弾かれ/吹っ飛びになる
@@ -155,8 +156,10 @@ pub const HOLLOW_FRICTION: f64 = 4.5;
 /// 凹から抜け出すのに必要な速さ(マス/秒)。抜けられる条件は 加速度 ≥ HOLLOW_FRICTION × HOLLOW_EXIT_SPEED = 4.5マス/秒²。
 /// 傾き最大(6マス/s^2)なら終端速度約1.3で約0.6秒で抜け、4回押しまでの傾きだけでは届かない
 pub const HOLLOW_EXIT_SPEED: f64 = 1.0;
-/// 凹凸のマスに入る向きと、跨いだ縁の法線のなす角のcos。これ未満(60°より浅い角度)なら斜め(側面接触)
+/// 凹凸に触れた時の速度と、接触の法線のなす角のcos。これ未満(60°より浅い角度)なら斜め(側面接触)
 pub const GRAZE_COS: f64 = 0.5;
+/// ベーゴマの半径(マス)。直径が1マス。見た目の円盤と凹凸への接触判定の両方に使う
+pub const TOP_RADIUS: f64 = 0.5;
 /// 凹の側面をこすった時に、着地の摩擦へ上乗せする分。G=0でも弾かれ、G>0.2で吹っ飛ぶ
 pub const HOLLOW_GRAZE_FRICTION: f64 = 1.0;
 /// 凸に斜めから当たった時に側面接触とみなす最低の速さ(マス/秒)。これ未満なら正面と同じく飛び上がる
@@ -294,6 +297,42 @@ impl Board {
         self.cell(pos.0 as usize, pos.1 as usize)
     }
 
+    /// 中心posのベーゴマ(半径TOP_RADIUS)が触れている凹凸(Bump/Hollow)のマス。
+    /// 距離が近い順(同じなら左上から行優先)。調べるのはpos ± TOP_RADIUSを含む2×2マスだけ
+    pub fn contacts(&self, pos: (f64, f64)) -> Vec<Contact> {
+        // pos ± TOP_RADIUSが掛かるマスの範囲を、盤の範囲で切り詰める(盤から遠い位置では空)
+        let span = |center: f64, size: usize| {
+            let lo = (center - TOP_RADIUS).floor().max(0.0);
+            let hi = (center + TOP_RADIUS).floor().min(size as f64 - 1.0);
+            (lo <= hi).then_some(lo as usize..=hi as usize)
+        };
+        let mut contacts = Vec::new();
+        let (Some(xs), Some(ys)) = (span(pos.0, BOARD_WIDTH), span(pos.1, BOARD_HEIGHT)) else {
+            return contacts;
+        };
+        for y in ys {
+            for x in xs.clone() {
+                // cellsはゴールを含まない(ゴールはgoalで持つ)ので、凹凸だけを見る
+                if !matches!(self.cells[y * BOARD_WIDTH + x], Cell::Bump | Cell::Hollow) {
+                    continue;
+                }
+                let distance = cell_distance(pos, (x, y));
+                if distance < TOP_RADIUS {
+                    contacts.push(Contact {
+                        cell: (x, y),
+                        distance,
+                    });
+                }
+            }
+        }
+        contacts.sort_by(|a, b| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then((a.cell.1, a.cell.0).cmp(&(b.cell.1, b.cell.0)))
+        });
+        contacts
+    }
+
     /// ベーゴマの投入位置(マスの中央)
     pub fn start_position(&self) -> (f64, f64) {
         cell_center(self.start)
@@ -427,7 +466,7 @@ fn decay_axis(value: &mut f64, idle: &mut Duration, dt: Duration) {
 /// 足元のマスとベーゴマの状態から決まる摩擦。凹にハマっている間は常にHOLLOW_FRICTION、
 /// それ以外の平坦な場所(ゴール・ハマらずに乗った凹も含む)はGの大小によらず一定
 pub fn surface_friction(cell: Cell, state: TopState, g: f64) -> f64 {
-    if state == TopState::Sunk {
+    if matches!(state, TopState::Sunk { .. }) {
         return HOLLOW_FRICTION;
     }
     match cell {
@@ -437,34 +476,61 @@ pub fn surface_friction(cell: Cell, state: TopState, g: f64) -> f64 {
     }
 }
 
-/// 凹凸のマスに入った時の当たり方(凸・凹共通)
+/// 凹凸に触れた時の当たり方(凸・凹共通)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeContact {
-    /// 正面から入った。凸なら飛び上がり、凹ならハマる
+    /// 正面から触れた。凸なら飛び上がり、凹ならハマる
     HeadOn,
-    /// 斜めに入った。側面をこする
+    /// 斜めに触れた。側面をこする
     Graze,
 }
 
-/// 凹凸のマスに入った向きの判定。prevからcurへ跨いだ縁の法線(curへ向かう向き)と速度のなす角で
-/// 正面(HeadOn)か斜め(Graze)かを決める。角を斜めに跨いだ時は対角の向きを法線とみなす。
-/// 縁を跨いでいない・止まっている時は正面扱い
-pub fn edge_contact(vel: (f64, f64), prev: (usize, usize), cur: (usize, usize)) -> EdgeContact {
-    let normal = (
-        (cur.0 as i64 - prev.0 as i64).signum() as f64,
-        (cur.1 as i64 - prev.1 as i64).signum() as f64,
-    );
+/// ベーゴマが触れている凹凸のマス1つ
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Contact {
+    pub cell: (usize, usize),
+    /// 中心からマスの四角形までの距離(中心が四角形の中なら0)
+    pub distance: f64,
+}
+
+/// posから見た、マスcellの四角形[cx, cx+1]×[cy, cy+1]の最も近い点
+fn nearest_point(pos: (f64, f64), cell: (usize, usize)) -> (f64, f64) {
+    let (x, y) = (cell.0 as f64, cell.1 as f64);
+    (pos.0.clamp(x, x + 1.0), pos.1.clamp(y, y + 1.0))
+}
+
+/// posからマスcellの四角形までの距離。四角形の中なら0
+pub fn cell_distance(pos: (f64, f64), cell: (usize, usize)) -> f64 {
+    let q = nearest_point(pos, cell);
+    (q.0 - pos.0).hypot(q.1 - pos.1)
+}
+
+/// 接触の法線: posから見た、マスcellの四角形の最も近い点への単位ベクトル。
+/// 縁に触れた時は軸に平行、角に触れた時は角への向き。中(距離0)なら(0, 0)
+pub fn contact_normal(pos: (f64, f64), cell: (usize, usize)) -> (f64, f64) {
+    let q = nearest_point(pos, cell);
+    let (dx, dy) = (q.0 - pos.0, q.1 - pos.1);
+    let length = dx.hypot(dy);
+    if length == 0.0 {
+        return (0.0, 0.0);
+    }
+    (dx / length, dy / length)
+}
+
+/// 凹凸に触れた向きの判定。速度と接触の法線のなす角のcosで正面(HeadOn)か斜め(Graze)かを決める。
+/// 法線が零(中心がマスの中)・止まっている時は正面扱い
+pub fn edge_contact(vel: (f64, f64), normal: (f64, f64)) -> EdgeContact {
     let normal_len = normal.0.hypot(normal.1);
     let speed = vel.0.hypot(vel.1);
     if normal_len == 0.0 || speed < 1e-9 {
-        // 縁を跨いでいない・止まっている(通常は起きない)時は正面扱いにする
+        // 中心がマスの中にある・止まっている(通常は起きない)時は正面扱いにする
         return EdgeContact::HeadOn;
     }
     let cos = (vel.0 * normal.0 + vel.1 * normal.1) / (speed * normal_len);
     edge_contact_from_cos(cos)
 }
 
-/// 入る向きと縁の法線のなす角のcosから当たり方を決める。GRAZE_COSちょうどは正面
+/// 速度と接触の法線のなす角のcosから当たり方を決める。GRAZE_COSちょうどは正面
 pub fn edge_contact_from_cos(cos: f64) -> EdgeContact {
     if cos >= GRAZE_COS {
         EdgeContact::HeadOn
@@ -473,7 +539,7 @@ pub fn edge_contact_from_cos(cos: f64) -> EdgeContact {
     }
 }
 
-/// 凸に入った時に側面接触になるか。斜め、かつ速さがBUMP_GRAZE_SPEED以上(ちょうどを含む)
+/// 凸に触れた時に側面接触になるか。斜め、かつ速さがBUMP_GRAZE_SPEED以上(ちょうどを含む)
 pub fn is_bump_graze(contact: EdgeContact, speed: f64) -> bool {
     contact == EdgeContact::Graze && speed >= BUMP_GRAZE_SPEED
 }
@@ -517,8 +583,8 @@ pub enum TopState {
     Rolling,
     /// 凸を踏んで飛び上がっている。contact_gは踏んだ瞬間のG
     Airborne { remaining: Duration, contact_g: f64 },
-    /// 凹にハマっている。凹のマスの縁で位置を留め、速さがHOLLOW_EXIT_SPEEDに届いたら抜ける
-    Sunk,
+    /// 凹cellにハマっている。凹のマスの縁で位置を留め、速さがHOLLOW_EXIT_SPEEDに届いたら抜ける
+    Sunk { cell: (usize, usize) },
 }
 
 /// 1ステップの間に起きた出来事
@@ -540,34 +606,27 @@ pub enum StepEvent {
     Goal,
 }
 
-/// 位置を含むマス(盤の範囲に収める)
-fn cell_index(pos: (f64, f64)) -> (usize, usize) {
-    (
-        (pos.0.max(0.0) as usize).min(BOARD_WIDTH - 1),
-        (pos.1.max(0.0) as usize).min(BOARD_HEIGHT - 1),
-    )
-}
-
 /// 盤の上のベーゴマ
 #[derive(Debug, Clone)]
 pub struct Top {
     pub pos: (f64, f64),
     pub vel: (f64, f64),
     pub state: TopState,
-    /// 直前のステップにいたマス。マスに入った瞬間(凸・凹の判定)の検出に使う。
-    /// ハマっている間は、ハマっている凹のマス
-    prev_cell: (usize, usize),
+    /// 今触れている凹凸のマス。新しく触れたマスだけ判定する
+    touching: Vec<(usize, usize)>,
 }
 
 impl Top {
-    /// posに止まった状態で置く(置いたマスには既に入っている扱い)
-    pub fn new(pos: (f64, f64)) -> Self {
-        Self {
+    /// posに止まった状態で置く。置いた位置で触れている凹凸には既に触れている扱い
+    pub fn new(board: &Board, pos: (f64, f64)) -> Self {
+        let mut top = Self {
             pos,
             vel: (0.0, 0.0),
             state: TopState::Rolling,
-            prev_cell: cell_index(pos),
-        }
+            touching: Vec::new(),
+        };
+        top.settle_contacts(board);
+        top
     }
 
     pub fn is_airborne(&self) -> bool {
@@ -589,32 +648,34 @@ impl Top {
                 remaining,
                 contact_g,
             } => self.fly(board, dt, remaining, contact_g),
-            TopState::Sunk => self.struggle(secs, tilt, g),
+            TopState::Sunk { .. } => self.struggle(board, secs, tilt, g),
             TopState::Rolling => self.roll(board, secs, tilt, g),
         }
     }
 
-    /// 転がっている間: 進んだ先のマスに入った瞬間だけ、凸・凹の判定をする
+    /// 転がっている間: 新しく触れた凹凸があれば、最も近い1つを判定する
+    /// (同時に触れた残りは触れている扱いにし、その接触が続く間は判定しない)
     fn roll(&mut self, board: &Board, secs: f64, tilt: &Tilt, g: GForce) -> Option<StepEvent> {
         let friction = surface_friction(board.cell_at(self.pos), self.state, g.magnitude());
         self.drive(secs, tilt, g, friction);
         if !Board::contains(self.pos) {
             return Some(StepEvent::FellOff);
         }
-        let prev = self.prev_cell;
-        let cur = cell_index(self.pos);
-        self.prev_cell = cur;
-        let cell = board.cell(cur.0, cur.1);
-        if cell == Cell::Goal {
-            // ゴールは入った瞬間に限らず、ゴールのマスにいれば入ったとみなす(着地・脱出した先も含む)
+        if board.cell_at(self.pos) == Cell::Goal {
+            // ゴールは入った瞬間に限らず、中心がゴールのマスにあれば入ったとみなす(着地・脱出した先も含む)
             return Some(StepEvent::Goal);
         }
-        if cur == prev {
-            return None;
-        }
-        match cell {
-            Cell::Bump => Some(self.enter_bump(prev, cur, g.magnitude())),
-            Cell::Hollow => Some(self.enter_hollow(prev, cur, g.magnitude())),
+        let contacts = board.contacts(self.pos);
+        let entered = contacts
+            .iter()
+            .find(|contact| !self.touching.contains(&contact.cell))
+            .map(|contact| contact.cell);
+        self.touching = contacts.iter().map(|contact| contact.cell).collect();
+        let cell = entered?;
+        let normal = contact_normal(self.pos, cell);
+        match board.cell(cell.0, cell.1) {
+            Cell::Bump => Some(self.enter_bump(board, normal, g.magnitude())),
+            Cell::Hollow => Some(self.enter_hollow(board, cell, normal, g.magnitude())),
             Cell::Flat | Cell::Goal => None,
         }
     }
@@ -624,13 +685,13 @@ impl Top {
         self.vel.0.hypot(self.vel.1)
     }
 
-    /// 凸のマスに入った瞬間。側面接触なら飛び上がらずその場で判定し、それ以外は飛び上がる
-    fn enter_bump(&mut self, prev: (usize, usize), cur: (usize, usize), g: f64) -> StepEvent {
+    /// 凸に触れた瞬間。側面接触なら飛び上がらずその場で判定し、それ以外は飛び上がる
+    fn enter_bump(&mut self, board: &Board, normal: (f64, f64), g: f64) -> StepEvent {
         let speed = self.speed();
-        let contact = edge_contact(self.vel, prev, cur);
+        let contact = edge_contact(self.vel, normal);
         if is_bump_graze(contact, speed) {
             // 斜めから速く当たった: 側面をこすり、速さとGで弾かれ/吹っ飛びが決まる
-            return self.graze(landing_friction(g) + bump_graze_friction(speed));
+            return self.graze(board, landing_friction(g) + bump_graze_friction(speed));
         }
         // 正面から、またはゆっくり斜めに乗り上げた: 一度飛び上がり、このときのGで着地の摩擦が決まる
         self.state = TopState::Airborne {
@@ -640,36 +701,45 @@ impl Top {
         StepEvent::Hopped { contact_g: g }
     }
 
-    /// 凹のマスに入った瞬間。正面ならハマり、斜めなら側面をこする
-    fn enter_hollow(&mut self, prev: (usize, usize), cur: (usize, usize), g: f64) -> StepEvent {
-        match edge_contact(self.vel, prev, cur) {
+    /// 凹cellに触れた瞬間。正面ならハマり、斜めなら側面をこする
+    fn enter_hollow(
+        &mut self,
+        board: &Board,
+        cell: (usize, usize),
+        normal: (f64, f64),
+        g: f64,
+    ) -> StepEvent {
+        match edge_contact(self.vel, normal) {
             EdgeContact::HeadOn => {
-                self.state = TopState::Sunk;
+                self.sink_into(cell);
                 StepEvent::Sank
             }
-            EdgeContact::Graze => self.graze(landing_friction(g) + HOLLOW_GRAZE_FRICTION),
+            EdgeContact::Graze => self.graze(board, landing_friction(g) + HOLLOW_GRAZE_FRICTION),
         }
     }
 
     /// 側面をこすった(凸・凹共通)。frictionから弾かれ/吹っ飛びを決め、弾かれるならbounce()して
-    /// 弾かれた先のマスに入った扱いにする。Grazed(landing)を返す
-    fn graze(&mut self, friction: f64) -> StepEvent {
+    /// 弾かれた先で触れている凹凸を持ち直す。Grazed(landing)を返す
+    fn graze(&mut self, board: &Board, friction: f64) -> StepEvent {
         let landing = classify_landing(friction);
         if landing == Landing::Bounce {
             self.bounce();
-            self.prev_cell = cell_index(self.pos);
+            self.settle_contacts(board);
         }
         StepEvent::Grazed(landing)
     }
 
     /// 凹にハマっている間: 摩擦はHOLLOW_FRICTIONで、凹のマスから出る位置まで進んでも
     /// 速さがHOLLOW_EXIT_SPEEDに届かなければ位置だけマスの内側に留める。
-    /// 速度は殺さないので、縁へ向かって傾け続けている間は速さが溜まっていく
-    fn struggle(&mut self, secs: f64, tilt: &Tilt, g: GForce) -> Option<StepEvent> {
+    /// 速度は殺さないので、縁へ向かって傾け続けている間は速さが溜まっていく。
+    /// 抜けた時は、抜けた位置で触れている凹凸を持ち直す(抜けた直後に同じ凹へ入り直さない)
+    fn struggle(&mut self, board: &Board, secs: f64, tilt: &Tilt, g: GForce) -> Option<StepEvent> {
+        let TopState::Sunk { cell: hollow } = self.state else {
+            return None;
+        };
         let friction = surface_friction(Cell::Hollow, self.state, g.magnitude());
         self.drive(secs, tilt, g, friction);
-        let hollow = self.prev_cell;
-        if Board::contains(self.pos) && cell_index(self.pos) == hollow {
+        if Board::contains(self.pos) && is_in_cell(self.pos, hollow) {
             return None;
         }
         if self.vel.0.hypot(self.vel.1) < HOLLOW_EXIT_SPEED {
@@ -679,9 +749,24 @@ impl Top {
         if !Board::contains(self.pos) {
             return Some(StepEvent::FellOff);
         }
-        // prev_cellは凹のままにしておき、次のステップで抜けた先のマスに入った判定をする
         self.state = TopState::Rolling;
+        self.settle_contacts(board);
         Some(StepEvent::Escaped)
+    }
+
+    /// 今の位置で触れている凹凸を全部「触れている」にする
+    fn settle_contacts(&mut self, board: &Board) {
+        self.touching = board
+            .contacts(self.pos)
+            .iter()
+            .map(|contact| contact.cell)
+            .collect();
+    }
+
+    /// 凹cellにハマる。中心をマスの最も近い縁まで動かし(動く量は最大TOP_RADIUS)、Sunk { cell }にする
+    fn sink_into(&mut self, cell: (usize, usize)) {
+        self.pos = clamp_into_cell(self.pos, cell);
+        self.state = TopState::Sunk { cell };
     }
 
     /// 傾きとGで加速し、摩擦で減速して、速度のぶん進める
@@ -700,8 +785,9 @@ impl Top {
     }
 
     /// 飛び上がっている間: 盤に触れていないので傾き・G・摩擦は効かず、そのままの速度で進む。
-    /// 着地したら、踏んだ時のGから決まる摩擦で結果を判定する。凹の上に着地したら
-    /// (吹っ飛んだ時以外は)そのままハマる。出来事は着地(Landed)を返す。
+    /// 着地したら、踏んだ時のGから決まる摩擦で結果を判定する。着地した位置で円盤が凹に触れていたら
+    /// (吹っ飛んだ時以外は)最も近い凹にハマり、触れていなければ触れている凹凸を持ち直す
+    /// (同じ凸の上で飛び上がり直さない)。出来事は着地(Landed)を返す。
     /// 飛び上がっている間に中心が縁を越えたら、着地を待たずに落ちる
     fn fly(
         &mut self,
@@ -727,13 +813,18 @@ impl Top {
         if landing == Landing::Bounce {
             self.bounce();
         }
-        // 着地したマスには既に入っている扱い(同じ凸の上で飛び上がり直さない)
-        self.prev_cell = cell_index(self.pos);
-        if landing != Landing::Flown
-            && Board::contains(self.pos)
-            && board.cell(self.prev_cell.0, self.prev_cell.1) == Cell::Hollow
-        {
-            self.state = TopState::Sunk;
+        let hollow = if landing != Landing::Flown && Board::contains(self.pos) {
+            board
+                .contacts(self.pos)
+                .iter()
+                .find(|contact| board.cell(contact.cell.0, contact.cell.1) == Cell::Hollow)
+                .map(|contact| contact.cell)
+        } else {
+            None
+        };
+        match hollow {
+            Some(cell) => self.sink_into(cell),
+            None => self.settle_contacts(board),
         }
         Some(StepEvent::Landed(landing))
     }
@@ -768,6 +859,12 @@ impl Top {
         self.pos.0 += self.vel.0 * secs;
         self.pos.1 += self.vel.1 * secs;
     }
+}
+
+/// 位置posがマスcellの中にあるか(左端・上端を含み、右端・下端を含まない)
+fn is_in_cell(pos: (f64, f64), cell: (usize, usize)) -> bool {
+    let (x, y) = (cell.0 as f64, cell.1 as f64);
+    (x..x + 1.0).contains(&pos.0) && (y..y + 1.0).contains(&pos.1)
 }
 
 /// マスの内側に収めた位置(右端・下端はわずかに内側にして、次のマスに入らないようにする)
@@ -821,7 +918,7 @@ mod tests {
             .flat_map(|y| (1..BOARD_WIDTH).map(move |x| (x, y)))
             .find(|&(x, y)| board.cell(x, y) == Cell::Bump && board.cell(x - 1, y) == Cell::Flat)
             .expect("左隣が平坦な障害物がある");
-        let mut top = Top::new((bx as f64 - 0.02, by as f64 + 0.5));
+        let mut top = Top::new(board, (bx as f64 - TOP_RADIUS - 0.02, by as f64 + 0.5));
         top.vel = (3.0, 0.0);
         top
     }
@@ -834,7 +931,7 @@ mod tests {
         let event = top.step(&board, STEP, &tilt, contact);
         assert!(
             matches!(event, Some(StepEvent::Hopped { contact_g }) if approx(contact_g, contact.magnitude())),
-            "障害物に入った瞬間に飛び上がる: {event:?}"
+            "障害物に触れた瞬間に飛び上がる: {event:?}"
         );
         assert!(top.is_airborne());
         for _ in 0..100 {
@@ -1160,8 +1257,8 @@ mod tests {
         for pos in &positions {
             assert!(approx(pos.1, sy), "上下にはずらさない");
             assert_eq!(
-                cell_index(*pos),
-                cell_index((sx, sy)),
+                cell_containing(*pos),
+                cell_containing((sx, sy)),
                 "投入マスからはみ出さない"
             );
         }
@@ -1173,7 +1270,7 @@ mod tests {
         let board = round1_board();
         let lead = top_just_left_of_bump(&board);
         let mut tops = [lead.clone(), lead];
-        tops[1].pos.0 -= 2.0 * TOP_PAIR_OFFSET_X;
+        tops[1].pos.0 -= TOP_RADIUS;
         let tilt = Tilt::new();
         let events: Vec<_> = tops
             .iter_mut()
@@ -1411,7 +1508,7 @@ mod tests {
         for cell in [Cell::Flat, Cell::Bump, Cell::Hollow, Cell::Goal] {
             for g in [0.0, 0.5, 3.0] {
                 assert_eq!(
-                    surface_friction(cell, TopState::Sunk, g),
+                    surface_friction(cell, TopState::Sunk { cell: HOLLOW_AT }, g),
                     HOLLOW_FRICTION,
                     "{cell:?} g={g}"
                 );
@@ -1537,7 +1634,7 @@ mod tests {
     #[test]
     fn top_stays_still_on_a_level_board_without_g() {
         let board = round1_board();
-        let mut top = Top::new(board.start_position());
+        let mut top = Top::new(&board, board.start_position());
         for _ in 0..100 {
             assert_eq!(top.step(&board, STEP, &Tilt::new(), NO_G), None);
         }
@@ -1558,7 +1655,7 @@ mod tests {
         for (key, (dx, dy)) in cases {
             let mut tilt = Tilt::new();
             tilt.press(key);
-            let mut top = Top::new(if dy < 0.0 { (10.5, 11.5) } else { center });
+            let mut top = Top::new(&board, if dy < 0.0 { (10.5, 11.5) } else { center });
             let start = top.pos;
             top.step(&board, STEP, &tilt, NO_G);
             // 1ステップ目の速度は 傾き×係数×時間(から摩擦の分だけ減る)
@@ -1581,7 +1678,7 @@ mod tests {
             for _ in 0..presses {
                 tilt.press(TiltKey::Right);
             }
-            let mut top = Top::new((2.5, 0.5));
+            let mut top = Top::new(&board, (2.5, 0.5));
             for _ in 0..30 {
                 top.step(&board, STEP, &tilt, NO_G);
             }
@@ -1595,7 +1692,7 @@ mod tests {
         let board = round1_board();
         let tilt = Tilt::new();
         // ブレーキ(後方向のG)で、ベーゴマは前(画面の上)へ押される
-        let mut top = Top::new((10.5, 11.5));
+        let mut top = Top::new(&board, (10.5, 11.5));
         top.step(
             &board,
             STEP,
@@ -1613,7 +1710,7 @@ mod tests {
                 * (1.0 - ROLLING_FRICTION * STEP.as_secs_f64())
         ));
         // 右へ避ける(右方向のG)と、ベーゴマは左へ押される
-        let mut top = Top::new((10.5, 0.5));
+        let mut top = Top::new(&board, (10.5, 0.5));
         top.step(&board, STEP, &tilt, lateral(0.5));
         assert!(top.vel.0 < 0.0);
     }
@@ -1621,7 +1718,7 @@ mod tests {
     #[test]
     fn rolling_friction_slows_the_top_down() {
         let board = round1_board();
-        let mut top = Top::new((2.5, 0.5));
+        let mut top = Top::new(&board, (2.5, 0.5));
         top.vel = (4.0, 0.0);
         let mut previous = speed(&top);
         for _ in 0..50 {
@@ -1635,7 +1732,7 @@ mod tests {
     fn flat_ground_never_causes_hops_even_under_huge_g() {
         // 最上段は全部平坦。左右のGで左右に振り回しても、平坦なら特別な影響は無い
         let board = round1_board();
-        let mut top = Top::new((10.5, 0.5));
+        let mut top = Top::new(&board, (10.5, 0.5));
         for i in 0..300 {
             let g = if (i / 50) % 2 == 0 { 3.0 } else { -3.0 };
             let event = top.step(&board, STEP, &Tilt::new(), lateral(g));
@@ -1682,6 +1779,7 @@ mod tests {
     #[test]
     fn top_falls_off_when_its_center_crosses_the_rim() {
         // 4辺とも、縁の近くの平坦なマスから外へ向かって転がすと落ちる(跳ね返らない)
+        let board = round1_board();
         let (w, h) = (BOARD_WIDTH as f64, BOARD_HEIGHT as f64);
         let cases = [
             ((0.6, 5.5), (-3.0, 0.0)),
@@ -1690,7 +1788,7 @@ mod tests {
             ((10.5, h - 0.6), (0.0, 3.0)),
         ];
         for (pos, vel) in cases {
-            let mut top = Top::new(pos);
+            let mut top = Top::new(&board, pos);
             top.vel = vel;
             let fell = roll_until_fell_off(&mut top);
             assert!(!Board::contains(fell), "{pos:?}: 中心が縁を越えたら場外");
@@ -1715,7 +1813,7 @@ mod tests {
         for _ in 0..10 {
             tilt.press(TiltKey::Forward);
         }
-        let mut top = Top::new((0.5, 0.5));
+        let mut top = Top::new(&board, (0.5, 0.5));
         let fell =
             (0..500).any(|_| top.step(&board, STEP, &tilt, NO_G) == Some(StepEvent::FellOff));
         assert!(fell, "{:?}", top.pos);
@@ -1725,7 +1823,7 @@ mod tests {
     fn airborne_top_also_falls_off_the_rim() {
         // 飛び上がっている最中でも、中心が縁を越えたら着地を待たずに落ちる
         let board = round1_board();
-        let mut top = Top::new((0.6, 5.5));
+        let mut top = Top::new(&board, (0.6, 5.5));
         top.vel = (-5.0, 0.0);
         top.state = TopState::Airborne {
             remaining: HOP_DURATION,
@@ -1745,7 +1843,7 @@ mod tests {
 
     /// posで着地して弾かれる状態を作り、1ステップ進めて弾かせる。incomingは弾かれる前の向きの速度
     fn bounce_at(board: &Board, pos: (f64, f64), incoming: (f64, f64)) -> Top {
-        let mut top = Top::new(pos);
+        let mut top = Top::new(board, pos);
         top.vel = incoming;
         top.state = TopState::Airborne {
             remaining: STEP,
@@ -1794,7 +1892,7 @@ mod tests {
     #[test]
     fn speed_is_capped() {
         let board = round1_board();
-        let mut top = Top::new((10.5, 0.5));
+        let mut top = Top::new(&board, (10.5, 0.5));
         for _ in 0..500 {
             top.step(&board, STEP, &Tilt::new(), lateral(5.0));
             assert!(speed(&top) <= MAX_SPEED + 1e-9);
@@ -1877,7 +1975,7 @@ mod tests {
         let (mut top, landing) = land_after_contact(lateral(-0.1), NO_G);
         assert_eq!(landing, Landing::Light);
         let board = round1_board();
-        // 着地後もしばらく同じ障害物の上にいても、入った瞬間ではないので飛び上がらない
+        // 着地後もしばらく同じ障害物の上にいても、触れた瞬間ではないので飛び上がらない
         top.vel = (0.0, 0.0);
         for _ in 0..20 {
             assert_eq!(top.step(&board, STEP, &Tilt::new(), NO_G), None);
@@ -1888,7 +1986,7 @@ mod tests {
     fn entering_the_goal_cell_reports_goal() {
         let board = round1_board();
         let (gx, gy) = board.goal();
-        let mut top = Top::new((gx as f64 - 0.02, gy as f64 + 0.5));
+        let mut top = Top::new(&board, (gx as f64 - 0.02, gy as f64 + 0.5));
         top.vel = (3.0, 0.0);
         assert_eq!(board.cell(gx - 1, gy), Cell::Flat, "ゴールの左隣は平坦");
         assert_eq!(
@@ -1924,10 +2022,12 @@ mod tests {
         (pos.0 as usize, pos.1 as usize)
     }
 
-    /// posで凹にハマって止まっているベーゴマ
-    fn sunk_top(pos: (f64, f64)) -> Top {
-        let mut top = Top::new(pos);
-        top.state = TopState::Sunk;
+    /// posで凹にハマって止まっているベーゴマ(posを含むマスの凹にハマっている)
+    fn sunk_top(board: &Board, pos: (f64, f64)) -> Top {
+        let mut top = Top::new(board, pos);
+        top.state = TopState::Sunk {
+            cell: cell_containing(pos),
+        };
         top
     }
 
@@ -1946,20 +2046,25 @@ mod tests {
         let board = hollow_board();
         let (hx, hy) = (HOLLOW_AT.0 as f64, HOLLOW_AT.1 as f64);
         let cases = [
-            ((hx - 0.02, hy + 0.5), (3.0, 0.0)),
-            ((hx + 1.02, hy + 0.5), (-3.0, 0.0)),
-            ((hx + 0.5, hy - 0.02), (0.0, 3.0)),
-            ((hx + 0.5, hy + 1.02), (0.0, -3.0)),
+            ((hx - TOP_RADIUS - 0.02, hy + 0.5), (3.0, 0.0)),
+            ((hx + 1.0 + TOP_RADIUS + 0.02, hy + 0.5), (-3.0, 0.0)),
+            ((hx + 0.5, hy - TOP_RADIUS - 0.02), (0.0, 3.0)),
+            ((hx + 0.5, hy + 1.0 + TOP_RADIUS + 0.02), (0.0, -3.0)),
         ];
         for (pos, vel) in cases {
-            let mut top = Top::new(pos);
+            let mut top = Top::new(&board, pos);
             top.vel = vel;
             assert_eq!(
                 top.step(&board, STEP, &Tilt::new(), NO_G),
                 Some(StepEvent::Sank),
                 "{pos:?}: 正面から入るとハマる"
             );
-            assert_eq!(top.state, TopState::Sunk);
+            assert_eq!(top.state, TopState::Sunk { cell: HOLLOW_AT });
+            assert_eq!(
+                cell_containing(top.pos),
+                HOLLOW_AT,
+                "{pos:?}: 触れた瞬間に中心を凹の縁まで動かす"
+            );
             for i in 0..300 {
                 assert_eq!(
                     top.step(&board, STEP, &Tilt::new(), NO_G),
@@ -1971,7 +2076,7 @@ mod tests {
                     HOLLOW_AT,
                     "{pos:?} i={i}: 凹の中に留まる"
                 );
-                assert_eq!(top.state, TopState::Sunk);
+                assert_eq!(top.state, TopState::Sunk { cell: HOLLOW_AT });
             }
         }
     }
@@ -1980,7 +2085,13 @@ mod tests {
     fn entering_a_hollow_at_a_shallow_angle_grazes_and_bounces() {
         // 上の縁(法線は下向き)に、横へ流れながら浅い角度(cos=1/√10≈0.32)で入る
         let board = hollow_board();
-        let mut top = Top::new((HOLLOW_AT.0 as f64 + 0.5, HOLLOW_AT.1 as f64 - 0.005));
+        let mut top = Top::new(
+            &board,
+            (
+                HOLLOW_AT.0 as f64 + 0.5,
+                HOLLOW_AT.1 as f64 - TOP_RADIUS - 0.005,
+            ),
+        );
         let incoming = (3.0, 1.0);
         top.vel = incoming;
         assert_eq!(
@@ -2002,6 +2113,12 @@ mod tests {
             top.vel
         );
         assert_ne!(cell_containing(top.pos), HOLLOW_AT, "凹の外へ弾き出される");
+        assert!(
+            cell_distance(top.pos, HOLLOW_AT) >= TOP_RADIUS,
+            "縁から半径以上離れる: {:?}",
+            top.pos
+        );
+        assert!(top.touching.is_empty(), "弾かれた直後は何にも触れていない");
         // 盤の中央付近で弾かれても場外へは出ない
         for i in 0..1000 {
             assert_eq!(top.step(&board, STEP, &Tilt::new(), NO_G), None, "i={i}");
@@ -2013,7 +2130,13 @@ mod tests {
     fn grazing_under_high_g_flies_the_top_off() {
         let board = hollow_board();
         let graze = |g: f64| {
-            let mut top = Top::new((HOLLOW_AT.0 as f64 + 0.5, HOLLOW_AT.1 as f64 - 0.005));
+            let mut top = Top::new(
+                &board,
+                (
+                    HOLLOW_AT.0 as f64 + 0.5,
+                    HOLLOW_AT.1 as f64 - TOP_RADIUS - 0.005,
+                ),
+            );
             top.vel = (3.0, 1.0);
             top.step(&board, STEP, &Tilt::new(), lateral(g))
         };
@@ -2036,21 +2159,31 @@ mod tests {
         assert_eq!(edge_contact_from_cos(1.0), EdgeContact::HeadOn);
         // 左の縁(法線は右向き)・上の縁(法線は下向き)とも、法線から60°の前後で分かれる
         let edge_angle = GRAZE_COS.acos();
-        let (left, right) = ((9, 6), (10, 6));
-        let (above, below) = ((10, 5), (10, 6));
+        let (rightward, downward) = ((1.0, 0.0), (0.0, 1.0));
         for (delta, expected) in [
             (-0.1_f64.to_radians(), EdgeContact::HeadOn),
             (0.1_f64.to_radians(), EdgeContact::Graze),
         ] {
             let angle = edge_angle + delta;
             let from_left = (2.0 * angle.cos(), 2.0 * angle.sin());
-            assert_eq!(edge_contact(from_left, left, right), expected, "{delta}");
+            assert_eq!(edge_contact(from_left, rightward), expected, "{delta}");
             let from_above = (2.0 * angle.sin(), 2.0 * angle.cos());
-            assert_eq!(edge_contact(from_above, above, below), expected, "{delta}");
+            assert_eq!(edge_contact(from_above, downward), expected, "{delta}");
         }
-        // 縁を跨いでいない・止まっている時は正面扱い
-        assert_eq!(edge_contact((3.0, 1.0), below, below), EdgeContact::HeadOn);
-        assert_eq!(edge_contact((0.0, 0.0), above, below), EdgeContact::HeadOn);
+        // 法線が零(中心がマスの中)・止まっている時は正面扱い
+        assert_eq!(edge_contact((3.0, 1.0), (0.0, 0.0)), EdgeContact::HeadOn);
+        assert_eq!(edge_contact((0.0, 0.0), downward), EdgeContact::HeadOn);
+        // 角の法線(0.6, 0.8)に対して
+        assert_eq!(
+            edge_contact((1.0, 1.0), (0.6, 0.8)),
+            EdgeContact::HeadOn,
+            "cos≈0.99は正面"
+        );
+        assert_eq!(
+            edge_contact((1.0, -0.5), (0.6, 0.8)),
+            EdgeContact::Graze,
+            "cos≈0.18は斜め"
+        );
     }
 
     #[test]
@@ -2066,7 +2199,7 @@ mod tests {
                 TiltKey::Back,
             ] {
                 let tilt = tilt_toward(key, presses);
-                let mut top = sunk_top(center);
+                let mut top = sunk_top(&board, center);
                 for i in 0..6000 {
                     assert_eq!(
                         top.step(&board, STEP, &tilt, NO_G),
@@ -2079,7 +2212,7 @@ mod tests {
                         "{key:?}×{presses} i={i}"
                     );
                 }
-                assert_eq!(top.state, TopState::Sunk);
+                assert_eq!(top.state, TopState::Sunk { cell: HOLLOW_AT });
                 assert!(speed(&top) < HOLLOW_EXIT_SPEED);
             }
         }
@@ -2096,7 +2229,7 @@ mod tests {
             TiltKey::Back,
         ] {
             let tilt = tilt_toward(key, 20);
-            let mut top = sunk_top(center);
+            let mut top = sunk_top(&board, center);
             let steps = (0..100)
                 .position(|_| top.step(&board, STEP, &tilt, NO_G) == Some(StepEvent::Escaped))
                 .unwrap_or_else(|| panic!("{key:?}: 1秒以内に抜け出せなかった: {:?}", top.pos));
@@ -2112,7 +2245,7 @@ mod tests {
         // 縁の手前から、抜け出せない強さで縁へ向かって傾け続ける
         let board = hollow_board();
         let tilt = tilt_toward(TiltKey::Right, 3);
-        let mut top = sunk_top((HOLLOW_AT.0 as f64 + 0.9, HOLLOW_AT.1 as f64 + 0.5));
+        let mut top = sunk_top(&board, (HOLLOW_AT.0 as f64 + 0.9, HOLLOW_AT.1 as f64 + 0.5));
         let mut previous = speed(&top);
         let mut clamped_steps = 0;
         for i in 0..100 {
@@ -2131,7 +2264,7 @@ mod tests {
         }
         assert!(clamped_steps > 30, "縁で留められていた: {clamped_steps}");
         assert!(top.vel.0 > 0.6, "速度は殺されていない: {:?}", top.vel);
-        assert_eq!(top.state, TopState::Sunk);
+        assert_eq!(top.state, TopState::Sunk { cell: HOLLOW_AT });
     }
 
     #[test]
@@ -2146,10 +2279,17 @@ mod tests {
             (TiltKey::Back, (0.5, 0.001)),
         ] {
             let tilt = tilt_toward(key, 20);
-            let mut top = sunk_top((HOLLOW_AT.0 as f64 + pos.0, HOLLOW_AT.1 as f64 + pos.1));
+            let mut top = sunk_top(
+                &board,
+                (HOLLOW_AT.0 as f64 + pos.0, HOLLOW_AT.1 as f64 + pos.1),
+            );
             for i in 0..60 {
                 assert_eq!(top.step(&board, STEP, &tilt, NO_G), None, "{key:?} i={i}");
-                assert_eq!(top.state, TopState::Sunk, "{key:?} i={i}");
+                assert_eq!(
+                    top.state,
+                    TopState::Sunk { cell: HOLLOW_AT },
+                    "{key:?} i={i}"
+                );
             }
             assert!(speed(&top) < 1.4, "{key:?}: {}", speed(&top));
             assert!(
@@ -2164,7 +2304,7 @@ mod tests {
         // 縁にある凹から盤の外へ抜け出したら、そのまま落ちる
         let board = board_with(&[((0, 6), Cell::Hollow)]);
         let tilt = tilt_toward(TiltKey::Left, 20);
-        let mut top = sunk_top((0.5, 6.5));
+        let mut top = sunk_top(&board, (0.5, 6.5));
         let event = (0..100).find_map(|_| top.step(&board, STEP, &tilt, NO_G));
         assert_eq!(event, Some(StepEvent::FellOff));
         assert!(!Board::contains(top.pos));
@@ -2175,7 +2315,10 @@ mod tests {
         // 凸を踏んで飛び上がり、隣の凹に着地する
         let (bump, hollow) = ((9, 6), (10, 6));
         let board = board_with(&[(bump, Cell::Bump), (hollow, Cell::Hollow)]);
-        let mut top = Top::new((bump.0 as f64 - 0.02, bump.1 as f64 + 0.5));
+        let mut top = Top::new(
+            &board,
+            (bump.0 as f64 - TOP_RADIUS - 0.02, bump.1 as f64 + 0.5),
+        );
         top.vel = (5.0, 0.0);
         let tilt = Tilt::new();
         assert!(matches!(
@@ -2188,16 +2331,22 @@ mod tests {
             Some(StepEvent::Landed(Landing::Light)),
             "着地の出来事を返す"
         );
+        // 中心が凸の上に着地しても、円盤が触れている凹があればその縁まで動いてハマる
         assert_eq!(cell_containing(top.pos), hollow, "凹の上に着地した");
-        assert_eq!(top.state, TopState::Sunk, "着地したらそのままハマる");
+        assert_eq!(board.cell_at(top.pos), Cell::Hollow);
+        assert_eq!(
+            top.state,
+            TopState::Sunk { cell: hollow },
+            "着地したらそのままハマる"
+        );
     }
 
     #[test]
     fn moving_within_a_cell_triggers_nothing() {
-        // マスが変わらなければ、凸・凹とも何も起きない(入った瞬間だけ判定する)
+        // 置いた時から触れている凹凸の中で動いても、凸・凹とも何も起きない(触れた瞬間だけ判定する)
         for cell in [Cell::Bump, Cell::Hollow] {
             let board = board_with(&[(HOLLOW_AT, cell)]);
-            let mut top = Top::new((HOLLOW_AT.0 as f64 + 0.1, HOLLOW_AT.1 as f64 + 0.5));
+            let mut top = Top::new(&board, (HOLLOW_AT.0 as f64 + 0.1, HOLLOW_AT.1 as f64 + 0.5));
             top.vel = (1.0, 0.0);
             for i in 0..50 {
                 assert_eq!(
@@ -2219,14 +2368,17 @@ mod tests {
         board_with(&[(BUMP_AT, Cell::Bump)])
     }
 
-    /// 凸の上の縁のすぐ外側(ここから下向きの成分を持つ速度で入ると上の縁を跨ぐ)
+    /// 凸の上の縁から半径よりわずかに離れた位置(ここから下向きの成分を持つ速度で進むと上の縁に触れる)
     fn above_bump() -> (f64, f64) {
-        (BUMP_AT.0 as f64 + 0.5, BUMP_AT.1 as f64 - 0.005)
+        (
+            BUMP_AT.0 as f64 + 0.5,
+            BUMP_AT.1 as f64 - TOP_RADIUS - 0.005,
+        )
     }
 
     /// posからvelで転がし、最初の出来事が起きるまで進める
     fn first_event(board: &Board, pos: (f64, f64), vel: (f64, f64), g: GForce) -> (Top, StepEvent) {
-        let mut top = Top::new(pos);
+        let mut top = Top::new(board, pos);
         top.vel = vel;
         for _ in 0..100 {
             if let Some(event) = top.step(board, STEP, &Tilt::new(), g) {
@@ -2239,7 +2391,7 @@ mod tests {
     #[test]
     fn entering_a_bump_head_on_hops_regardless_of_speed() {
         let board = bump_board();
-        let pos = (BUMP_AT.0 as f64 - 0.02, BUMP_AT.1 as f64 + 0.5);
+        let pos = (BUMP_AT.0 as f64 - TOP_RADIUS - 0.02, BUMP_AT.1 as f64 + 0.5);
         for vel in [(3.0, 0.0), (10.0, 0.0)] {
             let (top, event) = first_event(&board, pos, vel, NO_G);
             assert!(
@@ -2255,7 +2407,7 @@ mod tests {
         // 上の縁(法線は下向き)に、横へ流れながら浅い角度(cos≈0.32)・速さ約3.16で入る
         let board = bump_board();
         let incoming = (3.0, 1.0);
-        let mut top = Top::new(above_bump());
+        let mut top = Top::new(&board, above_bump());
         top.vel = incoming;
         assert_eq!(
             top.step(&board, STEP, &Tilt::new(), NO_G),
@@ -2289,7 +2441,9 @@ mod tests {
             "遅い斜めは飛び上がる: {event:?}"
         );
         assert!(top.is_airborne());
-        assert_eq!(cell_containing(top.pos), BUMP_AT);
+        // 凸のマスに入る前(円盤が触れた時点)で飛び上がる
+        assert!(cell_distance(top.pos, BUMP_AT) < TOP_RADIUS);
+        assert_ne!(cell_containing(top.pos), BUMP_AT);
     }
 
     #[test]
@@ -2322,14 +2476,14 @@ mod tests {
         let (bx, by) = (BUMP_AT.0 as f64, BUMP_AT.1 as f64);
         let cases = [
             // 上の縁・下の縁: 横方向の成分が大きい
-            ((bx + 0.5, by - 0.005), (3.0, 1.0)),
-            ((bx + 0.5, by + 1.005), (3.0, -1.0)),
+            ((bx + 0.5, by - TOP_RADIUS - 0.005), (3.0, 1.0)),
+            ((bx + 0.5, by + 1.0 + TOP_RADIUS + 0.005), (3.0, -1.0)),
             // 左の縁・右の縁: 縦方向の成分が大きい
-            ((bx - 0.005, by + 0.5), (1.0, 3.0)),
-            ((bx + 1.005, by + 0.5), (-1.0, 3.0)),
+            ((bx - TOP_RADIUS - 0.005, by + 0.5), (1.0, 3.0)),
+            ((bx + 1.0 + TOP_RADIUS + 0.005, by + 0.5), (-1.0, 3.0)),
         ];
         for (pos, vel) in cases {
-            let mut top = Top::new(pos);
+            let mut top = Top::new(&board, pos);
             top.vel = vel;
             assert_eq!(
                 top.step(&board, STEP, &Tilt::new(), NO_G),
@@ -2377,8 +2531,8 @@ mod tests {
     fn edge_contact_splits_bumps_and_hollows_the_same_way() {
         // 同じ入り方なら、凸でも凹でも正面/斜めの分かれ方が一致する(速さはBUMP_GRAZE_SPEED以上)
         let (bx, by) = (BUMP_AT.0 as f64, BUMP_AT.1 as f64);
-        let above = (bx + 0.5, by - 0.005);
-        let left = (bx - 0.005, by + 0.5);
+        let above = (bx + 0.5, by - TOP_RADIUS - 0.005);
+        let left = (bx - TOP_RADIUS - 0.005, by + 0.5);
         let cases = [
             (above, (3.0, 1.0)),
             (above, (1.0, 3.0)),
@@ -2390,14 +2544,14 @@ mod tests {
         let hollow = board_with(&[(BUMP_AT, Cell::Hollow)]);
         let mut seen = std::collections::HashSet::new();
         for (pos, vel) in cases {
-            let mut top = Top::new(pos);
+            let mut top = Top::new(&bump, pos);
             top.vel = vel;
             let bump_contact = match top.step(&bump, STEP, &Tilt::new(), NO_G) {
                 Some(StepEvent::Hopped { .. }) => EdgeContact::HeadOn,
                 Some(StepEvent::Grazed(_)) => EdgeContact::Graze,
                 other => panic!("{pos:?} {vel:?}: 凸で想定外: {other:?}"),
             };
-            let mut top = Top::new(pos);
+            let mut top = Top::new(&hollow, pos);
             top.vel = vel;
             let hollow_contact = match top.step(&hollow, STEP, &Tilt::new(), NO_G) {
                 Some(StepEvent::Sank) => EdgeContact::HeadOn,
@@ -2405,14 +2559,390 @@ mod tests {
                 other => panic!("{pos:?} {vel:?}: 凹で想定外: {other:?}"),
             };
             assert_eq!(bump_contact, hollow_contact, "{pos:?} {vel:?}");
-            let prev = cell_containing(pos);
             assert_eq!(
                 bump_contact,
-                edge_contact(vel, prev, BUMP_AT),
+                edge_contact(vel, contact_normal(pos, BUMP_AT)),
                 "{pos:?} {vel:?}: edge_contactの判定と同じ"
             );
             seen.insert(format!("{bump_contact:?}"));
         }
         assert_eq!(seen.len(), 2, "正面・斜めの両方を確かめている");
+    }
+
+    // --- 半径と接触(円盤がマスに触れた瞬間に判定する) ---
+
+    /// 傾き・Gなしで1ステップずつsteps回進め、各ステップの出来事と進んだ後の位置を記録する
+    fn roll_steps(
+        board: &Board,
+        top: &mut Top,
+        steps: usize,
+    ) -> Vec<(Option<StepEvent>, (f64, f64))> {
+        (0..steps)
+            .map(|_| {
+                let event = top.step(board, STEP, &Tilt::new(), NO_G);
+                (event, top.pos)
+            })
+            .collect()
+    }
+
+    fn approx_pair(a: (f64, f64), b: (f64, f64)) -> bool {
+        approx(a.0, b.0) && approx(a.1, b.1)
+    }
+
+    #[test]
+    fn top_radius_constants_keep_their_relations() {
+        assert_eq!(TOP_RADIUS, 0.5);
+        // 弾かれた直後は同じ凹凸に触れていない
+        const { assert!(TOP_RADIUS <= BOUNCE_KICK) };
+        // 直径がマスを超えない
+        const { assert!(TOP_RADIUS * 2.0 <= 1.0) };
+    }
+
+    #[test]
+    fn cell_distance_and_normal_on_each_edge() {
+        let cell = (10, 6);
+        for (pos, distance, normal) in [
+            ((9.6, 6.5), 0.4, (1.0, 0.0)),
+            ((10.5, 5.7), 0.3, (0.0, 1.0)),
+            ((11.4, 6.5), 0.4, (-1.0, 0.0)),
+            ((10.5, 7.4), 0.4, (0.0, -1.0)),
+        ] {
+            assert!(
+                (cell_distance(pos, cell) - distance).abs() < 1e-9,
+                "{pos:?}: {}",
+                cell_distance(pos, cell)
+            );
+            assert!(
+                approx_pair(contact_normal(pos, cell), normal),
+                "{pos:?}: {:?}",
+                contact_normal(pos, cell)
+            );
+        }
+    }
+
+    #[test]
+    fn cell_distance_and_normal_at_a_corner_and_inside() {
+        let cell = (10, 6);
+        assert!((cell_distance((9.7, 5.6), cell) - 0.5).abs() < 1e-9);
+        assert!(approx_pair(contact_normal((9.7, 5.6), cell), (0.6, 0.8)));
+        for pos in [(10.5, 6.5), (10.0, 6.0), (10.999, 6.999)] {
+            assert_eq!(cell_distance(pos, cell), 0.0, "{pos:?}: 中は距離0");
+            assert_eq!(contact_normal(pos, cell), (0.0, 0.0), "{pos:?}: 中は法線0");
+        }
+        // 法線の長さは常に1か0
+        for i in 0..=40 {
+            for j in 0..=40 {
+                let pos = (8.0 + f64::from(i) * 0.1, 4.0 + f64::from(j) * 0.1);
+                let n = contact_normal(pos, cell);
+                let len = n.0.hypot(n.1);
+                assert!(len == 0.0 || (len - 1.0).abs() < 1e-9, "{pos:?}: {len}");
+            }
+        }
+    }
+
+    fn contact_cells(board: &Board, pos: (f64, f64)) -> Vec<(usize, usize)> {
+        board.contacts(pos).iter().map(|c| c.cell).collect()
+    }
+
+    #[test]
+    fn contacts_of_a_single_hollow() {
+        let board = hollow_board();
+        let at = |pos: (f64, f64)| board.contacts(pos);
+        assert_eq!(
+            at((10.5, 6.5)),
+            vec![Contact {
+                cell: HOLLOW_AT,
+                distance: 0.0
+            }]
+        );
+        let near = at((10.5, 5.6));
+        assert_eq!(near.len(), 1);
+        assert_eq!(near[0].cell, HOLLOW_AT);
+        assert!((near[0].distance - 0.4).abs() < 1e-9);
+        assert!(at((10.5, 5.5)).is_empty(), "ちょうど半径は触れない");
+        assert!(at((10.5, 5.4)).is_empty());
+        let corner = at((9.7, 5.7));
+        assert_eq!(corner.len(), 1);
+        assert!((corner[0].distance - 0.3_f64.hypot(0.3)).abs() < 1e-9);
+        assert!(at((9.6, 5.6)).is_empty(), "角までの距離約0.566");
+    }
+
+    #[test]
+    fn contacts_between_two_bumps_on_the_center_line() {
+        let board = board_with(&[((9, 6), Cell::Bump), ((11, 6), Cell::Bump)]);
+        assert!(board.contacts((10.5, 6.5)).is_empty(), "両方ちょうど0.5");
+        assert_eq!(contact_cells(&board, (10.4, 6.5)), vec![(9, 6)]);
+    }
+
+    #[test]
+    fn contacts_are_sorted_by_distance_then_row_major() {
+        let board = board_with(&[((10, 5), Cell::Bump), ((9, 6), Cell::Hollow)]);
+        let contacts = board.contacts((10.2, 6.3));
+        assert_eq!(
+            contacts.iter().map(|c| c.cell).collect::<Vec<_>>(),
+            vec![(9, 6), (10, 5)],
+            "距離が近い方を先にする"
+        );
+        assert!((contacts[0].distance - 0.2).abs() < 1e-9);
+        assert!((contacts[1].distance - 0.3).abs() < 1e-9);
+        let board = board_with(&[((10, 5), Cell::Bump), ((9, 6), Cell::Bump)]);
+        // 距離がちょうど同じになるよう、2進で割り切れる位置(どちらも距離0.25)で確かめる
+        let contacts = board.contacts((10.25, 6.25));
+        assert_eq!(contacts[0].distance, contacts[1].distance);
+        assert_eq!(
+            contacts.iter().map(|c| c.cell).collect::<Vec<_>>(),
+            vec![(10, 5), (9, 6)],
+            "同じ距離なら左上から行優先"
+        );
+    }
+
+    #[test]
+    fn contacts_ignore_goal_and_flat_and_do_not_panic_at_the_rim() {
+        // ゴール(19, 0)の隣
+        let board = hollow_board();
+        assert!(board.contacts((18.7, 0.5)).is_empty(), "ゴールは含まない");
+        assert!(board.contacts((5.5, 5.5)).is_empty(), "平坦は含まない");
+        let board = board_with(&[((0, 6), Cell::Hollow)]);
+        assert_eq!(contact_cells(&board, (0.2, 6.5)), vec![(0, 6)]);
+        assert_eq!(
+            contact_cells(&board, (-0.3, 6.5)),
+            vec![(0, 6)],
+            "盤の外の位置でも触れていれば含む"
+        );
+        for pos in [
+            (-1000.0, -1000.0),
+            (1000.0, 1000.0),
+            (19.9, 11.9),
+            (0.0, 0.0),
+        ] {
+            assert!(board.contacts(pos).is_empty(), "{pos:?}");
+        }
+    }
+
+    #[test]
+    fn nothing_is_touched_at_the_start_or_the_round1_goal() {
+        let board = Board::with_goal(&LAYOUT_ROUND1, ROUND1_FARTHEST_GOAL);
+        assert!(board.contacts(board.start_position()).is_empty());
+        for pos in board.start_positions(2) {
+            assert!(board.contacts(pos).is_empty(), "{pos:?}");
+        }
+        assert!(board.contacts(center_of(ROUND1_FARTHEST_GOAL)).is_empty());
+    }
+
+    #[test]
+    fn a_top_touches_a_bump_before_its_center_enters_the_cell() {
+        let board = bump_board();
+        let mut top = Top::new(&board, (9.0, 6.5));
+        top.vel = (3.0, 0.0);
+        let mut previous = top.pos;
+        for i in 0..100 {
+            let event = top.step(&board, STEP, &Tilt::new(), NO_G);
+            if top.pos.0 <= 9.5 {
+                assert_eq!(event, None, "i={i}: 触れるまでは何も起きない");
+            } else {
+                assert!(previous.0 <= 9.5, "9.5を越えた最初のステップで判定する");
+                assert!(
+                    matches!(event, Some(StepEvent::Hopped { .. })),
+                    "i={i}: {event:?}"
+                );
+                assert_eq!(cell_containing(top.pos), (9, 6), "凸のマスに入る前に触れる");
+                return;
+            }
+            previous = top.pos;
+        }
+        panic!("凸に触れなかった: {:?}", top.pos);
+    }
+
+    #[test]
+    fn rolling_along_the_center_line_of_the_next_row_touches_nothing() {
+        let board = bump_board();
+        let mut top = Top::new(&board, (9.0, 5.5));
+        top.vel = (3.0, 0.0);
+        for (i, (event, _)) in roll_steps(&board, &mut top, 100).into_iter().enumerate() {
+            assert_eq!(event, None, "i={i}");
+        }
+        assert!(top.pos.0 > 10.9, "凸の横を通り過ぎた: {:?}", top.pos);
+    }
+
+    #[test]
+    fn passing_close_to_a_corner_fast_grazes() {
+        // 縁の延長線から0.45(> 0.433)の高さで角に近づく。角の法線と速度のなす角が60°を超えるので斜め。
+        // 摩擦で減速しても触れた時にBUMP_GRAZE_SPEED以上になるよう、角の近くから速めに転がす
+        let board = bump_board();
+        let (top, event) = first_event(&board, (9.7, 5.55), (3.5, 0.0), NO_G);
+        assert_eq!(event, StepEvent::Grazed(Landing::Bounce));
+        assert!(!top.is_airborne());
+        assert!(top.touching.is_empty(), "弾かれた直後は何にも触れていない");
+    }
+
+    #[test]
+    fn a_corner_contact_normal_points_to_the_corner() {
+        // (9.0, 5.55)から右へ: 角(10, 6)まで0.5未満になった時の法線は縦成分が約0.9で、斜め
+        let pos = (10.0 - 0.2, 5.55);
+        assert!(cell_distance(pos, BUMP_AT) < TOP_RADIUS);
+        let n = contact_normal(pos, BUMP_AT);
+        assert!(n.1 > 0.85 && n.0 > 0.0, "{n:?}");
+        assert_eq!(edge_contact((3.0, 0.0), n), EdgeContact::Graze);
+        // 縁から0.3なら角の法線は約(0.8, 0.6)で正面
+        let pos = (10.0 - 0.39, 5.7);
+        let n = contact_normal(pos, BUMP_AT);
+        assert!(n.0 > 0.75, "{n:?}");
+        assert_eq!(edge_contact((3.0, 0.0), n), EdgeContact::HeadOn);
+    }
+
+    #[test]
+    fn passing_close_to_a_corner_slowly_hops() {
+        let board = bump_board();
+        let (top, event) = first_event(&board, (9.0, 5.55), (1.5, 0.0), NO_G);
+        assert!(matches!(event, StepEvent::Hopped { .. }), "{event:?}");
+        assert!(top.is_airborne());
+        assert_eq!(cell_containing(top.pos), (9, 5), "中心は隣の行のまま");
+    }
+
+    #[test]
+    fn a_corner_hit_head_on_hops() {
+        let board = bump_board();
+        let (top, event) = first_event(&board, (9.0, 5.7), (3.0, 0.0), NO_G);
+        assert!(matches!(event, StepEvent::Hopped { .. }), "{event:?}");
+        assert_eq!(cell_containing(top.pos), (9, 5));
+    }
+
+    #[test]
+    fn a_bump_touched_when_placed_is_judged_only_after_leaving_it() {
+        let board = bump_board();
+        let mut top = Top::new(&board, (9.6, 6.5));
+        assert_eq!(top.touching, vec![BUMP_AT], "置いた位置で触れている");
+        top.vel = (3.0, 0.0);
+        // 凸のマスの中を通り過ぎ、半径以上離れるまで飛び上がらない
+        let mut steps = 0;
+        while cell_distance(top.pos, BUMP_AT) < TOP_RADIUS || top.pos.0 < 11.0 {
+            assert_eq!(
+                top.step(&board, STEP, &Tilt::new(), NO_G),
+                None,
+                "{:?}",
+                top.pos
+            );
+            steps += 1;
+            assert!(steps < 500, "通り過ぎなかった: {:?}", top.pos);
+        }
+        assert!(top.touching.is_empty());
+        // 戻ってくると再び飛び上がる
+        top.vel = (-3.0, 0.0);
+        let event = (0..100).find_map(|_| top.step(&board, STEP, &Tilt::new(), NO_G));
+        assert!(matches!(event, Some(StepEvent::Hopped { .. })), "{event:?}");
+    }
+
+    #[test]
+    fn touching_two_bumps_at_once_hops_only_once() {
+        let board = board_with(&[((10, 5), Cell::Bump), ((9, 6), Cell::Bump)]);
+        let mut top = Top::new(&board, (10.6, 6.6));
+        assert!(top.touching.is_empty());
+        top.vel = (-3.0, -3.0);
+        let mut events = Vec::new();
+        for _ in 0..100 {
+            if let Some(event) = top.step(&board, STEP, &Tilt::new(), NO_G) {
+                if events.is_empty() {
+                    let mut touching = top.touching.clone();
+                    touching.sort();
+                    assert_eq!(touching, vec![(9, 6), (10, 5)], "両方に触れている");
+                }
+                events.push(event);
+            }
+        }
+        assert!(matches!(events[0], StepEvent::Hopped { .. }), "{events:?}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, StepEvent::Hopped { .. }))
+                .count(),
+            1,
+            "飛び上がりは1回だけ: {events:?}"
+        );
+    }
+
+    #[test]
+    fn touching_a_hollow_head_on_sinks_to_its_rim() {
+        let board = hollow_board();
+        let mut top = Top::new(&board, (9.0, 6.5));
+        top.vel = (3.0, 0.0);
+        for (i, (event, pos)) in roll_steps(&board, &mut top, 100).into_iter().enumerate() {
+            if event.is_none() {
+                assert!(pos.0 <= 9.5, "i={i}: {pos:?}");
+                continue;
+            }
+            assert_eq!(event, Some(StepEvent::Sank), "i={i}");
+            assert_eq!(pos.0, 10.0, "中心を凹の縁まで動かす");
+            assert_eq!(top.state, TopState::Sunk { cell: HOLLOW_AT });
+            assert_eq!(board.cell_at(pos), Cell::Hollow);
+            return;
+        }
+        panic!("凹に触れなかった");
+    }
+
+    #[test]
+    fn touching_a_hollow_corner_head_on_sinks_to_the_corner() {
+        let board = hollow_board();
+        let mut top = Top::new(&board, (9.6, 5.6));
+        top.vel = (3.0, 3.0);
+        assert_eq!(top.step(&board, STEP, &Tilt::new(), NO_G), None);
+        assert_eq!(
+            top.step(&board, STEP, &Tilt::new(), NO_G),
+            Some(StepEvent::Sank)
+        );
+        assert_eq!(top.pos, (10.0, 6.0), "凹の左上の角");
+        assert_eq!(top.state, TopState::Sunk { cell: HOLLOW_AT });
+    }
+
+    #[test]
+    fn escaping_a_hollow_does_not_sink_again_until_leaving_it() {
+        let board = hollow_board();
+        let center = (HOLLOW_AT.0 as f64 + 0.5, HOLLOW_AT.1 as f64 + 0.5);
+        let mut top = sunk_top(&board, center);
+        let tilt = tilt_toward(TiltKey::Right, 20);
+        let escaped =
+            (0..200).any(|_| top.step(&board, STEP, &tilt, NO_G) == Some(StepEvent::Escaped));
+        assert!(escaped);
+        assert_eq!(
+            top.touching,
+            vec![HOLLOW_AT],
+            "抜けた直後は凹に触れている扱い"
+        );
+        assert_eq!(
+            top.step(&board, STEP, &tilt, NO_G),
+            None,
+            "すぐにハマり直さない"
+        );
+        // 半径以上離れるまで転がし、戻ってくると再びハマる
+        let mut steps = 0;
+        while cell_distance(top.pos, HOLLOW_AT) < TOP_RADIUS + 0.1 {
+            assert_eq!(top.step(&board, STEP, &tilt, NO_G), None);
+            steps += 1;
+            assert!(steps < 500);
+        }
+        top.vel = (-3.0, 0.0);
+        let event = (0..100).find_map(|_| top.step(&board, STEP, &Tilt::new(), NO_G));
+        assert_eq!(event, Some(StepEvent::Sank));
+    }
+
+    #[test]
+    fn landing_with_a_bounce_settles_the_contacts_where_it_lands() {
+        // 凸の上で弾かれても、弾かれた先で触れている凸へすぐには飛び上がり直さない
+        let board = round1_board();
+        let mut top = top_just_left_of_bump(&board);
+        let tilt = Tilt::new();
+        assert!(matches!(
+            top.step(&board, STEP, &tilt, lateral(-0.5)),
+            Some(StepEvent::Hopped { .. })
+        ));
+        let event = (0..100).find_map(|_| top.step(&board, STEP, &tilt, NO_G));
+        assert_eq!(event, Some(StepEvent::Landed(Landing::Bounce)));
+        let expected: Vec<_> = board.contacts(top.pos).iter().map(|c| c.cell).collect();
+        assert_eq!(top.touching, expected);
+        for i in 0..200 {
+            assert_eq!(top.step(&board, STEP, &tilt, NO_G), None, "i={i}");
+        }
+        // 盤の上の何もない所で弾かれたら、何にも触れていない
+        let top = bounce_at(&board, (13.5, 6.0), (0.0, 3.0));
+        assert!(top.touching.is_empty());
     }
 }

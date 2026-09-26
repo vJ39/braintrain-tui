@@ -26,7 +26,7 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::{Resize, StatefulImage};
 
-use super::board::{Board, Cell, Tilt, BOARD_HEIGHT, BOARD_WIDTH, TILT_MAX};
+use super::board::{Board, Cell, Tilt, BOARD_HEIGHT, BOARD_WIDTH, TILT_MAX, TOP_RADIUS};
 use super::truck::{GForce, Side, SignalLight, Upcoming, UpcomingKind};
 use crate::game::theme;
 use crate::ui::splash;
@@ -64,7 +64,14 @@ const HOLLOW_BG: Color = Color::Rgb(60, 38, 18);
 const HOLLOW_FG: Color = Color::Rgb(120, 90, 60);
 const GOAL_BG: Color = Color::Rgb(40, 40, 40);
 const GOAL_FG: Color = Color::Yellow;
-const TOP_FG: Color = Color::Rgb(220, 240, 255);
+/// テキスト表示のベーゴマの円盤の色(画像表示のTOP_FACE_PIXELと同じ)
+const TOP_BG: Color = Color::Rgb(200, 210, 225);
+/// 円盤の上に置く回転・飛び上がりの記号の色
+const TOP_FG: Color = Color::Rgb(60, 70, 90);
+/// 星の演出の記号の色(円盤は描かない)
+const STAR_FG: Color = Color::Rgb(220, 240, 255);
+/// 飛び上がっている間の円盤の半径の倍率
+const AIRBORNE_DISC_SCALE: f64 = 0.7;
 
 /// 平坦なマスの市松の2トーン。FLAT_BGを白・黒へこの割合だけ寄せる
 const CHECKER_MIX: f64 = 0.08;
@@ -783,8 +790,9 @@ fn cell_style(cell: Cell, mass: (usize, usize), frac: (f64, f64)) -> Style {
 }
 
 /// テキスト表示の盤面。マスごとに背景色で塗り(平坦なマスは市松、凹凸は左上から光を当てた陰影)、
-/// 凸・凹・ゴール・ベーゴマは記号で示す(凸は明るい色の▲、凹は暗い色の▽)。傾き(tilt)に応じて盤を疑似3Dで台形に変形して描く。
-/// ベーゴマが同じ場所に複数いる時は、右隣のセルへ1つずつずらして並べる
+/// 凸・凹・ゴールは記号で示す(凸は明るい色の▲、凹は暗い色の▽)。傾き(tilt)に応じて盤を疑似3Dで台形に変形して描く。
+/// ベーゴマは位置を中心とする直径1マスの円盤を塗り、その上に回転の記号を置く。
+/// ベーゴマの記号が同じセルに複数重なる時は、右隣のセルへ1つずつずらして並べる
 fn render_board_text(
     frame: &mut Frame,
     area: Rect,
@@ -824,16 +832,19 @@ fn render_board_text(
             put_glyph_at(buffer, glyph_cell(center), area, glyph, Style::default());
         }
     }
-    // 背景色はマスのものを残し、記号と文字色だけ変える
-    let style = Style::default().fg(TOP_FG).add_modifier(Modifier::BOLD);
+    // ベーゴマの円盤: 中心が盤の上の間だけ塗る(星の演出中は描かない)。重なった範囲は後のものが上
+    for top in tops {
+        if top.star_frame.is_none() && Board::contains(top.pos) {
+            paint_disc(buffer, &projection, area, top.pos, disc_radius(top));
+        }
+    }
     let panel = layout.panel;
     let (left, right) = (i32::from(panel.left()), i32::from(panel.right()) - 1);
-    // 位置を含むマスの中心を順変換する。場外に出た時は盤の外側の位置になり、panelの範囲に収める
+    // 位置そのものを順変換する。場外に出た時は盤の外側の位置になり、panelの範囲に収める
     let cells: Vec<(i32, i32)> = tops
         .iter()
         .map(|top| {
-            let center = projection.project((top.pos.0.floor() + 0.5, top.pos.1.floor() + 0.5));
-            let (x, y) = glyph_cell(center);
+            let (x, y) = glyph_cell(projection.project(top.pos));
             (
                 x.clamp(left, right),
                 y.clamp(i32::from(panel.top()), i32::from(panel.bottom()) - 1),
@@ -845,8 +856,95 @@ fn render_board_text(
     for ((top, &(x, y)), lane) in tops.iter().zip(&cells).zip(lanes) {
         let first = x.min(right - (lane.count as i32 - 1)).max(left);
         let cell = ((first + lane.index as i32).min(right), y);
+        // 背景色(円盤・マス)はそのまま残し、記号と文字色だけ変える
+        let fg = if top.star_frame.is_some() {
+            STAR_FG
+        } else {
+            TOP_FG
+        };
+        let style = Style::default().fg(fg).add_modifier(Modifier::BOLD);
         put_glyph_at(buffer, cell, area, top_glyph(top), style);
     }
+}
+
+/// ベーゴマの円盤の半径(マス)。飛び上がっている間は小さくする
+fn disc_radius(top: &TopView) -> f64 {
+    if top.airborne {
+        TOP_RADIUS * AIRBORNE_DISC_SCALE
+    } else {
+        TOP_RADIUS
+    }
+}
+
+/// posを中心とする半径radiusの円盤を塗る。セルの4隅を逆変換した外接矩形(マス座標)とposの距離が
+/// radius未満のセルの記号を空白にし、背景色をTOP_BGにする。調べるセルは、pos ± radiusの正方形の
+/// 4隅を順変換した外接矩形を上下左右1セルずつ広げてareaで切り詰めた範囲
+fn paint_disc(
+    buffer: &mut Buffer,
+    projection: &BoardProjection,
+    area: Rect,
+    pos: (f64, f64),
+    radius: f64,
+) {
+    let corners = [
+        (pos.0 - radius, pos.1 - radius),
+        (pos.0 + radius, pos.1 - radius),
+        (pos.0 - radius, pos.1 + radius),
+        (pos.0 + radius, pos.1 + radius),
+    ]
+    .map(|corner| projection.project(corner));
+    // 順変換した4隅の外接範囲を1セルずつ広げ、start..endで切り詰めたセルの範囲(空ならNone)。
+    // i64で求めてから切り詰めるので、u16に収まらない値でもpanicしない
+    let span = |values: [f64; 4], start: u16, end: u16| {
+        let lo = values.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let lo = (lo.floor() as i64 - 1).max(i64::from(start));
+        let hi = (hi.floor() as i64 + 1).min(i64::from(end) - 1);
+        (lo <= hi).then_some(lo as u16..=hi as u16)
+    };
+    let xs = span(corners.map(|c| c.0), area.left(), area.right());
+    let ys = span(corners.map(|c| c.1), area.top(), area.bottom());
+    let (Some(xs), Some(ys)) = (xs, ys) else {
+        return;
+    };
+    for y in ys {
+        for x in xs.clone() {
+            let Some(bounds) = cell_mass_bounds(projection, x, y) else {
+                continue;
+            };
+            if rect_distance(pos, bounds) < radius {
+                buffer[(x, y)].set_symbol(" ").set_bg(TOP_BG);
+            }
+        }
+    }
+}
+
+/// セル(x, y)の4隅を逆変換したマス座標の外接矩形((min_u, min_v), (max_u, max_v))。
+/// 4隅のどれかが地平線の向こう側ならNone
+fn cell_mass_bounds(
+    projection: &BoardProjection,
+    x: u16,
+    y: u16,
+) -> Option<((f64, f64), (f64, f64))> {
+    let (x, y) = (f64::from(x), f64::from(y));
+    let mut bounds = (
+        (f64::INFINITY, f64::INFINITY),
+        (f64::NEG_INFINITY, f64::NEG_INFINITY),
+    );
+    for corner in [(x, y), (x + 1.0, y), (x, y + 1.0), (x + 1.0, y + 1.0)] {
+        let (u, v) = projection.unproject(corner)?;
+        bounds.0 = (bounds.0 .0.min(u), bounds.0 .1.min(v));
+        bounds.1 = (bounds.1 .0.max(u), bounds.1 .1.max(v));
+    }
+    Some(bounds)
+}
+
+/// 点posから矩形((min_u, min_v), (max_u, max_v))までの距離。中なら0
+fn rect_distance(pos: (f64, f64), bounds: ((f64, f64), (f64, f64))) -> f64 {
+    let ((min_u, min_v), (max_u, max_v)) = bounds;
+    let dx = (min_u - pos.0).max(0.0).max(pos.0 - max_u);
+    let dy = (min_v - pos.1).max(0.0).max(pos.1 - max_v);
+    dx.hypot(dy)
 }
 
 /// ベーゴマの記号。星の演出中はそのコマ、飛び上がっている間は専用の記号、それ以外は回転のコマ
@@ -1638,7 +1736,8 @@ mod tests {
         let layout = board_area(area).unwrap();
         assert!(layout.rect != area, "盤の周りに余白がある");
         let renderer = BoardRenderer::from_parts(None, None, None);
-        let top = top_at(board.start_position());
+        // ベーゴマの円盤で塗られたセルが盤の背景色の数を変えないよう、盤から遠く離しておく
+        let top = top_at((-1000.0, -1000.0));
         let flat = painted_positions(
             &draw_board_with_tilt(&renderer, &board, &top, area, &Tilt::default()),
             area,
@@ -1675,7 +1774,8 @@ mod tests {
         let layout = board_area(area).unwrap();
         assert_eq!((layout.cell_width, layout.cell_height), (10, 5));
         let renderer = BoardRenderer::from_parts(None, None, None);
-        let top = top_at(board.start_position());
+        // ベーゴマの円盤で塗られたセルが盤の背景色の数を変えないよう、盤から遠く離しておく
+        let top = top_at((-1000.0, -1000.0));
 
         let pitched = draw_board_with_tilt(&renderer, &board, &top, area, &max_tilt(1, 0));
         let painted = painted_positions(&pitched, area);
@@ -1747,7 +1847,7 @@ mod tests {
     }
 
     #[test]
-    fn tilted_top_is_drawn_at_the_projected_center_of_its_cell() {
+    fn tilted_top_is_drawn_at_its_projected_position() {
         let board = Board::standard();
         let area = Rect::new(0, 0, 90, 26);
         let layout = board_area(area).unwrap();
@@ -1756,13 +1856,14 @@ mod tests {
             let projection = BoardProjection::new(&layout, &tilt);
             for pos in [(5.5, 3.5), (12.3, 8.9), (0.2, 11.7), (19.8, 0.1)] {
                 let buffer = draw_board_with_tilt(&renderer, &board, &top_at(pos), area, &tilt);
-                let (x, y) =
-                    glyph_cell(projection.project((pos.0.floor() + 0.5, pos.1.floor() + 0.5)));
+                let (x, y) = glyph_cell(projection.project(pos));
+                let cell = &buffer[(x as u16, y as u16)];
                 assert_eq!(
-                    buffer[(x as u16, y as u16)].symbol(),
+                    cell.symbol(),
                     TOP_SPIN_GLYPHS[0],
-                    "ベーゴマは位置を含むマスの中心を順変換したセルに描く: {pos:?} {tilt:?}"
+                    "ベーゴマは位置そのものを順変換したセルに描く: {pos:?} {tilt:?}"
                 );
+                assert_eq!(cell.bg, TOP_BG, "記号は円盤の中: {pos:?} {tilt:?}");
             }
         }
     }
@@ -1867,10 +1968,17 @@ mod tests {
             " ",
             "記号の右隣は空白"
         );
-        let mass = (top.pos.0.floor() as usize, top.pos.1.floor() as usize);
-        assert_eq!(board.cell(mass.0, mass.1), Cell::Flat);
         assert_eq!(
             buffer[(top_rect.x + 1, top_rect.y)].bg,
+            TOP_BG,
+            "記号の右隣はベーゴマの円盤の色"
+        );
+        // 市松はベーゴマの円盤の外のマスで確かめる
+        let mass = (top.pos.0.floor() as usize + 2, top.pos.1.floor() as usize);
+        assert_eq!(board.cell(mass.0, mass.1), Cell::Flat);
+        let flat = layout.cell_rect(mass.0, mass.1);
+        assert_eq!(
+            buffer[(flat.x + 1, flat.y)].bg,
             checker_of(mass),
             "平坦なマスはマスの偶奇に対応する市松のトーン"
         );
@@ -2024,6 +2132,8 @@ mod tests {
                 *glyph,
                 "star_frame={frame}では通常の回転記号ではなく星の演出を描く"
             );
+            assert_eq!(buffer[(rect.x, rect.y)].fg, STAR_FG, "星の記号の色");
+            assert_eq!(count_bg(&buffer, TOP_BG), 0, "星の演出中は円盤を描かない");
         }
     }
 
@@ -2099,7 +2209,14 @@ mod tests {
         for tilt in &tilts {
             for (w, h) in [(1, 1), (3, 2), (10, 4), (39, 11)] {
                 let area = Rect::new(0, 0, w, h);
-                for pos in [(19.9, 11.9), (0.0, 0.0), (-1000.0, -1000.0)] {
+                for pos in [
+                    (19.9, 11.9),
+                    (0.0, 0.0),
+                    (-1000.0, -1000.0),
+                    (10.5, 6.0),
+                    (0.2, 0.2),
+                    (19.8, 11.8),
+                ] {
                     draw_board_with_tilt(&renderer, &board, &top_at(pos), area, tilt);
                     draw_board_with_tilt(&image_renderer, &board, &top_at(pos), area, tilt);
                 }
@@ -2441,7 +2558,7 @@ mod tests {
                 for position in layout.rect.intersection(area).positions() {
                     let bg = buffer[position].bg;
                     assert!(
-                        bg == Color::Reset || is_board_bg(bg),
+                        bg == Color::Reset || bg == TOP_BG || is_board_bg(bg),
                         "塗ったセルは9色のどれか: {position:?} {bg:?} {tilt:?}"
                     );
                 }
@@ -2799,9 +2916,338 @@ mod tests {
                 for pair in [
                     [top_at((1.35, 10.5)), top_at((1.65, 10.5))],
                     [top_at((19.9, 11.9)), top_at((-1000.0, -1000.0))],
+                    [top_at((10.5, 6.0)), top_at((0.2, 0.2))],
+                    [top_at((19.8, 11.8)), top_at((19.8, 11.8))],
                 ] {
                     draw_tops_with_tilt(&renderer, &board, &pair, area, &tilt);
                     draw_tops_with_tilt(&image_renderer, &board, &pair, area, &tilt);
+                }
+            }
+        }
+    }
+
+    // --- ベーゴマの円盤(テキスト表示) ---
+
+    /// 背景色がcolorのセルの数
+    fn count_bg(buffer: &Buffer, color: Color) -> usize {
+        buffer.content().iter().filter(|c| c.bg == color).count()
+    }
+
+    /// 円盤の色で塗られたセルの位置(左上から行優先)
+    fn disc_positions(buffer: &Buffer) -> Vec<(u16, u16)> {
+        buffer
+            .content()
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| cell.bg == TOP_BG)
+            .map(|(i, _)| buffer.pos_of(i))
+            .collect()
+    }
+
+    /// 1つのベーゴマを傾き0で描き、円盤の色のセルを返す
+    fn disc_of(top: TopView, area: Rect) -> Vec<(u16, u16)> {
+        let renderer = BoardRenderer::from_parts(None, None, None);
+        disc_positions(&draw_board(&renderer, &Board::standard(), &top, area))
+    }
+
+    fn airborne_at(pos: (f64, f64)) -> TopView {
+        TopView {
+            airborne: true,
+            ..top_at(pos)
+        }
+    }
+
+    /// 凸を(10, 6)にだけ置いた盤(投入位置は(1, 10)、ゴールは(19, 0))
+    fn board_with_bump_at_10_6() -> Board {
+        let mut rows: [String; BOARD_HEIGHT] = std::array::from_fn(|_| ".".repeat(BOARD_WIDTH));
+        rows[6].replace_range(10..11, "#");
+        rows[10].replace_range(1..2, "S");
+        let layout: [&str; BOARD_HEIGHT] = std::array::from_fn(|i| rows[i].as_str());
+        Board::with_goal(&layout, (19, 0))
+    }
+
+    #[test]
+    fn disc_colors_are_brighter_than_every_board_color() {
+        assert_eq!(TOP_BG, Color::Rgb(200, 210, 225));
+        assert_eq!(TOP_FG, Color::Rgb(60, 70, 90));
+        assert_eq!(STAR_FG, Color::Rgb(220, 240, 255));
+        for color in board_bg_colors() {
+            assert!(luma(TOP_BG) > luma(color), "{color:?}");
+        }
+        assert!(luma(TOP_FG) < luma(TOP_BG), "記号は円盤より暗い色で読める");
+    }
+
+    #[test]
+    fn rect_distance_is_zero_inside_and_euclidean_outside() {
+        let bounds = ((10.0, 6.0), (11.0, 7.0));
+        assert_eq!(rect_distance((10.5, 6.5), bounds), 0.0);
+        assert_eq!(rect_distance((10.0, 7.0), bounds), 0.0);
+        assert!((rect_distance((9.6, 6.5), bounds) - 0.4).abs() < 1e-9);
+        assert!((rect_distance((11.3, 6.2), bounds) - 0.3).abs() < 1e-9);
+        assert!((rect_distance((9.7, 5.6), bounds) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cell_mass_bounds_covers_the_cell_in_mass_coordinates() {
+        let layout = board_area(Rect::new(0, 0, 40, 12)).unwrap();
+        let projection = BoardProjection::new(&layout, &Tilt::default());
+        let bounds = cell_mass_bounds(&projection, layout.rect.x + 20, layout.rect.y + 6).unwrap();
+        assert!(
+            close(bounds.0, (10.0, 6.0)) && close(bounds.1, (10.5, 7.0)),
+            "{bounds:?}"
+        );
+        let layout = board_area(Rect::new(0, 0, 90, 26)).unwrap();
+        let projection = BoardProjection::new(&layout, &Tilt::default());
+        let bounds = cell_mass_bounds(&projection, layout.rect.x + 40, layout.rect.y + 12).unwrap();
+        assert!(
+            close(bounds.0, (10.0, 6.0)) && close(bounds.1, (10.25, 6.5)),
+            "{bounds:?}"
+        );
+        for tilt in tilts_to_check() {
+            let projection = BoardProjection::new(&layout, &tilt);
+            for (x, y) in [(5, 1), (45, 13), (84, 24), (0, 0)] {
+                let ((min_u, min_v), (max_u, max_v)) = cell_mass_bounds(&projection, x, y).unwrap();
+                assert!(min_u < max_u && min_v < max_v, "({x}, {y}) {tilt:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn disc_radius_shrinks_while_airborne() {
+        assert_eq!(disc_radius(&top_at((1.5, 1.5))), 0.5);
+        assert!((disc_radius(&airborne_at((1.5, 1.5))) - 0.35).abs() < 1e-9);
+    }
+
+    #[test]
+    fn two_by_one_disc_covers_two_to_three_cells_across_and_one_to_two_rows() {
+        let area = Rect::new(0, 0, 40, 12);
+        let layout = board_area(area).unwrap();
+        let mass = layout.cell_rect(10, 6);
+        assert_eq!(
+            disc_of(top_at((10.5, 6.5)), area),
+            vec![(mass.x, mass.y), (mass.x + 1, mass.y)],
+            "マスの中央ならそのマスの2セルちょうど"
+        );
+        assert_eq!(
+            disc_of(top_at((10.3, 6.5)), area),
+            vec![(19, 6), (20, 6), (21, 6)]
+        );
+        assert_eq!(
+            disc_of(top_at((10.5, 6.0)), area),
+            vec![(20, 5), (21, 5), (20, 6), (21, 6)],
+            "行をまたぐ位置では上下2行"
+        );
+        for i in 0..=20 {
+            for j in 0..=20 {
+                let pos = (10.0 + f64::from(i) * 0.05, 6.0 + f64::from(j) * 0.05);
+                assert!(
+                    !disc_of(top_at(pos), area).is_empty(),
+                    "{pos:?}: 円盤が消えない"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn four_by_two_disc_is_rounded_at_the_corners() {
+        let area = Rect::new(0, 0, 90, 26);
+        let layout = board_area(area).unwrap();
+        let mass = layout.cell_rect(10, 6);
+        let cells: Vec<(u16, u16)> = mass.positions().map(|p| (p.x, p.y)).collect();
+        assert_eq!(
+            disc_of(top_at((10.5, 6.5)), area),
+            cells,
+            "マスの8セルちょうど"
+        );
+        // (10.4, 6.4): 左隣1列と上の1行に広がり、上の行の左右の端(角までの距離約0.57・約0.53)は含まない
+        let mut expected = Vec::new();
+        for y in mass.y - 1..mass.y + 2 {
+            for x in mass.x - 1..mass.x + 4 {
+                let corner = y == mass.y - 1 && (x == mass.x - 1 || x == mass.x + 3);
+                if !corner {
+                    expected.push((x, y));
+                }
+            }
+        }
+        assert_eq!(expected.len(), 13);
+        assert_eq!(disc_of(top_at((10.4, 6.4)), area), expected);
+    }
+
+    #[test]
+    fn large_disc_is_a_circle_of_about_one_mass() {
+        let area = Rect::new(0, 0, 200, 60);
+        let layout = board_area(area).unwrap();
+        assert_eq!((layout.cell_width, layout.cell_height), (10, 5));
+        let rolling = disc_of(top_at((10.5, 6.5)), area);
+        assert!((40..=50).contains(&rolling.len()), "{}", rolling.len());
+        let mass = layout.cell_rect(10, 6);
+        let shifted = disc_of(top_at((10.55, 6.55)), area);
+        assert!(
+            !shifted.contains(&(mass.x, mass.y)),
+            "左上のセルは角までの距離約0.57で含まない"
+        );
+        // 飛び上がり中は小さい
+        let airborne = disc_of(airborne_at((10.5, 6.5)), area);
+        assert!(airborne.len() < rolling.len());
+        let widest = (0..60)
+            .map(|y| airborne.iter().filter(|p| p.1 == y).count())
+            .max()
+            .unwrap();
+        assert!(widest <= 8, "横8セル以下: {widest}");
+    }
+
+    #[test]
+    fn airborne_disc_matches_rolling_at_the_center_of_small_masses() {
+        for area in [Rect::new(0, 0, 40, 12), Rect::new(0, 0, 90, 26)] {
+            assert_eq!(
+                disc_of(airborne_at((10.5, 6.5)), area).len(),
+                disc_of(top_at((10.5, 6.5)), area).len(),
+                "{area:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_top_glyph_sits_inside_its_disc() {
+        let board = Board::standard();
+        let renderer = BoardRenderer::from_parts(None, None, None);
+        for area in [
+            Rect::new(0, 0, 40, 12),
+            Rect::new(0, 0, 90, 26),
+            Rect::new(0, 0, 200, 60),
+        ] {
+            let layout = board_area(area).unwrap();
+            let projection = BoardProjection::new(&layout, &Tilt::default());
+            for top in [
+                top_at((10.5, 6.5)),
+                top_at((10.99, 6.01)),
+                top_at((5.3, 3.9)),
+                airborne_at((12.2, 8.8)),
+            ] {
+                let buffer = draw_board(&renderer, &board, &top, area);
+                let (x, y) = glyph_cell(projection.project(top.pos));
+                let cell = &buffer[(x as u16, y as u16)];
+                assert_eq!(cell.symbol(), top_glyph(&top), "{:?} {area:?}", top.pos);
+                assert_eq!(cell.bg, TOP_BG, "{:?} {area:?}", top.pos);
+                assert_eq!(cell.fg, TOP_FG, "{:?} {area:?}", top.pos);
+                assert!(cell.modifier.contains(Modifier::BOLD));
+            }
+        }
+    }
+
+    #[test]
+    fn the_disc_hides_the_bump_glyph_under_it() {
+        let board = board_with_bump_at_10_6();
+        let area = Rect::new(0, 0, 40, 12);
+        let layout = board_area(area).unwrap();
+        let renderer = BoardRenderer::from_parts(None, None, None);
+        let bump = layout.cell_rect(10, 6);
+        let near = draw_board(&renderer, &board, &top_at((9.6, 6.5)), area);
+        let hidden = &near[(bump.x, bump.y)];
+        assert_eq!(hidden.bg, TOP_BG);
+        assert!(
+            hidden.symbol() == " " || TOP_SPIN_GLYPHS.contains(&hidden.symbol()),
+            "{}",
+            hidden.symbol()
+        );
+        assert_eq!(count_symbol(&near, BUMP_GLYPH), 0, "▲は円盤の下に隠れる");
+        let away = draw_board(&renderer, &board, &top_at((5.5, 6.5)), area);
+        assert_eq!(away[(bump.x, bump.y)].symbol(), BUMP_GLYPH, "離すと▲が戻る");
+    }
+
+    #[test]
+    fn no_disc_is_drawn_while_the_center_is_off_the_board() {
+        let area = Rect::new(5, 3, 60, 20);
+        let layout = board_area(area).unwrap();
+        for pos in [(-1.0, 5.0), (-0.3, 5.5)] {
+            let renderer = BoardRenderer::from_parts(None, None, None);
+            let buffer = draw_board(&renderer, &Board::standard(), &top_at(pos), area);
+            assert_eq!(count_bg(&buffer, TOP_BG), 0, "{pos:?}");
+            assert_eq!(
+                count_symbol(&buffer, TOP_SPIN_GLYPHS[0]),
+                1,
+                "{pos:?}: 記号だけ"
+            );
+        }
+        // 中心が盤の上なら、盤の縁からはみ出す分も(パネルの中なら)塗る
+        let disc = disc_of(top_at((0.2, 5.5)), area);
+        assert!(!disc.is_empty());
+        assert!(
+            disc.iter().any(|&(x, _)| x < layout.rect.x),
+            "盤の描画範囲の左の外側にも塗る: {disc:?}"
+        );
+        for &(x, y) in &disc {
+            assert!(
+                area.contains(Position::new(x, y)),
+                "パネルの中だけ: ({x}, {y})"
+            );
+        }
+    }
+
+    #[test]
+    fn two_neighboring_discs_form_one_continuous_patch() {
+        let board = Board::standard();
+        let renderer = BoardRenderer::from_parts(None, None, None);
+        for area in [Rect::new(0, 0, 40, 12), Rect::new(0, 0, 90, 26)] {
+            let tops = [top_at((1.35, 10.5)), top_at((1.65, 10.5))];
+            let disc = disc_positions(&draw_tops(&renderer, &board, &tops, area));
+            assert!(!disc.is_empty());
+            for y in area.top()..area.bottom() {
+                let xs: Vec<u16> = disc.iter().filter(|p| p.1 == y).map(|p| p.0).collect();
+                if let (Some(&first), Some(&last)) = (xs.first(), xs.last()) {
+                    assert_eq!(
+                        xs.len(),
+                        usize::from(last - first + 1),
+                        "{area:?} 行{y}: 間に途切れが無い {xs:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tilted_disc_follows_the_projection() {
+        let board = Board::standard();
+        let renderer = BoardRenderer::from_parts(None, None, None);
+        for area in [Rect::new(0, 0, 40, 12), Rect::new(0, 0, 90, 26)] {
+            let layout = board_area(area).unwrap();
+            for tilt in tilts_to_check() {
+                let projection = BoardProjection::new(&layout, &tilt);
+                // 円盤のセルの中心が離れてよい距離: 半径0.5 + セルの対角線の半分。
+                // 2×1セルで両軸を傾けると、セルが平行四辺形に歪んで外接矩形が大きくなるので広めに取る
+                let both_axes = tilt.pitch() != 0.0 && tilt.roll() != 0.0;
+                let limit = if layout.cell_width == 2 && both_axes {
+                    1.5
+                } else {
+                    1.25
+                };
+                for pos in [(10.5, 6.5), (5.3, 3.9), (0.2, 11.7), (19.8, 0.1)] {
+                    let buffer = draw_board_with_tilt(&renderer, &board, &top_at(pos), area, &tilt);
+                    for position in area.positions() {
+                        let center = (f64::from(position.x) + 0.5, f64::from(position.y) + 0.5);
+                        let Some(mass) = projection.unproject(center) else {
+                            continue;
+                        };
+                        let distance = (mass.0 - pos.0).hypot(mass.1 - pos.1);
+                        let painted = buffer[position].bg == TOP_BG;
+                        if painted {
+                            assert!(
+                                distance <= limit,
+                                "円盤のセルは中心の近く: {position:?} {distance} {pos:?} {tilt:?}"
+                            );
+                        }
+                        if distance <= 0.25 {
+                            assert!(
+                                painted,
+                                "中心のすぐ近くは円盤: {position:?} {distance} {pos:?} {tilt:?}"
+                            );
+                        }
+                    }
+                    // 記号のセルは描く時と同じくパネルの範囲に収める
+                    let (x, y) = glyph_cell(projection.project(pos));
+                    let x = x.clamp(i32::from(area.left()), i32::from(area.right()) - 1);
+                    let y = y.clamp(i32::from(area.top()), i32::from(area.bottom()) - 1);
+                    assert_eq!(buffer[(x as u16, y as u16)].bg, TOP_BG, "{pos:?} {tilt:?}");
                 }
             }
         }
