@@ -37,8 +37,9 @@ pub const TOP_IMAGE: &str = "beigoma/top.png";
 /// このG以上の間は、軽トラ視点の女の子を踏ん張り時の絵にする
 pub const BRACE_G: f64 = 0.15;
 
-/// 盤1マスの大きさ(セル)の倍率の上限。広い画面でも盤が大きくなりすぎないようにする
-const MAX_CELL_SCALE: u16 = 3;
+/// 盤1マスの大きさ(セル)の倍率の上限。広い画面でも盤が大きくなりすぎないようにする。
+/// 3だと広い画面でもすぐ上限に張り付き、ベーゴマが豆粒のように小さく見えていたため引き上げた
+const MAX_CELL_SCALE: u16 = 5;
 
 /// テキスト表示の記号。記号は各マスの左端のセルに置き、残りは空白にする
 /// (端末によって記号が2セル幅で表示されても、隣のマスに食い込まないように)
@@ -414,8 +415,9 @@ fn patch_image(
     let (px, py, pw, ph) = pixel_rect(rect, origin, font_size);
     let mut patch = imageops::crop_imm(&base.composed, px, py, pw.max(1), ph.max(1)).to_image();
     let (tx, ty, tw, th) = pixel_rect(top_rect, (rect.x, rect.y), font_size);
-    // 飛び上がっている間は小さく描き、浮いているように見せる
-    let scale = if airborne { 0.6 } else { 0.85 };
+    // 飛び上がっている間は小さく描き、浮いているように見せる。
+    // 通常時はマスいっぱいに近い大きさにして豆粒にならないようにする
+    let scale = if airborne { 0.7 } else { 0.95 };
     let size = (f64::from(tw.min(th)) * scale).max(1.0) as u32;
     let center = (
         f64::from(tx) + f64::from(tw) / 2.0,
