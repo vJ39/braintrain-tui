@@ -1,7 +1,7 @@
 //! べーの軽トラの自動走行と、盤にかかるGの計算。
 //!
-//! Gは固定値・乱数ではなく、軽トラの速度・距離から運動方程式で求める。
-//! - 巡航: 一定速度。加速度0
+//! Gは基本的に軽トラの速度・距離から運動方程式で求める。
+//! - 巡航: 一定速度。ただし路面のガタガタとして常時小さな揺れ(CRUISE_VIBRATION_G)がかかる
 //! - 信号のブレーキ: 気づいた時点の信号までの距離dと速度vから a = v^2 / (2d)
 //! - 信号の発進: 巡航速度に戻るまで一定の目標加速度
 //! - 障害物回避: t = d / v の間に横へlateral_distanceだけ動く a = 2 * lateral_distance / t^2
@@ -32,6 +32,12 @@ pub const YELLOW_DISTANCE: f64 = 30.0;
 pub const RED_WAIT: Duration = Duration::from_millis(2500);
 /// 軽トラ視点に前方のイベントを予兆として出し始める距離(m)
 pub const VISIBLE_DISTANCE: f64 = 45.0;
+/// 巡航中、路面のガタガタとして常時かかる揺れの大きさ(G)。ブレーキ・段差・障害物回避の
+/// Gより明確に小さく、キーで傾けなくてもベーゴマが体感できる程度に動く強さにする
+pub const CRUISE_VIBRATION_G: f64 = 0.06;
+/// 巡航中の揺れの波長(m)。前後・左右で異なる値にして、単調な往復に見えないようにする
+const CRUISE_VIBRATION_WAVELENGTH_LONGITUDINAL: f64 = 2.6;
+const CRUISE_VIBRATION_WAVELENGTH_LATERAL: f64 = 1.7;
 
 /// 加速度(m/s^2)をG単位にする
 pub fn to_g(accel: f64) -> f64 {
@@ -357,6 +363,8 @@ impl Truck {
             Motion::Braking { decel, .. } => g.longitudinal = -to_g(decel),
             Motion::Launching => g.longitudinal = to_g(LAUNCH_ACCEL),
             Motion::Steering { accel, .. } => g.lateral = to_g(accel),
+            // 段差(bump)が起きている間は、その衝撃の方が支配的なので巡航の揺れは足さない
+            Motion::Cruise if self.bump.is_none() => g = self.cruise_vibration(),
             Motion::Cruise | Motion::Noticing { .. } | Motion::Stopped { .. } => {}
         }
         // 段差の突き上げは、盤面上は後方向の揺れとして表す
@@ -364,6 +372,22 @@ impl Truck {
             g.longitudinal -= bump;
         }
         g
+    }
+
+    /// 巡航中、路面のガタガタとして常時かかる小さな揺れ。走行距離を種にした周期関数で、
+    /// 前後・左右で異なる波長のsin波を合成し、単調な往復に見えないようにする
+    fn cruise_vibration(&self) -> GForce {
+        let phase = |wavelength: f64| self.position / wavelength * std::f64::consts::TAU;
+        GForce {
+            longitudinal: (phase(CRUISE_VIBRATION_WAVELENGTH_LONGITUDINAL).sin()
+                + (phase(CRUISE_VIBRATION_WAVELENGTH_LONGITUDINAL) * 2.3).sin())
+                * 0.5
+                * CRUISE_VIBRATION_G,
+            lateral: (phase(CRUISE_VIBRATION_WAVELENGTH_LATERAL).sin()
+                + (phase(CRUISE_VIBRATION_WAVELENGTH_LATERAL) * 1.7).sin())
+                * 0.5
+                * CRUISE_VIBRATION_G,
+        }
     }
 
     /// 前方(VISIBLE_DISTANCE以内)の次のイベント。軽トラ視点の予兆表示に使う
@@ -526,14 +550,36 @@ mod tests {
     // --- 走行シミュレーション ---
 
     #[test]
-    fn cruising_has_no_g() {
+    fn cruising_has_small_vibration_instead_of_zero_g() {
+        // 巡航中もキーで傾けなくてもベーゴマが動くよう、路面のガタガタとして
+        // 常時小さなGがかかる(完全なゼロではない)
         let mut truck = Truck::with_course(Vec::new(), 1000.0);
+        let mut saw_nonzero = false;
         for _ in 0..500 {
             truck.update(STEP);
-            assert_eq!(truck.current_g(), GForce::default());
+            let g = truck.current_g();
+            if g != GForce::default() {
+                saw_nonzero = true;
+            }
+            assert!(
+                g.magnitude() < CRUISE_VIBRATION_G * 2.0,
+                "巡航中の揺れは他のイベントより明確に小さい: {g:?}"
+            );
             assert!(approx(truck.speed(), CRUISE_SPEED));
         }
+        assert!(saw_nonzero, "巡航中も揺れが発生すること");
         assert!(truck.upcoming().is_none());
+    }
+
+    #[test]
+    fn cruise_vibration_changes_as_the_truck_moves() {
+        let mut truck = Truck::with_course(Vec::new(), 1000.0);
+        let first = truck.current_g();
+        for _ in 0..50 {
+            truck.update(STEP);
+        }
+        let later = truck.current_g();
+        assert_ne!(first, later, "走行距離が変われば揺れも変わる(固定値ではない)");
     }
 
     #[test]
@@ -579,7 +625,10 @@ mod tests {
         run_until(&mut truck, 10.0, |t| {
             matches!(t.motion, Motion::Noticing { .. })
         });
-        assert_eq!(truck.current_g(), GForce::default(), "気づくまではまだ巡航");
+        assert!(
+            truck.current_g().magnitude() < CRUISE_VIBRATION_G * 2.0,
+            "気づくまではまだ巡航(揺れの範囲内)"
+        );
         let upcoming = truck.upcoming().expect("信号が見えている");
         assert_eq!(upcoming.kind, UpcomingKind::Signal(SignalLight::Yellow));
         assert!(upcoming.distance <= YELLOW_DISTANCE + 1e-9);
@@ -610,7 +659,7 @@ mod tests {
         ));
         run_until(&mut truck, 10.0, |t| matches!(t.motion, Motion::Cruise));
         assert!(approx(truck.speed(), CRUISE_SPEED), "巡航速度に戻る");
-        assert_eq!(truck.current_g(), GForce::default());
+        assert!(truck.current_g().magnitude() < CRUISE_VIBRATION_G * 2.0);
     }
 
     #[test]
@@ -654,7 +703,7 @@ mod tests {
                 matches!(t.motion, Motion::Cruise)
             });
             assert!((elapsed - t).abs() < 0.05, "{side:?}: {elapsed} vs {t}");
-            assert_eq!(truck.current_g(), GForce::default());
+            assert!(truck.current_g().magnitude() < CRUISE_VIBRATION_G * 2.0);
         }
     }
 
@@ -667,15 +716,18 @@ mod tests {
             }],
             1000.0,
         );
-        run_until(&mut truck, 10.0, |t| t.current_g().magnitude() > 0.0);
+        // 巡航の揺れ(CRUISE_VIBRATION_G)よりずっと大きいので、閾値超えでbump本体と区別できる
+        run_until(&mut truck, 10.0, |t| {
+            t.current_g().magnitude() > CRUISE_VIBRATION_G * 2.0
+        });
         let g = truck.current_g();
         assert!(approx(g.longitudinal.abs(), bump_g(CRUISE_SPEED, 0.05)));
         assert_eq!(g.lateral, 0.0);
-        // 衝撃はBUMP_DURATIONで消える
+        // 衝撃はBUMP_DURATIONで消える(消えた後は巡航の揺れの範囲に戻る)
         let mut elapsed = 0.0;
         run_until(&mut truck, 5.0, |t| {
             elapsed += STEP.as_secs_f64();
-            t.current_g().magnitude() == 0.0
+            t.current_g().magnitude() < CRUISE_VIBRATION_G * 2.0
         });
         assert!((elapsed - BUMP_DURATION.as_secs_f64()).abs() < 0.03);
     }
@@ -709,7 +761,7 @@ mod tests {
         let mut was_jolting = false;
         for _ in 0..600 {
             truck.update(STEP);
-            let jolting = truck.current_g().magnitude() > 0.0;
+            let jolting = truck.current_g().magnitude() > CRUISE_VIBRATION_G * 2.0;
             if jolting && !was_jolting {
                 jolts += 1;
             }
