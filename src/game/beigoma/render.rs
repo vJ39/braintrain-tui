@@ -27,13 +27,19 @@ use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::{Resize, StatefulImage};
 
 use super::board::{Board, Cell, Tilt, BOARD_HEIGHT, BOARD_WIDTH, TILT_MAX, TOP_RADIUS};
-use super::truck::{GForce, Side, SignalLight, Upcoming, UpcomingKind};
+use super::truck::{GForce, MotionKind, Side, SignalLight, Upcoming, UpcomingKind};
 use crate::game::theme;
 use crate::ui::splash;
 
 /// 画像アセット(assets/image/からの相対パス)。無ければテキストで描く
 pub const TRUCK_NORMAL_IMAGE: &str = "beigoma/truck_normal.png";
 pub const TRUCK_BRACE_IMAGE: &str = "beigoma/truck_brace.png";
+/// 右へドリフト中の絵(操舵Gが右向き)
+pub const TRUCK_DRIFT_RIGHT_IMAGE: &str = "beigoma/truck_drift_right.png";
+/// 左へドリフト中の絵(操舵Gが左向き、右の絵を左右反転したもの)
+pub const TRUCK_DRIFT_LEFT_IMAGE: &str = "beigoma/truck_drift_left.png";
+/// 急ブレーキ中の絵
+pub const TRUCK_HARD_BRAKE_IMAGE: &str = "beigoma/truck_hard_brake.png";
 pub const BOARD_IMAGE: &str = "beigoma/board.png";
 pub const TOP_IMAGE: &str = "beigoma/top.png";
 
@@ -1056,12 +1062,41 @@ pub struct TruckViewInfo {
     pub upcoming: Option<Upcoming>,
     /// ゲーム開始からの経過時間。揺れのアニメーションの位相に使う
     pub elapsed: Duration,
+    /// 軽トラの走り方の種類。ドリフト・急ブレーキの絵を出し分けるのに使う
+    pub motion: MotionKind,
 }
 
 impl TruckViewInfo {
     /// 女の子を踏ん張り時の絵にするか(Gがかかっている間)
     pub fn bracing(&self) -> bool {
         self.g.magnitude() >= BRACE_G
+    }
+}
+
+/// 軽トラ視点に出す女の子の絵の種類
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PictureKind {
+    Normal,
+    Brace,
+    DriftRight,
+    DriftLeft,
+    HardBrake,
+}
+
+/// infoから出すべき絵の種類を決める。ブレーキ・ドリフトが最優先、それ以外は
+/// Gの大きさで通常/踏ん張りを決める(#135等の従来通り)
+fn picture_kind(info: &TruckViewInfo) -> PictureKind {
+    match info.motion {
+        MotionKind::Braking => PictureKind::HardBrake,
+        MotionKind::Steering => {
+            if info.g.lateral >= 0.0 {
+                PictureKind::DriftRight
+            } else {
+                PictureKind::DriftLeft
+            }
+        }
+        _ if info.bracing() => PictureKind::Brace,
+        _ => PictureKind::Normal,
     }
 }
 
@@ -1148,10 +1183,18 @@ const GIRL_BRACE: [&str; 5] = [
     " _/     \\_ ",
 ];
 
-/// 軽トラ視点の描画器。女の子の静止画(通常時・踏ん張り時)が両方読めた時だけ画像で描く
+/// 軽トラ視点の女の子の静止画5種(通常時・踏ん張り時・右ドリフト・左ドリフト・急ブレーキ)
+struct TruckImages {
+    normal: StatefulProtocol,
+    brace: StatefulProtocol,
+    drift_right: StatefulProtocol,
+    drift_left: StatefulProtocol,
+    hard_brake: StatefulProtocol,
+}
+
+/// 軽トラ視点の描画器。女の子の静止画5種が全て読めた時だけ画像で描く
 pub struct TruckViewRenderer {
-    /// (通常時, 踏ん張り時)
-    images: Option<RefCell<(StatefulProtocol, StatefulProtocol)>>,
+    images: Option<RefCell<TruckImages>>,
 }
 
 impl TruckViewRenderer {
@@ -1159,10 +1202,16 @@ impl TruckViewRenderer {
         let images = detect_picker().and_then(|picker| {
             let normal = splash::load_embedded_image(TRUCK_NORMAL_IMAGE)?;
             let brace = splash::load_embedded_image(TRUCK_BRACE_IMAGE)?;
-            Some(RefCell::new((
-                picker.new_resize_protocol(normal),
-                picker.new_resize_protocol(brace),
-            )))
+            let drift_right = splash::load_embedded_image(TRUCK_DRIFT_RIGHT_IMAGE)?;
+            let drift_left = splash::load_embedded_image(TRUCK_DRIFT_LEFT_IMAGE)?;
+            let hard_brake = splash::load_embedded_image(TRUCK_HARD_BRAKE_IMAGE)?;
+            Some(RefCell::new(TruckImages {
+                normal: picker.new_resize_protocol(normal),
+                brace: picker.new_resize_protocol(brace),
+                drift_right: picker.new_resize_protocol(drift_right),
+                drift_left: picker.new_resize_protocol(drift_left),
+                hard_brake: picker.new_resize_protocol(hard_brake),
+            }))
         });
         Self { images }
     }
@@ -1211,7 +1260,7 @@ impl TruckViewRenderer {
             header,
         );
 
-        let bracing = info.bracing();
+        let kind = picture_kind(info);
         let (shake_x, shake_y) = shake_offset(info.g, info.elapsed);
         let shaken_picture = offset_within(
             picture,
@@ -1219,22 +1268,27 @@ impl TruckViewRenderer {
             shake_y.round() as i32,
             area,
         );
-        self.render_picture(frame, shaken_picture, bracing);
+        self.render_picture(frame, shaken_picture, kind);
 
-        let brace_line = if bracing {
-            Line::from(Span::styled(
-                "ふんばり!",
+        let brace_label = match kind {
+            PictureKind::HardBrake => Some("急ブレーキ!"),
+            PictureKind::DriftRight | PictureKind::DriftLeft => Some("ドリフト!"),
+            PictureKind::Brace => Some("ふんばり!"),
+            PictureKind::Normal => None,
+        };
+        let brace_line = match brace_label {
+            Some(label) => Line::from(Span::styled(
+                label,
                 Style::default()
                     .fg(theme::INCORRECT)
                     .add_modifier(Modifier::BOLD),
-            ))
-        } else {
-            Line::from("")
+            )),
+            None => Line::from(""),
         };
-        let g_color = if bracing {
-            theme::HIGHLIGHT
-        } else {
+        let g_color = if kind == PictureKind::Normal {
             theme::TEXT
+        } else {
+            theme::HIGHLIGHT
         };
         let footer_lines = vec![
             brace_line,
@@ -1256,26 +1310,28 @@ impl TruckViewRenderer {
         );
     }
 
-    /// 女の子の絵(通常時・踏ん張り時)。画像が無ければテキストの絵
-    fn render_picture(&self, frame: &mut Frame, area: Rect, bracing: bool) {
+    /// 女の子の絵。画像が無ければテキストの絵(通常時・それ以外の2種のみ)
+    fn render_picture(&self, frame: &mut Frame, area: Rect, kind: PictureKind) {
         if area.is_empty() {
             return;
         }
         if let Some(images) = &self.images {
             let mut images = images.borrow_mut();
-            let protocol = if bracing {
-                &mut images.1
-            } else {
-                &mut images.0
+            let protocol = match kind {
+                PictureKind::Normal => &mut images.normal,
+                PictureKind::Brace => &mut images.brace,
+                PictureKind::DriftRight => &mut images.drift_right,
+                PictureKind::DriftLeft => &mut images.drift_left,
+                PictureKind::HardBrake => &mut images.hard_brake,
             };
             let widget = StatefulImage::default().resize(Resize::Fit(Some(FilterType::Triangle)));
             frame.render_stateful_widget(widget, area, protocol);
             return;
         }
-        let (art, color) = if bracing {
-            (GIRL_BRACE, theme::HIGHLIGHT)
-        } else {
+        let (art, color) = if kind == PictureKind::Normal {
             (GIRL_NORMAL, theme::ACCENT_STRONG)
+        } else {
+            (GIRL_BRACE, theme::HIGHLIGHT)
         };
         let lines: Vec<Line> = art
             .iter()
@@ -1405,6 +1461,7 @@ mod tests {
             g,
             upcoming,
             elapsed: Duration::ZERO,
+            motion: MotionKind::Cruise,
         }
     }
 
@@ -3512,6 +3569,20 @@ mod tests {
     // --- 軽トラ視点 ---
 
     #[test]
+    fn truck_drift_and_hard_brake_images_are_embedded_and_decodable() {
+        for path in [
+            TRUCK_DRIFT_RIGHT_IMAGE,
+            TRUCK_DRIFT_LEFT_IMAGE,
+            TRUCK_HARD_BRAKE_IMAGE,
+        ] {
+            assert!(
+                splash::load_embedded_image(path).is_some(),
+                "{path}が埋め込まれデコードできること"
+            );
+        }
+    }
+
+    #[test]
     fn truck_view_falls_back_to_text_without_images() {
         let renderer = TruckViewRenderer::new();
         assert!(!renderer.uses_image());
@@ -3537,6 +3608,74 @@ mod tests {
         assert!(!calm.contains("ふんばり"));
         assert!(bracing.contains("ふんばり"));
         assert_ne!(calm, bracing, "絵が切り替わる");
+    }
+
+    #[test]
+    fn braking_shows_the_hard_brake_label_even_with_low_g() {
+        let mut braking_info = info(GForce::default(), None);
+        braking_info.motion = MotionKind::Braking;
+        let renderer = TruckViewRenderer::new();
+        let text = draw_truck(&renderer, &braking_info, Rect::new(0, 0, 30, 14));
+        assert!(text.contains("急ブレーキ!"), "{text}");
+    }
+
+    #[test]
+    fn steering_shows_the_drift_label_regardless_of_side() {
+        let renderer = TruckViewRenderer::new();
+        for lateral in [0.5, -0.5] {
+            let mut steering_info = info(
+                GForce {
+                    longitudinal: 0.0,
+                    lateral,
+                },
+                None,
+            );
+            steering_info.motion = MotionKind::Steering;
+            let text = draw_truck(&renderer, &steering_info, Rect::new(0, 0, 30, 14));
+            assert!(text.contains("ドリフト!"), "lateral={lateral}: {text}");
+        }
+    }
+
+    #[test]
+    fn picture_kind_prioritizes_braking_and_steering_over_plain_bracing() {
+        let braking = info(GForce::default(), None);
+        let mut braking = braking;
+        braking.motion = MotionKind::Braking;
+        assert_eq!(picture_kind(&braking), PictureKind::HardBrake);
+
+        let mut steering_right = info(
+            GForce {
+                longitudinal: 0.0,
+                lateral: 0.1,
+            },
+            None,
+        );
+        steering_right.motion = MotionKind::Steering;
+        assert_eq!(picture_kind(&steering_right), PictureKind::DriftRight);
+
+        let mut steering_left = info(
+            GForce {
+                longitudinal: 0.0,
+                lateral: -0.1,
+            },
+            None,
+        );
+        steering_left.motion = MotionKind::Steering;
+        assert_eq!(picture_kind(&steering_left), PictureKind::DriftLeft);
+
+        let mut bracing = info(
+            GForce {
+                longitudinal: -0.5,
+                lateral: 0.0,
+            },
+            None,
+        );
+        bracing.motion = MotionKind::Cruise;
+        assert_eq!(picture_kind(&bracing), PictureKind::Brace);
+
+        let mut normal = info(GForce::default(), None);
+        normal.motion = MotionKind::Cruise;
+        assert_eq!(picture_kind(&normal), PictureKind::Normal);
     }
 
     #[test]
