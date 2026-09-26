@@ -85,6 +85,9 @@ pub struct BoardArea {
     pub rect: Rect,
     pub cell_width: u16,
     pub cell_height: u16,
+    /// 呼び出し時に渡された描画エリア全体(盤より外側に余白があり得る)。
+    /// 場外に出たベーゴマの位置をこの範囲内に収めるために使う
+    panel: Rect,
 }
 
 /// area(盤面パネルの内側)に盤を置く範囲。端末の1セルは縦長なので、1マスは横2セル×縦1セルを基本にし、
@@ -108,6 +111,7 @@ pub fn board_area(area: Rect) -> Option<BoardArea> {
         ),
         cell_width,
         cell_height,
+        panel: area,
     })
 }
 
@@ -122,18 +126,21 @@ impl BoardArea {
         )
     }
 
-    /// 位置posを含むマスのセル範囲
+    /// 位置posを含むマスのセル範囲。盤外の位置は、実際にずれた方向・距離に応じて
+    /// 盤の外側の位置を返す(panelの範囲を超える分はpanelの端に収める)
     pub fn top_rect(&self, pos: (f64, f64)) -> Rect {
-        let (x, y) = cell_of(pos);
-        self.cell_rect(x, y)
+        let cell_w = i32::from(self.cell_width);
+        let cell_h = i32::from(self.cell_height);
+        let raw_x = i32::from(self.rect.x) + (pos.0.floor() as i32) * cell_w;
+        let raw_y = i32::from(self.rect.y) + (pos.1.floor() as i32) * cell_h;
+        let min_x = i32::from(self.panel.x);
+        let min_y = i32::from(self.panel.y);
+        let max_x = min_x + i32::from(self.panel.width) - cell_w;
+        let max_y = min_y + i32::from(self.panel.height) - cell_h;
+        let x = raw_x.clamp(min_x, max_x.max(min_x));
+        let y = raw_y.clamp(min_y, max_y.max(min_y));
+        Rect::new(x as u16, y as u16, self.cell_width, self.cell_height)
     }
-}
-
-/// 位置を含むマス(盤の範囲に収める)
-fn cell_of(pos: (f64, f64)) -> (usize, usize) {
-    let x = (pos.0.max(0.0) as usize).min(BOARD_WIDTH - 1);
-    let y = (pos.1.max(0.0) as usize).min(BOARD_HEIGHT - 1);
-    (x, y)
 }
 
 /// 直前に作った盤の画像(障害物・ゴールまで重ねたもの)
@@ -835,11 +842,30 @@ mod tests {
     fn top_rect_is_the_cell_containing_the_top() {
         let layout = board_area(Rect::new(0, 0, 40, 12)).unwrap();
         assert_eq!(layout.top_rect((3.7, 2.1)), layout.cell_rect(3, 2));
-        // 盤の外の座標は盤の端のマスに収める
-        assert_eq!(
-            layout.top_rect((-1.0, 99.0)),
-            layout.cell_rect(0, BOARD_HEIGHT - 1)
+    }
+
+    #[test]
+    fn top_rect_moves_outside_the_board_when_the_top_falls_off() {
+        // 盤の周囲に余白があるpanel(盤より大きいarea)で、左に1マス分外れた位置は、
+        // 盤の端のマスではなく、その外側の位置になる(場外に出た方向が見た目でも分かるように)
+        let layout = board_area(Rect::new(0, 0, 60, 20)).unwrap();
+        let inside_top_left = layout.cell_rect(0, 0);
+        let off_left = layout.top_rect((-1.0, 0.0));
+        assert_eq!(off_left.y, inside_top_left.y, "縦方向はそのまま");
+        assert!(
+            off_left.x < inside_top_left.x,
+            "盤の外(左)に出た分だけ左にずれる: off_left={off_left:?} inside={inside_top_left:?}"
         );
+    }
+
+    #[test]
+    fn top_rect_does_not_panic_far_outside_the_panel() {
+        let layout = board_area(Rect::new(0, 0, 60, 20)).unwrap();
+        // panelの範囲を大きく超える座標でもpanicせず、panelの範囲内に収まる
+        let rect = layout.top_rect((-1000.0, -1000.0));
+        assert!(layout.panel.contains(Position::new(rect.x, rect.y)));
+        let rect = layout.top_rect((1000.0, 1000.0));
+        assert!(layout.panel.contains(Position::new(rect.x, rect.y)));
     }
 
     // --- テキスト表示の盤面 ---
