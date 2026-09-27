@@ -3,8 +3,10 @@
 //! 親父が指さして「ヤー!!」と叫んだら、指された方向と同じ矢印キーを押して防御する。
 //! 食事中に「ヤー」が来ると防御できず問答無用で♥を1つ失い、ごはんもおかわりになる。
 //! 「やっほー」と言われたらSpaceで「やっほー」と返す。
-//! 1問目は必ず「やっほー」から始まる。以降の待機はIDLE_WAIT_MS(最低5秒)で
-//! 「来るか来るか」という間を作ってから次のイベントが来る。
+//! 1問目は必ず「やっほー」から始まる。以降の待機はIDLE_WAIT_MSで「来るか来るか」
+//! という間を作ってから次のイベントが来る。1ROUNDあたり合計TARGET_EVENT_COUNT回
+//! (平均6秒に1回)のペースになるよう、残り時間・残り回数から待機時間を調整し、
+//! 間に合わなくなってきたら基本範囲より切り詰めてでも早く発動する(next_wait_duration)。
 //! どちらもRESPONSE_SAFE_WINDOW(800ms)以内に正しく反応すれば正解。
 //! 「ヤー」への反応が遅れた分だけ複数個の♥を失う(penalty_for参照)。
 //! 「やっほー」への反応が遅れるとごはんがおかわりされる(♥は減らない)。
@@ -55,8 +57,11 @@ pub const RICE_FULL: f32 = 1.0;
 pub const RICE_DRAIN_PER_SEC: f32 = 0.1 / 3.0;
 
 /// 待機(相手が何もしていない)の長さの範囲(最小, 最大)ms。
-/// 最低でも5秒は待たせ、「来るか来るか」という緊張感を持続させる
-pub const IDLE_WAIT_MS: (u64, u64) = (5000, 9000);
+/// 「来るか来るか」という緊張感を持続させつつ、1ROUNDでTARGET_EVENT_COUNT回
+/// (平均6秒に1回)のペースになるよう、実際の待機時間はnext_wait_durationで調整する
+pub const IDLE_WAIT_MS: (u64, u64) = (3000, 9000);
+/// 1ROUND(TIME_LIMIT=60秒)あたりの目安イベント回数。平均6秒に1回のペース
+pub const TARGET_EVENT_COUNT: u32 = 10;
 /// フッター(ライフ・ごはん・操作説明)の外側の高さ(枠線込み)
 const FOOTER_HEIGHT: u16 = 6;
 /// これ以内に正しい入力ができれば正解(♥は減らない)
@@ -525,6 +530,9 @@ pub struct LookAwayGame {
     last_countdown_tick_second: Option<u64>,
     /// 食べている絵のバリエーション番号。食べ始める度にランダムに選び直す
     eating_variant: usize,
+    /// これまでに発生した「ヤッホー」「ヤー」イベントの回数。
+    /// TARGET_EVENT_COUNTに対する残り回数から次の待機時間を切り詰めるのに使う(next_wait_duration参照)
+    event_count: u32,
 }
 
 /// 捨てゲー確認ダイアログの文言(y/Enterで確定・n/Escで続行)
@@ -626,6 +634,7 @@ impl LookAwayGame {
             abandon_prompt_dismissed: false,
             last_countdown_tick_second: None,
             eating_variant: 0,
+            event_count: 0,
         }
     }
 
@@ -654,10 +663,23 @@ impl LookAwayGame {
         time_needed > remaining_time
     }
 
+    /// 次の待機時間を選ぶ。基本はIDLE_WAIT_MSの範囲からランダムに選ぶが、
+    /// 1ROUND合計TARGET_EVENT_COUNT回・平均6秒に1回のペースを保てるよう、
+    /// 残り時間を残りイベント回数で割った割り当てを超える分は切り詰める。
+    /// 目安回数に達した後は帳尻合わせをやめ、基本範囲のまま継続する
+    fn next_wait_duration(&self) -> Duration {
+        let base = random_between(&mut rand::thread_rng(), IDLE_WAIT_MS);
+        let remaining_events = TARGET_EVENT_COUNT.saturating_sub(self.event_count).max(1);
+        let remaining_time = TIME_LIMIT.saturating_sub(self.elapsed_total);
+        let allowance = remaining_time / remaining_events;
+        base.min(allowance)
+    }
+
     /// 待機が終わった時に、次のイベントを始める。was_eatingは待機中に食事していたか
     /// (「ヤー」の場合、食事中なら防御操作を受け付けず問答無用で♥を失う。
     /// 「ヤッホー」は食事中かどうかに関わらず、正しく返せたかどうかだけで判定する)
     fn begin_event(&mut self, event: Event, was_eating: bool) {
+        self.event_count += 1;
         match event {
             Event::Yahho => {
                 audio::play_se(SeKind::LookAwayYahho);
@@ -1477,14 +1499,14 @@ impl Game for LookAwayGame {
         };
         if input == Input::Eat {
             let mut started_eating = false;
+            let next_wait = self.next_wait_duration();
             match &mut self.phase {
                 Phase::Idle { is_eating, .. } => {
                     *is_eating = !*is_eating;
                     started_eating = *is_eating;
                 }
                 Phase::WaitingToEat { .. } => {
-                    self.phase =
-                        new_idle_phase(random_between(&mut rand::thread_rng(), IDLE_WAIT_MS), true);
+                    self.phase = new_idle_phase(next_wait, true);
                     started_eating = true;
                 }
                 _ => {}
@@ -2155,11 +2177,66 @@ mod tests {
     }
 
     #[test]
-    fn idle_wait_is_at_least_five_seconds() {
-        assert!(
-            IDLE_WAIT_MS.0 >= 5000,
-            "「来るか来るか」の緊張感を作るため待機は最低5秒"
+    fn idle_wait_base_range_is_three_to_nine_seconds() {
+        assert_eq!(
+            IDLE_WAIT_MS,
+            (3000, 9000),
+            "1ROUND合計TARGET_EVENT_COUNT回・平均6秒に1回のペースになる基本範囲"
         );
+    }
+
+    // --- 帳尻合わせ(next_wait_duration) ---
+
+    #[test]
+    fn next_wait_duration_stays_within_the_base_range_when_on_pace() {
+        let game = LookAwayGame::new();
+        for _ in 0..500 {
+            let wait = game.next_wait_duration();
+            assert!(
+                (ms(IDLE_WAIT_MS.0)..=ms(IDLE_WAIT_MS.1)).contains(&wait),
+                "序盤(残り回数・残り時間とも十分)は基本範囲(3〜9秒)から選ばれる: {wait:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn next_wait_duration_is_clamped_when_behind_pace() {
+        // 残り5秒しかないのに、まだ1回もイベントが起きていない(残り10回分)
+        let mut game = LookAwayGame::new();
+        game.elapsed_total = TIME_LIMIT - ms(5000);
+        for _ in 0..500 {
+            let wait = game.next_wait_duration();
+            assert!(
+                wait <= ms(500),
+                "残り時間5秒・残り10回なら、1回あたりの割り当ては500msに切り詰められる: {wait:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn next_wait_duration_allows_full_range_once_only_one_event_remains() {
+        // 残り時間はたっぷりあるが、目安の10回にすでに達している
+        let mut game = LookAwayGame::new();
+        game.event_count = TARGET_EVENT_COUNT;
+        for _ in 0..500 {
+            let wait = game.next_wait_duration();
+            assert!(
+                (ms(IDLE_WAIT_MS.0)..=ms(IDLE_WAIT_MS.1)).contains(&wait),
+                "目安回数に達した後は残り回数を1扱いにし、基本範囲のまま継続する: {wait:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn begin_event_increments_event_count() {
+        let mut game = LookAwayGame::new();
+        assert_eq!(game.event_count, 0);
+        finish_countdown(&mut game);
+        match game.phase {
+            Phase::Idle { remaining, .. } => game.update(remaining),
+            _ => panic!("カウントダウンの後は待機のはず"),
+        }
+        assert_eq!(game.event_count, 1, "待機が終わってイベントが始まったら1回とカウントする");
     }
 
     #[test]
