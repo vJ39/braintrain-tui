@@ -63,10 +63,12 @@ pub const IDLE_WAIT_MS: (u64, u64) = (3000, 9000);
 /// 1ROUND(TIME_LIMIT=99秒)あたりの目安イベント回数。やっほー5回・ヤー10回の
 /// 合計15回で、平均6.6秒に1回のペース
 pub const TARGET_EVENT_COUNT: u32 = 15;
-/// フッター(残り秒数・ライフ・ごはん・操作説明)の外側の高さ(枠線込み)。
-/// 残り秒数を大きな数字で見せるため、内訳は大きな数字5+食事状態バッジ1+ライフ1+
-/// ごはんゲージ2+操作説明1の10行に、上下の枠線2行を足した12行
-const FOOTER_HEIGHT: u16 = 12;
+/// フッター(残り秒数・ごはん・ライフ・食事状態・操作説明)の外側の高さ(枠線込み)。
+/// 残り秒数の大きな数字とごはんの盾ゲージを横並びにした5行+ステータス行1+
+/// 操作説明1の7行に、上下の枠線2行を足した9行
+const FOOTER_HEIGHT: u16 = 9;
+/// ごはんの盾ゲージの横幅(セル数)。「ごはん」「100%」を収めつつコンパクトに保つ
+const RICE_SHIELD_WIDTH: u16 = 10;
 /// これ以内に正しい入力ができれば正解(♥は減らない)
 pub const RESPONSE_SAFE_WINDOW: Duration = Duration::from_millis(800);
 /// RESPONSE_SAFE_WINDOWを超えた経過時間をこの単位で区切り、超過1区分ごとに♥をもう1つ失う
@@ -916,27 +918,18 @@ impl LookAwayGame {
                 return;
             }
         }
-        let action_prompt = self.action_prompt_text();
-        let banner_height = if action_prompt.is_some() { 1.min(area.height) } else { 0 };
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(banner_height)])
-            .split(area);
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(rows[0]);
+            .split(area);
         self.render_opponent_stage(frame, cols[0]);
         self.render_player_stage(frame, cols[1]);
-        if let Some(text) = action_prompt {
-            render_action_prompt_banner(frame, rows[1], text);
-        }
     }
 
     /// 親父のアクション中、プレイヤーが今すべき操作をでかく示す文言。
-    /// 親父・自分の画像パネルの外側、ステージ下端の専用スペースに表示する
-    /// (render_stage参照。画像プロトコルで描いた絵の上にテキストを重ねると
-    /// 実機で表示されない端末があるため、area自体を分けている)
+    /// ステージ(画像パネル)には重ねず、フッター側に出す(render_footer参照。
+    /// 画像プロトコルで描いた絵の上にテキストを重ねると実機で
+    /// 表示されない端末があるため)
     fn action_prompt_text(&self) -> Option<&'static str> {
         match &self.phase {
             Phase::Yahho { .. } => Some("ヤッホーを押せ"),
@@ -1134,8 +1127,8 @@ impl LookAwayGame {
         self.mark_renderer.render(frame, area, is_correct, background);
     }
 
-    /// 残り秒数・ライフ・ごはんゲージと操作説明のフッター。残り秒数は大きな数字で、
-    /// ごはんゲージは画面幅いっぱいのバーで見やすくする
+    /// 残り秒数・ごはん・ライフ・食事状態・操作説明のフッター。残り秒数は大きな数字、
+    /// ごはんはその右横に縦積みの盾ゲージ(満タンから上が減っていく)で並べてコンパクトにする
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         let block = theme::sub_panel();
         let inner = block.inner(area);
@@ -1146,15 +1139,22 @@ impl LookAwayGame {
                 Constraint::Length(5),
                 Constraint::Length(1),
                 Constraint::Length(1),
-                Constraint::Length(2),
-                Constraint::Length(1),
             ])
             .split(inner);
+        let top_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(RICE_SHIELD_WIDTH)])
+            .split(rows[0]);
+        self.render_remaining_time_big(frame, top_cols[0]);
+        self.render_rice_shield(frame, top_cols[1]);
+
         let is_eating = matches!(self.phase, Phase::Idle { is_eating: true, .. });
-        self.render_remaining_time_big(frame, rows[0]);
-        self.render_eating_status_badge(frame, rows[1], is_eating);
-        self.render_lives(frame, rows[2]);
-        self.render_rice_gauge(frame, rows[3]);
+        if let Some(prompt) = self.action_prompt_text() {
+            render_action_prompt_banner(frame, rows[1], prompt);
+        } else {
+            self.render_status_row(frame, rows[1], is_eating);
+        }
+
         let eat_hint = if is_eating {
             "食べるのをやめる"
         } else {
@@ -1166,27 +1166,44 @@ impl LookAwayGame {
         ));
         frame.render_widget(
             Paragraph::new(help_line).alignment(Alignment::Center),
-            rows[4],
+            rows[2],
         );
     }
 
-    /// 食べているかどうかがひと目でわかるバッジ。背景色はステージの食事中/待機中の
-    /// 背景色(EATING_BG/IDLE_BG)と揃え、行全体を塗って視認性を上げる
-    fn render_eating_status_badge(&self, frame: &mut Frame, area: Rect, is_eating: bool) {
-        let (background, text) = if is_eating {
+    /// 食事状態バッジとライフを1行にまとめて出す(Phase::Shout/Yahho中は
+    /// render_footerが代わりに操作案内を出すのでここは呼ばれない)
+    fn render_status_row(&self, frame: &mut Frame, area: Rect, is_eating: bool) {
+        let (eating_bg, eating_text) = if is_eating {
             (EATING_BG, "● 食事中")
         } else {
             (IDLE_BG, "○ 様子見中")
         };
-        let line = Line::from(Span::styled(
-            text,
-            Style::default()
-                .fg(theme::TEXT)
-                .bg(background)
-                .add_modifier(Modifier::BOLD),
-        ));
-        frame.render_widget(Block::default().style(Style::default().bg(background)), area);
-        frame.render_widget(Paragraph::new(line).alignment(Alignment::Center), area);
+        let hearts_bg = Color::Rgb(40, 0, 0);
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {eating_text} "),
+                Style::default()
+                    .fg(theme::TEXT)
+                    .bg(eating_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                " ライフ ",
+                Style::default()
+                    .fg(theme::TEXT)
+                    .bg(hearts_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {} ", hearts(self.lives)),
+                Style::default()
+                    .fg(theme::INCORRECT)
+                    .bg(hearts_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line).alignment(Alignment::Left), area);
     }
 
     /// 残り秒数を大きな数字(5x5ドットフォント)で見せる。残りが少ない時は警告色にする
@@ -1212,52 +1229,30 @@ impl LookAwayGame {
         frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), text_area);
     }
 
-    /// ライフ(ハート)。背景パネルで強調する
-    fn render_lives(&self, frame: &mut Frame, area: Rect) {
-        let hearts_bg = Color::Rgb(40, 0, 0);
-        let hearts_line = Line::from(vec![
-            Span::styled(
-                " ライフ ",
-                Style::default()
-                    .fg(theme::TEXT)
-                    .bg(hearts_bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" {} ", hearts(self.lives)),
-                Style::default()
-                    .fg(theme::INCORRECT)
-                    .bg(hearts_bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(hearts_line).alignment(Alignment::Center), area);
-    }
-
-    /// ごはんゲージ。ラベル行と、画面幅いっぱいの太いバー本体を2行に分けて見やすくする
-    fn render_rice_gauge(&self, frame: &mut Frame, area: Rect) {
+    /// ごはんゲージを縦積みの盾状バーで見せる。ラベル・バー本体・パーセントの順に
+    /// 縦へ積み、バー本体は満タンなら全部埋まり、減るにつれて上から欠けていく
+    fn render_rice_shield(&self, frame: &mut Frame, area: Rect) {
         let rice_percent = (self.rice.clamp(0.0, 1.0) * 100.0).round() as u32;
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1)])
-            .split(area);
-        let label_line = Line::from(Span::styled(
-            format!("ごはん {rice_percent:>3}%"),
+        let bar_height = area.height.saturating_sub(2);
+        let filled = ((rice_percent as f32 / 100.0) * bar_height as f32).round() as u16;
+        let mut lines = vec![Line::from(Span::styled("ごはん", theme::title_style()))];
+        for i in 0..bar_height {
+            let is_filled = i >= bar_height.saturating_sub(filled);
+            let (symbol, color) = if is_filled {
+                ("██████", theme::ACCENT)
+            } else {
+                ("░░░░░░", theme::MUTED)
+            };
+            lines.push(Line::from(Span::styled(
+                symbol,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            format!("{rice_percent}%"),
             theme::title_style(),
-        ));
-        frame.render_widget(
-            Paragraph::new(label_line).alignment(Alignment::Center),
-            rows[0],
-        );
-        let bar_width = area.width as usize;
-        let bar_line = Line::from(Span::styled(
-            theme::progress_bar(rice_percent, 100, bar_width),
-            Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
-        ));
-        frame.render_widget(
-            Paragraph::new(bar_line).alignment(Alignment::Center),
-            rows[1],
-        );
+        )));
+        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
     }
 }
 
@@ -3199,12 +3194,12 @@ mod tests {
         let mut game = LookAwayGame::new();
         shout(&mut game, Side::Left);
         assert!(
-            stage_text(&rendered(&game)).contains(&compact("左ガード")),
+            footer_text(&rendered(&game)).contains(&compact("左ガード")),
             "左からのヤーには「左ガード」の大表示"
         );
         let mut game = LookAwayGame::new();
         shout(&mut game, Side::Right);
-        let text = stage_text(&rendered(&game));
+        let text = footer_text(&rendered(&game));
         assert!(text.contains(&compact("右ガード")), "右からのヤーには「右ガード」の大表示: {text}");
         assert!(!text.contains(&compact("左ガード")));
     }
@@ -3214,7 +3209,7 @@ mod tests {
         let mut game = LookAwayGame::new();
         yahho(&mut game);
         assert!(
-            stage_text(&rendered(&game)).contains(&compact("ヤッホーを押せ")),
+            footer_text(&rendered(&game)).contains(&compact("ヤッホーを押せ")),
             "「やっほー」には「ヤッホーを押せ」の大表示"
         );
     }
@@ -3223,7 +3218,7 @@ mod tests {
     fn action_prompt_is_not_shown_while_idle() {
         let mut game = LookAwayGame::new();
         finish_countdown(&mut game);
-        let text = stage_text(&rendered(&game));
+        let text = footer_text(&rendered(&game));
         assert!(!text.contains(&compact("左ガード")));
         assert!(!text.contains(&compact("右ガード")));
         assert!(!text.contains(&compact("ヤッホーを押せ")));
