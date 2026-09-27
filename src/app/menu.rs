@@ -30,7 +30,7 @@ impl App {
     pub(super) fn enter_menu(&mut self) {
         self.screen = Screen::Menu;
         self.pending_scrollback_clear = true;
-        let total = typewriter::char_count(&menu_item_lines(screen_rect(self.last_area)));
+        let total = menu_typing_total_chars(screen_rect(self.last_area));
         self.menu_typewriter = Typewriter::with_interval(total, MENU_CHAR_INTERVAL);
         self.menu_typewriter
             .start_loop_se(audio::TypewriterSeKind::Menu);
@@ -347,6 +347,17 @@ fn menu_item_lines(area: Rect) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// タイプライターが表示し切ったとみなす基準の文字数。全カードを同時に(並列で)
+/// タイプするため、個々のカードの文字数ではなく、最も文字数が多いカードに合わせる
+fn menu_typing_total_chars(area: Rect) -> usize {
+    let grid = menu_grid(area);
+    menu_item_lines(area)
+        .chunks(grid.lines_per_card())
+        .map(typewriter::char_count)
+        .max()
+        .unwrap_or(0)
+}
+
 pub(super) fn render(
     frame: &mut Frame,
     area: Rect,
@@ -358,14 +369,17 @@ pub(super) fn render(
     let grid = menu_grid(area);
     state.row_offset = grid.scroll_offset(state.selected, state.row_offset);
 
-    // 画面サイズによって説明文の折り返し(=空行の数)が変わるので、描画する内容に全文字数を合わせる
+    // 画面サイズによって説明文の折り返し(=空行の数)が変わるので、描画する内容に全文字数を合わせる。
+    // 全カードを同じvisible_charsで独立に切り詰めるので、カードは同時に(並列で)タイプされる
     let lines = menu_item_lines(area);
-    typing.set_total_chars(typewriter::char_count(&lines));
-    let lines = typewriter::truncate_lines(&lines, typing.visible_chars());
-    for (index, card_lines) in lines.chunks(grid.lines_per_card()).enumerate() {
+    let per_card = grid.lines_per_card();
+    typing.set_total_chars(menu_typing_total_chars(area));
+    let visible = typing.visible_chars();
+    for (index, card_lines) in lines.chunks(per_card).enumerate() {
         if let Some(card) = grid.card_rect(index, state.row_offset) {
             let selected = index == state.selected;
-            render_menu_card(frame, card, index, selected, card_lines, icons);
+            let truncated = typewriter::truncate_lines(card_lines, visible);
+            render_menu_card(frame, card, index, selected, &truncated, icons);
         }
     }
 }
@@ -919,7 +933,7 @@ mod tests {
     // --- タイプライター表示 ---
 
     #[test]
-    fn menu_starts_empty_and_types_items_from_the_top() {
+    fn menu_starts_empty_and_types_all_cards_in_parallel() {
         let mut app = app_entering_menu();
         assert_eq!(app.menu_typewriter.visible_chars(), 0);
         assert!(!app.menu_typewriter.is_finished());
@@ -927,12 +941,17 @@ mod tests {
         assert!(before.contains("BRAINTRAIN"), "枠と見出しは最初から出る");
         assert!(!before.contains(MENU_ITEMS[0]), "項目はまだ出ない");
 
-        // 1枚目のゲーム名「図形回転判定」の先頭2文字
+        // 全カードが同時にタイプされるので、1枚目だけでなく2枚目の名前も途中まで出る
         app.update(MENU_CHAR_INTERVAL * 2);
         let mid = rendered_compact(&mut app);
-        assert!(mid.contains("図形"), "1枚目の名前が途中まで出る");
+        let first_prefix: String = MENU_ITEMS[0].chars().take(2).collect();
+        let second_prefix: String = MENU_ITEMS[1].chars().take(2).collect();
+        assert!(mid.contains(&first_prefix), "1枚目の名前が途中まで出る");
         assert!(!mid.contains(MENU_ITEMS[0]));
-        assert!(!mid.contains(MENU_ITEMS[1]), "2枚目はまだ出ない");
+        assert!(
+            mid.contains(&second_prefix),
+            "2枚目の名前も同時に途中まで出る(並列タイプ)"
+        );
 
         app.update(LONG_ENOUGH);
         assert!(app.menu_typewriter.is_finished());
@@ -960,24 +979,22 @@ mod tests {
     }
 
     #[test]
-    fn menu_items_appear_in_card_order_from_top_left_to_bottom_right() {
+    fn every_card_types_simultaneously_not_one_after_another() {
+        // 短いカードが流れ終わった後も、まだ流れきっていない長いカードだけが進み続ける
+        // (逐次表示なら、短いカードの後に長いカードの表示が0から始まるはず)
         let mut app = app_entering_menu();
-        let mut shown = 0;
-        while !app.menu_typewriter.is_finished() {
-            app.update(MENU_CHAR_INTERVAL * 5);
-            let text = rendered_rows_without_spaces(&mut app, 200, 60).concat();
-            let now = MENU_ITEMS
-                .iter()
-                .take_while(|name| text.contains(*name))
-                .count();
-            assert!(
-                MENU_ITEMS[now..].iter().all(|name| !text.contains(*name)),
-                "上の項目より先に下の項目が出ないこと"
-            );
-            assert!(now >= shown, "一度出た項目は消えない");
-            shown = now;
-        }
-        assert_eq!(shown, MENU_ITEMS.len());
+        app.update(MENU_CHAR_INTERVAL * 3);
+        let text = rendered_rows_without_spaces(&mut app, 200, 60).concat();
+        let first_prefix: String = MENU_ITEMS[0].chars().take(2).collect();
+        let last_prefix: String = MENU_ITEMS[MENU_ITEMS.len() - 1]
+            .chars()
+            .take(2)
+            .collect();
+        assert!(text.contains(&first_prefix), "1枚目のカードが途中まで出る");
+        assert!(
+            text.contains(&last_prefix),
+            "最後のカードも同時に途中まで出る(逐次表示なら出ないはず)"
+        );
     }
 
     #[test]
@@ -986,8 +1003,7 @@ mod tests {
             let mut app = App::new();
             app.last_area = rect(0, 0, width, height);
             press(&mut app, KeyCode::Enter);
-            let expected =
-                typewriter::char_count(&menu_item_lines(screen_rect(rect(0, 0, width, height))));
+            let expected = menu_typing_total_chars(screen_rect(rect(0, 0, width, height)));
             assert_eq!(
                 app.menu_typewriter.total_chars(),
                 expected,
@@ -995,7 +1011,7 @@ mod tests {
             );
             // 描画した画面サイズの内容に合わせて全文字数が更新される
             rendered_rows_without_spaces(&mut app, 80, 30);
-            let resized = typewriter::char_count(&menu_item_lines(screen_rect(rect(0, 0, 80, 30))));
+            let resized = menu_typing_total_chars(screen_rect(rect(0, 0, 80, 30)));
             assert_eq!(
                 app.menu_typewriter.total_chars(),
                 resized,
@@ -1034,7 +1050,8 @@ mod tests {
             let mut app = App::new();
             app.last_area = rect(0, 0, width, height);
             press(&mut app, KeyCode::Enter);
-            app.update(MENU_CHAR_INTERVAL * 120);
+            // 全カードが同時にタイプされるので、短い時間でも複数カードの項目名が見え始める
+            app.update(MENU_CHAR_INTERVAL * 8);
             let area = screen_rect(rect(0, 0, width, height));
             let visible: Vec<(usize, (u16, u16))> = (0..MENU_ITEMS.len())
                 .filter_map(|i| {
@@ -1341,7 +1358,7 @@ mod tests {
         press(&mut app, KeyCode::Enter); // Splash -> Menu
         assert_eq!(
             app.menu_typewriter.total_chars(),
-            typewriter::char_count(&menu_item_lines(screen_rect(area)))
+            menu_typing_total_chars(screen_rect(area))
         );
         press(&mut app, KeyCode::Down);
         assert_eq!(
