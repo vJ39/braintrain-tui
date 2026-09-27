@@ -307,6 +307,9 @@ struct Verdict {
     player_stage: PlayerStageKind,
     /// 結果表示中に見せる、判定結果を強調する書道風テキスト画像
     judge_stamp: JudgeStamp,
+    /// 結果表示中も親父側に見せ続ける「ヤー」の映像(食事中に問答無用で被弾した時のみ)。
+    /// Someの間は結果の赤背景や✗を出さず、親父はヤーの映像のままにする
+    opponent_shout: Option<(Side, usize)>,
 }
 
 impl Verdict {
@@ -323,6 +326,7 @@ impl Verdict {
             is_guard_success: false,
             player_stage: PlayerStageKind::YahhoReply,
             judge_stamp: JudgeStamp::Default,
+            opponent_shout: None,
         }
     }
 
@@ -358,6 +362,7 @@ impl Verdict {
             is_guard_success: false,
             player_stage,
             judge_stamp,
+            opponent_shout: None,
         }
     }
 
@@ -373,12 +378,15 @@ impl Verdict {
             is_guard_success: false,
             player_stage: PlayerStageKind::Watching,
             judge_stamp: JudgeStamp::RiceRefilled,
+            opponent_shout: None,
         }
     }
 
     /// 食事中に「ヤー」で襲われた時。防御操作を受け付けず、通常の即時誤入力(1個)の
-    /// 2倍にあたる♥2個を問答無用で失う。おかわりは発生しない(ダメージのみ)
-    fn caught_eating() -> Self {
+    /// 2倍にあたる♥2個を問答無用で失う。おかわりは発生しない(ダメージのみ)。
+    /// side/variantは襲ってきた「ヤー」の絵をそのまま指定し、結果表示中も
+    /// 親父側にヤーの映像を出し続ける(赤い結果背景にはしない)
+    fn caught_eating(side: Side, variant: usize) -> Self {
         Self {
             is_correct: false,
             detail: "食事を邪魔された".to_string(),
@@ -388,6 +396,7 @@ impl Verdict {
             is_guard_success: false,
             player_stage: PlayerStageKind::DamagedEating,
             judge_stamp: JudgeStamp::Default,
+            opponent_shout: Some((side, variant)),
         }
     }
 }
@@ -476,13 +485,15 @@ enum Phase {
     Yahho { remaining: Duration },
     /// 正誤の結果表示。この表示が終わるまで次の問題へは進まず、入力も受け付けない。
     /// player_stageはこの結果に応じてプレイヤー側に見せる絵、judge_stampは
-    /// 判定結果を強調する書道風テキスト画像
+    /// 判定結果を強調する書道風テキスト画像。opponent_shoutがSomeの間(食事中に
+    /// 問答無用で被弾した時)は、親父側は結果の赤背景ではなくヤーの映像のままにする
     Result {
         is_correct: bool,
         elapsed: Duration,
         message: Option<ResultMessage>,
         player_stage: PlayerStageKind,
         judge_stamp: JudgeStamp,
+        opponent_shout: Option<(Side, usize)>,
     },
 }
 
@@ -671,11 +682,11 @@ impl LookAwayGame {
             Event::Shout(side) => {
                 audio::play_se(SeKind::LookAwayShout);
                 audio::play_se(SeKind::LookAwayExplosion);
+                let variant = rand::thread_rng().gen_range(0..STAGE_SHOUT_RIGHT_IMAGES.len());
                 if was_eating {
-                    self.finish_question(Verdict::caught_eating());
+                    self.finish_question(Verdict::caught_eating(side, variant));
                     return;
                 }
-                let variant = rand::thread_rng().gen_range(0..STAGE_SHOUT_RIGHT_IMAGES.len());
                 self.phase = Phase::Shout {
                     side,
                     remaining: MAX_RESPONSE_WINDOW,
@@ -733,6 +744,7 @@ impl LookAwayGame {
             message,
             player_stage: verdict.player_stage,
             judge_stamp,
+            opponent_shout: verdict.opponent_shout,
         };
     }
 
@@ -754,6 +766,7 @@ impl LookAwayGame {
                 message: None,
                 player_stage: PlayerStageKind::Watching,
                 judge_stamp: JudgeStamp::Default,
+                opponent_shout: None,
             };
             return;
         }
@@ -791,6 +804,7 @@ impl LookAwayGame {
                             message: None,
                             player_stage: PlayerStageKind::Eating(self.eating_variant),
                             judge_stamp: JudgeStamp::Default,
+                            opponent_shout: None,
                         };
                         return;
                     }
@@ -907,8 +921,31 @@ impl LookAwayGame {
                 is_correct,
                 message,
                 judge_stamp,
+                opponent_shout,
                 ..
-            } => self.render_result(frame, area, *is_correct, *message, *judge_stamp),
+            } => {
+                if let Some((side, variant)) = opponent_shout {
+                    let kind = if *side == Side::Left {
+                        StageKind::ShoutLeft(*variant)
+                    } else {
+                        StageKind::ShoutRight(*variant)
+                    };
+                    self.render_scene(
+                        frame,
+                        area,
+                        SHOUT_BG,
+                        Color::Black,
+                        kind,
+                        vec![
+                            pointing_line(Some(*side)),
+                            String::new(),
+                            SHOUT_TEXT.to_string(),
+                        ],
+                    )
+                } else {
+                    self.render_result(frame, area, *is_correct, *message, *judge_stamp)
+                }
+            }
             Phase::Idle { is_eating, .. } => {
                 let (background, status_text) = if *is_eating {
                     (EATING_BG, EATING_TEXT)
@@ -1432,6 +1469,7 @@ impl Game for LookAwayGame {
                         message: None,
                         player_stage: PlayerStageKind::Watching,
                         judge_stamp: JudgeStamp::Default,
+                        opponent_shout: None,
                     };
                 }
                 KeyCode::Char('n') | KeyCode::Esc => {
@@ -2751,6 +2789,27 @@ mod tests {
         assert_eq!(result_player_stage(&game), PlayerStageKind::DamagedEating);
         assert_eq!(result_judge_stamp(&game), JudgeStamp::Default);
         assert!(player_stage_text(&rendered(&game)).contains(&compact(PLAYER_DAMAGED_EATING_TEXT)));
+    }
+
+    #[test]
+    fn caught_eating_keeps_showing_the_opponent_shout_scene_without_the_red_result_background() {
+        for side in SIDES {
+            let mut game = LookAwayGame::new();
+            finish_countdown(&mut game);
+            game.begin_event(Event::Shout(side), true);
+            assert!(is_result(&game, false));
+            let buffer = rendered(&game);
+            assert!(
+                stage_text(&buffer).contains(&compact(SHOUT_TEXT)),
+                "食事中に問答無用で被弾しても、親父側はヤーの映像のまま: {}",
+                stage_text(&buffer)
+            );
+            assert_eq!(
+                stage_bg(&buffer),
+                SHOUT_BG,
+                "赤い結果背景ではなく、ヤーの背景色のままにする"
+            );
+        }
     }
 
     // --- ブーイングSEを鳴らすべき判定 ---
