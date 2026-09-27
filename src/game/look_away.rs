@@ -5,7 +5,7 @@
 //! 「やっほー」と言われたらSpaceで「やっほー」と返す。
 //! 1問目は必ず「やっほー」から始まる。以降の待機はIDLE_WAIT_MS(最低5秒)で
 //! 「来るか来るか」という間を作ってから次のイベントが来る。
-//! どちらもRESPONSE_SAFE_WINDOW(500ms)以内に正しく反応すれば正解。
+//! どちらもRESPONSE_SAFE_WINDOW(800ms)以内に正しく反応すれば正解。
 //! 「ヤー」への反応が遅れた分だけ複数個の♥を失う(penalty_for参照)。
 //! 「やっほー」への反応が遅れるとごはんがおかわりされる(♥は減らない)。
 //! ♥が0になるか、60秒以内に完食できなければGAME OVER。
@@ -58,11 +58,11 @@ pub const RICE_DRAIN_PER_SEC: f32 = 0.1 / 3.0;
 /// 最低でも5秒は待たせ、「来るか来るか」という緊張感を持続させる
 pub const IDLE_WAIT_MS: (u64, u64) = (5000, 9000);
 /// これ以内に正しい入力ができれば正解(♥は減らない)
-pub const RESPONSE_SAFE_WINDOW: Duration = Duration::from_millis(500);
+pub const RESPONSE_SAFE_WINDOW: Duration = Duration::from_millis(800);
 /// RESPONSE_SAFE_WINDOWを超えた経過時間をこの単位で区切り、超過1区分ごとに♥をもう1つ失う
 pub const PENALTY_STEP: Duration = Duration::from_millis(80);
 /// 入力を受け付ける最大時間。これを過ぎても入力が無ければ自動的に不正解確定(経過時間はこの値として計算する)
-pub const MAX_RESPONSE_WINDOW: Duration = Duration::from_millis(900);
+pub const MAX_RESPONSE_WINDOW: Duration = Duration::from_millis(1200);
 /// 正誤の結果(◯/✗)を表示し続ける時間。この間は次の問題へ進まず、入力も受け付けない
 pub const RESULT_HOLD: Duration = Duration::from_millis(1000);
 /// セッション全体の制限時間。これを過ぎても完食できていなければGAME OVER
@@ -195,7 +195,7 @@ fn player_fallback_text(kind: PlayerStageKind) -> &'static str {
 enum JudgeStamp {
     /// 通常の✗マーク(TIMEOUT_TEXT・逆方向・Yahho押した・やっほー失敗等)
     Default,
-    /// 「ヤー」への反応が0.5秒(RESPONSE_SAFE_WINDOW)を超えた
+    /// 「ヤー」への反応が0.8秒(RESPONSE_SAFE_WINDOW)を超えた
     Late,
     /// 待機中のフライング
     FalseStart,
@@ -2089,7 +2089,7 @@ mod tests {
         let mut game = LookAwayGame::new();
         finish_countdown(&mut game);
         shout(&mut game, Side::Left);
-        // 400ms(RESPONSE_SAFE_WINDOW)を160ms超えたところで正しい方向を押す→penalty=3
+        // 800ms(RESPONSE_SAFE_WINDOW)を160ms超えたところで正しい方向を押す→penalty=3
         game.update(RESPONSE_SAFE_WINDOW + ms(160));
         press(&mut game, Side::Left.key());
         assert!(is_result(&game, false), "遅れれば正しい方向でも不正解");
