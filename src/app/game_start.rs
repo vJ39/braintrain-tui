@@ -389,9 +389,10 @@ mod tests {
 
     // --- ヤッホー ---
 
-    /// ヤッホーが始まり、ごはんゲージ満タンで食べ始めるまでの催促画面が表示されていることを
-    /// 確かめる。食べ始めたらゲーム内カウントダウンが始まる。問題ごとに自前のカウントダウンを
-    /// 持つため、画面遷移側のカウントダウン(Screen::Countdown)は経由しない
+    /// ヤッホーが始まり、まず「3.2.1.GO!!」のゲーム内カウントダウンから始まることを確かめる。
+    /// 問題ごとに自前のカウントダウンを持つため、画面遷移側のカウントダウン
+    /// (Screen::Countdown)は経由しない。カウントダウンが終わったら食べ始めるまでの
+    /// 催促画面になり、食べ始めて初めてタイマー・イベントが動き出す
     fn assert_look_away_round1_is_playing(app: &mut App) {
         let Screen::Playing(game) = &app.screen else {
             panic!("外側のカウントダウンを挟まず直接Playing画面になるはず");
@@ -404,10 +405,17 @@ mod tests {
             text.contains(crate::game::look_away::DISPLAY_NAME),
             "{text}"
         );
+        assert!(
+            text.contains('█'),
+            "セッション開始直後はゲーム内のカウントダウンを大きな文字で出す: {text}"
+        );
+        // カウントダウンを終わらせる
+        app.update(Duration::from_millis(2500));
+        let text = rendered_text(app).replace(' ', "");
         assert!(text.contains("ごはん"), "ごはんゲージが表示される: {text}");
         assert!(
             text.contains(&crate::game::look_away::WATCHING_TEXT.replace(' ', "")),
-            "食べ始めるまでは様子見の通常表示から始まる: {text}"
+            "カウントダウンが終わったら食べ始めるまでは様子見の通常表示: {text}"
         );
         // 食べ始めていないので入力は記録されない
         app.handle_key(KeyEvent::from(KeyCode::Left));
@@ -416,12 +424,12 @@ mod tests {
             panic!("Playing画面のまま");
         };
         assert_eq!(game.result().total, 0);
-        // Enterで食べ始めるとゲーム内カウントダウンが大きな文字で始まる
+        // Enterで食べ始めると食事中の表示になる
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         let text = rendered_text(app).replace(' ', "");
         assert!(
-            text.contains('█'),
-            "食べ始めたらゲーム内のカウントダウンを大きな文字で出す: {text}"
+            text.contains(&crate::game::look_away::EATING_TEXT.replace(' ', "")),
+            "食べ始めたら食事中の表示になる: {text}"
         );
     }
 

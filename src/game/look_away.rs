@@ -514,9 +514,6 @@ pub struct LookAwayGame {
     mark_renderer: MarkRenderer,
     /// カウントダウンの「GO!!」の音を1問目だけ鳴らすためのゲート
     go_se: GoSeOnce,
-    /// 「3.2.1.GO!!」のカウントダウン演出自体を出したことがあるか。1問目だけ出し、
-    /// 2問目以降は演出を挟まず直接待機から始める
-    shown_countdown_once: bool,
     /// カウンター越しの親父の絵(通常/ヤー左右/やっほー)の描画器
     stage_renderer: StageRenderer,
     /// 詰み(理論上完食が間に合わない)を検知して捨てゲー確認ダイアログを出しているか。
@@ -603,20 +600,27 @@ fn pointing_line(side: Option<Side>) -> String {
 }
 
 impl LookAwayGame {
+    /// セッション開始時は必ず「3.2.1.GO!!」から始める(2問目以降のイベント再開には
+    /// この演出を挟まない。start_round参照)
     pub fn new() -> Self {
+        let mut go_se = GoSeOnce::new();
+        let state = CountdownState::new();
+        // 最初のフェーズ「3」の音
+        if let Some(phase) = state.phase() {
+            if let Some(se) = go_se.se_for(phase) {
+                audio::play_se(se);
+            }
+        }
         Self {
             tracker: ScoreTracker::new(),
-            phase: Phase::WaitingToEat {
-                elapsed: Duration::ZERO,
-            },
+            phase: Phase::Countdown { state },
             lives: MAX_LIVES,
             rice: RICE_FULL,
             elapsed_total: Duration::ZERO,
             finished: false,
             feedback: AnswerFeedback::new(),
             mark_renderer: MarkRenderer::new(),
-            go_se: GoSeOnce::new(),
-            shown_countdown_once: false,
+            go_se,
             stage_renderer: StageRenderer::new(),
             abandon_prompt_shown: false,
             abandon_prompt_dismissed: false,
@@ -648,23 +652,6 @@ impl LookAwayGame {
         let remaining_time = TIME_LIMIT.saturating_sub(self.elapsed_total);
         let time_needed = Duration::from_secs_f32(self.rice / RICE_DRAIN_PER_SEC);
         time_needed > remaining_time
-    }
-
-    /// 新しい問題を始める。1問目だけ「3.2.1.GO!!」の
-    /// カウントダウンから始め、2問目以降は演出を挟まず直接待機から始める
-    fn start_round(&mut self) {
-        if self.shown_countdown_once {
-            self.phase = new_idle_phase(random_between(&mut rand::thread_rng(), IDLE_WAIT_MS), false);
-            return;
-        }
-        let state = CountdownState::new();
-        // 最初のフェーズ「3」の音
-        if let Some(phase) = state.phase() {
-            if let Some(se) = self.go_se.se_for(phase) {
-                audio::play_se(se);
-            }
-        }
-        self.phase = Phase::Countdown { state };
     }
 
     /// 待機が終わった時に、次のイベントを始める。was_eatingは待機中に食事していたか
@@ -781,11 +768,11 @@ impl LookAwayGame {
                     }
                 }
                 if state.is_finished() {
-                    self.shown_countdown_once = true;
-                    // 食べる操作をしたことでカウントダウンが始まったので、食事中から始める
-                    self.eating_variant = choose_eating_variant(&mut rand::thread_rng());
-                    self.phase =
-                        new_idle_phase(random_between(&mut rand::thread_rng(), IDLE_WAIT_MS), true);
+                    // 「3.2.1.GO!!」が終わっても食事はまだ始めない。食べ始めるまでの
+                    // 待機に入り、Enterが押されるまでタイマー・イベントは動かさない
+                    self.phase = Phase::WaitingToEat {
+                        elapsed: Duration::ZERO,
+                    };
                 }
             }
             Phase::Idle {
@@ -843,7 +830,11 @@ impl LookAwayGame {
                     if self.is_last_round() {
                         self.finished = true;
                     } else {
-                        self.start_round();
+                        // 結果表示が終わっても食事は自動再開しない。食べ始めるまでの
+                        // 待機に入り、Enterが押されるまでタイマー・イベントは動かさない
+                        self.phase = Phase::WaitingToEat {
+                            elapsed: Duration::ZERO,
+                        };
                     }
                 }
             }
@@ -1491,7 +1482,11 @@ impl Game for LookAwayGame {
                     *is_eating = !*is_eating;
                     started_eating = *is_eating;
                 }
-                Phase::WaitingToEat { .. } => self.start_round(),
+                Phase::WaitingToEat { .. } => {
+                    self.phase =
+                        new_idle_phase(random_between(&mut rand::thread_rng(), IDLE_WAIT_MS), true);
+                    started_eating = true;
+                }
                 _ => {}
             }
             if started_eating {
@@ -1594,21 +1589,28 @@ mod tests {
         }
     }
 
-    /// 問題冒頭のカウントダウンを最後まで進め、待機にする。まだ食べ始めていなければ
-    /// 先にEnterを押してカウントダウンを開始させる。フェーズ(PHASE_DURATION)ごとに
-    /// 分けて進める(実機のフレームループと同じく、一度に全部進めるとGO!!への遷移自体を
-    /// 検出できずSEが鳴らないため)
-    fn finish_countdown(game: &mut LookAwayGame) {
-        if matches!(game.phase, Phase::WaitingToEat { .. }) {
-            press(game, KeyCode::Enter);
-        }
+    /// 冒頭の「3.2.1.GO!!」を最後まで進めて食べ始めるまでの待機(WaitingToEat)にする。
+    /// フェーズ(PHASE_DURATION)ごとに分けて進める(実機のフレームループと同じく、
+    /// 一度に全部進めるとGO!!への遷移自体を検出できずSEが鳴らないため)
+    fn advance_to_waiting_to_eat(game: &mut LookAwayGame) {
         assert!(is_countdown(game), "カウントダウン中のはず");
         for _ in 0..(COUNTDOWN_TOTAL.as_millis() / PHASE_DURATION.as_millis()) {
             game.update(PHASE_DURATION);
         }
         assert!(
+            matches!(game.phase, Phase::WaitingToEat { .. }),
+            "カウントダウンが終わったら食べ始めるまでの待機"
+        );
+    }
+
+    /// 冒頭の「3.2.1.GO!!」を最後まで進めて食べ始めるまでの待機にし、続けてEnterで
+    /// 食べ始めて待機(食事中)にする
+    fn finish_countdown(game: &mut LookAwayGame) {
+        advance_to_waiting_to_eat(game);
+        press(game, KeyCode::Enter);
+        assert!(
             matches!(game.phase, Phase::Idle { .. }),
-            "カウントダウンが終わったら待機"
+            "食べ始めたら待機"
         );
     }
 
@@ -1635,11 +1637,13 @@ mod tests {
         };
     }
 
-    /// (1問目ならカウントダウンを終えて)「ヤー!!」を出し、correctに応じて正解/不正解のキーを
-    /// 即座に(elapsed≈0で)押す。不正解の場合はpenalty=1になる
+    /// (1問目ならカウントダウン・食べ始めを終えて)「ヤー!!」を出し、correctに応じて
+    /// 正解/不正解のキーを即座に(elapsed≈0で)押す。不正解の場合はpenalty=1になる
     fn answer_round(game: &mut LookAwayGame, correct: bool) {
-        if matches!(game.phase, Phase::WaitingToEat { .. } | Phase::Countdown { .. }) {
+        if matches!(game.phase, Phase::Countdown { .. }) {
             finish_countdown(game);
+        } else if matches!(game.phase, Phase::WaitingToEat { .. }) {
+            press(game, KeyCode::Enter);
         }
         shout(game, Side::Left);
         let code = if correct {
@@ -2010,19 +2014,34 @@ mod tests {
     }
 
     #[test]
-    fn countdown_finishes_into_idle_eating_within_wait_range() {
+    fn countdown_finishes_into_waiting_to_eat() {
+        let mut game = LookAwayGame::new();
+        game.update(COUNTDOWN_TOTAL - ms(1));
+        assert!(is_countdown(&game), "GO!!が終わるまではカウントダウン");
+        game.update(ms(1));
+        assert!(
+            matches!(
+                game.phase,
+                Phase::WaitingToEat {
+                    elapsed: Duration::ZERO
+                }
+            ),
+            "カウントダウンの後はまだ食事は始めず、食べ始めるまでの待機になる"
+        );
+    }
+
+    #[test]
+    fn pressing_eat_after_the_countdown_starts_eating_within_wait_range() {
         for _ in 0..30 {
             let mut game = LookAwayGame::new();
+            game.update(COUNTDOWN_TOTAL);
             press(&mut game, KeyCode::Enter);
-            game.update(COUNTDOWN_TOTAL - ms(1));
-            assert!(is_countdown(&game), "GO!!が終わるまではカウントダウン");
-            game.update(ms(1));
             match game.phase {
                 Phase::Idle { remaining, is_eating } => {
                     assert!((ms(IDLE_WAIT_MS.0)..=ms(IDLE_WAIT_MS.1)).contains(&remaining));
                     assert!(is_eating, "食べる操作をしたので食事中から始まる");
                 }
-                _ => panic!("カウントダウンの後は待機"),
+                _ => panic!("Enterを押したら待機(食事中)"),
             }
         }
     }
@@ -2045,14 +2064,12 @@ mod tests {
     // --- 食べ始めるまでの待機 ---
 
     #[test]
-    fn new_game_starts_in_waiting_to_eat_phase() {
+    fn new_game_starts_with_the_countdown() {
         let game = LookAwayGame::new();
-        assert!(matches!(
-            game.phase,
-            Phase::WaitingToEat {
-                elapsed: Duration::ZERO
-            }
-        ));
+        assert!(
+            is_countdown(&game),
+            "セッション開始時はまず3.2.1.GO!!から始まる"
+        );
         assert!(!game.is_finished());
         assert_eq!(game.tracker.total(), 0);
     }
@@ -2060,6 +2077,7 @@ mod tests {
     #[test]
     fn time_does_not_pass_while_waiting_to_eat() {
         let mut game = LookAwayGame::new();
+        advance_to_waiting_to_eat(&mut game);
         game.update(Duration::from_secs(10));
         assert!(
             matches!(game.phase, Phase::WaitingToEat { .. }),
@@ -2071,6 +2089,7 @@ mod tests {
     #[test]
     fn other_keys_are_ignored_while_waiting_to_eat() {
         let mut game = LookAwayGame::new();
+        advance_to_waiting_to_eat(&mut game);
         for code in GAME_KEYS {
             press(&mut game, code);
             assert!(
@@ -2083,7 +2102,8 @@ mod tests {
 
     #[test]
     fn waiting_to_eat_shows_watching_text_before_prompt_delay() {
-        let game = LookAwayGame::new();
+        let mut game = LookAwayGame::new();
+        advance_to_waiting_to_eat(&mut game);
         let buffer = rendered(&game);
         assert!(
             text_of(&buffer).contains(&compact(WATCHING_TEXT)),
@@ -2095,6 +2115,7 @@ mod tests {
     #[test]
     fn waiting_to_eat_shows_prompt_text_after_delay() {
         let mut game = LookAwayGame::new();
+        advance_to_waiting_to_eat(&mut game);
         game.update(WAITING_TO_EAT_PROMPT_DELAY);
         let buffer = rendered(&game);
         assert!(text_of(&buffer).contains(&compact(WAITING_TO_EAT_TEXT)));
@@ -2349,7 +2370,7 @@ mod tests {
     // --- 結果表示と次の問題 ---
 
     #[test]
-    fn result_holds_then_next_round_starts_without_countdown() {
+    fn result_holds_then_next_round_starts_the_waiting_to_eat_phase() {
         let mut game = LookAwayGame::new();
         answer_round(&mut game, true);
         game.update(RESULT_HOLD - ms(1));
@@ -2359,8 +2380,8 @@ mod tests {
         );
         game.update(ms(1));
         assert!(
-            matches!(game.phase, Phase::Idle { .. }),
-            "2問目以降はカウントダウンを挟まず直接待機から始まる"
+            matches!(game.phase, Phase::WaitingToEat { .. }),
+            "結果表示が終わったら食べ始めるまでの待機に戻る(カウントダウンは挟まない)"
         );
         assert!(!game.is_finished());
     }
@@ -2368,14 +2389,21 @@ mod tests {
     #[test]
     fn countdown_is_shown_on_the_first_round_only() {
         let mut game = LookAwayGame::new();
-        press(&mut game, KeyCode::Enter);
-        assert!(is_countdown(&game), "食べ始めたら1問目のカウントダウンが始まる");
+        assert!(
+            is_countdown(&game),
+            "セッション開始時は1問目のカウントダウンから始まる"
+        );
         for _ in 0..3 {
             answer_round(&mut game, true);
             game.update(RESULT_HOLD);
             assert!(
+                matches!(game.phase, Phase::WaitingToEat { .. }),
+                "結果表示後は食べ始めるまでの待機になる"
+            );
+            press(&mut game, KeyCode::Enter);
+            assert!(
                 matches!(game.phase, Phase::Idle { .. }),
-                "2問目以降はカウントダウンを挟まない"
+                "2問目以降はカウントダウンを挟まず直接食事再開になる"
             );
         }
     }
