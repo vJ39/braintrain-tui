@@ -922,6 +922,25 @@ impl LookAwayGame {
         self.render_player_stage(frame, cols[1]);
     }
 
+    /// 親父のアクション中、プレイヤーが今すべき操作をでかく示す文言。
+    /// 親父側パネルのテキストに追加行として重ねる(render_opponent_stage参照)
+    fn action_prompt_text(&self) -> Option<&'static str> {
+        match &self.phase {
+            Phase::Yahho { .. } => Some("ヤッホーを押せ"),
+            Phase::Shout { side: Side::Left, .. } => Some("左ガード"),
+            Phase::Shout { side: Side::Right, .. } => Some("右ガード"),
+            _ => None,
+        }
+    }
+
+    /// linesの末尾に、いまの操作指示(あれば)を空行を挿んで追加する
+    fn with_action_prompt(&self, mut lines: Vec<String>) -> Vec<String> {
+        if let Some(prompt) = self.action_prompt_text() {
+            lines.push(prompt.to_string());
+        }
+        lines
+    }
+
     /// カウンター越しの親父を描く(Countdownと、催促表示に切り替わった後のWaitingToEat以外の全フェーズ)
     fn render_opponent_stage(&self, frame: &mut Frame, area: Rect) {
         match &self.phase {
@@ -985,31 +1004,19 @@ impl LookAwayGame {
                 } else {
                     StageKind::ShoutRight(*variant)
                 };
-                self.render_scene(
-                    frame,
-                    area,
-                    SHOUT_BG,
-                    Color::Black,
-                    kind,
-                    vec![
-                        pointing_line(Some(*side)),
-                        String::new(),
-                        SHOUT_TEXT.to_string(),
-                    ],
-                )
+                let lines = self.with_action_prompt(vec![
+                    pointing_line(Some(*side)),
+                    SHOUT_TEXT.to_string(),
+                ]);
+                self.render_scene(frame, area, SHOUT_BG, Color::Black, kind, lines)
             }
-            Phase::Yahho { .. } => self.render_scene(
-                frame,
-                area,
-                YAHHO_BG,
-                Color::Black,
-                StageKind::Yahho,
-                vec![
+            Phase::Yahho { .. } => {
+                let lines = self.with_action_prompt(vec![
                     pointing_line(None),
-                    String::new(),
                     YAHHO_CALL_TEXT.to_string(),
-                ],
-            ),
+                ]);
+                self.render_scene(frame, area, YAHHO_BG, Color::Black, StageKind::Yahho, lines)
+            }
         }
     }
 
@@ -1050,6 +1057,9 @@ impl LookAwayGame {
         texts: Vec<String>,
     ) {
         if self.stage_renderer.render(frame, area, kind) {
+            if let Some(prompt) = self.action_prompt_text() {
+                render_action_prompt_overlay(frame, area, prompt);
+            }
             return;
         }
         render_character(frame, area, background, text_color, texts);
@@ -1273,6 +1283,32 @@ fn render_character(
     frame.render_widget(
         Paragraph::new(lines).alignment(Alignment::Center),
         text_area,
+    );
+}
+
+/// 画像表示時、画像の下部に操作指示を帯状の背景色パネルで重ねて出す(テキスト表示時は
+/// render_scene側でtextsに追加済みなのでこちらは通らない)
+fn render_action_prompt_overlay(frame: &mut Frame, area: Rect, text: &str) {
+    let height = 1.min(area.height.saturating_sub(2));
+    if height == 0 {
+        return;
+    }
+    let banner_area = Rect::new(
+        area.x + 1,
+        area.bottom().saturating_sub(1 + height),
+        area.width.saturating_sub(2),
+        height,
+    );
+    let block = Block::default().style(Style::default().bg(theme::HIGHLIGHT));
+    let inner = block.inner(banner_area);
+    frame.render_widget(block, banner_area);
+    let line = Line::from(Span::styled(
+        text,
+        Style::default().fg(Color::Black).add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(
+        Paragraph::new(line).alignment(Alignment::Center),
+        theme::vertical_center(inner, 1),
     );
 }
 
@@ -3158,6 +3194,41 @@ mod tests {
         assert!(text.contains(&compact(YAHHO_CALL_TEXT)), "{text}");
         assert!(!stage_text(&buffer).contains(&compact(SHOUT_TEXT)));
         assert_eq!(stage_bg(&buffer), YAHHO_BG);
+    }
+
+    #[test]
+    fn shout_shows_the_action_prompt_for_its_side() {
+        let mut game = LookAwayGame::new();
+        shout(&mut game, Side::Left);
+        assert!(
+            stage_text(&rendered(&game)).contains(&compact("左ガード")),
+            "左からのヤーには「左ガード」の大表示"
+        );
+        let mut game = LookAwayGame::new();
+        shout(&mut game, Side::Right);
+        let text = stage_text(&rendered(&game));
+        assert!(text.contains(&compact("右ガード")), "右からのヤーには「右ガード」の大表示: {text}");
+        assert!(!text.contains(&compact("左ガード")));
+    }
+
+    #[test]
+    fn yahho_shows_the_action_prompt() {
+        let mut game = LookAwayGame::new();
+        yahho(&mut game);
+        assert!(
+            stage_text(&rendered(&game)).contains(&compact("ヤッホーを押せ")),
+            "「やっほー」には「ヤッホーを押せ」の大表示"
+        );
+    }
+
+    #[test]
+    fn action_prompt_is_not_shown_while_idle() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        let text = stage_text(&rendered(&game));
+        assert!(!text.contains(&compact("左ガード")));
+        assert!(!text.contains(&compact("右ガード")));
+        assert!(!text.contains(&compact("ヤッホーを押せ")));
     }
 
     #[test]
