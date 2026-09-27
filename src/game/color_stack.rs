@@ -1,12 +1,11 @@
 //! シタケシ: 積まれた色ブロックを、色ボタンで「一番下」から消していくタイムアタック。
 //!
-//! 1セッション=3ラウンドで、難易度選択は無い。ラウンドごとに盤面の構成と段数が決まっている。
-//! - ROUND1(36段)・ROUND2(72段): 4列。各列は専用の色で、1段に1列だけブロックがある(同時押しは無い)。
-//!   盤面の最下段にある色を押した時だけ最下段が消え、それ以外の色はミスでその列の一番上に1個追加される
-//! - ROUND3(ROUND2と同じ72段・同じ制限時間): 1列。押した色が最下段の色と一致すれば消え、
-//!   一致しなければミスとしてパレット(4色)からランダムに選んだ色が一番上に積まれる
+//! 1セッション=制限時間60秒で、難易度選択は無い。盤面は4列で、各列は専用の色。
+//! 1段に1列だけブロックがあり(同時押しは無い)、盤面の最下段にある色を押した時だけ最下段が消える。
+//! 消えたブロックはその列の一番上にすぐ補充されるので、盤面は空にならず時間いっぱい消し続けられる。
+//! それ以外の色はミスで、その列の一番上に1個追加される(段が増えるだけで詰みにはしない)。
 //!
-//! 盤面を空にしたらラウンドクリア。制限時間を超えたラウンドは失敗として記録する。
+//! スコアは消せた数と、1個消すごとの間隔(応答時間)。ミスは記録しない。
 
 use std::time::Duration;
 
@@ -30,11 +29,8 @@ pub const GAME_ID: &str = "color_stack";
 /// (これまでの記録と同じ扱いになるよう中級のままにする)
 pub const SESSION_DIFFICULTY: Difficulty = Difficulty::Intermediate;
 
-/// 1セッションのラウンド数
-pub const ROUNDS_PER_SESSION: u32 = 3;
-
-/// ラウンド終了から次のラウンド開始までの間隔。この間は入力を受け付けない
-pub const ROUND_INTERVAL: Duration = Duration::from_millis(1200);
+/// セッション全体の制限時間。これを過ぎたら終了する
+pub const TIME_LIMIT: Duration = Duration::from_secs(60);
 
 /// 色ボタンを並べる領域の高さ(枠込み)
 const BUTTONS_HEIGHT: u16 = 3;
@@ -42,21 +38,17 @@ const BUTTONS_HEIGHT: u16 = 3;
 /// マスの幅の上限。広い画面でもブロックが横に伸びすぎないようにする
 const MAX_CELL_WIDTH: u16 = 16;
 
-/// 1段の高さの上限(全ラウンド共通)。低い積み上げでも縦に伸びすぎないようにする
+/// 1段の高さの上限。低い積み上げでも縦に伸びすぎないようにする
 const MAX_ROW_HEIGHT: u16 = 2;
 
-/// 4列の盤面(ROUND1・ROUND2)の列数。列iの専用色はStackColor::ALL[i]
+/// 盤面の列数。列iの専用色はStackColor::ALL[i]
 const LANE_COUNT: usize = StackColor::ALL.len();
 
-/// ROUND1の初期の高さ。ROUND2・ROUND3はこの2倍にする
-const ROUND1_HEIGHT: usize = 36;
-
-/// 制限時間を決める、1段あたりの目安時間。制限時間は「初期の段数×この時間」にする。
-/// 1段を消すのに1回押すだけなので、ミスで増えた段を消す時間も含めて十分な余裕がある
-const TIME_PER_ROW: Duration = Duration::from_millis(2500);
+/// 開始時の段数。正解では補充されて減らないので、ミスが無ければ最後までこの高さのまま
+const INITIAL_HEIGHT: usize = 36;
 
 /// 盤面パネルの見出し
-const PANEL_TITLE: &str = " 各列の一番下の色を押して全部消す ";
+const PANEL_TITLE: &str = " 各列の一番下の色を押して消す ";
 
 /// ブロックの色。並び順がボタンの並び・数字キー(1始まり)に対応する
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -94,73 +86,8 @@ impl StackColor {
     }
 }
 
-/// ラウンドの盤面の構成と、色ボタンを押した時のルール
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BoardRule {
-    /// 4列で列ごとに専用色、1段に1列だけブロックがある。
-    /// 押した色の列が最下段にある時だけ消え、そうでなければその列の専用色を一番上に積む
-    Lanes,
-    /// 1列。押した色が最下段と一致すれば消え、不一致ならパレットからランダムな色を一番上に積む
-    SingleColumn,
-}
-
-/// ラウンドごとのパラメータ
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct RoundParams {
-    /// 盤面の構成(4列か1列か)と押した時のルール
-    pub rule: BoardRule,
-    /// 初期の段数(1段に1個なので初期のブロック数と同じ)
-    pub height: usize,
-    /// 使う色の数(StackColor::ALLの先頭から)。ボタンの数でもあり、4列の盤面では列数でもある
-    pub color_count: usize,
-    /// 1ラウンドの制限時間
-    pub time_limit: Duration,
-    /// 1段の表示上の高さの上限
-    pub max_row_height: u16,
-    /// HUD・ラウンド間の案内に出す、このラウンドの盤面の説明
-    pub label: &'static str,
-}
-
-/// round_index番目(0始まり)のラウンドのパラメータ。最終ラウンドより先は最終ラウンドのまま。
-/// ROUND2はROUND1の2倍の段数、ROUND3はROUND2と同じ段数で盤面を1列にする
-pub fn round_params(round_index: u32) -> RoundParams {
-    let (rule, height, label) = match round_index {
-        0 => (BoardRule::Lanes, ROUND1_HEIGHT, "4列 36段"),
-        1 => (BoardRule::Lanes, ROUND1_HEIGHT * 2, "4列 72段"),
-        _ => (BoardRule::SingleColumn, ROUND1_HEIGHT * 2, "1列 72段"),
-    };
-    RoundParams {
-        rule,
-        height,
-        color_count: LANE_COUNT,
-        time_limit: time_limit_for(height),
-        max_row_height: MAX_ROW_HEIGHT,
-        label,
-    }
-}
-
-/// 初期の段数から制限時間を決める(1段あたりTIME_PER_ROW)
-fn time_limit_for(height: usize) -> Duration {
-    TIME_PER_ROW * u32::try_from(height).unwrap_or(u32::MAX)
-}
-
-impl RoundParams {
-    /// このラウンドで使う色(ボタンの並び順)
-    fn colors(&self) -> &'static [StackColor] {
-        &StackColor::ALL[..self.color_count]
-    }
-
-    /// 盤面の列数。4列の盤面は各色に専用の列が1つずつあり、1列の盤面は1
-    fn columns(&self) -> usize {
-        match self.rule {
-            BoardRule::Lanes => self.color_count,
-            BoardRule::SingleColumn => 1,
-        }
-    }
-}
-
 /// 盤面。rows[0]が最下段で、各段は列数ぶんのセル(Noneは空白)。
-/// どのルールでも「ブロックが1個も無い段」は残さない(消えた段は上の段が詰めて下りてくる)
+/// 「ブロックが1個も無い段」は残さない(消えた段は上の段が詰めて下りてくる)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Board {
     columns: usize,
@@ -168,14 +95,6 @@ struct Board {
 }
 
 impl Board {
-    /// 下から順にcolorsを積んだ1列の盤面
-    fn single_column(colors: impl IntoIterator<Item = StackColor>) -> Self {
-        Self {
-            columns: 1,
-            rows: colors.into_iter().map(|c| vec![Some(c)]).collect(),
-        }
-    }
-
     /// 下から順に、各段のlanes[i]列目にだけその列の専用色を置いた4列の盤面
     fn lanes(lanes: impl IntoIterator<Item = usize>) -> Self {
         Self {
@@ -188,16 +107,6 @@ impl Board {
     fn block_count(&self) -> usize {
         self.rows.iter().flatten().filter(|c| c.is_some()).count()
     }
-
-    /// 全部消えたか
-    fn is_cleared(&self) -> bool {
-        self.rows.is_empty()
-    }
-
-    /// 最下段にあるブロックの色(1段に1個なので、その段の唯一のブロック)。盤面が空ならNone
-    fn bottom_color(&self) -> Option<StackColor> {
-        self.rows.first()?.iter().flatten().next().copied()
-    }
 }
 
 /// column列目にだけその列の専用色を置いた、4列盤面の1段
@@ -207,27 +116,21 @@ fn lane_row(column: usize) -> Vec<Option<StackColor>> {
         .collect()
 }
 
-/// ラウンド開始時の盤面を作る。各段にどの色(4列なら、その色の専用列)を置くかを決める。
-/// 先頭の色数ぶんに各色を1個ずつ置き、残りをランダムにしてから全体をシャッフルするので、
-/// どの色(列)も最低1個は含まれる
-fn new_board(rng: &mut impl Rng, params: &RoundParams) -> Board {
-    let choices = params.color_count;
-    let mut picks: Vec<usize> = (0..params.height)
+/// セッション開始時の盤面を作る。各段にどの列を置くかを決める。
+/// 先頭の列数ぶんに各列を1個ずつ置き、残りをランダムにしてから全体をシャッフルするので、
+/// どの列も最低1個は含まれる
+fn new_board(rng: &mut impl Rng) -> Board {
+    let mut picks: Vec<usize> = (0..INITIAL_HEIGHT)
         .map(|i| {
-            if i < choices {
+            if i < LANE_COUNT {
                 i
             } else {
-                rng.gen_range(0..choices)
+                rng.gen_range(0..LANE_COUNT)
             }
         })
         .collect();
     picks.shuffle(rng);
-    match params.rule {
-        BoardRule::Lanes => Board::lanes(picks),
-        BoardRule::SingleColumn => {
-            Board::single_column(picks.into_iter().map(|i| StackColor::ALL[i]))
-        }
-    }
+    Board::lanes(picks)
 }
 
 /// 色ボタンを押した結果
@@ -239,7 +142,7 @@ enum PressOutcome {
     Added,
 }
 
-/// 4列の盤面(ROUND1・ROUND2)でcolumn列目のボタンを押した時の処理。
+/// column列目のボタンを押した時の処理。
 /// 盤面全体の最下段(rows[0])のブロックがcolumn列にある時だけ、その段を消して上の段を詰める。
 /// それ以外(押した列の順番がまだ来ていない・盤面が空)はミスとして、
 /// その列の専用色を一番上の新しい段に置く(1段1列を保つ)
@@ -254,25 +157,6 @@ fn press_lane(board: &mut Board, column: usize) -> PressOutcome {
         PressOutcome::Removed
     } else {
         board.rows.push(lane_row(column));
-        PressOutcome::Added
-    }
-}
-
-/// 1列の盤面(ROUND3)でcolorを押した時の処理。最下段がcolorなら消して上のブロックを詰め、
-/// 違えば(盤面が空の時も)ミスとしてpaletteからランダムに選んだ色を一番上に積む
-/// (押した色をそのまま積むと、ミスの度に同じ色が積み上がり続けるため)
-fn press_single(
-    rng: &mut impl Rng,
-    board: &mut Board,
-    color: StackColor,
-    palette: &[StackColor],
-) -> PressOutcome {
-    if board.bottom_color() == Some(color) {
-        board.rows.remove(0);
-        PressOutcome::Removed
-    } else {
-        let added = palette[rng.gen_range(0..palette.len())];
-        board.rows.push(vec![Some(added)]);
         PressOutcome::Added
     }
 }
@@ -310,7 +194,7 @@ impl GridGeometry {
 
 /// board(盤面パネルの内側)にcolumns列のマス目を置く。
 /// 盤面を列数で等分した帯(色ボタンの並びと同じ分け方)の中央に各列を置き、
-/// 縦は最下段を盤面の下端にそろえる。1列なら盤面の横中央に1列だけ置く。
+/// 縦は最下段を盤面の下端にそろえる。
 /// 1段の高さは初期の高さ(base_height)が収まるように決め(max_row_heightまで)、ミスで伸びても変えない。
 /// 描ける段数は盤面に入るぶんだけで、入りきらない上の段は描かない
 fn grid_geometry(
@@ -363,127 +247,62 @@ fn buttons_area(area: Rect) -> Rect {
     split_areas(area).2
 }
 
-/// 1ラウンドの状態
-struct Round {
-    board: Board,
-    /// ラウンド開始からの経過時間
-    elapsed: Duration,
-}
-
-fn new_round(params: &RoundParams) -> Round {
-    Round {
-        board: new_board(&mut rand::thread_rng(), params),
-        elapsed: Duration::ZERO,
-    }
-}
-
 pub struct ColorStackGame {
-    /// いまのラウンド(0始まり)。ラウンド間の待ち時間中は終えたラウンドのまま
-    round_index: u32,
-    params: RoundParams,
-    round: Round,
-    /// ラウンド間の待ち時間の残り。Noneならプレイ中
-    interval: Option<Duration>,
+    board: Board,
+    /// 直前にブロックを消してからの経過時間(応答時間の測定に使う)
+    elapsed_since_clear: Duration,
+    /// セッション開始からの経過時間。TIME_LIMITを超えたら終了
+    elapsed_total: Duration,
     tracker: ScoreTracker,
     feedback: AnswerFeedback,
 }
 
 impl ColorStackGame {
     pub fn new() -> Self {
-        let params = round_params(0);
         Self {
-            round_index: 0,
-            params,
-            round: new_round(&params),
-            interval: None,
+            board: new_board(&mut rand::thread_rng()),
+            elapsed_since_clear: Duration::ZERO,
+            elapsed_total: Duration::ZERO,
             tracker: ScoreTracker::new(),
             feedback: AnswerFeedback::new(),
         }
     }
 
-    /// round_index番目(0始まり)のラウンドを、そのラウンドのパラメータで始める
-    fn start_round(&mut self, round_index: u32) {
-        self.round_index = round_index;
-        self.params = round_params(round_index);
-        self.round = new_round(&self.params);
-        self.interval = None;
+    /// プレイ中(制限時間内)か
+    fn is_playing(&self) -> bool {
+        !self.is_finished()
     }
 
-    /// プレイ中(待ち時間中でもセッション終了後でもない)か
-    fn is_playing(&self) -> bool {
-        !self.is_finished() && self.interval.is_none()
+    /// 残り時間(秒・切り上げ)。開始直後を60秒、終了直前を1秒と見せ、0秒のまま押せる瞬間を作らない
+    fn remaining_seconds(&self) -> u64 {
+        let remaining = TIME_LIMIT.saturating_sub(self.elapsed_total);
+        remaining.as_nanos().div_ceil(1_000_000_000) as u64
     }
 
     /// index番目(0始まり)の色ボタンを押す。使わない色の番号やプレイ中以外は無視する
     fn press_button(&mut self, index: usize) {
-        if !self.is_playing() {
+        if !self.is_playing() || index >= LANE_COUNT {
             return;
         }
-        let Some(&color) = self.params.colors().get(index) else {
-            return;
-        };
-        let outcome = match self.params.rule {
-            // 列iのボタン=列iの専用色なので、ボタン番号がそのまま列になる
-            BoardRule::Lanes => press_lane(&mut self.round.board, index),
-            BoardRule::SingleColumn => press_single(
-                &mut rand::thread_rng(),
-                &mut self.round.board,
-                color,
-                self.params.colors(),
-            ),
-        };
-        if outcome == PressOutcome::Added {
-            // ミス: 一番上に1個積まれた(ラウンドは続き、スコアには記録しない)
+        // 列iのボタン=列iの専用色なので、ボタン番号がそのまま列になる
+        if press_lane(&mut self.board, index) == PressOutcome::Added {
+            // ミス: 一番上に1個積まれた(ゲームは続き、スコアには記録しない)
             audio::play_se(SeKind::ColorStackMiss);
             self.feedback.record(false, "+1段");
             return;
         }
         audio::play_se(SeKind::ColorStackClear);
-        if self.round.board.is_cleared() {
-            let seconds = self.round.elapsed.as_secs_f64();
-            self.tracker.record(true, seconds * 1000.0);
-            self.feedback.record(true, format!("CLEAR {seconds:.1}秒"));
-            self.finish_round();
-        }
-    }
-
-    /// 制限時間を超えたラウンドを失敗として終える
-    fn time_up(&mut self) {
-        audio::play_se(SeKind::Incorrect);
+        // 盤面を空にしないため、消えた列の一番上にすぐ同じ色を補充する
+        self.board.rows.push(lane_row(index));
         self.tracker
-            .record(false, self.params.time_limit.as_secs_f64() * 1000.0);
-        self.feedback.record(false, "時間切れ");
-        self.finish_round();
-    }
-
-    /// ラウンドを終える。最終ラウンドでなければ次のラウンドまでの待ち時間に入る
-    fn finish_round(&mut self) {
-        if !self.is_finished() {
-            self.interval = Some(ROUND_INTERVAL);
-        }
-    }
-
-    fn start_next_round(&mut self) {
-        self.start_round(self.round_index + 1);
-    }
-
-    /// いま何ラウンド目か(1始まり。待ち時間中・全ラウンド終了後は終えたラウンドのまま)
-    fn current_round_number(&self) -> u32 {
-        (self.round_index + 1).min(ROUNDS_PER_SESSION)
+            .record(true, self.elapsed_since_clear.as_secs_f64() * 1000.0);
+        self.feedback.record(true, "");
+        self.elapsed_since_clear = Duration::ZERO;
     }
 
     fn render_hud(&self, frame: &mut Frame, area: Rect) {
         let block = theme::panel(" ◆ シタケシ ")
-            .border_style(Style::default().fg(theme::flash_border_color(self.feedback.current())))
-            .title(
-                Line::from(Span::styled(
-                    format!(" {} ", self.params.label),
-                    Style::default()
-                        .fg(theme::ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .right_aligned(),
-            );
+            .border_style(Style::default().fg(theme::flash_border_color(self.feedback.current())));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -496,49 +315,33 @@ impl ColorStackGame {
             ])
             .split(inner);
 
-        let progress = Line::from(vec![
-            Span::styled(
-                format!(
-                    " ROUND {}/{ROUNDS_PER_SESSION} ",
-                    self.current_round_number()
-                ),
-                theme::title_style(),
-            ),
-            Span::styled(
-                theme::progress_bar(
-                    self.tracker.total(),
-                    ROUNDS_PER_SESSION,
-                    ROUNDS_PER_SESSION as usize,
-                ),
-                Style::default().fg(theme::ACCENT),
-            ),
+        let cleared = Line::from(vec![
+            Span::styled(" 消せた ", Style::default().fg(theme::MUTED)),
+            Span::styled(format!("{}枚", self.tracker.total()), theme::title_style()),
         ]);
-        frame.render_widget(Paragraph::new(progress), cols[0]);
+        frame.render_widget(Paragraph::new(cleared), cols[0]);
 
-        // 中央: 正誤表示中はそれを、プレイ中は経過時間と制限時間を出す
+        // 中央: 正誤表示中はそれを、プレイ中は残り時間を出す
         let center = match self.feedback.current() {
             Some(flash) => theme::flash_line(flash),
             None if self.is_playing() => Line::from(vec![
-                Span::styled("経過 ", Style::default().fg(theme::MUTED)),
+                Span::styled("残り ", Style::default().fg(theme::MUTED)),
                 Span::styled(
-                    format!("{:.1}秒", self.round.elapsed.as_secs_f64()),
+                    format!("{}秒", self.remaining_seconds()),
                     Style::default()
                         .fg(theme::HIGHLIGHT)
                         .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" / {}秒", self.params.time_limit.as_secs()),
-                    Style::default().fg(theme::MUTED),
                 ),
             ]),
             None => Line::from(""),
         };
         frame.render_widget(Paragraph::new(center).alignment(Alignment::Center), cols[1]);
 
+        // 無限に補充されるので、ミスで増えた分が分かる程度の参考値
         let remaining = Line::from(vec![
             Span::styled("残り ", Style::default().fg(theme::MUTED)),
             Span::styled(
-                format!("{}個", self.round.board.block_count()),
+                format!("{}個", self.board.block_count()),
                 Style::default()
                     .fg(theme::ACCENT_STRONG)
                     .add_modifier(Modifier::BOLD),
@@ -553,23 +356,11 @@ impl ColorStackGame {
 
     /// 盤面のブロックを描く。各列の一番下のブロックには対応する数字キーを重ねて、押す色を分かりやすくする
     fn render_board(&self, frame: &mut Frame, board: Rect) {
-        let grid = grid_geometry(
-            board,
-            self.params.columns(),
-            self.params.height,
-            self.params.max_row_height,
-        );
+        let grid = grid_geometry(board, LANE_COUNT, INITIAL_HEIGHT, MAX_ROW_HEIGHT);
         // 数字キーを重ねた列(列ごとに一番下のブロックにだけ出す)
-        let mut labeled = vec![false; self.round.board.columns];
+        let mut labeled = vec![false; self.board.columns];
         // 入りきらない上の段は描かない
-        for (level, row) in self
-            .round
-            .board
-            .rows
-            .iter()
-            .enumerate()
-            .take(grid.visible_rows)
-        {
+        for (level, row) in self.board.rows.iter().enumerate().take(grid.visible_rows) {
             for (column, cell) in row.iter().enumerate() {
                 let (Some(color), Some(rect)) = (cell, grid.cell_rect(column, level)) else {
                     continue;
@@ -604,8 +395,7 @@ impl ColorStackGame {
 
     /// colorのボタン番号(数字キー。1始まり)
     fn button_number(&self, color: StackColor) -> usize {
-        self.params
-            .colors()
+        StackColor::ALL
             .iter()
             .position(|&c| c == color)
             .map_or(0, |i| i + 1)
@@ -613,7 +403,7 @@ impl ColorStackGame {
 
     /// 色ボタンを横に等分して描く。分割はクリック判定のcolumn_indexと同じcolumn_bands
     fn render_buttons(&self, frame: &mut Frame, area: Rect) {
-        let colors = self.params.colors();
+        let colors = &StackColor::ALL;
         for (index, (band, color)) in theme::column_bands(area, colors.len() as u16)
             .into_iter()
             .zip(colors)
@@ -639,35 +429,6 @@ impl ColorStackGame {
                 .block(theme::sub_panel().border_style(Style::default().fg(color.color())));
             frame.render_widget(paragraph, band);
         }
-    }
-
-    /// ラウンド間の待ち時間中に盤面中央へ出す案内
-    fn render_interval_message(&self, frame: &mut Frame, board: Rect) {
-        // 盤面を消し切っていればクリア、そうでなければ時間切れ
-        let (headline, color) = if self.round.board.is_cleared() {
-            ("CLEAR!", theme::CORRECT)
-        } else {
-            ("TIME UP", theme::INCORRECT)
-        };
-        let next_index = self.round_index + 1;
-        let next_round = (next_index + 1).min(ROUNDS_PER_SESSION);
-        let lines = vec![
-            Line::from(Span::styled(
-                headline,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                format!("NEXT ROUND {next_round}/{ROUNDS_PER_SESSION}"),
-                theme::title_style(),
-            )),
-            Line::from(Span::styled(
-                round_params(next_index).label,
-                Style::default().fg(theme::ACCENT),
-            )),
-        ];
-        let area = theme::vertical_center(board, lines.len() as u16);
-        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
     }
 }
 
@@ -697,31 +458,19 @@ impl Game for ColorStackGame {
         if !contains(buttons, mouse.column, mouse.row) {
             return;
         }
-        let count = self.params.colors().len() as u16;
-        if let Some(index) = column_index(buttons, mouse.column, count) {
+        if let Some(index) = column_index(buttons, mouse.column, LANE_COUNT as u16) {
             self.press_button(index);
         }
     }
 
     fn update(&mut self, dt: Duration) {
         self.feedback.tick(dt);
-        if let Some(remaining) = self.interval {
-            let remaining = remaining.saturating_sub(dt);
-            if remaining.is_zero() {
-                self.start_next_round();
-            } else {
-                self.interval = Some(remaining);
-            }
-            return;
-        }
         if self.is_finished() {
             return;
         }
-        let limit = self.params.time_limit;
-        self.round.elapsed = (self.round.elapsed + dt).min(limit);
-        if self.round.elapsed >= limit {
-            self.time_up();
-        }
+        // 1回のtickで大きく越えても、表示・判定上は制限時間で止める
+        self.elapsed_total = (self.elapsed_total + dt).min(TIME_LIMIT);
+        self.elapsed_since_clear += dt;
     }
 
     fn render(&self, frame: &mut Frame, area: Rect) {
@@ -733,17 +482,13 @@ impl Game for ColorStackGame {
         // focus_panelは1セル枠なので、内側はboard_area(テストでの位置確認と共有)と一致する
         let board = board_area(area);
         if !board.is_empty() {
-            if self.interval.is_some() {
-                self.render_interval_message(frame, board);
-            } else {
-                self.render_board(frame, board);
-            }
+            self.render_board(frame, board);
         }
         self.render_buttons(frame, buttons);
     }
 
     fn is_finished(&self) -> bool {
-        self.tracker.total() >= ROUNDS_PER_SESSION
+        self.elapsed_total >= TIME_LIMIT
     }
 
     fn result(&self) -> GameResult {
@@ -754,6 +499,7 @@ impl Game for ColorStackGame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::feedback::{Verdict, FEEDBACK_HOLD};
     use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
     use rand::rngs::StdRng;
     use rand::SeedableRng;
@@ -762,19 +508,8 @@ mod tests {
 
     const AREA: Rect = Rect::new(0, 0, 100, 36);
 
-    /// 初期のブロック(最大のROUND2・ROUND3の72段)が全段、1段2行でも収まる縦長の画面
+    /// 初期のブロック(INITIAL_HEIGHT段)が全段、1段2行でも収まる縦長の画面
     const TALL_AREA: Rect = Rect::new(0, 0, 100, 160);
-
-    /// ROUND1の36段は1段2行で収まるが、72段は1段2行では収まらない(1段1行なら収まる)画面
-    const MID_AREA: Rect = Rect::new(0, 0, 100, 100);
-
-    /// ラウンドの番号(0始まり)
-    const ROUND1: u32 = 0;
-    const ROUND2: u32 = 1;
-    const ROUND3: u32 = 2;
-    const ALL_ROUNDS: [u32; 3] = [ROUND1, ROUND2, ROUND3];
-    /// 4列の盤面を使うラウンド
-    const LANE_ROUNDS: [u32; 2] = [ROUND1, ROUND2];
 
     fn left_click(column: u16, row: u16) -> MouseEvent {
         MouseEvent {
@@ -789,7 +524,7 @@ mod tests {
         game.handle_key(KeyEvent::from(KeyCode::Char(c)));
     }
 
-    /// 色colorの並び順(0始まり)。4列の盤面ではこの番号の列がcolorの専用列
+    /// 色colorの並び順(0始まり)。この番号の列がcolorの専用列
     fn color_index(color: StackColor) -> usize {
         StackColor::ALL.iter().position(|&c| c == color).unwrap()
     }
@@ -799,60 +534,9 @@ mod tests {
         char::from_digit(color_index(color) as u32 + 1, 10).unwrap()
     }
 
-    /// そのラウンドの盤面ルールで、下から順にcolorsを積んだ盤面。
-    /// 4列ならcolorの専用列に置き、1列ならそのまま積む
-    fn board_of(round: u32, colors: &[StackColor]) -> Board {
-        match round_params(round).rule {
-            BoardRule::Lanes => Board::lanes(colors.iter().map(|&c| color_index(c))),
-            BoardRule::SingleColumn => Board::single_column(colors.iter().copied()),
-        }
-    }
-
-    /// 最下段をcolorにし、その上に残りの色を1個ずつ積んだ盤面と、最下段を消した後の盤面
-    fn board_with_bottom_color(round: u32, color: StackColor) -> (Board, Board) {
-        let others: Vec<StackColor> = StackColor::ALL
-            .iter()
-            .copied()
-            .filter(|&c| c != color)
-            .collect();
-        let all: Vec<StackColor> = std::iter::once(color).chain(others.clone()).collect();
-        (board_of(round, &all), board_of(round, &others))
-    }
-
-    /// 1列の盤面の各段の色(下から)
-    fn colors_of_single_column(board: &Board) -> Vec<StackColor> {
-        board
-            .rows
-            .iter()
-            .map(|row| {
-                assert_eq!(row.len(), 1, "1列の盤面の各段は1セル: {row:?}");
-                row[0].expect("1列の盤面に空白セルは無い")
-            })
-            .collect()
-    }
-
-    /// 1列の盤面が「1列」「各段に1個」を満たすか
-    fn assert_single_column_invariants(board: &Board) {
-        assert_eq!(board.columns, 1);
-        for row in &board.rows {
-            assert_eq!(row.len(), 1, "各段は1列ぶんのセル");
-            assert!(row[0].is_some(), "各段にブロックが1個ある");
-        }
-    }
-
-    /// そのラウンドの盤面ルールに合った盤面か
-    fn assert_round_invariants(round: u32, board: &Board) {
-        match round_params(round).rule {
-            BoardRule::Lanes => assert_lane_invariants(board),
-            BoardRule::SingleColumn => assert_single_column_invariants(board),
-        }
-    }
-
-    /// 指定ラウンドから始めたゲーム
-    fn game_at(round_index: u32) -> ColorStackGame {
-        let mut game = ColorStackGame::new();
-        game.start_round(round_index);
-        game
+    /// column列目に対応する数字キー
+    fn key_for_lane(column: usize) -> char {
+        key_for(StackColor::ALL[column])
     }
 
     /// 確認しやすい盤面(下から: 赤の列,青の列,青の列,黄の列,緑の列)
@@ -860,9 +544,9 @@ mod tests {
         Board::lanes([0, 1, 1, 2, 3])
     }
 
-    /// 最下段にあるブロックの色。盤面が空ならNone
-    fn bottom_color(board: &Board) -> Option<StackColor> {
-        board.bottom_color()
+    /// 最下段のブロックがある列。盤面が空ならNone
+    fn bottom_lane(board: &Board) -> Option<usize> {
+        board.rows.first()?.iter().position(|c| c.is_some())
     }
 
     /// 最下段をcolumn列にし、その上に残りの列を1段ずつ積んだ盤面と、残りの列
@@ -870,6 +554,12 @@ mod tests {
         let others: Vec<usize> = (0..LANE_COUNT).filter(|&c| c != column).collect();
         let board = Board::lanes(std::iter::once(column).chain(others.iter().copied()));
         (board, others)
+    }
+
+    /// column列を最下段から消した直後の盤面(残りの列が下りてきて、一番上にcolumn列が補充される)
+    fn board_after_clearing_bottom_lane(column: usize) -> Board {
+        let (_, others) = board_with_bottom_lane(column);
+        Board::lanes(others.into_iter().chain(std::iter::once(column)))
     }
 
     /// 4列の盤面で、各段のブロックがどの列にあるか(下から)。ブロックが1段に1個である前提
@@ -881,6 +571,19 @@ mod tests {
                 let lanes: Vec<usize> = (0..row.len()).filter(|&c| row[c].is_some()).collect();
                 assert_eq!(lanes.len(), 1, "1段にブロックは1個だけ: {row:?}");
                 lanes[0]
+            })
+            .collect()
+    }
+
+    /// 各列にあるブロックの数(列の高さ)
+    fn lane_heights(board: &Board) -> Vec<usize> {
+        (0..LANE_COUNT)
+            .map(|column| {
+                board
+                    .rows
+                    .iter()
+                    .filter(|row| row[column].is_some())
+                    .count()
             })
             .collect()
     }
@@ -903,18 +606,16 @@ mod tests {
         }
     }
 
-    /// 最下段のブロックの色をキーで押し続けて、ラウンドをクリアする。
-    /// 4列でも1列でも、最下段の色のボタンを押せば必ず1段消える
-    fn solve_round(game: &mut ColorStackGame) {
-        while let Some(color) = bottom_color(&game.round.board) {
-            press_key(game, key_for(color));
-        }
+    /// 最下段の列のボタンを押す(必ず1個消える)
+    fn press_bottom(game: &mut ColorStackGame) {
+        let column = bottom_lane(&game.board).expect("無限生成なので盤面は空にならない");
+        press_key(game, key_for_lane(column));
     }
 
-    /// 今のラウンドをクリアし、待ち時間を終えて次のラウンドに進める
-    fn clear_and_advance(game: &mut ColorStackGame) {
-        solve_round(game);
-        game.update(ROUND_INTERVAL);
+    /// 最下段ではない列のボタンを押す(必ずミスになる)
+    fn press_wrong(game: &mut ColorStackGame) {
+        let bottom = bottom_lane(&game.board).expect("盤面は空にならない");
+        press_key(game, key_for_lane((bottom + 1) % LANE_COUNT));
     }
 
     /// 画面を描画してバッファを返す
@@ -946,128 +647,30 @@ mod tests {
             .collect()
     }
 
-    /// rect(1個のマス)の全セルの背景色がexpectedであることを確かめる
-    fn assert_cell_bg(buffer: &ratatui::buffer::Buffer, rect: Rect, expected: Color, what: &str) {
-        for y in rect.y..rect.bottom() {
-            for x in rect.x..rect.right() {
-                assert_eq!(buffer[(x, y)].bg, expected, "{what} ({x},{y})");
-            }
-        }
+    /// 盤面のマス目
+    fn grid_for(board: Rect) -> GridGeometry {
+        grid_geometry(board, LANE_COUNT, INITIAL_HEIGHT, MAX_ROW_HEIGHT)
     }
 
-    /// あるラウンドの盤面のマス目
-    fn grid_for(round_index: u32, board: Rect) -> GridGeometry {
-        let p = round_params(round_index);
-        grid_geometry(board, p.columns(), p.height, p.max_row_height)
-    }
-
-    // --- ラウンドごとのパラメータ ---
-
-    #[test]
-    fn round1_and_round2_use_the_four_lane_board_with_dedicated_colors() {
-        for round in LANE_ROUNDS {
-            let p = round_params(round);
-            assert_eq!(p.rule, BoardRule::Lanes, "round={round}: 4列ルール");
-            assert_eq!(p.columns(), LANE_COUNT, "round={round}: 4列");
-            assert_eq!(p.color_count, 4, "round={round}: 4色(=4ボタン)");
-            let board = new_board(&mut StdRng::seed_from_u64(0), &p);
-            assert_eq!(board.columns, LANE_COUNT, "round={round}: 盤面も4列");
-            assert_lane_invariants(&board);
-        }
-    }
-
-    #[test]
-    fn round3_uses_the_single_column_board_with_four_colors() {
-        let p = round_params(ROUND3);
-        assert_eq!(p.rule, BoardRule::SingleColumn, "ROUND3は1列ルール");
-        assert_eq!(p.columns(), 1, "ROUND3は1列");
-        assert_eq!(p.color_count, 4, "パレットは4色(=4ボタン)");
-        for seed in 0..20 {
-            let board = new_board(&mut StdRng::seed_from_u64(seed), &p);
-            assert_eq!(board.columns, 1, "seed={seed}: 盤面も1列");
-            assert_single_column_invariants(&board);
-        }
-    }
-
-    #[test]
-    fn rounds_have_36_72_and_72_rows() {
-        let heights: Vec<usize> = ALL_ROUNDS.iter().map(|&r| round_params(r).height).collect();
-        assert_eq!(heights, vec![36, 72, 72]);
-        assert_eq!(
-            round_params(ROUND2).height,
-            round_params(ROUND1).height * 2,
-            "ROUND2はROUND1の2倍"
-        );
-        assert_eq!(
-            round_params(ROUND3).height,
-            round_params(ROUND2).height,
-            "ROUND3はROUND2と同じ段数"
+    fn assert_latency(result: &GameResult, expected_ms: f64) {
+        assert!(
+            (result.avg_latency_ms - expected_ms).abs() < 1e-6,
+            "avg_latency_ms={} expected={expected_ms}",
+            result.avg_latency_ms
         );
     }
 
+    // --- 定数 ---
+
     #[test]
-    fn round3_has_the_same_time_limit_as_round2() {
-        assert_eq!(
-            round_params(ROUND3).time_limit,
-            round_params(ROUND2).time_limit
-        );
-        assert_eq!(round_params(ROUND3).time_limit, Duration::from_secs(180));
+    fn time_limit_is_60_seconds() {
+        assert_eq!(TIME_LIMIT, Duration::from_secs(60));
     }
 
     #[test]
-    fn time_limit_is_proportional_to_the_number_of_rows() {
-        // 1段あたりの目安時間(ROUND1は従来通り36段で90秒)で、段数が倍になれば制限時間も倍になる
-        assert_eq!(TIME_PER_ROW, Duration::from_millis(2500));
-        let limits: Vec<Duration> = ALL_ROUNDS
-            .iter()
-            .map(|&r| round_params(r).time_limit)
-            .collect();
-        assert_eq!(
-            limits,
-            vec![
-                Duration::from_secs(90),
-                Duration::from_secs(180),
-                Duration::from_secs(180)
-            ]
-        );
-        for round in ALL_ROUNDS {
-            let p = round_params(round);
-            assert_eq!(
-                p.time_limit,
-                TIME_PER_ROW * p.height as u32,
-                "round={round}: 段数×1段あたりの時間"
-            );
-        }
-    }
-
-    #[test]
-    fn every_round_has_the_same_row_height_limit() {
-        for round in ALL_ROUNDS {
-            assert_eq!(round_params(round).max_row_height, MAX_ROW_HEIGHT);
-        }
-    }
-
-    #[test]
-    fn round_params_beyond_the_last_round_stay_at_the_last_round() {
-        assert_eq!(round_params(ROUNDS_PER_SESSION), round_params(ROUND3));
-        assert_eq!(round_params(100), round_params(ROUND3));
-    }
-
-    #[test]
-    fn each_round_has_a_distinct_label() {
-        let labels: HashSet<&str> = ALL_ROUNDS.iter().map(|&r| round_params(r).label).collect();
-        assert_eq!(labels.len(), ALL_ROUNDS.len());
-    }
-
-    #[test]
-    fn labels_tell_the_number_of_columns_and_rows() {
-        assert_eq!(round_params(ROUND1).label, "4列 36段");
-        assert_eq!(round_params(ROUND2).label, "4列 72段");
-        assert_eq!(
-            round_params(ROUND3).label,
-            "1列 72段",
-            "ROUND3は1列と分かる"
-        );
+    fn initial_height_is_36_rows_on_four_lanes() {
+        assert_eq!(INITIAL_HEIGHT, 36);
+        assert_eq!(LANE_COUNT, 4);
     }
 
     #[test]
@@ -1080,87 +683,58 @@ mod tests {
     // --- 初期盤面 ---
 
     #[test]
-    fn lane_board_has_exactly_one_block_per_row() {
-        for round in LANE_ROUNDS {
-            let p = round_params(round);
-            for seed in 0..50 {
-                let board = new_board(&mut StdRng::seed_from_u64(seed), &p);
-                assert_eq!(
-                    board.rows.len(),
-                    p.height,
-                    "round={round} seed={seed}: 初期の高さぶんの段"
-                );
-                assert_eq!(
-                    board.block_count(),
-                    p.height,
-                    "1段に1個なので段数=ブロック数"
-                );
-                assert_lane_invariants(&board);
-            }
-        }
-    }
-
-    #[test]
-    fn lane_board_uses_every_column_at_least_once() {
-        for round in LANE_ROUNDS {
-            let p = round_params(round);
-            for seed in 0..300 {
-                let board = new_board(&mut StdRng::seed_from_u64(seed), &p);
-                let used: HashSet<usize> = lane_of_each_row(&board).into_iter().collect();
-                assert_eq!(
-                    used.len(),
-                    LANE_COUNT,
-                    "round={round} seed={seed}: 全列が最低1回"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn single_column_board_has_one_block_per_row_and_uses_every_color() {
-        let p = round_params(ROUND3);
-        for seed in 0..300 {
-            let board = new_board(&mut StdRng::seed_from_u64(seed), &p);
+    fn new_board_has_four_lanes_and_exactly_one_block_per_row() {
+        for seed in 0..50 {
+            let board = new_board(&mut StdRng::seed_from_u64(seed));
+            assert_eq!(board.columns, LANE_COUNT, "seed={seed}: 4列");
             assert_eq!(
                 board.rows.len(),
-                p.height,
+                INITIAL_HEIGHT,
                 "seed={seed}: 初期の高さぶんの段"
             );
-            assert_eq!(board.block_count(), p.height, "1段に1個");
-            assert_single_column_invariants(&board);
-            let used: HashSet<StackColor> = colors_of_single_column(&board).into_iter().collect();
             assert_eq!(
-                used.len(),
-                StackColor::ALL.len(),
-                "seed={seed}: 全色が最低1回"
+                board.block_count(),
+                INITIAL_HEIGHT,
+                "1段に1個なので段数=ブロック数"
             );
+            assert_lane_invariants(&board);
         }
     }
 
     #[test]
-    fn board_is_random_in_every_round() {
-        for round in ALL_ROUNDS {
-            let p = round_params(round);
-            let boards: HashSet<Board> = (0..5)
-                .map(|seed| new_board(&mut StdRng::seed_from_u64(seed), &p))
-                .collect();
-            assert!(
-                boards.len() > 1,
-                "round={round}: シードが違えば盤面も変わる"
-            );
+    fn new_board_uses_every_column_at_least_once() {
+        for seed in 0..300 {
+            let board = new_board(&mut StdRng::seed_from_u64(seed));
+            let used: HashSet<usize> = lane_of_each_row(&board).into_iter().collect();
+            assert_eq!(used.len(), LANE_COUNT, "seed={seed}: 全列が最低1回");
         }
     }
 
     #[test]
-    fn each_round_starts_with_its_initial_number_of_blocks() {
-        let counts: Vec<usize> = ALL_ROUNDS
-            .iter()
-            .map(|&r| game_at(r).round.board.block_count())
+    fn new_board_is_random() {
+        let boards: HashSet<Board> = (0..5)
+            .map(|seed| new_board(&mut StdRng::seed_from_u64(seed)))
             .collect();
-        assert_eq!(counts, vec![36, 72, 72]);
+        assert!(boards.len() > 1, "シードが違えば盤面も変わる");
     }
 
-    // --- 消去・追加ルール(4列: ROUND1・ROUND2) ---
+    #[test]
+    fn new_game_starts_playing_with_a_full_lane_board_and_no_records() {
+        let game = ColorStackGame::new();
+        assert_eq!(game.board.columns, LANE_COUNT);
+        assert_eq!(game.board.block_count(), INITIAL_HEIGHT);
+        assert_lane_invariants(&game.board);
+        assert!(game.elapsed_total.is_zero());
+        assert!(game.elapsed_since_clear.is_zero());
+        assert!(game.is_playing());
+        assert!(!game.is_finished());
+        let result = game.result();
+        assert_eq!(result.game_id, GAME_ID);
+        assert_eq!(result.difficulty, SESSION_DIFFICULTY);
+        assert_eq!(result.total, 0);
+    }
+
+    // --- 消去・追加ルール(press_lane) ---
 
     #[test]
     fn pressing_the_lane_of_the_bottom_row_removes_it_and_drops_the_rest() {
@@ -1238,7 +812,6 @@ mod tests {
     fn pressing_any_lane_on_an_empty_board_is_a_miss() {
         for column in 0..LANE_COUNT {
             let mut board = Board::lanes([]);
-            assert!(board.is_cleared());
             assert_eq!(
                 press_lane(&mut board, column),
                 PressOutcome::Added,
@@ -1268,43 +841,28 @@ mod tests {
 
     #[test]
     fn lane_invariants_hold_after_many_random_presses() {
-        for round in LANE_ROUNDS {
-            let p = round_params(round);
-            let mut rng = StdRng::seed_from_u64(7);
-            let mut board = new_board(&mut rng, &p);
-            for _ in 0..500 {
-                let column = rng.gen_range(0..LANE_COUNT);
-                let before = board.block_count();
-                let bottom_lane = lane_of_each_row(&board).first().copied();
-                let outcome = press_lane(&mut board, column);
-                assert_eq!(
-                    outcome == PressOutcome::Removed,
-                    bottom_lane == Some(column),
-                    "消えるのは押した列が最下段の列と一致した時だけ"
-                );
-                match outcome {
-                    PressOutcome::Removed => assert_eq!(board.block_count(), before - 1),
-                    PressOutcome::Added => assert_eq!(board.block_count(), before + 1),
-                }
-                assert_lane_invariants(&board);
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut board = new_board(&mut rng);
+        for _ in 0..500 {
+            let column = rng.gen_range(0..LANE_COUNT);
+            let before = board.block_count();
+            let bottom = bottom_lane(&board);
+            let outcome = press_lane(&mut board, column);
+            assert_eq!(
+                outcome == PressOutcome::Removed,
+                bottom == Some(column),
+                "消えるのは押した列が最下段の列と一致した時だけ"
+            );
+            match outcome {
+                PressOutcome::Removed => assert_eq!(board.block_count(), before - 1),
+                PressOutcome::Added => assert_eq!(board.block_count(), before + 1),
             }
+            assert_lane_invariants(&board);
         }
     }
 
     #[test]
-    fn lane_board_is_cleared_when_every_lane_is_empty() {
-        let mut board = Board::lanes([0, 1, 2, 3]);
-        for column in [0, 1, 2] {
-            assert_eq!(press_lane(&mut board, column), PressOutcome::Removed);
-            assert!(!board.is_cleared());
-        }
-        assert_eq!(press_lane(&mut board, 3), PressOutcome::Removed);
-        assert!(board.is_cleared());
-        assert_eq!(board.block_count(), 0);
-    }
-
-    #[test]
-    fn pressing_lanes_from_the_top_down_does_not_clear_the_board() {
+    fn pressing_lanes_from_the_top_down_removes_only_the_bottom_row() {
         // 下から: 列0, 列1, 列2, 列3 を上から(逆順に)押すと、最下段の列0以外は全部ミスになる
         let mut board = Board::lanes([0, 1, 2, 3]);
         let outcomes: Vec<PressOutcome> = [3, 2, 1, 0]
@@ -1320,578 +878,305 @@ mod tests {
                 PressOutcome::Removed
             ]
         );
-        assert!(!board.is_cleared());
         assert_eq!(lane_of_each_row(&board), vec![1, 2, 3, 3, 2, 1]);
         assert_lane_invariants(&board);
     }
 
-    // --- 消去・追加ルール(1列: ROUND3) ---
+    // --- 正解: 即座に補充する ---
 
     #[test]
-    fn single_press_of_the_bottom_color_removes_it_and_drops_the_rest() {
-        let mut rng = StdRng::seed_from_u64(0);
-        let mut board = Board::single_column([Red, Blue, Red]);
-        assert_eq!(
-            press_single(&mut rng, &mut board, Red, &StackColor::ALL),
-            PressOutcome::Removed
-        );
-        assert_eq!(
-            colors_of_single_column(&board),
-            vec![Blue, Red],
-            "最下段の赤が消え、上のブロックが1段ずつ下りてくる"
-        );
-        assert_eq!(
-            press_single(&mut rng, &mut board, Blue, &StackColor::ALL),
-            PressOutcome::Removed
-        );
-        assert_eq!(colors_of_single_column(&board), vec![Red]);
-        assert_single_column_invariants(&board);
-    }
-
-    #[test]
-    fn single_press_of_a_color_used_only_above_the_bottom_is_a_miss() {
-        // 下から: 青,赤。赤は2段目にあるが、最下段(青)と違うので消えない
-        for seed in 0..20 {
-            let mut rng = StdRng::seed_from_u64(seed);
-            let mut board = Board::single_column([Blue, Red]);
+    fn correct_press_refills_the_cleared_lane_on_top_immediately() {
+        for column in 0..LANE_COUNT {
+            let mut game = ColorStackGame::new();
+            let (board, _) = board_with_bottom_lane(column);
+            game.board = board;
+            let heights_before = lane_heights(&game.board);
+            press_key(&mut game, key_for_lane(column));
             assert_eq!(
-                press_single(&mut rng, &mut board, Red, &StackColor::ALL),
-                PressOutcome::Added,
-                "seed={seed}"
+                game.board,
+                board_after_clearing_bottom_lane(column),
+                "列{column}: 最下段が消えて残りが詰まり、一番上に同じ列が補充される"
             );
-            let colors = colors_of_single_column(&board);
-            assert_eq!(colors.len(), 3, "一番上に1個増える");
-            assert_eq!(&colors[..2], &[Blue, Red], "既存のブロックは変わらない");
-            assert_single_column_invariants(&board);
+            assert_eq!(
+                lane_heights(&game.board),
+                heights_before,
+                "列{column}: どの列の高さも変わらない"
+            );
+            assert_lane_invariants(&game.board);
         }
     }
 
     #[test]
-    fn single_miss_adds_a_random_palette_color_on_top() {
-        let before = Board::single_column([Yellow, Green, Blue]);
-        let mut added = HashSet::new();
-        for seed in 0..200 {
-            let mut rng = StdRng::seed_from_u64(seed);
-            let mut board = before.clone();
-            assert_eq!(
-                press_single(&mut rng, &mut board, Red, &StackColor::ALL),
-                PressOutcome::Added
-            );
-            assert_eq!(
-                &board.rows[..before.rows.len()],
-                before.rows.as_slice(),
-                "既存の段は1個も変わらない"
-            );
-            let top = colors_of_single_column(&board).pop().unwrap();
-            assert!(StackColor::ALL.contains(&top), "追加されるのはパレットの色");
-            added.insert(top);
-        }
-        assert_eq!(
-            added.len(),
-            StackColor::ALL.len(),
-            "押した色に関係なくパレットからランダムに選ぶ"
-        );
-    }
-
-    #[test]
-    fn single_miss_picks_only_from_the_given_palette() {
-        for seed in 0..50 {
-            let mut rng = StdRng::seed_from_u64(seed);
-            let mut board = Board::single_column([Yellow]);
-            press_single(&mut rng, &mut board, Red, &[Green]);
-            assert_eq!(colors_of_single_column(&board), vec![Yellow, Green]);
-        }
-    }
-
-    #[test]
-    fn single_press_on_an_empty_board_is_a_miss() {
-        for color in StackColor::ALL {
-            let mut rng = StdRng::seed_from_u64(3);
-            let mut board = Board::single_column([]);
-            assert!(board.is_cleared());
-            assert_eq!(
-                press_single(&mut rng, &mut board, color, &StackColor::ALL),
-                PressOutcome::Added,
-                "{color:?}: 空の盤面ではミス"
-            );
-            assert_eq!(board.block_count(), 1);
-            assert_single_column_invariants(&board);
-        }
-    }
-
-    #[test]
-    fn single_column_board_is_cleared_by_pressing_the_bottom_color_each_time() {
-        let mut rng = StdRng::seed_from_u64(0);
-        let mut board = Board::single_column([Green, Green, Red, Yellow]);
-        for color in [Green, Green, Red] {
-            assert_eq!(
-                press_single(&mut rng, &mut board, color, &StackColor::ALL),
-                PressOutcome::Removed
-            );
-            assert!(!board.is_cleared());
-        }
-        assert_eq!(
-            press_single(&mut rng, &mut board, Yellow, &StackColor::ALL),
-            PressOutcome::Removed
-        );
-        assert!(board.is_cleared());
-        assert_eq!(board.block_count(), 0);
-    }
-
-    #[test]
-    fn single_column_invariants_hold_after_many_random_presses() {
-        let p = round_params(ROUND3);
-        let mut rng = StdRng::seed_from_u64(11);
-        let mut board = new_board(&mut rng, &p);
-        for _ in 0..500 {
-            let color = StackColor::ALL[rng.gen_range(0..StackColor::ALL.len())];
-            let before = board.block_count();
-            let bottom = board.bottom_color();
-            let outcome = press_single(&mut rng, &mut board, color, p.colors());
-            assert_eq!(
-                outcome == PressOutcome::Removed,
-                bottom == Some(color),
-                "消えるのは押した色が最下段の色と一致した時だけ"
-            );
-            match outcome {
-                PressOutcome::Removed => assert_eq!(board.block_count(), before - 1),
-                PressOutcome::Added => assert_eq!(board.block_count(), before + 1),
-            }
-            assert_single_column_invariants(&board);
-        }
-    }
-
-    // --- セッションの進行 ---
-
-    #[test]
-    fn new_game_starts_at_round1_with_a_full_lane_board_and_no_records() {
-        let game = ColorStackGame::new();
-        assert_eq!(game.round_index, ROUND1);
-        assert_eq!(game.params, round_params(ROUND1));
-        assert_eq!(game.round.board.columns, LANE_COUNT, "ROUND1は4列");
-        assert_eq!(game.round.board.block_count(), round_params(ROUND1).height);
-        assert_lane_invariants(&game.round.board);
-        assert!(game.round.elapsed.is_zero());
-        assert!(game.interval.is_none());
-        assert_eq!(game.result().total, 0);
-        assert!(!game.is_finished());
-    }
-
-    #[test]
-    fn session_goes_round1_then_round2_then_round3() {
+    fn correct_press_keeps_the_total_height_constant_forever() {
         let mut game = ColorStackGame::new();
-        assert_eq!(game.round.board.columns, LANE_COUNT);
-
-        clear_and_advance(&mut game);
-        assert_eq!(game.round_index, ROUND2);
-        assert_eq!(game.params, round_params(ROUND2));
-        assert_eq!(game.round.board.columns, LANE_COUNT, "ROUND2も4列");
-        assert_eq!(game.round.board.block_count(), 72);
-        assert_lane_invariants(&game.round.board);
-
-        clear_and_advance(&mut game);
-        assert_eq!(game.round_index, ROUND3);
-        assert_eq!(game.params, round_params(ROUND3));
-        assert_eq!(game.round.board.columns, 1, "ROUND3は1列");
-        assert_eq!(
-            game.round.board.block_count(),
-            72,
-            "ROUND3はROUND2と同じ72段"
-        );
-        assert_single_column_invariants(&game.round.board);
-        assert!(!game.is_finished());
-
-        solve_round(&mut game);
-        assert!(game.is_finished());
-        let result = game.result();
-        assert_eq!(result.game_id, GAME_ID);
-        assert_eq!(result.difficulty, SESSION_DIFFICULTY);
-        assert_eq!(result.total, ROUNDS_PER_SESSION);
-        assert_eq!(result.correct, ROUNDS_PER_SESSION);
+        for i in 0..500 {
+            press_bottom(&mut game);
+            assert_eq!(
+                game.board.block_count(),
+                INITIAL_HEIGHT,
+                "{i}回目: 消しても補充されるので段数は一定"
+            );
+            assert_eq!(game.board.rows.len(), INITIAL_HEIGHT);
+            assert_lane_invariants(&game.board);
+        }
+        assert!(!game.board.rows.is_empty(), "盤面は空にならない");
+        assert!(!game.is_finished(), "消し続けても時間内なら続く");
+        assert_eq!(game.result().total, 500);
     }
 
     #[test]
-    fn session_finishes_after_three_rounds_with_mixed_outcomes() {
+    fn correct_press_is_recorded_as_correct_with_correct_feedback() {
         let mut game = ColorStackGame::new();
-        // ROUND1: クリア / ROUND2: 時間切れ / ROUND3: クリア
-        clear_and_advance(&mut game);
-        assert!(!game.is_finished());
-        game.update(round_params(ROUND2).time_limit);
-        game.update(ROUND_INTERVAL);
-        assert!(!game.is_finished());
-        assert_eq!(game.round_index, ROUND3, "時間切れでも次のラウンドへ進む");
-        solve_round(&mut game);
-        assert!(game.is_finished());
-        let result = game.result();
-        assert_eq!(result.total, ROUNDS_PER_SESSION);
-        assert_eq!(result.correct, 2);
-    }
-
-    #[test]
-    fn next_round_starts_with_a_fresh_full_board_after_interval() {
-        let mut game = ColorStackGame::new();
-        // ミスで伸ばしてから時間切れにしても、次のラウンドは初期の高さから
-        game.round.board = Board::lanes([0]);
-        for _ in 0..20 {
-            press_key(&mut game, key_for(Green));
-        }
-        game.update(round_params(ROUND1).time_limit);
-        assert!(game.interval.is_some());
-        game.update(ROUND_INTERVAL);
-        assert!(game.interval.is_none());
-        assert!(game.round.elapsed.is_zero(), "経過時間も0から");
-        assert_eq!(game.round.board.block_count(), round_params(ROUND2).height);
-    }
-
-    #[test]
-    fn inputs_are_ignored_and_time_stops_during_interval() {
-        let mut game = ColorStackGame::new();
-        solve_round(&mut game);
-        let board_before = game.round.board.clone();
-        game.round.board = Board::lanes([0, 1]);
-        press_key(&mut game, key_for(Red));
-        press_key(&mut game, key_for(Yellow));
-        assert_eq!(
-            game.round.board,
-            Board::lanes([0, 1]),
-            "待ち時間中のキーは無視"
-        );
-        game.round.board = board_before;
-
-        game.update(ROUND_INTERVAL / 2);
-        game.update(ROUND_INTERVAL / 2);
-        game.update(Duration::from_millis(700));
-        solve_round(&mut game);
-        let result = game.result();
-        // 2ラウンド目の記録は、ラウンド開始後に進めた700msだけ(1ラウンド目は0ms)
-        assert_eq!(result.total, 2);
-        assert!((result.avg_latency_ms - 350.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn inputs_and_time_after_session_finished_are_ignored() {
-        let mut game = ColorStackGame::new();
-        for _ in 0..ROUNDS_PER_SESSION {
-            clear_and_advance(&mut game);
-        }
-        assert!(game.is_finished());
-        game.round.board = sample_board();
-        press_key(&mut game, key_for(Red));
-        press_key(&mut game, key_for(Blue));
-        game.update(Duration::from_secs(600));
-        let button = buttons_area(AREA);
-        game.handle_mouse(left_click(button.x + 1, button.y + 1), AREA);
-        assert_eq!(game.round.board, sample_board());
-        assert_eq!(game.result().total, ROUNDS_PER_SESSION);
-    }
-
-    // --- キー入力 ---
-
-    #[test]
-    fn number_key_of_the_bottom_color_removes_the_bottom_row() {
-        for round in ALL_ROUNDS {
-            for color in StackColor::ALL {
-                let mut game = game_at(round);
-                let (board, after) = board_with_bottom_color(round, color);
-                game.round.board = board;
-                press_key(&mut game, key_for(color));
-                assert_eq!(
-                    game.round.board, after,
-                    "round={round} {color:?}: 最下段が消え、残りが詰まる"
-                );
-                assert_round_invariants(round, &game.round.board);
-                assert_eq!(
-                    game.feedback.current().map(|f| f.verdict),
-                    None,
-                    "round={round} {color:?}: 消えた時はミス表示しない"
-                );
-                assert_eq!(game.result().total, 0);
-            }
-        }
-    }
-
-    #[test]
-    fn number_key_of_the_bottom_lane_removes_the_bottom_row() {
-        for round in LANE_ROUNDS {
-            for column in 0..LANE_COUNT {
-                let mut game = game_at(round);
-                let (board, others) = board_with_bottom_lane(column);
-                game.round.board = board;
-                press_key(&mut game, key_for(StackColor::ALL[column]));
-                assert_eq!(
-                    lane_of_each_row(&game.round.board),
-                    others,
-                    "round={round} 列{column}: 最下段が消え、残りが詰まる"
-                );
-                assert_eq!(
-                    game.feedback.current().map(|f| f.verdict),
-                    None,
-                    "round={round} 列{column}: 消えた時はミス表示しない"
-                );
-                assert_eq!(game.result().total, 0);
-            }
-        }
-    }
-
-    #[test]
-    fn round3_number_key_of_a_color_not_at_the_bottom_is_a_miss_adding_a_random_color() {
-        let mut added = HashSet::new();
-        for _ in 0..200 {
-            let mut game = game_at(ROUND3);
-            // 下から: 赤,青,黄,緑。最下段は赤なので、青・黄・緑はミス
-            let before = Board::single_column([Red, Blue, Yellow, Green]);
-            for color in [Blue, Yellow, Green] {
-                game.round.board = before.clone();
-                press_key(&mut game, key_for(color));
-                let colors = colors_of_single_column(&game.round.board);
-                assert_eq!(colors.len(), 5, "{color:?}: 何も消えず一番上に1個増える");
-                assert_eq!(
-                    &colors[..4],
-                    &[Red, Blue, Yellow, Green],
-                    "既存は変わらない"
-                );
-                added.insert(colors[4]);
-                assert_eq!(
-                    game.feedback.current().map(|f| f.verdict),
-                    Some(crate::game::feedback::Verdict::Incorrect),
-                    "{color:?}: 最下段と違う色はミス"
-                );
-                assert_eq!(game.result().total, 0, "ミスはスコアに記録しない");
-                assert!(game.interval.is_none(), "ミスしてもラウンドは続く");
-            }
-        }
-        assert_eq!(
-            added.len(),
-            StackColor::ALL.len(),
-            "ミスで積まれる色はパレット(4色)からランダム"
-        );
-    }
-
-    #[test]
-    fn round3_is_cleared_after_misses_by_pressing_the_bottom_color() {
-        let mut game = game_at(ROUND3);
-        game.update(Duration::from_millis(2500));
-        game.round.board = Board::single_column([Yellow, Red]);
-        // 最下段は黄。緑を押すとミスで一番上にランダムな色が1個増える
-        press_key(&mut game, key_for(Green));
-        assert_eq!(game.round.board.block_count(), 3);
-        // 以後は最下段の色を押し続ければクリアできる
-        let mut presses = 0;
-        while let Some(color) = bottom_color(&game.round.board) {
-            press_key(&mut game, key_for(color));
-            presses += 1;
-        }
-        assert_eq!(presses, 3, "ミスで増えた分も1回ずつで消える");
+        press_bottom(&mut game);
         let result = game.result();
         assert_eq!(result.total, 1);
-        assert_eq!(result.correct, 1, "クリアが記録される");
-        assert!((result.avg_latency_ms - 2500.0).abs() < 1e-9);
+        assert_eq!(result.correct, 1);
+        assert_eq!(
+            game.feedback.current().map(|f| f.verdict),
+            Some(Verdict::Correct)
+        );
     }
 
-    #[test]
-    fn number_key_of_a_lane_not_at_the_bottom_is_a_miss() {
-        for round in LANE_ROUNDS {
-            for column in 1..LANE_COUNT {
-                let mut game = game_at(round);
-                game.round.board = Board::lanes([0, 1, 2, 3]);
-                press_key(&mut game, key_for(StackColor::ALL[column]));
-                assert_eq!(
-                    lane_of_each_row(&game.round.board),
-                    vec![0, 1, 2, 3, column],
-                    "round={round} 列{column}: 何も消えず、押した列が一番上に1個増える"
-                );
-                assert_eq!(
-                    game.feedback.current().map(|f| f.verdict),
-                    Some(crate::game::feedback::Verdict::Incorrect),
-                    "round={round} 列{column}: 順番が来ていない列はミス"
-                );
-                assert_eq!(game.result().total, 0);
-            }
-        }
-    }
+    // --- ミス: 1段増えるが詰まない ---
 
     #[test]
-    fn full_play_pressing_the_bottom_color_every_time_clears_every_round_without_misses() {
-        for round in ALL_ROUNDS {
-            for _ in 0..20 {
-                let mut game = game_at(round);
-                let height = game.round.board.block_count();
-                assert_eq!(height, round_params(round).height);
-                let mut presses = 0;
-                while let Some(color) = bottom_color(&game.round.board) {
-                    press_key(&mut game, key_for(color));
-                    presses += 1;
-                    assert!(
-                        presses <= height,
-                        "round={round}: 最下段だけ押せばミスは起きない"
-                    );
-                    assert_round_invariants(round, &game.round.board);
-                }
-                assert_eq!(presses, height, "round={round}: 1回押すごとに1段消える");
-                let result = game.result();
-                assert_eq!(result.total, 1);
-                assert_eq!(result.correct, 1, "round={round}: クリアが記録される");
-                assert!(game.interval.is_some());
-            }
-        }
-    }
-
-    #[test]
-    fn full_play_pressing_from_the_top_down_does_not_clear() {
-        for round in LANE_ROUNDS {
-            let mut game = game_at(round);
-            // 下から: 黄, 赤, 緑, 青
-            game.round.board = Board::lanes([2, 0, 3, 1]);
-            // 上の段から順に(逆順に)押す: 青・緑・赤はミスで一番上に増え、最後の黄だけ最下段と一致して消える
-            for color in [Blue, Green, Red, Yellow] {
-                press_key(&mut game, key_for(color));
-            }
-            assert!(
-                !game.round.board.is_cleared(),
-                "round={round}: 逆順に押しても盤面は空にならない"
+    fn miss_adds_one_row_to_the_pressed_lane_and_is_not_recorded() {
+        for column in 1..LANE_COUNT {
+            let mut game = ColorStackGame::new();
+            game.board = Board::lanes([0, 1, 2, 3]);
+            press_key(&mut game, key_for_lane(column));
+            assert_eq!(
+                lane_of_each_row(&game.board),
+                vec![0, 1, 2, 3, column],
+                "列{column}: 何も消えず、押した列が一番上に1個増える"
             );
-            assert_eq!(lane_of_each_row(&game.round.board), vec![0, 3, 1, 1, 3, 0]);
-            assert_eq!(game.result().total, 0, "クリアは記録されない");
-            assert!(game.interval.is_none(), "ラウンドは続く");
-            assert_lane_invariants(&game.round.board);
-        }
-    }
-
-    #[test]
-    fn wrong_color_press_during_full_play_is_recorded_as_a_miss() {
-        for round in LANE_ROUNDS {
-            let mut game = game_at(round);
-            game.round.board = Board::lanes([2, 0, 3]);
-            // 最下段は黄。赤を押すとミス(赤の段が一番上に増える)
-            press_key(&mut game, key_for(Red));
-            assert_eq!(lane_of_each_row(&game.round.board), vec![2, 0, 3, 0]);
             assert_eq!(
                 game.feedback.current().map(|f| f.verdict),
-                Some(crate::game::feedback::Verdict::Incorrect)
+                Some(Verdict::Incorrect),
+                "列{column}: 順番が来ていない列はミス"
             );
-            // 以後は最下段の色を押し続ければクリアできる
-            for color in [Yellow, Red, Green, Red] {
-                press_key(&mut game, key_for(color));
-            }
-            assert!(game.round.board.is_cleared(), "round={round}");
-            assert_eq!(game.result().correct, 1);
+            assert_eq!(game.result().total, 0, "ミスはスコアに記録しない");
         }
+    }
+
+    #[test]
+    fn many_misses_grow_the_board_but_never_finish_the_game() {
+        let mut game = ColorStackGame::new();
+        for i in 1..=300 {
+            press_wrong(&mut game);
+            assert_eq!(
+                game.board.block_count(),
+                INITIAL_HEIGHT + i,
+                "{i}回目のミスで1段増える"
+            );
+            assert!(!game.is_finished(), "{i}回目: ミスで詰みにはならない");
+            assert!(game.is_playing());
+        }
+        assert_lane_invariants(&game.board);
+        assert_eq!(game.result().total, 0, "ミスは記録しない");
+        // 伸びた盤面でも最下段を押せば消せる
+        press_bottom(&mut game);
+        assert_eq!(game.result().correct, 1);
+        assert_eq!(
+            game.board.block_count(),
+            INITIAL_HEIGHT + 300,
+            "補充で高さは保つ"
+        );
     }
 
     #[test]
     fn miss_on_an_empty_lane_adds_a_block_to_that_lane_only() {
-        for round in LANE_ROUNDS {
-            let mut game = game_at(round);
-            game.round.board = Board::lanes([0, 1]);
-            press_key(&mut game, key_for(Yellow));
-            assert_eq!(
-                lane_of_each_row(&game.round.board),
-                vec![0, 1, 2],
-                "round={round}: 黄の列の最上段に追加"
-            );
-            assert_lane_invariants(&game.round.board);
-            assert_eq!(
-                game.feedback.current().map(|f| f.verdict),
-                Some(crate::game::feedback::Verdict::Incorrect),
-                "ミスは不正解として表示する"
-            );
-            assert_eq!(game.result().total, 0, "ミスはスコアに記録しない");
-            assert!(game.interval.is_none(), "ミスしてもラウンドは続く");
-        }
-    }
-
-    #[test]
-    fn clearing_every_lane_records_success() {
-        for round in ALL_ROUNDS {
-            let mut game = game_at(round);
-            game.update(Duration::from_millis(1500));
-            game.round.board = board_of(round, &[Yellow, Red, Green, Blue]);
-            for color in [Yellow, Red, Green] {
-                press_key(&mut game, key_for(color));
-                assert_eq!(game.result().total, 0, "まだ残っている");
-            }
-            press_key(&mut game, key_for(Blue));
-            let result = game.result();
-            assert_eq!(result.total, 1);
-            assert_eq!(result.correct, 1, "round={round}");
-            assert!((result.avg_latency_ms - 1500.0).abs() < 1e-9);
-            assert!(game.interval.is_some(), "クリア後は待ち時間に入る");
-        }
-    }
-
-    #[test]
-    fn clearing_after_misses_still_records_success() {
-        for round in ALL_ROUNDS {
-            let mut game = game_at(round);
-            game.round.board = board_of(round, &[Red]);
-            press_key(&mut game, key_for(Green));
-            assert_eq!(game.round.board.block_count(), 2, "ミスで1個増える");
-            solve_round(&mut game);
-            assert_eq!(game.result().correct, 1, "round={round}");
-        }
-    }
-
-    #[test]
-    fn clearing_is_recorded_only_once_at_the_moment_the_board_empties() {
-        let mut game = game_at(ROUND2);
-        game.round.board = Board::lanes([0, 1]);
-        press_key(&mut game, key_for(Red));
-        assert_eq!(game.result().total, 0, "まだ青が残っている");
-        press_key(&mut game, key_for(Blue));
-        assert_eq!(game.result().total, 1);
-        press_key(&mut game, key_for(Blue));
-        assert_eq!(game.result().total, 1, "待ち時間中の入力で二重に記録しない");
-        assert!(
-            game.round.board.is_cleared(),
-            "待ち時間中はミスの追加も起きない"
+        let mut game = ColorStackGame::new();
+        game.board = Board::lanes([0, 1]);
+        press_key(&mut game, key_for(Yellow));
+        assert_eq!(
+            lane_of_each_row(&game.board),
+            vec![0, 1, 2],
+            "黄の列の最上段に追加"
         );
+        assert_lane_invariants(&game.board);
+        assert_eq!(
+            game.feedback.current().map(|f| f.verdict),
+            Some(Verdict::Incorrect)
+        );
+        assert_eq!(game.result().total, 0);
+    }
+
+    #[test]
+    fn pressing_from_the_top_down_misses_then_clears_and_refills_the_bottom() {
+        let mut game = ColorStackGame::new();
+        // 下から: 黄, 赤, 緑, 青
+        game.board = Board::lanes([2, 0, 3, 1]);
+        // 上の段から順に押す: 青・緑・赤はミスで一番上に増え、最後の黄だけ最下段と一致して消え、一番上に補充される
+        for color in [Blue, Green, Red, Yellow] {
+            press_key(&mut game, key_for(color));
+        }
+        assert_eq!(lane_of_each_row(&game.board), vec![0, 3, 1, 1, 3, 0, 2]);
+        let result = game.result();
+        assert_eq!(result.total, 1, "消せた1個だけ記録される");
+        assert_eq!(result.correct, 1);
+        assert_lane_invariants(&game.board);
     }
 
     #[test]
     fn keys_beyond_color_count_and_other_keys_are_ignored() {
-        for round in ALL_ROUNDS {
-            let mut game = game_at(round);
-            let before = game.round.board.clone();
-            for code in [
-                KeyCode::Char('5'),
-                KeyCode::Char('0'),
-                KeyCode::Char('a'),
-                KeyCode::Enter,
-                KeyCode::Left,
-            ] {
-                game.handle_key(KeyEvent::from(code));
-            }
-            assert_eq!(game.round.board, before, "round={round}");
-            assert!(game.feedback.current().is_none());
+        let mut game = ColorStackGame::new();
+        let before = game.board.clone();
+        for code in [
+            KeyCode::Char('5'),
+            KeyCode::Char('0'),
+            KeyCode::Char('a'),
+            KeyCode::Enter,
+            KeyCode::Left,
+        ] {
+            game.handle_key(KeyEvent::from(code));
         }
+        assert_eq!(game.board, before);
+        assert!(game.feedback.current().is_none());
+        assert_eq!(game.result().total, 0);
+    }
+
+    // --- スコア ---
+
+    #[test]
+    fn result_correct_always_equals_total_even_with_misses() {
+        let mut game = ColorStackGame::new();
+        let mut rng = StdRng::seed_from_u64(3);
+        let mut clears = 0;
+        for _ in 0..400 {
+            game.update(Duration::from_millis(50));
+            if rng.gen_bool(0.4) {
+                press_wrong(&mut game);
+            } else {
+                press_bottom(&mut game);
+                clears += 1;
+            }
+        }
+        let result = game.result();
+        assert_eq!(result.total, clears, "消せた数だけ記録される");
+        assert_eq!(result.correct, result.total, "ミスは記録されない");
+    }
+
+    #[test]
+    fn first_latency_is_measured_from_the_start_of_the_session() {
+        let mut game = ColorStackGame::new();
+        game.update(Duration::from_millis(1500));
+        press_bottom(&mut game);
+        assert_latency(&game.result(), 1500.0);
+    }
+
+    #[test]
+    fn latency_is_the_time_since_the_previous_clear() {
+        let mut game = ColorStackGame::new();
+        for ms in [1500, 500, 1000] {
+            game.update(Duration::from_millis(ms));
+            press_bottom(&mut game);
+        }
+        let result = game.result();
+        assert_eq!(result.total, 3);
+        assert_latency(&result, 1000.0);
+    }
+
+    #[test]
+    fn misses_do_not_reset_the_latency_timer() {
+        let mut game = ColorStackGame::new();
+        game.update(Duration::from_millis(400));
+        press_wrong(&mut game);
+        game.update(Duration::from_millis(600));
+        press_bottom(&mut game);
+        assert_latency(&game.result(), 1000.0);
+    }
+
+    #[test]
+    fn clearing_resets_the_latency_timer() {
+        let mut game = ColorStackGame::new();
+        game.update(Duration::from_millis(700));
+        press_bottom(&mut game);
+        assert!(
+            game.elapsed_since_clear.is_zero(),
+            "消した直後は0から数え直す"
+        );
+        assert_eq!(
+            game.elapsed_total,
+            Duration::from_millis(700),
+            "全体の経過は続く"
+        );
     }
 
     // --- 制限時間 ---
 
     #[test]
-    fn exceeding_time_limit_records_failure_with_limit_latency() {
-        for round in ALL_ROUNDS {
-            let mut game = game_at(round);
-            let limit = round_params(round).time_limit;
-            game.update(limit - Duration::from_millis(1));
-            assert_eq!(game.result().total, 0, "制限時間ちょうど手前ではまだ続く");
-            game.update(Duration::from_millis(1));
-            let result = game.result();
-            assert_eq!(result.total, 1, "round={round}: 制限時間でラウンド終了");
-            assert_eq!(result.correct, 0);
-            assert!((result.avg_latency_ms - limit.as_secs_f64() * 1000.0).abs() < 1e-9);
-            assert!(game.interval.is_some());
-        }
+    fn game_finishes_when_the_time_limit_passes() {
+        let mut game = ColorStackGame::new();
+        game.update(TIME_LIMIT - Duration::from_millis(1));
+        assert!(!game.is_finished(), "制限時間ちょうど手前ではまだ続く");
+        assert!(game.is_playing());
+        game.update(Duration::from_millis(1));
+        assert!(game.is_finished(), "60秒で終了");
+        assert!(!game.is_playing());
     }
 
     #[test]
-    fn overshooting_time_limit_in_one_tick_still_records_the_limit() {
+    fn small_ticks_add_up_to_the_time_limit() {
         let mut game = ColorStackGame::new();
-        let limit = round_params(ROUND1).time_limit;
-        game.update(limit + Duration::from_secs(15));
+        for i in 1..=600 {
+            assert!(!game.is_finished(), "{i}回目の前はまだ続く");
+            game.update(Duration::from_millis(100));
+        }
+        assert!(game.is_finished(), "100ms×600回=60秒で終了");
+    }
+
+    #[test]
+    fn time_up_records_nothing() {
+        let mut game = ColorStackGame::new();
+        game.update(Duration::from_millis(800));
+        press_bottom(&mut game);
+        game.update(TIME_LIMIT + Duration::from_secs(15));
+        assert!(game.is_finished());
         let result = game.result();
-        assert_eq!(result.total, 1);
-        assert!((result.avg_latency_ms - limit.as_secs_f64() * 1000.0).abs() < 1e-9);
+        assert_eq!(result.total, 1, "時間切れ自体は記録しない");
+        assert_eq!(result.correct, 1);
+        assert_latency(&result, 800.0);
+    }
+
+    #[test]
+    fn cleared_count_keeps_growing_until_time_up() {
+        let mut game = ColorStackGame::new();
+        let mut counts = Vec::new();
+        loop {
+            game.update(Duration::from_millis(250));
+            if game.is_finished() {
+                break;
+            }
+            press_bottom(&mut game);
+            counts.push(game.result().total);
+        }
+        // 250msごとに消すと、60秒になる直前(59.75秒)までの239回消せる
+        assert_eq!(counts.len(), 239);
+        assert!(
+            counts.windows(2).all(|w| w[1] == w[0] + 1),
+            "消すたびに1ずつ増え続ける"
+        );
+        let result = game.result();
+        assert_eq!(result.total, 239);
+        assert_eq!(result.correct, 239);
+        assert_latency(&result, 250.0);
+        assert_eq!(game.board.block_count(), INITIAL_HEIGHT);
+    }
+
+    #[test]
+    fn inputs_and_time_after_session_finished_are_ignored() {
+        let mut game = ColorStackGame::new();
+        game.update(TIME_LIMIT);
+        assert!(game.is_finished());
+        game.board = sample_board();
+        press_key(&mut game, key_for(Red));
+        press_key(&mut game, key_for(Blue));
+        game.update(Duration::from_secs(600));
+        let button = buttons_area(AREA);
+        game.handle_mouse(left_click(button.x + 1, button.y + 1), AREA);
+        assert_eq!(game.board, sample_board());
+        assert_eq!(game.result().total, 0);
     }
 
     // --- マウス: 色ボタン ---
@@ -1907,20 +1192,18 @@ mod tests {
 
     #[test]
     fn buttons_are_drawn_where_clicking_presses_their_color() {
-        for round in ALL_ROUNDS {
-            for color in StackColor::ALL {
-                let mut game = game_at(round);
-                // 押す色を最下段にし、その上に残りの色を1段ずつ積む
-                let (board, after) = board_with_bottom_color(round, color);
-                game.round.board = board;
-                let buffer = render_buffer(&game, AREA.width, AREA.height);
-                let (x, y) = button_label_position(&buffer, color);
-                game.handle_mouse(left_click(x, y), AREA);
-                assert_eq!(
-                    game.round.board, after,
-                    "round={round}: {color:?}(最下段)のブロックが消える"
-                );
-            }
+        for column in 0..LANE_COUNT {
+            let mut game = ColorStackGame::new();
+            let (board, _) = board_with_bottom_lane(column);
+            game.board = board;
+            let buffer = render_buffer(&game, AREA.width, AREA.height);
+            let (x, y) = button_label_position(&buffer, StackColor::ALL[column]);
+            game.handle_mouse(left_click(x, y), AREA);
+            assert_eq!(
+                game.board,
+                board_after_clearing_bottom_lane(column),
+                "列{column}(最下段)のブロックが消えて補充される"
+            );
         }
     }
 
@@ -1928,45 +1211,45 @@ mod tests {
     fn clicking_edges_of_each_button_band_presses_that_color() {
         let area = buttons_area(AREA);
         let bands = crate::game::theme::column_bands(area, 4);
-        for round in ALL_ROUNDS {
-            for (&color, band) in StackColor::ALL.iter().zip(&bands) {
-                for x in [band.x, band.right() - 1] {
-                    let mut game = game_at(round);
-                    let (board, after) = board_with_bottom_color(round, color);
-                    game.round.board = board;
-                    game.handle_mouse(left_click(x, band.y), AREA);
-                    assert_eq!(game.round.board, after, "round={round} {color:?} x={x}");
-                }
+        for (column, band) in bands.iter().enumerate() {
+            for x in [band.x, band.right() - 1] {
+                let mut game = ColorStackGame::new();
+                let (board, _) = board_with_bottom_lane(column);
+                game.board = board;
+                game.handle_mouse(left_click(x, band.y), AREA);
+                assert_eq!(
+                    game.board,
+                    board_after_clearing_bottom_lane(column),
+                    "列{column} x={x}"
+                );
             }
         }
     }
 
     #[test]
     fn clicks_outside_buttons_or_non_left_clicks_do_nothing() {
-        for round in ALL_ROUNDS {
-            let mut game = game_at(round);
-            let before = game.round.board.clone();
-            // HUD・盤面のクリック
-            game.handle_mouse(left_click(1, 1), AREA);
-            let board = board_area(AREA);
-            for y in board.y..board.bottom() {
-                for x in [board.x + 1, board.x + board.width / 2, board.right() - 2] {
-                    game.handle_mouse(left_click(x, y), AREA);
-                }
+        let mut game = ColorStackGame::new();
+        let before = game.board.clone();
+        // HUD・盤面のクリック
+        game.handle_mouse(left_click(1, 1), AREA);
+        let board = board_area(AREA);
+        for y in board.y..board.bottom() {
+            for x in [board.x + 1, board.x + board.width / 2, board.right() - 2] {
+                game.handle_mouse(left_click(x, y), AREA);
             }
-            // ボタン上の右クリック
-            let button = buttons_area(AREA);
-            game.handle_mouse(
-                MouseEvent {
-                    kind: MouseEventKind::Down(MouseButton::Right),
-                    column: button.x + 1,
-                    row: button.y + 1,
-                    modifiers: KeyModifiers::NONE,
-                },
-                AREA,
-            );
-            assert_eq!(game.round.board, before, "round={round}");
         }
+        // ボタン上の右クリック
+        let button = buttons_area(AREA);
+        game.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: button.x + 1,
+                row: button.y + 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            AREA,
+        );
+        assert_eq!(game.board, before);
     }
 
     // --- 盤面の配置 ---
@@ -1982,72 +1265,49 @@ mod tests {
     }
 
     #[test]
-    fn round3_grid_has_a_single_column_in_the_horizontal_center() {
-        for area in [AREA, TALL_AREA] {
-            let board = board_area(area);
-            let grid = grid_for(ROUND3, board);
-            assert_eq!(grid.columns, 1);
-            let cell = grid.cell_rect(0, 0).expect("最下段は描ける");
-            assert_eq!(cell.bottom(), board.bottom(), "下端にそろう");
-            assert!(cell.x >= board.x && cell.right() <= board.right());
-            let cell_center = cell.x + cell.width / 2;
-            let board_center = board.x + board.width / 2;
-            assert!(
-                cell_center.abs_diff(board_center) <= 1,
-                "{area:?}: 1列は盤面の横中央に置く"
-            );
-            assert!(grid.cell_rect(1, 0).is_none(), "2列目は無い");
-        }
-    }
-
-    #[test]
     fn lane_grid_has_four_side_by_side_columns_above_their_buttons() {
-        for round in LANE_ROUNDS {
-            let board = board_area(AREA);
-            let grid = grid_for(round, board);
-            let bands = crate::game::theme::column_bands(buttons_area(AREA), 4);
+        let board = board_area(AREA);
+        let grid = grid_for(board);
+        let bands = crate::game::theme::column_bands(buttons_area(AREA), 4);
+        assert!(
+            grid_for(board_area(TALL_AREA)).visible_rows >= INITIAL_HEIGHT,
+            "縦長の画面なら初期の高さは全段描ける"
+        );
+        let mut previous: Option<Rect> = None;
+        for (column, band) in bands.iter().enumerate() {
+            let cell = grid.cell_rect(column, 0).expect("各列の最下段は描ける");
+            assert_eq!(cell.bottom(), board.bottom(), "列{column}: 下端にそろう");
+            assert!(cell.x >= board.x && cell.right() <= board.right());
+            let center = cell.x + cell.width / 2;
             assert!(
-                grid_for(round, board_area(TALL_AREA)).visible_rows >= round_params(round).height,
-                "round={round}: 縦長の画面なら初期の高さは全段描ける"
+                center >= band.x && center < band.right(),
+                "列{column}はそのボタンの真上に来る"
             );
-            let mut previous: Option<Rect> = None;
-            for (column, band) in bands.iter().enumerate() {
-                let cell = grid.cell_rect(column, 0).expect("各列の最下段は描ける");
-                assert_eq!(cell.bottom(), board.bottom(), "列{column}: 下端にそろう");
-                assert!(cell.x >= board.x && cell.right() <= board.right());
-                let center = cell.x + cell.width / 2;
-                assert!(
-                    center >= band.x && center < band.right(),
-                    "列{column}はそのボタンの真上に来る"
-                );
-                if let Some(prev) = previous {
-                    assert!(prev.right() < cell.x, "列どうしは重ならず、すき間がある");
-                    assert_eq!(prev.width, cell.width, "列の幅はそろう");
-                }
-                previous = Some(cell);
+            if let Some(prev) = previous {
+                assert!(prev.right() < cell.x, "列どうしは重ならず、すき間がある");
+                assert_eq!(prev.width, cell.width, "列の幅はそろう");
             }
-            assert!(grid.cell_rect(LANE_COUNT, 0).is_none(), "5列目は無い");
+            previous = Some(cell);
         }
+        assert!(grid.cell_rect(LANE_COUNT, 0).is_none(), "5列目は無い");
     }
 
     #[test]
     fn grid_rows_are_stacked_from_the_bottom_without_gaps() {
-        for round in ALL_ROUNDS {
-            let board = board_area(TALL_AREA);
-            let grid = grid_for(round, board);
-            for column in 0..round_params(round).columns() {
-                for level in 0..grid.visible_rows {
-                    let rect = grid.cell_rect(column, level).expect("描ける段");
-                    assert!(rect.width > 0 && rect.height > 0);
-                    assert!(rect.y >= board.y && rect.bottom() <= board.bottom());
-                    if level > 0 {
-                        let below = grid.cell_rect(column, level - 1).unwrap();
-                        assert_eq!(rect.bottom(), below.y, "上の段は下の段のすぐ上");
-                        assert_eq!(rect.x, below.x, "同じ列は縦にそろう");
-                    }
+        let board = board_area(TALL_AREA);
+        let grid = grid_for(board);
+        for column in 0..LANE_COUNT {
+            for level in 0..grid.visible_rows {
+                let rect = grid.cell_rect(column, level).expect("描ける段");
+                assert!(rect.width > 0 && rect.height > 0);
+                assert!(rect.y >= board.y && rect.bottom() <= board.bottom());
+                if level > 0 {
+                    let below = grid.cell_rect(column, level - 1).unwrap();
+                    assert_eq!(rect.bottom(), below.y, "上の段は下の段のすぐ上");
+                    assert_eq!(rect.x, below.x, "同じ列は縦にそろう");
                 }
-                assert!(grid.cell_rect(column, grid.visible_rows).is_none());
             }
+            assert!(grid.cell_rect(column, grid.visible_rows).is_none());
         }
     }
 
@@ -2070,58 +1330,16 @@ mod tests {
     }
 
     #[test]
-    fn row_height_is_fixed_by_initial_height_even_when_the_board_grows() {
-        // 1段の高さは初期の高さで決め、ミスで伸びても変えない(伸びたぶんは上に積む)
-        let board = board_area(TALL_AREA);
-        let mut game = game_at(ROUND2);
-        let before = grid_for(ROUND2, board);
-        assert_eq!(before.row_height, 2);
-        assert_eq!(before.visible_rows, (board.height / 2) as usize);
-        game.round.board = Board::lanes([0]);
-        for _ in 0..200 {
-            press_key(&mut game, key_for(Green));
-        }
-        assert_eq!(game.round.board.block_count(), 201);
-        assert_eq!(
-            grid_for(ROUND2, board),
-            before,
-            "盤面が伸びてもマス目は同じ"
-        );
-    }
-
-    #[test]
-    fn rows_are_squeezed_to_one_line_when_the_initial_height_does_not_fit_at_two_lines() {
-        // 標準の画面では36段・72段は1段2行で入りきらないので1段1行になり、入るぶんだけ描く
+    fn rows_are_one_line_on_a_standard_screen_and_two_lines_on_a_tall_screen() {
+        // 標準の画面では36段は1段2行で入りきらないので1段1行になり、入るぶんだけ描く
         let board = board_area(AREA);
-        for round in ALL_ROUNDS {
-            let grid = grid_for(round, board);
-            assert_eq!(grid.row_height, 1, "round={round}");
-            assert_eq!(grid.visible_rows, board.height as usize, "round={round}");
-        }
-        // 72段が1段2行では入らないが36段なら入る画面では、ROUND1だけ1段2行になる
-        let mid = board_area(MID_AREA);
-        assert_eq!(grid_for(ROUND1, mid).row_height, 2);
-        assert_eq!(grid_for(ROUND2, mid).row_height, 1);
-        assert_eq!(
-            grid_for(ROUND3, mid).row_height,
-            1,
-            "ROUND3はROUND2と同じ段数"
-        );
-        assert!(grid_for(ROUND3, mid).visible_rows >= round_params(ROUND3).height);
-    }
-
-    #[test]
-    fn every_round_draws_rows_two_lines_tall_when_they_fit() {
-        // 1段の高さの上限は全ラウンド同じなので、72段が1段2行で入る画面なら全ラウンド2行で描く
-        let board = board_area(TALL_AREA);
-        for round in ALL_ROUNDS {
-            let grid = grid_for(round, board);
-            assert_eq!(grid.row_height, 2, "round={round}");
-            assert!(
-                grid.visible_rows >= round_params(round).height,
-                "round={round}: 全段描ける"
-            );
-        }
+        let grid = grid_for(board);
+        assert_eq!(grid.row_height, 1);
+        assert_eq!(grid.visible_rows, board.height as usize);
+        // 縦長の画面なら1段2行で全段描ける
+        let tall = grid_for(board_area(TALL_AREA));
+        assert_eq!(tall.row_height, 2);
+        assert!(tall.visible_rows >= INITIAL_HEIGHT);
     }
 
     // --- 盤面の描画 ---
@@ -2137,26 +1355,23 @@ mod tests {
 
     /// 盤面の全マスが、ブロックがあればその本来の色で、無ければブロック以外の色で塗られていることを確かめる
     fn assert_board_cells_are_painted(game: &ColorStackGame, area: Rect) {
-        let round = game.round_index;
         let buffer = render_buffer(game, area.width, area.height);
-        let grid = grid_for(round, board_area(area));
+        let grid = grid_for(board_area(area));
         let colors = block_bg_colors();
-        for column in 0..game.params.columns() {
+        for column in 0..LANE_COUNT {
             for level in 0..grid.visible_rows {
                 let rect = grid.cell_rect(column, level).unwrap();
-                let cell = game.round.board.rows.get(level).and_then(|row| row[column]);
+                let cell = game.board.rows.get(level).and_then(|row| row[column]);
                 for y in rect.y..rect.bottom() {
                     for x in rect.x..rect.right() {
                         let bg = buffer[(x, y)].bg;
                         match cell {
-                            Some(color) => assert_eq!(
-                                bg,
-                                color.color(),
-                                "round={round} 列{column} {level}段目は本来の色"
-                            ),
+                            Some(color) => {
+                                assert_eq!(bg, color.color(), "列{column} {level}段目は本来の色")
+                            }
                             None => assert!(
                                 !colors.contains(&format!("{bg:?}")),
-                                "round={round} 列{column} {level}段目は空"
+                                "列{column} {level}段目は空"
                             ),
                         }
                     }
@@ -2174,161 +1389,80 @@ mod tests {
                 assert_ne!(
                     buffer[(x, y)].bg,
                     theme::MUTED,
-                    "round={} ({x},{y})に灰色のブロックは無い",
-                    game.round_index
+                    "({x},{y})に灰色のブロックは無い"
                 );
             }
         }
     }
 
     #[test]
-    fn board_cells_are_painted_with_their_own_colors_in_every_round() {
+    fn board_cells_are_painted_with_their_own_colors() {
         for area in [AREA, TALL_AREA] {
-            for round in ALL_ROUNDS {
-                assert_board_cells_are_painted(&game_at(round), area);
-            }
+            let mut game = ColorStackGame::new();
+            assert_board_cells_are_painted(&game, area);
+            // 消して補充した後・ミスで伸びた後も本来の色で描く
+            press_bottom(&mut game);
+            press_wrong(&mut game);
+            assert_board_cells_are_painted(&game, area);
         }
     }
 
     #[test]
-    fn no_round_hides_block_colors_in_gray() {
+    fn block_colors_are_never_hidden_in_gray() {
         for area in [AREA, TALL_AREA] {
-            for round in ALL_ROUNDS {
-                let game = game_at(round);
-                assert_no_gray_on_board(&game, area);
-            }
+            assert_no_gray_on_board(&ColorStackGame::new(), area);
         }
-    }
-
-    #[test]
-    fn round3_draws_every_block_of_the_single_column_in_its_own_color() {
-        // 下から: 赤,青,青,黄,緑。1列に積んだブロックを全段本来の色で描く
-        let colors = [Red, Blue, Blue, Yellow, Green];
-        for area in [AREA, TALL_AREA] {
-            let mut game = game_at(ROUND3);
-            game.round.board = Board::single_column(colors);
-            let buffer = render_buffer(&game, area.width, area.height);
-            let grid = grid_for(ROUND3, board_area(area));
-            for (level, color) in colors.iter().enumerate() {
-                let rect = grid.cell_rect(0, level).unwrap();
-                assert_cell_bg(
-                    &buffer,
-                    rect,
-                    color.color(),
-                    &format!("{area:?} {level}段目"),
-                );
-            }
-            assert_no_gray_on_board(&game, area);
-        }
-    }
-
-    #[test]
-    fn round3_miss_adds_a_block_drawn_in_its_own_color_on_top() {
-        let mut game = game_at(ROUND3);
-        game.round.board = Board::single_column([Red, Blue, Blue, Yellow, Green]);
-        // 最下段は赤。緑を押すとミスで一番上(6段目)にランダムな色が1個増える
-        press_key(&mut game, key_for(Green));
-        assert_eq!(game.round.board.block_count(), 6);
-        let added = colors_of_single_column(&game.round.board)[5];
-        let buffer = render_buffer(&game, AREA.width, AREA.height);
-        let grid = grid_for(ROUND3, board_area(AREA));
-        assert_cell_bg(
-            &buffer,
-            grid.cell_rect(0, 5).unwrap(),
-            added.color(),
-            "追加されたブロックは本来の色",
-        );
-        assert_no_gray_on_board(&game, AREA);
-    }
-
-    #[test]
-    fn single_column_board_paints_blocks_only_inside_the_column() {
-        let mut game = game_at(ROUND3);
-        game.round.board = Board::single_column([Red, Blue, Yellow, Green, Green, Red]);
-        let buffer = render_buffer(&game, AREA.width, AREA.height);
-        let cell = grid_for(ROUND3, board_area(AREA)).cell_rect(0, 0).unwrap();
-        let painted = painted_block_cells(&buffer, board_area(AREA));
-        assert!(!painted.is_empty());
-        for (x, _) in painted {
-            assert!(
-                x >= cell.x && x < cell.right(),
-                "x={x}は1列の外に塗られている"
-            );
-        }
-    }
-
-    #[test]
-    fn single_column_shows_the_key_only_on_the_bottom_block() {
-        let mut game = game_at(ROUND3);
-        // 下から: 黄,赤,黄
-        game.round.board = Board::single_column([Yellow, Red, Yellow]);
-        let buffer = render_buffer(&game, AREA.width, AREA.height);
-        let grid = grid_for(ROUND3, board_area(AREA));
-        let row_text = |level: usize| -> String {
-            let rect = grid.cell_rect(0, level).unwrap();
-            (rect.y..rect.bottom())
-                .flat_map(|y| (rect.x..rect.right()).map(move |x| (x, y)))
-                .map(|(x, y)| buffer[(x, y)].symbol().to_string())
-                .collect()
-        };
-        assert!(row_text(0).contains('3'), "一番下の黄に3キー");
-        assert!(!row_text(1).contains('1'), "一番下でない赤には出さない");
-        assert!(!row_text(2).contains('3'), "一番下でない黄には出さない");
     }
 
     #[test]
     fn lane_board_paints_blocks_only_inside_the_lanes() {
-        for round in LANE_ROUNDS {
-            let mut game = game_at(round);
-            game.round.board = Board::lanes([0, 1, 2, 3, 3, 0]);
-            let buffer = render_buffer(&game, AREA.width, AREA.height);
-            let grid = grid_for(round, board_area(AREA));
-            let painted = painted_block_cells(&buffer, board_area(AREA));
-            assert!(!painted.is_empty());
-            for (x, _) in painted {
-                let lane = (0..LANE_COUNT)
-                    .find(|&c| {
-                        let cell = grid.cell_rect(c, 0).unwrap();
-                        x >= cell.x && x < cell.right()
-                    })
-                    .unwrap_or_else(|| panic!("x={x}はどの列にも入っていない"));
-                assert!(lane < LANE_COUNT);
-            }
+        let mut game = ColorStackGame::new();
+        game.board = Board::lanes([0, 1, 2, 3, 3, 0]);
+        let buffer = render_buffer(&game, AREA.width, AREA.height);
+        let grid = grid_for(board_area(AREA));
+        let painted = painted_block_cells(&buffer, board_area(AREA));
+        assert!(!painted.is_empty());
+        for (x, _) in painted {
+            let lane = (0..LANE_COUNT)
+                .find(|&c| {
+                    let cell = grid.cell_rect(c, 0).unwrap();
+                    x >= cell.x && x < cell.right()
+                })
+                .unwrap_or_else(|| panic!("x={x}はどの列にも入っていない"));
+            assert!(lane < LANE_COUNT);
         }
     }
 
     #[test]
     fn lowest_block_of_each_lane_shows_its_key() {
-        for round in LANE_ROUNDS {
-            let mut game = game_at(round);
-            // 下から: 列2, 列0, 列2, 列1(列3は空)
-            game.round.board = Board::lanes([2, 0, 2, 1]);
-            let buffer = render_buffer(&game, AREA.width, AREA.height);
-            let grid = grid_for(round, board_area(AREA));
-            let row_text = |column: usize, level: usize| -> String {
-                let rect = grid.cell_rect(column, level).unwrap();
-                (rect.y..rect.bottom())
-                    .flat_map(|y| (rect.x..rect.right()).map(move |x| (x, y)))
-                    .map(|(x, y)| buffer[(x, y)].symbol().to_string())
-                    .collect()
-            };
-            assert!(row_text(2, 0).contains('3'), "列2の一番下に3キー");
-            assert!(row_text(0, 1).contains('1'), "列0の一番下に1キー");
-            assert!(row_text(1, 3).contains('2'), "列1の一番下に2キー");
-            assert!(
-                !row_text(2, 2).contains('3'),
-                "一番下でない列2のブロックには出さない"
-            );
-        }
+        let mut game = ColorStackGame::new();
+        // 下から: 列2, 列0, 列2, 列1(列3は空)
+        game.board = Board::lanes([2, 0, 2, 1]);
+        let buffer = render_buffer(&game, AREA.width, AREA.height);
+        let grid = grid_for(board_area(AREA));
+        let row_text = |column: usize, level: usize| -> String {
+            let rect = grid.cell_rect(column, level).unwrap();
+            (rect.y..rect.bottom())
+                .flat_map(|y| (rect.x..rect.right()).map(move |x| (x, y)))
+                .map(|(x, y)| buffer[(x, y)].symbol().to_string())
+                .collect()
+        };
+        assert!(row_text(2, 0).contains('3'), "列2の一番下に3キー");
+        assert!(row_text(0, 1).contains('1'), "列0の一番下に1キー");
+        assert!(row_text(1, 3).contains('2'), "列1の一番下に2キー");
+        assert!(
+            !row_text(2, 2).contains('3'),
+            "一番下でない列2のブロックには出さない"
+        );
     }
 
     #[test]
     fn two_row_blocks_have_a_separator_line_on_their_bottom_row() {
-        // 縦長の画面ならROUND2は1段2行で描ける。同じ色が縦に続いても1個ずつ見分けられるよう、各ブロックの下の行に線を引く
-        let mut game = game_at(ROUND2);
-        game.round.board = Board::lanes([0, 0, 0]);
+        // 縦長の画面なら1段2行で描ける。同じ色が縦に続いても1個ずつ見分けられるよう、各ブロックの下の行に線を引く
+        let mut game = ColorStackGame::new();
+        game.board = Board::lanes([0, 0, 0]);
         let buffer = render_buffer(&game, TALL_AREA.width, TALL_AREA.height);
-        let grid = grid_for(ROUND2, board_area(TALL_AREA));
+        let grid = grid_for(board_area(TALL_AREA));
         assert_eq!(grid.row_height, 2);
         for level in 0..3 {
             let rect = grid.cell_rect(0, level).unwrap();
@@ -2348,25 +1482,30 @@ mod tests {
     }
 
     #[test]
-    fn board_drawing_follows_removal_and_addition() {
-        let mut game = game_at(ROUND2);
+    fn board_drawing_follows_removal_refill_and_addition() {
+        let mut game = ColorStackGame::new();
         // 下から: 赤,青,青,黄,緑
-        game.round.board = sample_board();
+        game.board = sample_board();
         press_key(&mut game, key_for(Red));
         let buffer = render_buffer(&game, AREA.width, AREA.height);
-        let grid = grid_for(ROUND2, board_area(AREA));
-        // 赤が消えて青が最下段に下りてくる。5段目(level 4)は空く
+        let grid = grid_for(board_area(AREA));
+        // 赤が消えて青が最下段に下りてくる。一番上(level 4)には赤が補充される
         let cell = grid.cell_rect(1, 0).unwrap();
         assert_eq!(buffer[(cell.x, cell.y)].bg, Blue.color());
+        let cell = grid.cell_rect(0, 4).unwrap();
+        assert_eq!(buffer[(cell.x, cell.y)].bg, Red.color(), "補充された赤");
         for column in 0..LANE_COUNT {
-            let cell = grid.cell_rect(column, 4).unwrap();
-            assert!(!block_bg_colors().contains(&format!("{:?}", buffer[(cell.x, cell.y)].bg)));
+            let cell = grid.cell_rect(column, 5).unwrap();
+            assert!(
+                !block_bg_colors().contains(&format!("{:?}", buffer[(cell.x, cell.y)].bg)),
+                "列{column}: 6段目は空のまま"
+            );
         }
 
-        // 最下段は青なので赤はミスで、赤の列の一番上(level 4)に追加される
+        // 最下段は青なので赤はミスで、赤の列の一番上(level 5)に追加される
         press_key(&mut game, key_for(Red));
         let buffer = render_buffer(&game, AREA.width, AREA.height);
-        let cell = grid.cell_rect(0, 4).unwrap();
+        let cell = grid.cell_rect(0, 5).unwrap();
         assert_eq!(buffer[(cell.x, cell.y)].bg, Red.color());
         let cell = grid.cell_rect(1, 0).unwrap();
         assert_eq!(
@@ -2377,160 +1516,154 @@ mod tests {
     }
 
     #[test]
-    fn initial_blocks_of_every_round_are_all_drawn_on_a_tall_screen() {
-        for round in ALL_ROUNDS {
-            let game = game_at(round);
-            let buffer = render_buffer(&game, TALL_AREA.width, TALL_AREA.height);
-            let grid = grid_for(round, board_area(TALL_AREA));
-            for (level, row) in game.round.board.rows.iter().enumerate() {
-                let column = row.iter().position(|c| c.is_some()).unwrap();
-                let cell = grid.cell_rect(column, level).unwrap();
-                assert!(
-                    block_bg_colors().contains(&format!("{:?}", buffer[(cell.x, cell.y)].bg)),
-                    "round={round} level{level}も描かれる"
-                );
-            }
+    fn initial_blocks_are_all_drawn_on_a_tall_screen() {
+        let game = ColorStackGame::new();
+        let buffer = render_buffer(&game, TALL_AREA.width, TALL_AREA.height);
+        let grid = grid_for(board_area(TALL_AREA));
+        for (level, row) in game.board.rows.iter().enumerate() {
+            let column = row.iter().position(|c| c.is_some()).unwrap();
+            let cell = grid.cell_rect(column, level).unwrap();
+            assert!(
+                block_bg_colors().contains(&format!("{:?}", buffer[(cell.x, cell.y)].bg)),
+                "level{level}も描かれる"
+            );
         }
     }
 
     #[test]
     fn initial_blocks_on_a_standard_screen_are_drawn_from_the_bottom_as_far_as_they_fit() {
-        // 標準の画面では36段・72段・144段は入りきらず、盤面の高さぶんだけ下から描く(上の段は描かない)
-        for round in ALL_ROUNDS {
-            let game = game_at(round);
-            let buffer = render_buffer(&game, AREA.width, AREA.height);
-            let board = board_area(AREA);
-            let grid = grid_for(round, board);
-            assert!(
-                grid.visible_rows < round_params(round).height,
-                "round={round}"
-            );
-            let painted_rows: HashSet<u16> = painted_block_cells(&buffer, board)
-                .into_iter()
-                .map(|(_, y)| y)
-                .collect();
-            assert_eq!(
-                painted_rows.len(),
-                board.height as usize,
-                "round={round}: 盤面の全行にブロックが描かれる"
-            );
-            let above_board = Rect::new(0, 0, AREA.width, board.y);
-            assert!(
-                painted_block_cells(&buffer, above_board).is_empty(),
-                "round={round}: 盤面より上にははみ出さない"
-            );
-        }
+        // 標準の画面では36段は入りきらず、盤面の高さぶんだけ下から描く(上の段は描かない)
+        let game = ColorStackGame::new();
+        let buffer = render_buffer(&game, AREA.width, AREA.height);
+        let board = board_area(AREA);
+        let grid = grid_for(board);
+        assert!(grid.visible_rows < INITIAL_HEIGHT);
+        let painted_rows: HashSet<u16> = painted_block_cells(&buffer, board)
+            .into_iter()
+            .map(|(_, y)| y)
+            .collect();
+        assert_eq!(
+            painted_rows.len(),
+            board.height as usize,
+            "盤面の全行にブロックが描かれる"
+        );
+        let above_board = Rect::new(0, 0, AREA.width, board.y);
+        assert!(
+            painted_block_cells(&buffer, above_board).is_empty(),
+            "盤面より上にははみ出さない"
+        );
     }
 
     #[test]
     fn board_overflowing_the_panel_draws_bottom_rows_only_without_panic() {
-        for round in ALL_ROUNDS {
-            let mut game = game_at(round);
-            // 同じ色を押し続けると追加と消去を繰り返すので、伸びた盤面を直接作る
-            // (最下段は赤、その上に緑が300段)
-            let colors: Vec<StackColor> = std::iter::once(Red)
-                .chain(std::iter::repeat_n(Green, 300))
-                .collect();
-            game.round.board = board_of(round, &colors);
-            assert_eq!(game.round.board.block_count(), 301);
-            assert!(game.interval.is_none(), "伸びてもラウンドは続く");
+        let mut game = ColorStackGame::new();
+        // 最下段は赤、その上に緑が300段(ミスを重ねて伸びた状態)
+        game.board = Board::lanes(std::iter::once(0).chain(std::iter::repeat_n(3, 300)));
+        assert_eq!(game.board.block_count(), 301);
+        assert!(game.is_playing(), "伸びてもゲームは続く");
 
-            let buffer = render_buffer(&game, AREA.width, AREA.height);
-            let board = board_area(AREA);
-            let grid = grid_for(round, board);
-            assert!(
-                grid.visible_rows < game.round.board.rows.len(),
-                "盤面に収まらない高さ"
-            );
-            let cell = grid.cell_rect(0, 0).unwrap();
-            assert_eq!(buffer[(cell.x, cell.y)].bg, Red.color(), "最下段は元のまま");
-            // はみ出た段は盤面より上(HUD・盤面の枠)に描かない
-            let above_board = Rect::new(0, 0, AREA.width, board.y);
-            assert!(
-                painted_block_cells(&buffer, above_board).is_empty(),
-                "round={round}"
-            );
+        let buffer = render_buffer(&game, AREA.width, AREA.height);
+        let board = board_area(AREA);
+        let grid = grid_for(board);
+        assert!(
+            grid.visible_rows < game.board.rows.len(),
+            "盤面に収まらない高さ"
+        );
+        let cell = grid.cell_rect(0, 0).unwrap();
+        assert_eq!(buffer[(cell.x, cell.y)].bg, Red.color(), "最下段は元のまま");
+        // はみ出た段は盤面より上(HUD・盤面の枠)に描かない
+        let above_board = Rect::new(0, 0, AREA.width, board.y);
+        assert!(painted_block_cells(&buffer, above_board).is_empty());
 
-            // 狭い画面でも描画がパニックしない
-            for (w, h) in [(1, 1), (3, 8), (20, 6), (30, 10), (100, 12), (200, 60)] {
-                rendered_text(&game, w, h);
-            }
-            // 伸びた盤面でも、最下段から押していけばクリアできる
-            solve_round(&mut game);
-            assert_eq!(game.result().correct, 1);
+        // 狭い画面でも描画がパニックしない
+        for (w, h) in [(1, 1), (3, 8), (20, 6), (30, 10), (100, 12), (200, 60)] {
+            rendered_text(&game, w, h);
         }
+        // 伸びた盤面でも、最下段を押せば消せる
+        press_key(&mut game, key_for(Red));
+        assert_eq!(game.result().correct, 1);
     }
 
     // --- HUD・その他の描画 ---
 
     #[test]
-    fn hud_shows_round_elapsed_time_and_remaining_blocks() {
-        let mut game = game_at(ROUND2);
-        game.round.board = sample_board();
-        game.update(Duration::from_millis(12_300));
+    fn hud_shows_cleared_count_remaining_seconds_and_remaining_blocks() {
+        let mut game = ColorStackGame::new();
+        game.board = sample_board();
         let text = rendered_text(&game, AREA.width, AREA.height);
-        assert!(text.contains("ROUND2/3"));
-        assert!(text.contains("12.3"), "経過時間");
-        assert!(text.contains("/180秒"), "制限時間");
+        assert!(text.contains("消せた0枚"), "{text}");
+        assert!(text.contains("残り60秒"), "開始時は制限時間いっぱい");
         assert!(text.contains("残り5個"));
 
-        press_key(&mut game, key_for(Red));
+        game.update(Duration::from_millis(12_300));
         let text = rendered_text(&game, AREA.width, AREA.height);
-        assert!(text.contains("残り4個"), "消すと減る");
+        assert!(text.contains("残り48秒"), "残り47.7秒は切り上げて表示");
+
+        press_key(&mut game, key_for(Red));
+        game.update(FEEDBACK_HOLD);
+        let text = rendered_text(&game, AREA.width, AREA.height);
+        assert!(text.contains("消せた1枚"), "消すと増える");
+        assert!(text.contains("残り5個"), "消しても補充されるので変わらない");
+        assert!(text.contains("残り47秒"));
 
         press_key(&mut game, key_for(Red));
         let text = rendered_text(&game, AREA.width, AREA.height);
-        assert!(text.contains("残り5個"), "ミスで追加されると増える");
+        assert!(text.contains("残り6個"), "ミスで追加されると増える");
+        assert!(text.contains("消せた1枚"), "ミスは数えない");
     }
 
     #[test]
-    fn hud_shows_the_round_label_instead_of_difficulty() {
-        for round in ALL_ROUNDS {
-            let game = game_at(round);
-            let text = rendered_text(&game, AREA.width, AREA.height);
-            let label = round_params(round).label.replace(' ', "");
-            assert!(text.contains(&label), "round={round}: {label}を表示");
-            assert!(text.contains(&format!("ROUND{}/3", round + 1)));
-            for difficulty in ["初級", "中級", "上級"] {
-                assert!(!text.contains(difficulty), "難易度は表示しない");
-            }
+    fn hud_shows_one_second_left_just_before_time_up() {
+        let mut game = ColorStackGame::new();
+        game.update(TIME_LIMIT - Duration::from_millis(1));
+        let text = rendered_text(&game, AREA.width, AREA.height);
+        assert!(text.contains("残り1秒"));
+    }
+
+    #[test]
+    fn hud_shows_feedback_instead_of_remaining_seconds_while_flashing() {
+        let mut game = ColorStackGame::new();
+        press_wrong(&mut game);
+        let text = rendered_text(&game, AREA.width, AREA.height);
+        assert!(text.contains("+1段"), "ミスの表示を優先する");
+        assert!(!text.contains("残り60秒"));
+        game.update(FEEDBACK_HOLD);
+        let text = rendered_text(&game, AREA.width, AREA.height);
+        assert!(!text.contains("+1段"), "表示時間を過ぎたら消える");
+        assert!(
+            text.contains("残り60秒"),
+            "残り秒数の表示に戻る(59.1秒は切り上げ)"
+        );
+    }
+
+    #[test]
+    fn hud_does_not_show_rounds_or_difficulty() {
+        let game = ColorStackGame::new();
+        let text = rendered_text(&game, AREA.width, AREA.height);
+        assert!(text.contains("シタケシ"));
+        assert!(!text.contains("ROUND"), "ラウンド制は無い");
+        for difficulty in ["初級", "中級", "上級"] {
+            assert!(!text.contains(difficulty), "難易度は表示しない");
         }
     }
 
     #[test]
     fn hud_counts_remaining_blocks_on_the_lane_board() {
-        let mut game = game_at(ROUND1);
-        game.round.board = Board::lanes([0, 1, 2]);
+        let mut game = ColorStackGame::new();
+        game.board = Board::lanes([0, 1, 2]);
         let text = rendered_text(&game, AREA.width, AREA.height);
         assert!(text.contains("残り3個"), "空白セルは数えない");
     }
 
     #[test]
-    fn interval_message_tells_clear_or_time_up_and_the_next_round() {
-        let mut game = ColorStackGame::new();
-        solve_round(&mut game);
-        let text = rendered_text(&game, AREA.width, AREA.height);
-        assert!(text.contains("CLEAR!"));
-        assert!(text.contains("NEXTROUND2/3"));
-        assert!(text.contains(&round_params(ROUND2).label.replace(' ', "")));
-
-        game.update(ROUND_INTERVAL);
-        game.update(round_params(ROUND2).time_limit);
-        let text = rendered_text(&game, AREA.width, AREA.height);
-        assert!(text.contains("TIMEUP"));
-        assert!(text.contains("NEXTROUND3/3"));
-        assert!(text.contains(&round_params(ROUND3).label.replace(' ', "")));
-    }
-
-    #[test]
     fn render_does_not_panic_in_tiny_areas() {
-        for round in ALL_ROUNDS {
-            let mut game = game_at(round);
-            for (w, h) in [(1, 1), (3, 8), (20, 6), (30, 10), (100, 12)] {
-                rendered_text(&game, w, h);
-            }
-            solve_round(&mut game);
-            rendered_text(&game, 20, 6);
+        let mut game = ColorStackGame::new();
+        for (w, h) in [(1, 1), (3, 8), (20, 6), (30, 10), (100, 12)] {
+            rendered_text(&game, w, h);
+        }
+        game.update(TIME_LIMIT);
+        for (w, h) in [(1, 1), (20, 6), (100, 36)] {
+            rendered_text(&game, w, h);
         }
     }
 }

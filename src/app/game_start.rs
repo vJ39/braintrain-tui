@@ -240,7 +240,6 @@ mod tests {
         // 全角文字の2セル目は空白で埋まるため、空白を除いて比較する
         let text = rendered_text(app).replace(' ', "");
         assert!(text.contains("シタケシ"));
-        assert!(text.contains("ROUND1/3"), "ROUND1から始まる");
     }
 
     #[test]
