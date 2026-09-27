@@ -1,7 +1,9 @@
 //! ヤッホー(look_away): お茶漬け屋のカウンター越しに親父(白い割烹着)と対峙する。
+//! 開始前にあそびかたのガイダンス(Phase::Guide)を出し、Enterで「3.2.1.GO!!」へ進む。
 //! Enterで「食べる」をトグルし、TIME_LIMIT(60秒)以内にごはんゲージを完食すればクリア。
 //! 親父が指さして「ヤー!!」と叫んだら、指された方向と同じ矢印キーを押して防御する。
-//! 食事中に「ヤー」が来ると防御できず問答無用で♥を1つ失い、ごはんもおかわりになる。
+//! 食事中に「ヤー」が来ると防御できず問答無用で♥をCAUGHT_EATING_PENALTY(2)個失う
+//! (ごはんのおかわりは無い)。
 //! 「やっほー」と言われたらSpaceで「やっほー」と返す。
 //! 1問目は必ず「やっほー」から始まる。以降の待機はIDLE_WAIT_MSで「来るか来るか」
 //! という間を作ってから次のイベントが来る。1ROUNDあたり合計TARGET_EVENT_COUNT回
@@ -89,8 +91,11 @@ pub const TIME_LIMIT_WARNING_SECONDS: u64 = 10;
 
 /// 待機の後に「やっほー」イベントになる確率(やっほー3回:ヤー7回の割合)
 pub const YAHHO_RATE: f64 = 3.0 / 10.0;
+/// 食事中に「ヤー」で襲われた時に問答無用で失う♥の個数(Verdict::caught_eating)。
+/// ガイダンスの説明文もこの値から作る
+pub const CAUGHT_EATING_PENALTY: u32 = 2;
 
-/// 相手の決め台詞。指さしと一緒にこれを叫んだら、逆を向く合図
+/// 相手の決め台詞。指さしと一緒にこれを叫んだら、指された方向と同じ矢印キーを押す合図
 pub const SHOUT_TEXT: &str = "ヤー!!";
 /// 相手の呼びかけ。これを言われたらSpaceで返す
 pub const YAHHO_CALL_TEXT: &str = "やっほー!";
@@ -398,7 +403,7 @@ impl Verdict {
     }
 
     /// 食事中に「ヤー」で襲われた時。防御操作を受け付けず、通常の即時誤入力(1個)の
-    /// 2倍にあたる♥2個を問答無用で失う。おかわりは発生しない(ダメージのみ)。
+    /// 2倍にあたる♥CAUGHT_EATING_PENALTY個を問答無用で失う。おかわりは発生しない(ダメージのみ)。
     /// side/variantは襲ってきた「ヤー」の絵をそのまま指定し、結果表示中も
     /// 親父側にヤーの映像を出し続ける(赤い結果背景にはしない)
     fn caught_eating(side: Side, variant: usize) -> Self {
@@ -406,7 +411,7 @@ impl Verdict {
             is_correct: false,
             detail: "食事を邪魔された".to_string(),
             latency_ms: 0.0,
-            penalty: 2,
+            penalty: CAUGHT_EATING_PENALTY,
             message: None,
             is_guard_success: false,
             player_stage: PlayerStageKind::DamagedEating,
@@ -416,12 +421,18 @@ impl Verdict {
     }
 }
 
-/// いまの状態で入力inputを受けた時の判定。判定しない状態(カウントダウン・結果表示)ならNone。
-/// Input::Eat(食べるトグル)は呼び出し元(handle_key)で先に処理するので常にNone
+/// いまの状態で入力inputを受けた時の判定。判定しない状態(ガイダンス・カウントダウン・
+/// 結果表示)ならNone。Input::Eat(食べるトグル)は呼び出し元(handle_key)で先に処理するので常にNone
 fn judge(phase: &Phase, input: Input) -> Option<Verdict> {
     match (phase, input) {
         (_, Input::Eat) => None,
-        (Phase::WaitingToEat { .. } | Phase::Countdown { .. } | Phase::Result { .. }, _) => None,
+        (
+            Phase::Guide
+            | Phase::WaitingToEat { .. }
+            | Phase::Countdown { .. }
+            | Phase::Result { .. },
+            _,
+        ) => None,
         (Phase::Idle { .. }, _) => Some(Verdict::incorrect(
             FALSE_START_TEXT,
             Duration::ZERO,
@@ -477,6 +488,9 @@ enum ResultMessage {
 
 /// 問題内の状態
 enum Phase {
+    /// セッション開始前のあそびかたガイダンス。Enterで閉じると「3.2.1.GO!!」が始まる。
+    /// この間はタイマー・イベント・判定を一切動かさない
+    Guide,
     /// セッション開始直後、プレイヤーが「食べる」操作をするまでの待機。
     /// この間はゲームが始まっておらず、経過時間も進まない。elapsedが
     /// WAITING_TO_EAT_PROMPT_DELAYに達するまでは何もない静止を見せ、
@@ -624,27 +638,19 @@ fn pointing_line(side: Option<Side>) -> String {
 }
 
 impl LookAwayGame {
-    /// セッション開始時は必ず「3.2.1.GO!!」から始める(2問目以降のイベント再開には
-    /// この演出を挟まない。start_round参照)
+    /// セッション開始時は必ずあそびかたのガイダンスから始め、Enterで閉じたら
+    /// 「3.2.1.GO!!」へ進む(start_countdown。2問目以降の再開にはどちらも挟まない)
     pub fn new() -> Self {
-        let mut go_se = GoSeOnce::new();
-        let state = CountdownState::new();
-        // 最初のフェーズ「3」の音
-        if let Some(phase) = state.phase() {
-            if let Some(se) = go_se.se_for(phase) {
-                audio::play_se(se);
-            }
-        }
         Self {
             tracker: ScoreTracker::new(),
-            phase: Phase::Countdown { state },
+            phase: Phase::Guide,
             lives: MAX_LIVES,
             rice: RICE_FULL,
             elapsed_total: Duration::ZERO,
             finished: false,
             feedback: AnswerFeedback::new(),
             mark_renderer: MarkRenderer::new(),
-            go_se,
+            go_se: GoSeOnce::new(),
             stage_renderer: StageRenderer::new(),
             abandon_prompt_shown: false,
             abandon_prompt_dismissed: false,
@@ -654,6 +660,17 @@ impl LookAwayGame {
             early_shout_forced: false,
             pending_forced_event: None,
         }
+    }
+
+    /// 「3.2.1.GO!!」を最初から始め、最初のフェーズ「3」の音を鳴らす
+    fn start_countdown(&mut self) {
+        let state = CountdownState::new();
+        if let Some(phase) = state.phase() {
+            if let Some(se) = self.go_se.se_for(phase) {
+                audio::play_se(se);
+            }
+        }
+        self.phase = Phase::Countdown { state };
     }
 
     /// ライフが尽きたか、制限時間内に完食できなかったか
@@ -789,8 +806,8 @@ impl LookAwayGame {
 
     /// 時間経過で状態を進める。制限時間を過ぎた問題は不正解にする
     fn tick_phase(&mut self, dt: Duration) {
-        // 捨てゲー確認ダイアログの表示中はゲーム進行を止める
-        if self.abandon_prompt_shown {
+        // 捨てゲー確認ダイアログ・ガイダンスの表示中はゲーム進行を止める
+        if self.abandon_prompt_shown || matches!(self.phase, Phase::Guide) {
             return;
         }
         // カウントダウン演出中・食べ始めるまでの待機中はプレイヤーが操作できないので、
@@ -810,6 +827,8 @@ impl LookAwayGame {
             return;
         }
         match &mut self.phase {
+            // 関数の先頭で戻っているので、ここには来ない
+            Phase::Guide => {}
             Phase::WaitingToEat { elapsed } => {
                 *elapsed += dt;
             }
@@ -965,6 +984,7 @@ impl LookAwayGame {
     /// カウンター越しの親父を描く(Countdownと、催促表示に切り替わった後のWaitingToEat以外の全フェーズ)
     fn render_opponent_stage(&self, frame: &mut Frame, area: Rect) {
         match &self.phase {
+            Phase::Guide => unreachable!("renderでGuideは処理済み"),
             Phase::Countdown { .. } => unreachable!("render_stageでCountdownは処理済み"),
             // ここに来るのは催促(食べよ)表示前だけ。Idle(食べていない)と同じ通常表示にする
             Phase::WaitingToEat { .. } => self.render_scene(
@@ -1048,7 +1068,9 @@ impl LookAwayGame {
     /// いまの局面でプレイヤー自身に見せる絵の種類
     fn player_stage_kind(&self) -> PlayerStageKind {
         match &self.phase {
-            Phase::WaitingToEat { .. } | Phase::Countdown { .. } => PlayerStageKind::Watching,
+            Phase::Guide | Phase::WaitingToEat { .. } | Phase::Countdown { .. } => {
+                PlayerStageKind::Watching
+            }
             Phase::Idle { is_eating, .. } => {
                 if *is_eating {
                     PlayerStageKind::Eating(self.eating_variant)
@@ -1308,6 +1330,189 @@ fn render_character(
         Paragraph::new(lines).alignment(Alignment::Center),
         text_area,
     );
+}
+
+/// ガイダンス内で、キーをキー風(黒字・シアン地)に強調する(theme::key_hintのキー部分と同じ見た目)
+fn guide_key(key: &str) -> Span<'static> {
+    Span::styled(
+        format!(" {key} "),
+        Style::default()
+            .fg(Color::Black)
+            .bg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+/// 表示幅がwidthになるまで右を空白で埋める(ガイダンスの左の列をそろえるため)
+fn pad_to_width(text: &str, width: usize) -> String {
+    let current = Span::raw(text).width();
+    format!("{text}{}", " ".repeat(width.saturating_sub(current)))
+}
+
+/// ガイダンスの本文。目的・基本操作・合図・注意の順に短い行で並べる。
+/// 秒数・♥の数などはゲームの定数から作り、ルールと説明がずれないようにする
+fn guide_lines() -> Vec<Line<'static>> {
+    let heading = |text: &'static str| Line::from(Span::styled(text, theme::title_style()));
+    let text = Style::default().fg(theme::TEXT);
+    let strong = text.add_modifier(Modifier::BOLD);
+    let penalty = Style::default()
+        .fg(theme::INCORRECT)
+        .add_modifier(Modifier::BOLD);
+    let refill = Style::default()
+        .fg(theme::HIGHLIGHT)
+        .add_modifier(Modifier::BOLD);
+    let indent = || Span::raw("  ");
+
+    // 「合図」の左の列(「ヤー!!」「やっほー!」)
+    let calls = [
+        format!("「{SHOUT_TEXT}」"),
+        format!("「{YAHHO_CALL_TEXT}」"),
+    ];
+    let call_width = calls
+        .iter()
+        .map(|c| Span::raw(c.as_str()).width())
+        .max()
+        .unwrap_or(0)
+        + 2;
+    let [shout_call, yahho_call] =
+        calls.map(|c| Span::styled(pad_to_width(&c, call_width), strong));
+
+    // 「注意」の左の列(何をしたら)
+    let causes = [
+        format!("食事中に「{SHOUT_TEXT}」"),
+        format!("「{YAHHO_CALL_TEXT}」に失敗"),
+        "合図前の ← / → / Space".to_string(),
+    ];
+    let cause_width = causes
+        .iter()
+        .map(|c| Span::raw(c.as_str()).width())
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let [caught_eating, yahho_failed, false_start] =
+        causes.map(|c| Span::styled(pad_to_width(&c, cause_width), text));
+    let arrow = || Span::styled("→ ", text);
+
+    vec![
+        heading("目的"),
+        Line::from(vec![
+            indent(),
+            Span::styled(
+                format!("{}秒以内にごはんを食べきれ！", TIME_LIMIT.as_secs()),
+                strong,
+            ),
+        ]),
+        Line::from(vec![
+            indent(),
+            Span::styled("ライフ ", text),
+            Span::styled(hearts(MAX_LIVES), penalty),
+            Span::styled("  0になるとGAME OVER", text),
+        ]),
+        Line::from(""),
+        heading("基本操作"),
+        Line::from(vec![
+            indent(),
+            guide_key("Enter"),
+            Span::styled(" 食べる / 様子を見る", strong),
+        ]),
+        Line::from(vec![
+            indent(),
+            Span::styled("食事中だけ、ごはんゲージが減っていく", text),
+        ]),
+        Line::from(vec![
+            indent(),
+            Span::styled("判定が終わったら ", text),
+            guide_key("Enter"),
+            Span::styled(" でまた食べ始める", text),
+        ]),
+        Line::from(""),
+        heading("合図"),
+        Line::from(vec![
+            indent(),
+            shout_call,
+            Span::styled("左を指したら ", text),
+            guide_key("←"),
+            Span::styled(" / 右を指したら ", text),
+            guide_key("→"),
+        ]),
+        Line::from(vec![
+            indent(),
+            Span::raw(" ".repeat(call_width)),
+            Span::styled(
+                format!(
+                    "食事中は不可。{}秒以内にガード！",
+                    RESPONSE_SAFE_WINDOW.as_secs_f32()
+                ),
+                text,
+            ),
+        ]),
+        Line::from(vec![
+            indent(),
+            yahho_call,
+            guide_key("Space"),
+            Span::styled(
+                "で返す。逃すと強制おかわり！",
+                text,
+            ),
+        ]),
+        Line::from(""),
+        heading("注意"),
+        Line::from(vec![
+            indent(),
+            caught_eating,
+            arrow(),
+            Span::styled("防御できない・", text),
+            Span::styled(
+                format!(
+                    "{} -{CAUGHT_EATING_PENALTY}",
+                    "♥".repeat(CAUGHT_EATING_PENALTY as usize)
+                ),
+                penalty,
+            ),
+        ]),
+        Line::from(vec![
+            indent(),
+            yahho_failed,
+            arrow(),
+            Span::styled(
+                format!("ごはんが{}%に戻る", (RICE_FULL * 100.0).round() as u32),
+                refill,
+            ),
+        ]),
+        Line::from(vec![
+            indent(),
+            false_start,
+            arrow(),
+            Span::styled(
+                format!("フライング・♥ -{}", penalty_for(Duration::ZERO)),
+                penalty,
+            ),
+        ]),
+    ]
+}
+
+/// ゲーム開始前のあそびかたガイダンス。枠の上辺に見出し、下辺に開始キーを置き、
+/// 本文は最長行の幅の列を中央に置いて左寄せで描く(端末が小さい時ははみ出た分を切る)
+fn render_guide(frame: &mut Frame, area: Rect) {
+    let block = theme::panel(Line::from(format!(" {DISPLAY_NAME} — あそびかた ")).centered())
+        .title_bottom(theme::hints_line(&[("Enter", "スタート")]).centered());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let lines = guide_lines();
+    let width = lines
+        .iter()
+        .map(|line| line.width() as u16)
+        .max()
+        .unwrap_or(0)
+        .min(inner.width);
+    let body = theme::vertical_center(inner, lines.len() as u16);
+    let column = Rect::new(
+        body.x + (body.width - width) / 2,
+        body.y,
+        width,
+        body.height,
+    );
+    frame.render_widget(Paragraph::new(lines), column);
 }
 
 /// 画像表示時、画像の下部に操作指示を帯状の背景色パネルで重ねて出す(テキスト表示時は
@@ -1576,9 +1781,16 @@ impl Default for LookAwayGame {
 }
 
 impl Game for LookAwayGame {
-    /// ←→Space・Enterを受け付ける。カウントダウン中・結果表示中の入力は無視する
+    /// ←→Space・Enterを受け付ける。カウントダウン中・結果表示中の入力は無視する。
+    /// ガイダンス表示中はEnterでカウントダウンへ進むだけで、他のキーは無視する(フライングにしない)
     fn handle_key(&mut self, key: KeyEvent) {
         if self.finished {
+            return;
+        }
+        if matches!(self.phase, Phase::Guide) {
+            if key.code == KeyCode::Enter {
+                self.start_countdown();
+            }
             return;
         }
         if self.abandon_prompt_shown {
@@ -1653,6 +1865,11 @@ impl Game for LookAwayGame {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect) {
+        // ガイダンスは説明を一画面に収めるため、HUD・ステージ・フッターを出さず全面に描く
+        if matches!(self.phase, Phase::Guide) {
+            render_guide(frame, area);
+            return;
+        }
         let (hud_area, body) = theme::split_hud(area);
         // ごはん・ライフはフッターにまとめて表示するので、HUD左欄は空にする
         theme::render_hud_with_progress_line(
@@ -1714,6 +1931,17 @@ mod tests {
         matches!(game.phase, Phase::Countdown { .. })
     }
 
+    fn is_guide(game: &LookAwayGame) -> bool {
+        matches!(game.phase, Phase::Guide)
+    }
+
+    /// ゲーム開始前のガイダンスをEnterで閉じ、「3.2.1.GO!!」を始める
+    fn close_guide(game: &mut LookAwayGame) {
+        assert!(is_guide(game), "ガイダンス表示中のはず");
+        press(game, KeyCode::Enter);
+        assert!(is_countdown(game), "ガイダンスを閉じたらカウントダウン");
+    }
+
     fn is_result(game: &LookAwayGame, correct: bool) -> bool {
         matches!(game.phase, Phase::Result { is_correct, .. } if is_correct == correct)
     }
@@ -1734,10 +1962,14 @@ mod tests {
         }
     }
 
-    /// 冒頭の「3.2.1.GO!!」を最後まで進めて食べ始めるまでの待機(WaitingToEat)にする。
+    /// (ガイダンス表示中ならEnterで閉じてから)冒頭の「3.2.1.GO!!」を最後まで進めて
+    /// 食べ始めるまでの待機(WaitingToEat)にする。
     /// フェーズ(PHASE_DURATION)ごとに分けて進める(実機のフレームループと同じく、
     /// 一度に全部進めるとGO!!への遷移自体を検出できずSEが鳴らないため)
     fn advance_to_waiting_to_eat(game: &mut LookAwayGame) {
+        if is_guide(game) {
+            close_guide(game);
+        }
         assert!(is_countdown(game), "カウントダウン中のはず");
         for _ in 0..(COUNTDOWN_TOTAL.as_millis() / PHASE_DURATION.as_millis()) {
             game.update(PHASE_DURATION);
@@ -1782,10 +2014,10 @@ mod tests {
         };
     }
 
-    /// (1問目ならカウントダウン・食べ始めを終えて)「ヤー!!」を出し、correctに応じて
+    /// (1問目ならガイダンス・カウントダウン・食べ始めを終えて)「ヤー!!」を出し、correctに応じて
     /// 正解/不正解のキーを即座に(elapsed≈0で)押す。不正解の場合はpenalty=1になる
     fn answer_round(game: &mut LookAwayGame, correct: bool) {
-        if matches!(game.phase, Phase::Countdown { .. }) {
+        if matches!(game.phase, Phase::Guide | Phase::Countdown { .. }) {
             finish_countdown(game);
         } else if matches!(game.phase, Phase::WaitingToEat { .. }) {
             press(game, KeyCode::Enter);
@@ -2155,7 +2387,7 @@ mod tests {
     // --- カウントダウン ---
 
     #[test]
-    fn pressing_eat_while_waiting_starts_the_countdown_from_three() {
+    fn pressing_enter_on_the_guide_starts_the_countdown_from_three() {
         let mut game = LookAwayGame::new();
         press(&mut game, KeyCode::Enter);
         assert!(is_countdown(&game));
@@ -2167,11 +2399,44 @@ mod tests {
         }
         assert!(!game.is_finished());
         assert_eq!(game.tracker.total(), 0);
+        assert_eq!(game.elapsed_total, Duration::ZERO);
+    }
+
+    #[test]
+    fn countdown_started_from_the_guide_runs_its_full_length() {
+        // ガイダンスをどれだけ眺めていても、カウントダウンはEnterを押した時点から数え始める
+        let mut game = LookAwayGame::new();
+        game.update(Duration::from_secs(30));
+        close_guide(&mut game);
+        game.update(COUNTDOWN_TOTAL - ms(1));
+        assert!(
+            is_countdown(&game),
+            "Enterから数えてGO!!が終わるまではカウントダウン"
+        );
+        game.update(ms(1));
+        assert!(matches!(game.phase, Phase::WaitingToEat { .. }));
+    }
+
+    #[test]
+    fn pressing_enter_again_during_the_countdown_does_not_restart_it() {
+        let mut game = LookAwayGame::new();
+        close_guide(&mut game);
+        game.update(PHASE_DURATION);
+        press(&mut game, KeyCode::Enter);
+        match &game.phase {
+            Phase::Countdown { state } => assert_eq!(
+                state.phase(),
+                Some(countdown_ui::Phase::Two),
+                "カウントダウン中のEnterでは最初からやり直さない"
+            ),
+            _ => panic!("カウントダウン中のまま"),
+        }
     }
 
     #[test]
     fn countdown_finishes_into_waiting_to_eat() {
         let mut game = LookAwayGame::new();
+        close_guide(&mut game);
         game.update(COUNTDOWN_TOTAL - ms(1));
         assert!(is_countdown(&game), "GO!!が終わるまではカウントダウン");
         game.update(ms(1));
@@ -2190,6 +2455,7 @@ mod tests {
     fn pressing_eat_after_the_countdown_starts_eating_within_wait_range() {
         for _ in 0..30 {
             let mut game = LookAwayGame::new();
+            close_guide(&mut game);
             game.update(COUNTDOWN_TOTAL);
             press(&mut game, KeyCode::Enter);
             match game.phase {
@@ -2217,18 +2483,185 @@ mod tests {
         assert!(game.feedback.current().is_none());
     }
 
-    // --- 食べ始めるまでの待機 ---
+    // --- ゲーム開始前のガイダンス ---
 
     #[test]
-    fn new_game_starts_with_the_countdown() {
+    fn new_game_starts_with_the_guide() {
         let game = LookAwayGame::new();
         assert!(
-            is_countdown(&game),
-            "セッション開始時はまず3.2.1.GO!!から始まる"
+            is_guide(&game),
+            "セッション開始時はまずあそびかたのガイダンスを出す"
         );
         assert!(!game.is_finished());
         assert_eq!(game.tracker.total(), 0);
+        assert_eq!(game.lives, MAX_LIVES);
+        assert_eq!(game.rice, RICE_FULL);
+        assert_eq!(game.elapsed_total, Duration::ZERO);
     }
+
+    #[test]
+    fn time_does_not_pass_while_the_guide_is_shown() {
+        let mut game = LookAwayGame::new();
+        // 制限時間を大きく超えて放置しても、ゲームは何も進まない
+        for _ in 0..10 {
+            game.update(Duration::from_secs(30));
+        }
+        assert!(is_guide(&game), "Enterを押すまでガイダンスのまま");
+        assert_eq!(game.elapsed_total, Duration::ZERO, "60秒タイマーを進めない");
+        assert_eq!(game.rice, RICE_FULL, "ごはんは減らない");
+        assert_eq!(game.lives, MAX_LIVES, "ライフは減らない");
+        assert_eq!(game.tracker.total(), 0, "何も記録しない");
+        assert_eq!(game.event_count, 0, "イベントを発生させない");
+        assert!(!game.abandon_prompt_shown, "詰みダイアログも出さない");
+        assert_eq!(
+            game.last_countdown_tick_second, None,
+            "残り時間の警告音も鳴らさない"
+        );
+        assert!(!game.is_game_over());
+        assert!(!game.is_finished());
+    }
+
+    #[test]
+    fn game_keys_on_the_guide_are_ignored_without_a_false_start() {
+        let mut game = LookAwayGame::new();
+        let other_keys = [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Char('a'),
+            KeyCode::Char('y'),
+            KeyCode::Char('n'),
+            KeyCode::Esc,
+        ];
+        for code in GAME_KEYS.into_iter().chain(other_keys) {
+            press(&mut game, code);
+            assert!(
+                is_guide(&game),
+                "{code:?}: Enter以外ではガイダンスを閉じない"
+            );
+        }
+        assert_eq!(game.tracker.total(), 0, "フライングとして記録しない");
+        assert_eq!(game.lives, MAX_LIVES, "フライングのペナルティも受けない");
+        assert_eq!(game.rice, RICE_FULL);
+        assert!(game.feedback.current().is_none());
+    }
+
+    #[test]
+    fn guide_leads_through_the_countdown_and_waiting_to_eat_into_idle() {
+        let mut game = LookAwayGame::new();
+        assert!(is_guide(&game));
+        press(&mut game, KeyCode::Enter);
+        assert!(is_countdown(&game), "Enterで3.2.1.GO!!へ");
+        for _ in 0..(COUNTDOWN_TOTAL.as_millis() / PHASE_DURATION.as_millis()) {
+            game.update(PHASE_DURATION);
+        }
+        assert!(
+            matches!(game.phase, Phase::WaitingToEat { .. }),
+            "GO!!の後は食べ始めるまでの待機"
+        );
+        assert_eq!(game.elapsed_total, Duration::ZERO);
+        press(&mut game, KeyCode::Enter);
+        assert!(
+            matches!(
+                game.phase,
+                Phase::Idle {
+                    is_eating: true,
+                    ..
+                }
+            ),
+            "Enterで食べ始めてゲーム開始"
+        );
+    }
+
+    #[test]
+    fn guide_explains_every_rule() {
+        let text = text_of(&rendered(&LookAwayGame::new()));
+        for expected in [
+            DISPLAY_NAME,
+            "あそびかた",
+            "60秒",
+            "Enter",
+            "Space",
+            "←",
+            "→",
+            "ヤー",
+            "やっほー",
+            "0.8秒",
+            "GAME OVER",
+            "フライング",
+            "100%",
+            "スタート",
+        ] {
+            assert!(text.contains(&compact(expected)), "{expected}: {text}");
+        }
+    }
+
+    #[test]
+    fn guide_values_follow_the_game_constants() {
+        let text = text_of(&rendered(&LookAwayGame::new()));
+        assert!(text.contains(&format!("{}秒", TIME_LIMIT.as_secs())));
+        assert!(text.contains(&"♥".repeat(MAX_LIVES as usize)), "{text}");
+        assert!(
+            text.contains(&format!(
+                "{}-{}",
+                "♥".repeat(CAUGHT_EATING_PENALTY as usize),
+                CAUGHT_EATING_PENALTY
+            )),
+            "食事中のヤーで失う♥の数: {text}"
+        );
+        assert!(
+            text.contains(&format!("フライング・♥-{}", penalty_for(Duration::ZERO))),
+            "フライングで失う♥の数: {text}"
+        );
+    }
+
+    #[test]
+    fn guide_gives_concrete_examples_for_the_shout_direction() {
+        // 「同方向」「逆方向」の言葉だけにせず、左なら←・右なら→と具体例で示す
+        let text = text_of(&rendered(&LookAwayGame::new()));
+        assert!(text.contains(&compact("左を指したら ←")), "{text}");
+        assert!(text.contains(&compact("右を指したら →")), "{text}");
+        assert!(
+            !text.contains('逆'),
+            "逆方向と誤解させる語を使わない: {text}"
+        );
+    }
+
+    #[test]
+    fn guide_is_not_the_play_screen() {
+        let text = text_of(&rendered(&LookAwayGame::new()));
+        assert!(
+            !text.contains('█'),
+            "カウントダウン・残り秒数の大きな数字は出さない"
+        );
+        assert!(!text.contains(&compact(WATCHING_TEXT)));
+        assert!(!text.contains(&compact(EATING_TEXT)));
+    }
+
+    #[test]
+    fn guide_fits_on_one_screen_without_clipping() {
+        // 通常の端末サイズ(80x24)とテスト用の小さめの画面(AREA)で、どの行も欠けずに出る
+        for (width, height) in [(80u16, 24u16), (AREA.width, AREA.height)] {
+            let area = Rect::new(0, 0, width, height);
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| LookAwayGame::new().render(frame, area))
+                .unwrap();
+            let text = text_of(terminal.backend().buffer());
+            for line in guide_lines() {
+                let expected = compact(&line.to_string());
+                assert!(
+                    text.contains(&expected),
+                    "{width}x{height}: {expected}が欠けている"
+                );
+            }
+            assert!(
+                text.contains(&compact("スタート")),
+                "{width}x{height}: 開始の案内"
+            );
+        }
+    }
+
+    // --- 食べ始めるまでの待機 ---
 
     #[test]
     fn time_does_not_pass_while_waiting_to_eat() {
@@ -2698,9 +3131,11 @@ mod tests {
     #[test]
     fn countdown_is_shown_on_the_first_round_only() {
         let mut game = LookAwayGame::new();
+        assert!(is_guide(&game), "セッション開始時はガイダンスから始まる");
+        press(&mut game, KeyCode::Enter);
         assert!(
             is_countdown(&game),
-            "セッション開始時は1問目のカウントダウンから始まる"
+            "ガイダンスを閉じたら1問目のカウントダウン"
         );
         for _ in 0..3 {
             answer_round(&mut game, true);
@@ -3392,8 +3827,10 @@ mod tests {
     #[test]
     fn render_does_not_panic_in_tiny_area() {
         let mut game = LookAwayGame::new();
-        let setups: [fn(&mut LookAwayGame); 5] = [
+        let setups: [fn(&mut LookAwayGame); 6] = [
+            // ガイダンス(new直後)
             |_| {},
+            |g| g.start_countdown(),
             |g| {
                 g.phase = new_idle_phase(ms(500), false)
             },

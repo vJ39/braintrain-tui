@@ -71,7 +71,7 @@ pub(super) const MENU_DESCRIPTIONS: [&str; MENU_ITEMS.len()] = [
     "矢印キーで曲に合わせてステップする",
     "合図が出たら即座に反応する",
     "軽トラの揺れに耐えてベーゴマをゴールへ運ぶ",
-    "指さして「ヤー!!」と叫んだ方の逆を向く",
+    "食べつつ、ヤーは指された向きのキー・やっほーはSpace",
     "BGMを選んで聴く",
     "ゲームごとの反応時間の推移を見る",
 ];
@@ -116,7 +116,7 @@ pub(super) fn new_game(item: usize, difficulty: Difficulty) -> Box<dyn Game> {
         QUICK_DRAW_ITEM_INDEX => Box::new(QuickDrawGame::new()),
         // べーは難易度を持たず、ROUND1・ROUND2が固定の内容で進む
         BEIGOMA_ITEM_INDEX => Box::new(BeigomaGame::new()),
-        // ヤッホーは難易度を持たず、10問固定(ライフ制)で進む
+        // ヤッホーは難易度を持たず、60秒以内の完食を目指すライフ制で進む
         LOOK_AWAY_ITEM_INDEX => Box::new(LookAwayGame::new()),
         _ => unreachable!("history is handled without creating a game"),
     }
@@ -344,6 +344,15 @@ mod tests {
             !MENU_DESCRIPTIONS[LOOK_AWAY_ITEM_INDEX].contains(crate::game::look_away::DISPLAY_NAME)
         );
         assert!(!MENU_DESCRIPTIONS[LOOK_AWAY_ITEM_INDEX].is_empty());
+    }
+
+    #[test]
+    fn look_away_description_matches_the_same_direction_rule() {
+        // 「ヤー」は指された方向と同じキーが正解(look_away::judge)。逆を向くと誤解させない
+        let description = MENU_DESCRIPTIONS[LOOK_AWAY_ITEM_INDEX];
+        assert!(!description.contains('逆'), "{description}");
+        assert!(description.contains("指された向き"), "{description}");
+        assert!(description.contains("Space"), "{description}");
     }
 
     #[test]

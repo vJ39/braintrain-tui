@@ -388,8 +388,9 @@ mod tests {
 
     // --- ヤッホー ---
 
-    /// ヤッホーが始まり、まず「3.2.1.GO!!」のゲーム内カウントダウンから始まることを確かめる。
-    /// 問題ごとに自前のカウントダウンを持つため、画面遷移側のカウントダウン
+    /// ヤッホーが始まり、まずゲーム内のあそびかたガイダンスを出し、Enterで
+    /// 「3.2.1.GO!!」のゲーム内カウントダウンへ進むことを確かめる。
+    /// 自前のガイダンス・カウントダウンを持つため、画面遷移側のカウントダウン
     /// (Screen::Countdown)は経由しない。カウントダウンが終わったら食べ始めるまでの
     /// 催促画面になり、食べ始めて初めてタイマー・イベントが動き出す
     fn assert_look_away_round1_is_playing(app: &mut App) {
@@ -405,8 +406,21 @@ mod tests {
             "{text}"
         );
         assert!(
+            text.contains("あそびかた") && !text.contains('█'),
+            "セッション開始直後はカウントダウンではなくガイダンスを出す: {text}"
+        );
+        // ガイダンスは時間では閉じず、Enter以外のキーでも閉じない
+        app.update(Duration::from_millis(2500));
+        app.handle_key(KeyEvent::from(KeyCode::Left));
+        app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        let text = rendered_text(app).replace(' ', "");
+        assert!(text.contains("あそびかた"), "ガイダンスのまま: {text}");
+        // Enterでガイダンスを閉じるとゲーム内のカウントダウンが始まる
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        let text = rendered_text(app).replace(' ', "");
+        assert!(
             text.contains('█'),
-            "セッション開始直後はゲーム内のカウントダウンを大きな文字で出す: {text}"
+            "ガイダンスを閉じたらゲーム内のカウントダウンを大きな文字で出す: {text}"
         );
         // カウントダウンを終わらせる
         app.update(Duration::from_millis(2500));
