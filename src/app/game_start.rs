@@ -406,8 +406,8 @@ mod tests {
         );
         assert!(text.contains("ごはん"), "ごはんゲージが表示される: {text}");
         assert!(
-            text.contains(&crate::game::look_away::WAITING_TO_EAT_TEXT.replace(' ', "")),
-            "食べ始めるまでの催促画面を出す: {text}"
+            text.contains(&crate::game::look_away::WATCHING_TEXT.replace(' ', "")),
+            "食べ始めるまでは様子見の通常表示から始まる: {text}"
         );
         // 食べ始めていないので入力は記録されない
         app.handle_key(KeyEvent::from(KeyCode::Left));
