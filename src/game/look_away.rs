@@ -62,8 +62,10 @@ pub const RICE_DRAIN_PER_SEC: f32 = 0.1 / 3.0;
 pub const IDLE_WAIT_MS: (u64, u64) = (3000, 9000);
 /// 1ROUND(TIME_LIMIT=60秒)あたりの目安イベント回数。平均6秒に1回のペース
 pub const TARGET_EVENT_COUNT: u32 = 10;
-/// フッター(ライフ・ごはん・操作説明)の外側の高さ(枠線込み)
-const FOOTER_HEIGHT: u16 = 6;
+/// フッター(残り秒数・ライフ・ごはん・操作説明)の外側の高さ(枠線込み)。
+/// 残り秒数を大きな数字で見せるため、内訳は大きな数字5+ライフ1+
+/// ごはんゲージ2+操作説明1の9行に、上下の枠線2行を足した11行
+const FOOTER_HEIGHT: u16 = 11;
 /// これ以内に正しい入力ができれば正解(♥は減らない)
 pub const RESPONSE_SAFE_WINDOW: Duration = Duration::from_millis(800);
 /// RESPONSE_SAFE_WINDOWを超えた経過時間をこの単位で区切り、超過1区分ごとに♥をもう1つ失う
@@ -1113,7 +1115,8 @@ impl LookAwayGame {
         self.mark_renderer.render(frame, area, is_correct, background);
     }
 
-    /// ライフ・ごはんゲージと操作説明のフッター
+    /// 残り秒数・ライフ・ごはんゲージと操作説明のフッター。残り秒数は大きな数字で、
+    /// ごはんゲージは画面幅いっぱいのバーで見やすくする
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         let block = theme::sub_panel();
         let inner = block.inner(area);
@@ -1121,12 +1124,56 @@ impl LookAwayGame {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(5),
                 Constraint::Length(1),
+                Constraint::Length(2),
                 Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(1),
             ])
             .split(inner);
+        self.render_remaining_time_big(frame, rows[0]);
+        self.render_lives(frame, rows[1]);
+        self.render_rice_gauge(frame, rows[2]);
+        let is_eating = matches!(self.phase, Phase::Idle { is_eating: true, .. });
+        let eat_hint = if is_eating {
+            "食べるのをやめる"
+        } else {
+            "食べ始める"
+        };
+        let help_line = Line::from(Span::styled(
+            format!("←→:防御 Space:やっほー Enter:{eat_hint}"),
+            Style::default().fg(theme::MUTED),
+        ));
+        frame.render_widget(
+            Paragraph::new(help_line).alignment(Alignment::Center),
+            rows[3],
+        );
+    }
+
+    /// 残り秒数を大きな数字(5x5ドットフォント)で見せる。残りが少ない時は警告色にする
+    fn render_remaining_time_big(&self, frame: &mut Frame, area: Rect) {
+        let remaining_secs = TIME_LIMIT.saturating_sub(self.elapsed_total).as_secs();
+        let label = format!("{remaining_secs:02}");
+        let color = if remaining_secs <= TIME_LIMIT_WARNING_SECONDS {
+            theme::INCORRECT
+        } else {
+            theme::ACCENT_STRONG
+        };
+        let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+        let scale = (1..=2).rev().find(|&s| {
+            let (width, height) = countdown::big_text_size(&label, s);
+            width <= area.width && height <= area.height
+        });
+        let lines: Vec<Line> = match scale.and_then(|s| countdown::big_text_lines(&label, s)) {
+            Some(big) => big.into_iter().map(|l| Line::from(Span::styled(l, style))).collect(),
+            None => vec![Line::from(Span::styled(format!("{remaining_secs}秒"), style))],
+        };
+        let height = (lines.len() as u16).min(area.height);
+        let text_area = theme::vertical_center(area, height);
+        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), text_area);
+    }
+
+    /// ライフ(ハート)。背景パネルで強調する
+    fn render_lives(&self, frame: &mut Frame, area: Rect) {
         let hearts_bg = Color::Rgb(40, 0, 0);
         let hearts_line = Line::from(vec![
             Span::styled(
@@ -1143,45 +1190,33 @@ impl LookAwayGame {
                     .bg(hearts_bg)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                format!("  残り{}秒", TIME_LIMIT.saturating_sub(self.elapsed_total).as_secs()),
-                Style::default().fg(theme::TEXT),
-            ),
         ]);
-        frame.render_widget(
-            Paragraph::new(hearts_line).alignment(Alignment::Center),
-            rows[0],
-        );
+        frame.render_widget(Paragraph::new(hearts_line).alignment(Alignment::Center), area);
+    }
+
+    /// ごはんゲージ。ラベル行と、画面幅いっぱいの太いバー本体を2行に分けて見やすくする
+    fn render_rice_gauge(&self, frame: &mut Frame, area: Rect) {
         let rice_percent = (self.rice.clamp(0.0, 1.0) * 100.0).round() as u32;
-        let rice_line = Line::from(vec![
-            Span::styled(" ごはん ", theme::title_style()),
-            Span::styled(
-                theme::progress_bar(rice_percent, 100, 10),
-                Style::default().fg(theme::ACCENT),
-            ),
-        ]);
-        frame.render_widget(
-            Paragraph::new(rice_line).alignment(Alignment::Center),
-            rows[1],
-        );
-        let help_line = Line::from(Span::styled(
-            "←→:ヤーを防御 / Space:やっほー",
-            Style::default().fg(theme::MUTED),
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(area);
+        let label_line = Line::from(Span::styled(
+            format!("ごはん {rice_percent:>3}%"),
+            theme::title_style(),
         ));
         frame.render_widget(
-            Paragraph::new(help_line).alignment(Alignment::Center),
-            rows[2],
+            Paragraph::new(label_line).alignment(Alignment::Center),
+            rows[0],
         );
-        let is_eating = matches!(self.phase, Phase::Idle { is_eating: true, .. });
-        let eat_hint = if is_eating {
-            "Enterで食べるのをやめる"
-        } else {
-            "Enterで食べ始める"
-        };
-        let eat_line = Line::from(Span::styled(eat_hint, Style::default().fg(theme::MUTED)));
+        let bar_width = area.width as usize;
+        let bar_line = Line::from(Span::styled(
+            theme::progress_bar(rice_percent, 100, bar_width),
+            Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+        ));
         frame.render_widget(
-            Paragraph::new(eat_line).alignment(Alignment::Center),
-            rows[3],
+            Paragraph::new(bar_line).alignment(Alignment::Center),
+            rows[1],
         );
     }
 }
@@ -2655,17 +2690,18 @@ mod tests {
 
     #[test]
     fn footer_shows_remaining_time_that_counts_down() {
+        // 残り秒数は大きな数字(5x5ドットフォント)で表示するので、経過時間に応じて
+        // グリフの並びが変わることを確認する(具体的なスケールは画面幅依存のため見ない)
         let mut game = LookAwayGame::new();
         finish_countdown(&mut game);
+        let footer_at_60 = footer_text(&rendered(&game));
         assert!(
-            text_of(&rendered(&game)).contains(&compact("残り60秒")),
-            "開始直後は残り60秒"
+            footer_at_60.contains('█'),
+            "残り秒数が大きな数字で表示される: {footer_at_60}"
         );
         game.update(ms(30_000));
-        assert!(
-            text_of(&rendered(&game)).contains(&compact("残り30秒")),
-            "30秒経過したら残り30秒"
-        );
+        let footer_at_30 = footer_text(&rendered(&game));
+        assert_ne!(footer_at_60, footer_at_30, "秒数が変わればグリフの表示も変わる");
     }
 
     #[test]
@@ -2795,12 +2831,12 @@ mod tests {
         finish_countdown(&mut game);
         // 食べ始めた直後から始まるので、まず「やめる」の案内が出る
         assert!(
-            text_of(&rendered(&game)).contains(&compact("Enterで食べるのをやめる")),
+            text_of(&rendered(&game)).contains(&compact("Enter:食べるのをやめる")),
             "食べている時は「やめる」と案内する"
         );
         press(&mut game, KeyCode::Enter);
         assert!(
-            text_of(&rendered(&game)).contains(&compact("Enterで食べ始める")),
+            text_of(&rendered(&game)).contains(&compact("Enter:食べ始める")),
             "食べていない時は「食べ始める」と案内する"
         );
     }
@@ -3113,3 +3149,4 @@ mod tests {
         }
     }
 }
+

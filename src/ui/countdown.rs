@@ -130,12 +130,19 @@ const GLYPH_GAP: u16 = 1;
 /// 大きな文字の最大倍率
 const MAX_SCALE: u16 = 3;
 
-/// カウントダウンで使う文字だけの5x5ドットフォント('#'がドット)
+/// カウントダウンや残り秒数表示で使う文字の5x5ドットフォント('#'がドット)
 fn glyph(c: char) -> Option<[&'static str; GLYPH_ROWS as usize]> {
     let rows = match c {
-        '3' => ["#####", "    #", "#####", "    #", "#####"],
-        '2' => ["#####", "    #", "#####", "#    ", "#####"],
+        '0' => ["#####", "#   #", "#   #", "#   #", "#####"],
         '1' => ["  #  ", " ##  ", "  #  ", "  #  ", "#####"],
+        '2' => ["#####", "    #", "#####", "#    ", "#####"],
+        '3' => ["#####", "    #", "#####", "    #", "#####"],
+        '4' => ["#   #", "#   #", "#####", "    #", "    #"],
+        '5' => ["#####", "#    ", "#####", "    #", "#####"],
+        '6' => ["#####", "#    ", "#####", "#   #", "#####"],
+        '7' => ["#####", "    #", "   # ", "  #  ", "  #  "],
+        '8' => ["#####", "#   #", "#####", "#   #", "#####"],
+        '9' => ["#####", "#   #", "#####", "    #", "#####"],
         'G' => ["#####", "#    ", "# ###", "#   #", "#####"],
         'O' => ["#####", "#   #", "#   #", "#   #", "#####"],
         '!' => ["  #  ", "  #  ", "  #  ", "     ", "  #  "],
@@ -146,7 +153,7 @@ fn glyph(c: char) -> Option<[&'static str; GLYPH_ROWS as usize]> {
 
 /// labelを大きな文字の行の並びにする。scaleはドットの倍率(1ドット=縦scale行 x 横scale*DOT_WIDTHセル)。
 /// フォントに無い文字を含む場合はNone
-fn big_text_lines(label: &str, scale: u16) -> Option<Vec<String>> {
+pub(crate) fn big_text_lines(label: &str, scale: u16) -> Option<Vec<String>> {
     let glyphs: Vec<_> = label.chars().map(glyph).collect::<Option<_>>()?;
     let cells = (DOT_WIDTH * scale) as usize;
     let dot_on = "█".repeat(cells);
@@ -172,7 +179,7 @@ fn big_text_lines(label: &str, scale: u16) -> Option<Vec<String>> {
 }
 
 /// labelを倍率scaleで描いた時の(幅, 高さ)のセル数
-fn big_text_size(label: &str, scale: u16) -> (u16, u16) {
+pub(crate) fn big_text_size(label: &str, scale: u16) -> (u16, u16) {
     let chars = label.chars().count() as u16;
     let dots = chars * GLYPH_COLS + chars.saturating_sub(1) * GLYPH_GAP;
     (dots * DOT_WIDTH * scale, GLYPH_ROWS * scale)
@@ -325,6 +332,25 @@ mod tests {
                 phase.label()
             );
         }
+    }
+
+    #[test]
+    fn big_text_has_glyph_for_every_digit() {
+        // 残り秒数の大表示(look_awayのHUD)で0〜9すべて使うため、全数字のグリフが必要
+        for digit in '0'..='9' {
+            assert!(
+                big_text_lines(&digit.to_string(), 1).is_some(),
+                "{digit}のグリフがあること"
+            );
+        }
+    }
+
+    #[test]
+    fn big_text_of_two_digit_number_has_consistent_glyph_width() {
+        let lines = big_text_lines("42", 1).unwrap();
+        assert_eq!(lines.len(), GLYPH_ROWS as usize);
+        let width = lines[0].chars().count();
+        assert!(lines.iter().all(|l| l.chars().count() == width), "全行同じ幅");
     }
 
     #[test]
