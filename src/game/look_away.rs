@@ -5,9 +5,9 @@
 //! 「やっほー」と言われたらSpaceで「やっほー」と返す。
 //! 1問目は必ず「やっほー」から始まる。以降の待機はIDLE_WAIT_MSで「来るか来るか」
 //! という間を作ってから次のイベントが来る。1ROUNDあたり合計TARGET_EVENT_COUNT回
-//! (やっほー3回・ヤー5回、平均7.5秒に1回)のペースになるよう、残り時間・残り回数から
+//! (やっほー3回・ヤー7回、平均6秒に1回)のペースになるよう、残り時間・残り回数から
 //! 待機時間を調整し、間に合わなくなってきたら基本範囲より切り詰めてでも早く発動する
-//! (next_wait_duration)。加えて、5回のヤーのうち1回は食事開始(再開)から2秒以内に
+//! (next_wait_duration)。加えて、7回のヤーのうち1回は食事開始(再開)から2秒以内に
 //! 発生するよう強制する(early_shout_forced参照)。どちらもRESPONSE_SAFE_WINDOW(800ms)
 //! 以内に正しく反応すれば正解。
 //! 「ヤー」への反応が遅れた分だけ複数個の♥を失う(penalty_for参照)。
@@ -60,12 +60,12 @@ pub const RICE_DRAIN_PER_SEC: f32 = 0.1 / 3.0;
 
 /// 待機(相手が何もしていない)の長さの範囲(最小, 最大)ms。
 /// 「来るか来るか」という緊張感を持続させつつ、1ROUNDでTARGET_EVENT_COUNT回
-/// (平均7.5秒に1回)のペースになるよう、実際の待機時間はnext_wait_durationで調整する
+/// (平均6秒に1回)のペースになるよう、実際の待機時間はnext_wait_durationで調整する
 pub const IDLE_WAIT_MS: (u64, u64) = (3000, 9000);
-/// 1ROUND(TIME_LIMIT=60秒)あたりの目安イベント回数。やっほー3回・ヤー5回の
-/// 合計8回で、平均7.5秒に1回のペース
-pub const TARGET_EVENT_COUNT: u32 = 8;
-/// 5回のヤーのうち1回は、食事開始(再開)からこの時間未満で発生させる
+/// 1ROUND(TIME_LIMIT=60秒)あたりの目安イベント回数。やっほー3回・ヤー7回の
+/// 合計10回で、平均6秒に1回のペース
+pub const TARGET_EVENT_COUNT: u32 = 10;
+/// 7回のヤーのうち1回は、食事開始(再開)からこの時間未満で発生させる
 /// (early_shout_forced参照)
 pub const EARLY_SHOUT_WAIT_MS: (u64, u64) = (300, 1900);
 /// フッター(残り秒数・ごはん・ライフ・食事状態・操作説明)の外側の高さ(枠線込み)。
@@ -87,8 +87,8 @@ pub const TIME_LIMIT: Duration = Duration::from_secs(60);
 /// 残り時間がこの秒数以下になったら、1秒ごとにカウントダウン音を鳴らし始める
 pub const TIME_LIMIT_WARNING_SECONDS: u64 = 10;
 
-/// 待機の後に「やっほー」イベントになる確率(やっほー3回:ヤー5回の割合)
-pub const YAHHO_RATE: f64 = 3.0 / 8.0;
+/// 待機の後に「やっほー」イベントになる確率(やっほー3回:ヤー7回の割合)
+pub const YAHHO_RATE: f64 = 3.0 / 10.0;
 
 /// 相手の決め台詞。指さしと一緒にこれを叫んだら、逆を向く合図
 pub const SHOUT_TEXT: &str = "ヤー!!";
@@ -682,7 +682,7 @@ impl LookAwayGame {
     }
 
     /// 次の待機時間を選ぶ。基本はIDLE_WAIT_MSの範囲からランダムに選ぶが、
-    /// 1ROUND合計TARGET_EVENT_COUNT回・平均7.5秒に1回のペースを保てるよう、
+    /// 1ROUND合計TARGET_EVENT_COUNT回・平均6秒に1回のペースを保てるよう、
     /// 残り時間を残りイベント回数で割った割り当てを超える分は切り詰める。
     /// 目安回数に達した後は帳尻合わせをやめ、基本範囲のまま継続する
     fn next_wait_duration(&self) -> Duration {
@@ -691,6 +691,14 @@ impl LookAwayGame {
         let remaining_time = TIME_LIMIT.saturating_sub(self.elapsed_total);
         let allowance = remaining_time / remaining_events;
         base.min(allowance)
+    }
+
+    /// 食事開始2秒以内の強制ヤーを今回発動するか。発動タイミングを予測できないよう、
+    /// 残りイベント回数が少なくなるほど発動確率を上げていく(1/残り回数)。
+    /// 残り1回になったら確率1で必ず発動するので、1ROUND中に取りこぼすことはない
+    fn should_force_early_shout(&self, rng: &mut impl Rng) -> bool {
+        let remaining_events = TARGET_EVENT_COUNT.saturating_sub(self.event_count).max(1);
+        remaining_events <= 1 || rng.gen_bool(1.0 / f64::from(remaining_events))
     }
 
     /// 待機が終わった時に、次のイベントを始める。was_eatingは待機中に食事していたか
@@ -1608,7 +1616,10 @@ impl Game for LookAwayGame {
                     started_eating = *is_eating;
                 }
                 Phase::WaitingToEat { .. } => {
-                    if !self.early_shout_forced && self.tracker.total() > 0 {
+                    if !self.early_shout_forced
+                        && self.tracker.total() > 0
+                        && self.should_force_early_shout(&mut rand::thread_rng())
+                    {
                         self.early_shout_forced = true;
                         self.pending_forced_event =
                             Some(Event::Shout(Side::random(&mut rand::thread_rng())));
@@ -2131,8 +2142,8 @@ mod tests {
         let events: Vec<Event> = (0..1000).map(|_| choose_event(&mut rng)).collect();
         let count = |f: &dyn Fn(&Event) -> bool| events.iter().filter(|e| f(e)).count();
         let yahho = count(&|e| *e == Event::Yahho);
-        // 1000回中の目安375回(ヤッホー3回:ヤー5回=3/8)。乱数のゆれを見込んで幅を持たせる
-        assert!((320..=430).contains(&yahho), "やっほーの出現数: {yahho}");
+        // 1000回中の目安300回(ヤッホー3回:ヤー7回=3/10)。乱数のゆれを見込んで幅を持たせる
+        assert!((250..=350).contains(&yahho), "やっほーの出現数: {yahho}");
         for side in SIDES {
             assert!(
                 count(&|e| *e == Event::Shout(side)) > 0,
@@ -2304,7 +2315,7 @@ mod tests {
         assert_eq!(
             IDLE_WAIT_MS,
             (3000, 9000),
-            "1ROUND合計TARGET_EVENT_COUNT回・平均7.5秒に1回のペースになる基本範囲"
+            "1ROUND合計TARGET_EVENT_COUNT回・平均6秒に1回のペースになる基本範囲"
         );
     }
 
@@ -2324,14 +2335,14 @@ mod tests {
 
     #[test]
     fn next_wait_duration_is_clamped_when_behind_pace() {
-        // 残り5秒しかないのに、まだ1回もイベントが起きていない(残り8回分)
+        // 残り5秒しかないのに、まだ1回もイベントが起きていない(残り10回分)
         let mut game = LookAwayGame::new();
         game.elapsed_total = TIME_LIMIT - ms(5000);
         for _ in 0..500 {
             let wait = game.next_wait_duration();
             assert!(
-                wait <= ms(625),
-                "残り時間5秒・残り8回なら、1回あたりの割り当ては625msに切り詰められる: {wait:?}"
+                wait <= ms(500),
+                "残り時間5秒・残り10回なら、1回あたりの割り当ては500msに切り詰められる: {wait:?}"
             );
         }
     }
@@ -2353,7 +2364,40 @@ mod tests {
     // --- 食事開始2秒以内の強制ヤー(early_shout_forced) ---
 
     #[test]
-    fn second_meal_start_forces_a_shout_within_two_seconds() {
+    fn should_force_early_shout_always_true_when_only_one_event_remains() {
+        let mut game = LookAwayGame::new();
+        game.event_count = TARGET_EVENT_COUNT - 1;
+        let mut rng = StdRng::seed_from_u64(1);
+        for _ in 0..100 {
+            assert!(
+                game.should_force_early_shout(&mut rng),
+                "残り1回になったら取りこぼさないよう必ず発動する"
+            );
+        }
+    }
+
+    #[test]
+    fn should_force_early_shout_is_randomized_when_events_remain() {
+        let mut game = LookAwayGame::new();
+        game.event_count = 0;
+        let mut rng = StdRng::seed_from_u64(2);
+        let mut forced = 0;
+        let mut not_forced = 0;
+        for _ in 0..500 {
+            if game.should_force_early_shout(&mut rng) {
+                forced += 1;
+            } else {
+                not_forced += 1;
+            }
+        }
+        assert!(
+            forced > 0 && not_forced > 0,
+            "発動タイミングが固定されていないなら、発動・非発動の両方が出るはず: forced={forced}, not_forced={not_forced}"
+        );
+    }
+
+    #[test]
+    fn early_shout_forces_a_shout_within_two_seconds_when_only_one_event_remains() {
         let mut game = LookAwayGame::new();
         finish_countdown(&mut game);
         // 1問目は必ず「やっほー」から始まるので、正解して消化する
@@ -2367,7 +2411,8 @@ mod tests {
         finish_result(&mut game);
         assert!(matches!(game.phase, Phase::WaitingToEat { .. }));
 
-        // 2回目の食事開始(再開)
+        // 残り1回にして、次の食事開始で必ず発動する状況を作る
+        game.event_count = TARGET_EVENT_COUNT - 1;
         press(&mut game, KeyCode::Enter);
         match game.phase {
             Phase::Idle {
