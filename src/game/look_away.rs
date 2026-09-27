@@ -505,6 +505,54 @@ pub struct LookAwayGame {
     shown_countdown_once: bool,
     /// カウンター越しの親父の絵(通常/ヤー左右/やっほー)の描画器
     stage_renderer: StageRenderer,
+    /// 詰み(理論上完食が間に合わない)を検知して捨てゲー確認ダイアログを出しているか。
+    /// 表示中はゲーム進行(経過時間・イベント)を止める
+    abandon_prompt_shown: bool,
+    /// 一度「いいえ(続ける)」を選んだら、そのセッションでは二度と確認を出さない
+    abandon_prompt_dismissed: bool,
+}
+
+/// 捨てゲー確認ダイアログの文言(y/Enterで確定・n/Escで続行)
+const ABANDON_PROMPT_TEXT: &str = "これ以上は無理です。あきらめますか？";
+
+/// areaの中央にwidth x heightの矩形を切り出す(終了確認ダイアログと同じロジック)
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(height),
+            Constraint::Fill(1),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(width),
+            Constraint::Fill(1),
+        ])
+        .split(rows[1])[1]
+}
+
+/// 詰み(間に合わない)確認ダイアログ。背景のプレイ画面が見えるよう中央に小さなパネルを重ねて描く
+fn render_abandon_prompt(frame: &mut Frame, area: Rect) {
+    let hints = theme::hints_line(&[("y / Enter", "あきらめる"), ("n / Esc", "続ける")]);
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled(ABANDON_PROMPT_TEXT, theme::title_style())),
+        Line::from(""),
+        hints,
+    ];
+    let content_width = text.iter().map(|l| l.width() as u16).max().unwrap_or(0);
+    let width = (content_width + 4).min(area.width);
+    let height = (text.len() as u16 + 2).min(area.height);
+    let dialog = centered_rect(area, width, height);
+    frame.render_widget(ratatui::widgets::Clear, dialog);
+    let paragraph = Paragraph::new(text)
+        .alignment(Alignment::Center)
+        .block(theme::panel(Line::from(" 確認 ").centered()));
+    frame.render_widget(paragraph, dialog);
 }
 
 /// 結果表示(◯/✗)のエリアを塗る色。画像表示の時は画像の背景と周りのセルを同じ色で塗れる
@@ -552,6 +600,8 @@ impl LookAwayGame {
             go_se: GoSeOnce::new(),
             shown_countdown_once: false,
             stage_renderer: StageRenderer::new(),
+            abandon_prompt_shown: false,
+            abandon_prompt_dismissed: false,
         };
         game.start_round();
         game
@@ -570,6 +620,16 @@ impl LookAwayGame {
     /// 最後の結果表示が終わったらセッションを終えるか(ライフ切れ・完食)
     fn is_last_round(&self) -> bool {
         self.is_game_over() || self.rice <= 0.0
+    }
+
+    /// 残り時間ぶん今から食べ続けても完食に間に合わない(理論上詰み)か
+    fn is_unwinnable(&self) -> bool {
+        if self.rice <= 0.0 {
+            return false;
+        }
+        let remaining_time = TIME_LIMIT.saturating_sub(self.elapsed_total);
+        let time_needed = Duration::from_secs_f32(self.rice / RICE_DRAIN_PER_SEC);
+        time_needed > remaining_time
     }
 
     /// 新しい問題を始める。1問目だけ「3.2.1.GO!!」の
@@ -658,6 +718,10 @@ impl LookAwayGame {
 
     /// 時間経過で状態を進める。制限時間を過ぎた問題は不正解にする
     fn tick_phase(&mut self, dt: Duration) {
+        // 捨てゲー確認ダイアログの表示中はゲーム進行を止める
+        if self.abandon_prompt_shown {
+            return;
+        }
         // カウントダウン演出中はプレイヤーが操作できないので、制限時間には含めない
         if !matches!(self.phase, Phase::Countdown { .. }) {
             self.elapsed_total += dt;
@@ -751,6 +815,13 @@ impl LookAwayGame {
                     }
                 }
             }
+        }
+        // 食事・判定処理が済んだ後の状態で、間に合わなくなっていないか判定する
+        if !self.abandon_prompt_dismissed
+            && !matches!(self.phase, Phase::Countdown { .. } | Phase::Result { .. })
+            && self.is_unwinnable()
+        {
+            self.abandon_prompt_shown = true;
         }
     }
 
@@ -1255,6 +1326,27 @@ impl Game for LookAwayGame {
         if self.finished {
             return;
         }
+        if self.abandon_prompt_shown {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    self.abandon_prompt_shown = false;
+                    self.lives = 0;
+                    self.phase = Phase::Result {
+                        is_correct: false,
+                        elapsed: Duration::ZERO,
+                        message: None,
+                        player_stage: PlayerStageKind::Watching,
+                        judge_stamp: JudgeStamp::Default,
+                    };
+                }
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    self.abandon_prompt_shown = false;
+                    self.abandon_prompt_dismissed = true;
+                }
+                _ => {}
+            }
+            return;
+        }
         let Some(input) = Input::from_key(key.code) else {
             return;
         };
@@ -1301,6 +1393,9 @@ impl Game for LookAwayGame {
             .split(body);
         self.render_stage(frame, rows[0]);
         self.render_footer(frame, rows[1]);
+        if self.abandon_prompt_shown {
+            render_abandon_prompt(frame, area);
+        }
     }
 
     fn is_finished(&self) -> bool {
@@ -1488,7 +1583,14 @@ mod tests {
         let mut game = LookAwayGame::new();
         finish_countdown(&mut game);
         assert!(!game.is_game_over());
-        game.update(TIME_LIMIT - ms(1));
+        // 何も食べていないので、TIME_LIMITに達するより先に詰みダイアログが出る。
+        // 「続ける」を選んで進行させ、それでも60秒経てばGAME OVERになることを確認する
+        let time_needed = Duration::from_secs_f32(RICE_FULL / RICE_DRAIN_PER_SEC);
+        game.update(TIME_LIMIT.saturating_sub(time_needed) + ms(1));
+        assert!(game.abandon_prompt_shown, "食べていないので先に詰みダイアログが出る");
+        press(&mut game, KeyCode::Char('n'));
+        let remaining = TIME_LIMIT.saturating_sub(game.elapsed_total);
+        game.update(remaining - ms(1));
         assert!(!game.is_game_over(), "制限時間ぴったり手前ではまだGAME OVERにしない");
         game.update(ms(1));
         assert!(
@@ -1507,6 +1609,105 @@ mod tests {
         assert!(game.is_finished());
         assert!(game.is_cleared());
         assert!(!game.is_game_over());
+    }
+
+    // --- 詰み(間に合わない)判定と捨てゲー確認ダイアログ ---
+
+    #[test]
+    fn is_unwinnable_when_remaining_time_is_shorter_than_eating_time_needed() {
+        let mut game = LookAwayGame::new();
+        game.rice = RICE_FULL;
+        game.elapsed_total = Duration::ZERO;
+        assert!(
+            !game.is_unwinnable(),
+            "開始直後は満タンのごはんでも時間内に食べきれるはず"
+        );
+        let time_needed = Duration::from_secs_f32(RICE_FULL / RICE_DRAIN_PER_SEC);
+        game.elapsed_total = TIME_LIMIT.saturating_sub(time_needed) + ms(1);
+        assert!(
+            game.is_unwinnable(),
+            "残り時間が食べきるのに必要な時間を1msでも下回れば詰み"
+        );
+    }
+
+    #[test]
+    fn is_not_unwinnable_when_rice_is_already_empty() {
+        let mut game = LookAwayGame::new();
+        game.rice = 0.0;
+        game.elapsed_total = TIME_LIMIT;
+        assert!(!game.is_unwinnable(), "既に完食していれば詰みではない");
+    }
+
+    #[test]
+    fn tick_shows_abandon_prompt_and_pauses_once_unwinnable() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        let time_needed = Duration::from_secs_f32(RICE_FULL / RICE_DRAIN_PER_SEC);
+        let just_before_unwinnable = TIME_LIMIT.saturating_sub(time_needed);
+        game.update(just_before_unwinnable);
+        assert!(!game.abandon_prompt_shown, "詰みになる直前はまだ出さない");
+        game.update(ms(2));
+        assert!(game.abandon_prompt_shown, "詰みになった瞬間にダイアログを出す");
+        let elapsed_when_shown = game.elapsed_total;
+        game.update(ms(500));
+        assert_eq!(
+            game.elapsed_total, elapsed_when_shown,
+            "ダイアログ表示中は時間経過を止める"
+        );
+    }
+
+    #[test]
+    fn abandon_prompt_yes_ends_the_session_as_game_over() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        game.rice = RICE_FULL;
+        let time_needed = Duration::from_secs_f32(RICE_FULL / RICE_DRAIN_PER_SEC);
+        game.elapsed_total = TIME_LIMIT.saturating_sub(time_needed);
+        game.update(ms(2));
+        assert!(game.abandon_prompt_shown);
+        press(&mut game, KeyCode::Enter);
+        assert!(!game.abandon_prompt_shown);
+        assert!(is_result(&game, false));
+        finish_result(&mut game);
+        assert!(game.is_finished());
+        assert!(game.is_game_over(), "あきらめた場合はGAME OVER扱い");
+        assert!(!game.is_cleared());
+    }
+
+    #[test]
+    fn abandon_prompt_no_dismisses_and_the_session_continues() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        game.rice = RICE_FULL;
+        let time_needed = Duration::from_secs_f32(RICE_FULL / RICE_DRAIN_PER_SEC);
+        game.elapsed_total = TIME_LIMIT.saturating_sub(time_needed);
+        game.update(ms(2));
+        assert!(game.abandon_prompt_shown);
+        press(&mut game, KeyCode::Char('n'));
+        assert!(!game.abandon_prompt_shown);
+        assert!(game.abandon_prompt_dismissed);
+        assert!(
+            matches!(game.phase, Phase::Idle { .. }),
+            "続行を選んだら元のフェーズのまま"
+        );
+        assert!(!game.is_finished());
+    }
+
+    #[test]
+    fn abandon_prompt_is_not_shown_again_after_being_dismissed() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        game.rice = RICE_FULL;
+        let time_needed = Duration::from_secs_f32(RICE_FULL / RICE_DRAIN_PER_SEC);
+        game.elapsed_total = TIME_LIMIT.saturating_sub(time_needed);
+        game.update(ms(2));
+        assert!(game.abandon_prompt_shown, "詰みダイアログを経由するはず");
+        press(&mut game, KeyCode::Char('n'));
+        game.update(ms(1));
+        assert!(
+            !game.abandon_prompt_shown,
+            "一度いいえを選んだら同じセッションでは二度と出さない"
+        );
     }
 
     #[test]
@@ -2418,13 +2619,14 @@ mod tests {
     #[test]
     fn render_does_not_panic_in_tiny_area() {
         let mut game = LookAwayGame::new();
-        let setups: [fn(&mut LookAwayGame); 4] = [
+        let setups: [fn(&mut LookAwayGame); 5] = [
             |_| {},
             |g| {
                 g.phase = new_idle_phase(ms(500), false)
             },
             |g| shout(g, Side::Right),
             yahho,
+            |g| g.abandon_prompt_shown = true,
         ];
         for setup in setups {
             setup(&mut game);
