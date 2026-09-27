@@ -745,6 +745,9 @@ impl LookAwayGame {
         });
         if verdict.is_guard_success {
             audio::play_se(SeKind::LookAwayGuardSuccess);
+        } else if verdict.is_correct {
+            // 「やっほー」に正しく返せた時(is_guard_successでない正解は必ずこちら)
+            audio::play_se(SeKind::LookAwayYahhoReply);
         }
         if Self::should_play_boo(judge_stamp, verdict.player_stage, message) {
             audio::play_se(SeKind::LookAwayBoo);
