@@ -1,16 +1,16 @@
 //! ヤッホー(look_away): お茶漬け屋のカウンター越しに親父(白い割烹着)と対峙する。
-//! Enterで「食べる」をトグルし、TIME_LIMIT(60秒)以内にごはんゲージを完食すればクリア。
+//! Enterで「食べる」をトグルし、TIME_LIMIT(99秒)以内にごはんゲージを完食すればクリア。
 //! 親父が指さして「ヤー!!」と叫んだら、指された方向と同じ矢印キーを押して防御する。
 //! 食事中に「ヤー」が来ると防御できず問答無用で♥を1つ失い、ごはんもおかわりになる。
 //! 「やっほー」と言われたらSpaceで「やっほー」と返す。
 //! 1問目は必ず「やっほー」から始まる。以降の待機はIDLE_WAIT_MSで「来るか来るか」
 //! という間を作ってから次のイベントが来る。1ROUNDあたり合計TARGET_EVENT_COUNT回
-//! (平均6秒に1回)のペースになるよう、残り時間・残り回数から待機時間を調整し、
-//! 間に合わなくなってきたら基本範囲より切り詰めてでも早く発動する(next_wait_duration)。
-//! どちらもRESPONSE_SAFE_WINDOW(800ms)以内に正しく反応すれば正解。
+//! (やっほー5回・ヤー10回、平均6.6秒に1回)のペースになるよう、残り時間・残り回数から
+//! 待機時間を調整し、間に合わなくなってきたら基本範囲より切り詰めてでも早く発動する
+//! (next_wait_duration)。どちらもRESPONSE_SAFE_WINDOW(800ms)以内に正しく反応すれば正解。
 //! 「ヤー」への反応が遅れた分だけ複数個の♥を失う(penalty_for参照)。
 //! 「やっほー」への反応が遅れるとごはんがおかわりされる(♥は減らない)。
-//! ♥が0になるか、60秒以内に完食できなければGAME OVER。
+//! ♥が0になるか、99秒以内に完食できなければGAME OVER。
 //!
 //! 表示名(DISPLAY_NAME)は仮名称。改名はDISPLAY_NAMEを変えるだけで済むよう、
 //! メニュー・HUD・テストはすべてこの定数を参照する。GAME_ID・モジュール名は
@@ -58,10 +58,11 @@ pub const RICE_DRAIN_PER_SEC: f32 = 0.1 / 3.0;
 
 /// 待機(相手が何もしていない)の長さの範囲(最小, 最大)ms。
 /// 「来るか来るか」という緊張感を持続させつつ、1ROUNDでTARGET_EVENT_COUNT回
-/// (平均6秒に1回)のペースになるよう、実際の待機時間はnext_wait_durationで調整する
+/// (平均6.6秒に1回)のペースになるよう、実際の待機時間はnext_wait_durationで調整する
 pub const IDLE_WAIT_MS: (u64, u64) = (3000, 9000);
-/// 1ROUND(TIME_LIMIT=60秒)あたりの目安イベント回数。平均6秒に1回のペース
-pub const TARGET_EVENT_COUNT: u32 = 10;
+/// 1ROUND(TIME_LIMIT=99秒)あたりの目安イベント回数。やっほー5回・ヤー10回の
+/// 合計15回で、平均6.6秒に1回のペース
+pub const TARGET_EVENT_COUNT: u32 = 15;
 /// フッター(残り秒数・ライフ・ごはん・操作説明)の外側の高さ(枠線込み)。
 /// 残り秒数を大きな数字で見せるため、内訳は大きな数字5+食事状態バッジ1+ライフ1+
 /// ごはんゲージ2+操作説明1の10行に、上下の枠線2行を足した12行
@@ -75,12 +76,12 @@ pub const MAX_RESPONSE_WINDOW: Duration = Duration::from_millis(1200);
 /// 正誤の結果(◯/✗)を表示し続ける時間。この間は次の問題へ進まず、入力も受け付けない
 pub const RESULT_HOLD: Duration = Duration::from_millis(1000);
 /// セッション全体の制限時間。これを過ぎても完食できていなければGAME OVER
-pub const TIME_LIMIT: Duration = Duration::from_secs(60);
+pub const TIME_LIMIT: Duration = Duration::from_secs(99);
 /// 残り時間がこの秒数以下になったら、1秒ごとにカウントダウン音を鳴らし始める
 pub const TIME_LIMIT_WARNING_SECONDS: u64 = 10;
 
-/// 待機の後に「やっほー」イベントになる確率(やっほー5割・ヤー5割)
-pub const YAHHO_RATE: f64 = 0.5;
+/// 待機の後に「やっほー」イベントになる確率(やっほー5回:ヤー10回の割合)
+pub const YAHHO_RATE: f64 = 5.0 / 15.0;
 
 /// 相手の決め台詞。指さしと一緒にこれを叫んだら、逆を向く合図
 pub const SHOUT_TEXT: &str = "ヤー!!";
@@ -2111,8 +2112,8 @@ mod tests {
         let events: Vec<Event> = (0..1000).map(|_| choose_event(&mut rng)).collect();
         let count = |f: &dyn Fn(&Event) -> bool| events.iter().filter(|e| f(e)).count();
         let yahho = count(&|e| *e == Event::Yahho);
-        // 1000回中の目安500回(50%)。乱数のゆれを見込んで幅を持たせる
-        assert!((430..=570).contains(&yahho), "やっほーの出現数: {yahho}");
+        // 1000回中の目安333回(ヤッホー5回:ヤー10回=1/3)。乱数のゆれを見込んで幅を持たせる
+        assert!((280..=390).contains(&yahho), "やっほーの出現数: {yahho}");
         for side in SIDES {
             assert!(
                 count(&|e| *e == Event::Shout(side)) > 0,
