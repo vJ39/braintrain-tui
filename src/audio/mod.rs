@@ -73,6 +73,8 @@ pub enum SeKind {
     LookAwayBoo,
     /// 「やっほー」でSpaceを押して「やっほー」に正しく返せた時の音声(複数候補からランダムに1つ)
     LookAwayYahhoReply,
+    /// 「やっほー」で食事中に「ヤー」で襲われた時のプレイヤー側の声(親父のヤーSE・ブーイングと同時再生)
+    LookAwayCaughtEatingVoice,
     /// スタジアムの歓声(TTR選曲時・プレイ後など、複数の場面で使い回す)
     Cheer,
     /// 勝利ジングル(「やっほー」完食クリア時、Cheerと同時に鳴らす)
@@ -220,6 +222,7 @@ impl SeKind {
             SeKind::LookAwayExplosion => Some("se_look_away_explosion.mp3"),
             SeKind::LookAwayGuardSuccess => Some("se_look_away_guard_success.mp3"),
             SeKind::LookAwayBoo => Some("se_look_away_boo.mp3"),
+            SeKind::LookAwayCaughtEatingVoice => Some("voice_look_away_caught_eating.mp3"),
             SeKind::Cheer => Some("se_cheer.mp3"),
             SeKind::VictoryJingle => Some("se_victory_jingle.mp3"),
             SeKind::ConfirmPrompt => Some("se_confirm_prompt.mp3"),
@@ -572,7 +575,7 @@ pub fn playing_typewriter_kind() -> Option<TypewriterSeKind> {
 mod tests {
     use super::*;
 
-    const ALL_SE_KINDS: [SeKind; 30] = [
+    const ALL_SE_KINDS: [SeKind; 31] = [
         SeKind::Correct,
         SeKind::Incorrect,
         SeKind::Transition,
@@ -599,6 +602,7 @@ mod tests {
         SeKind::LookAwayGuardSuccess,
         SeKind::LookAwayBoo,
         SeKind::LookAwayYahhoReply,
+        SeKind::LookAwayCaughtEatingVoice,
         SeKind::Cheer,
         SeKind::VictoryJingle,
         SeKind::ConfirmPrompt,

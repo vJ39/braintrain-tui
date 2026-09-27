@@ -695,6 +695,7 @@ impl LookAwayGame {
                 audio::play_se(SeKind::LookAwayExplosion);
                 let variant = rand::thread_rng().gen_range(0..STAGE_SHOUT_RIGHT_IMAGES.len());
                 if was_eating {
+                    audio::play_se(SeKind::LookAwayCaughtEatingVoice);
                     self.finish_question(Verdict::caught_eating(side, variant));
                     return;
                 }
