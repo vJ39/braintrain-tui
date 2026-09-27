@@ -106,9 +106,8 @@ pub const EATING_TEXT: &str = "むしゃむしゃ...";
 pub const WATCHING_TEXT: &str = "様子を見ている";
 
 /// 画像アセット(assets/image/からの相対パス)。無ければテキストで描く
-/// 通常時(何もしていない)の顔の候補。待機中は一定間隔でランダムに切り替え、
-/// 目を開けたり閉じたりするフェイントを演出する(NORMAL_FEINT_RATEの確率で2枚目)
-pub const STAGE_NORMAL_IMAGES: [&str; 2] = ["look_away/normal.png", "look_away/normal_feint.png"];
+/// 通常時(何もしていない)の顔
+pub const STAGE_NORMAL_IMAGE: &str = "look_away/normal.png";
 /// 右を指して叫んでいる絵の候補(1問ごとにランダムに1枚選ぶ)
 pub const STAGE_SHOUT_RIGHT_IMAGES: [&str; 2] =
     ["look_away/shout_right.png", "look_away/shout_right_2.png"];
@@ -117,10 +116,6 @@ pub const STAGE_SHOUT_LEFT_IMAGES: [&str; 2] =
     ["look_away/shout_left.png", "look_away/shout_left_2.png"];
 /// 「やっほー」と呼びかけている絵
 pub const STAGE_YAHHO_IMAGE: &str = "look_away/yahho.png";
-/// 通常時の顔でフェイント(2枚目、目を閉じた顔)が選ばれる確率
-pub const NORMAL_FEINT_RATE: f64 = 0.2;
-/// 通常時の顔がランダムに切り替わる間隔の範囲(ms)。この間隔でチラチラと表情を変える
-pub const NORMAL_FLICKER_MS: (u64, u64) = (400, 900);
 
 /// プレイヤー自身を映した絵。カウンター越しの親父とは別に、画面のもう半分に表示する
 pub const PLAYER_EATING_IMAGE: &str = "look_away/player_eating.png";
@@ -231,15 +226,11 @@ fn random_between(rng: &mut impl Rng, (min_ms, max_ms): (u64, u64)) -> Duration 
     Duration::from_millis(rng.gen_range(min_ms..=max_ms))
 }
 
-/// 待機(Idle)フェーズを新しく作る。通常顔のバリエーションとフェイントの
-/// 次回切り替えまでの間隔をここでランダムに決める
+/// 待機(Idle)フェーズを新しく作る
 fn new_idle_phase(remaining: Duration, is_eating: bool) -> Phase {
-    let mut rng = rand::thread_rng();
     Phase::Idle {
         remaining,
         is_eating,
-        normal_variant: choose_normal_variant(&mut rng),
-        flicker_remaining: random_between(&mut rng, NORMAL_FLICKER_MS),
     }
 }
 
@@ -249,15 +240,6 @@ fn choose_event(rng: &mut impl Rng) -> Event {
         Event::Yahho
     } else {
         Event::Shout(Side::random(rng))
-    }
-}
-
-/// 通常時の顔バリエーションをランダムに選ぶ(NORMAL_FEINT_RATEの確率でフェイント顔=1)
-fn choose_normal_variant(rng: &mut impl Rng) -> usize {
-    if rng.gen_bool(NORMAL_FEINT_RATE) {
-        1
-    } else {
-        0
     }
 }
 
@@ -455,12 +437,9 @@ enum Phase {
     /// 問題冒頭の「3.2.1.GO!!」。この間の入力は受け付けない
     Countdown { state: CountdownState },
     /// 相手が何もしていない待機。残りの待機時間と、食事中かどうか。
-    /// normal_variant/flicker_remainingは通常顔のフェイント(チラチラ切り替え)用
     Idle {
         remaining: Duration,
         is_eating: bool,
-        normal_variant: usize,
-        flicker_remaining: Duration,
     },
     /// 指さして「ヤー!!」と叫んでいる。残りの入力受付時間(MAX_RESPONSE_WINDOWから減っていく)。
     /// variantは叫び顔の絵のバリエーション番号(begin_event時にランダムに決め、以後は固定)
@@ -752,8 +731,6 @@ impl LookAwayGame {
             Phase::Idle {
                 remaining,
                 is_eating,
-                normal_variant,
-                flicker_remaining,
             } => {
                 if *is_eating {
                     self.rice = (self.rice - RICE_DRAIN_PER_SEC * dt.as_secs_f32()).max(0.0);
@@ -770,12 +747,6 @@ impl LookAwayGame {
                         };
                         return;
                     }
-                }
-                *flicker_remaining = flicker_remaining.saturating_sub(dt);
-                if flicker_remaining.is_zero() {
-                    let mut rng = rand::thread_rng();
-                    *normal_variant = choose_normal_variant(&mut rng);
-                    *flicker_remaining = random_between(&mut rng, NORMAL_FLICKER_MS);
                 }
                 *remaining = remaining.saturating_sub(dt);
                 if remaining.is_zero() {
@@ -849,11 +820,7 @@ impl LookAwayGame {
                 judge_stamp,
                 ..
             } => self.render_result(frame, area, *is_correct, *message, *judge_stamp),
-            Phase::Idle {
-                is_eating,
-                normal_variant,
-                ..
-            } => {
+            Phase::Idle { is_eating, .. } => {
                 let (background, status_text) = if *is_eating {
                     (EATING_BG, EATING_TEXT)
                 } else {
@@ -864,7 +831,7 @@ impl LookAwayGame {
                     area,
                     background,
                     theme::TEXT,
-                    StageKind::Normal(*normal_variant),
+                    StageKind::Normal,
                     vec![pointing_line(None), String::new(), status_text.to_string()],
                 )
             }
@@ -1114,19 +1081,18 @@ fn detect_picker() -> Option<Picker> {
         .cloned()
 }
 
-/// カウンター越しの親父の絵の種類。Normalの引数は通常顔のバリエーション番号(フェイント用)、
-/// ShoutLeft/ShoutRightの引数は叫び顔のバリエーション番号
+/// カウンター越しの親父の絵の種類。ShoutLeft/ShoutRightの引数は叫び顔のバリエーション番号
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StageKind {
-    Normal(usize),
+    Normal,
     ShoutLeft(usize),
     ShoutRight(usize),
     Yahho,
 }
 
-/// 親父の静止画(通常の複数バリエーション/ヤー左右の複数バリエーション/やっほー)
+/// 親父の静止画(通常/ヤー左右の複数バリエーション/やっほー)
 struct StageImages {
-    normal: Vec<StatefulProtocol>,
+    normal: StatefulProtocol,
     shout_left: Vec<StatefulProtocol>,
     shout_right: Vec<StatefulProtocol>,
     yahho: StatefulProtocol,
@@ -1163,10 +1129,7 @@ impl StageRenderer {
     fn new() -> Self {
         let picker = detect_picker();
         let images = picker.clone().and_then(|picker| {
-            let normal: Option<Vec<_>> = STAGE_NORMAL_IMAGES
-                .iter()
-                .map(|path| splash::load_embedded_image(path))
-                .collect();
+            let normal = splash::load_embedded_image(STAGE_NORMAL_IMAGE)?;
             let yahho = splash::load_embedded_image(STAGE_YAHHO_IMAGE)?;
             let shout_right: Option<Vec<_>> = STAGE_SHOUT_RIGHT_IMAGES
                 .iter()
@@ -1176,14 +1139,10 @@ impl StageRenderer {
                 .iter()
                 .map(|path| splash::load_embedded_image(path))
                 .collect();
-            let normal = normal?;
             let shout_right = shout_right?;
             let shout_left = shout_left?;
             Some(RefCell::new(StageImages {
-                normal: normal
-                    .into_iter()
-                    .map(|img| picker.new_resize_protocol(img))
-                    .collect(),
+                normal: picker.new_resize_protocol(normal),
                 shout_left: shout_left
                     .into_iter()
                     .map(|img| picker.new_resize_protocol(img))
@@ -1258,7 +1217,7 @@ impl StageRenderer {
         }
         let mut images = images.borrow_mut();
         let protocol = match kind {
-            StageKind::Normal(i) => &mut images.normal[i],
+            StageKind::Normal => &mut images.normal,
             StageKind::ShoutLeft(i) => &mut images.shout_left[i],
             StageKind::ShoutRight(i) => &mut images.shout_right[i],
             StageKind::Yahho => &mut images.yahho,
@@ -1758,40 +1717,6 @@ mod tests {
                 "{side:?}を指して叫ぶ"
             );
         }
-    }
-
-    #[test]
-    fn choose_normal_variant_is_mostly_the_default_face() {
-        let mut rng = StdRng::seed_from_u64(7);
-        let variants: Vec<usize> = (0..1000).map(|_| choose_normal_variant(&mut rng)).collect();
-        let feint_count = variants.iter().filter(|&&v| v == 1).count();
-        // 1000回中の目安200回(20%)。乱数のゆれを見込んで幅を持たせる
-        assert!(
-            (140..=260).contains(&feint_count),
-            "フェイント顔の出現数: {feint_count}"
-        );
-        assert!(variants.contains(&0), "通常顔も出る");
-    }
-
-    #[test]
-    fn idle_flicker_remaining_resets_after_reaching_zero() {
-        let mut game = LookAwayGame::new();
-        finish_countdown(&mut game);
-        let Phase::Idle {
-            flicker_remaining, ..
-        } = game.phase
-        else {
-            panic!("待機のはず")
-        };
-        game.update(flicker_remaining);
-        let Phase::Idle {
-            flicker_remaining: after,
-            ..
-        } = game.phase
-        else {
-            panic!("待機のはず")
-        };
-        assert!(after > Duration::ZERO, "0になったら即座に新しい間隔が設定される");
     }
 
     // --- カウントダウン ---
@@ -2316,8 +2241,7 @@ mod tests {
 
     #[test]
     fn stage_images_are_embedded_and_decodable() {
-        let mut paths = vec![STAGE_YAHHO_IMAGE];
-        paths.extend(STAGE_NORMAL_IMAGES);
+        let mut paths = vec![STAGE_YAHHO_IMAGE, STAGE_NORMAL_IMAGE];
         paths.extend(STAGE_SHOUT_RIGHT_IMAGES);
         paths.extend(STAGE_SHOUT_LEFT_IMAGES);
         for path in paths {
