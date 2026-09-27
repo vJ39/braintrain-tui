@@ -161,10 +161,12 @@ pub fn random_bgm_track(category: BgmCategory) -> Option<String> {
 }
 
 /// 「やっほー」で相手が「やっほー」と言う時の音声の候補(1つをランダムに再生)
-const LOOK_AWAY_YAHHO_VOICES: [&str; 3] = [
+const LOOK_AWAY_YAHHO_VOICES: [&str; 5] = [
     "voice_look_away_yahho_1.mp3",
     "voice_look_away_yahho_2.mp3",
     "voice_look_away_yahho_3.mp3",
+    "voice_look_away_yahho_4.mp3",
+    "voice_look_away_yahho_5.mp3",
 ];
 
 /// 「やっほー」で相手が「ヤー!」と叫ぶ時の音声の候補(1つをランダムに再生)
