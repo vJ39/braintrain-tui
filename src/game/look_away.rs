@@ -67,6 +67,8 @@ pub const MAX_RESPONSE_WINDOW: Duration = Duration::from_millis(900);
 pub const RESULT_HOLD: Duration = Duration::from_millis(1000);
 /// セッション全体の制限時間。これを過ぎても完食できていなければGAME OVER
 pub const TIME_LIMIT: Duration = Duration::from_secs(60);
+/// 残り時間がこの秒数以下になったら、1秒ごとにカウントダウン音を鳴らし始める
+pub const TIME_LIMIT_WARNING_SECONDS: u64 = 10;
 
 /// 待機の後に「やっほー」イベントになる確率(やっほー5割・ヤー5割)
 pub const YAHHO_RATE: f64 = 0.5;
@@ -489,6 +491,8 @@ pub struct LookAwayGame {
     abandon_prompt_shown: bool,
     /// 一度「いいえ(続ける)」を選んだら、そのセッションでは二度と確認を出さない
     abandon_prompt_dismissed: bool,
+    /// 直前にカウントダウン音を鳴らした時の残り秒数。同じ秒内での重複再生を防ぐ
+    last_countdown_tick_second: Option<u64>,
 }
 
 /// 捨てゲー確認ダイアログの文言(y/Enterで確定・n/Escで続行)
@@ -581,6 +585,7 @@ impl LookAwayGame {
             stage_renderer: StageRenderer::new(),
             abandon_prompt_shown: false,
             abandon_prompt_dismissed: false,
+            last_countdown_tick_second: None,
         };
         game.start_round();
         game
@@ -793,6 +798,23 @@ impl LookAwayGame {
             && self.is_unwinnable()
         {
             self.abandon_prompt_shown = true;
+        }
+        self.tick_time_limit_warning();
+    }
+
+    /// 残り時間がTIME_LIMIT_WARNING_SECONDS以下になったら、1秒ごとにカウントダウン音を鳴らす
+    fn tick_time_limit_warning(&mut self) {
+        if self.abandon_prompt_shown
+            || matches!(self.phase, Phase::Countdown { .. } | Phase::Result { .. })
+        {
+            return;
+        }
+        let remaining_secs = TIME_LIMIT.saturating_sub(self.elapsed_total).as_secs();
+        if (1..=TIME_LIMIT_WARNING_SECONDS).contains(&remaining_secs)
+            && self.last_countdown_tick_second != Some(remaining_secs)
+        {
+            audio::play_tick();
+            self.last_countdown_tick_second = Some(remaining_secs);
         }
     }
 
@@ -1666,6 +1688,85 @@ mod tests {
         assert!(
             !game.abandon_prompt_shown,
             "一度いいえを選んだら同じセッションでは二度と出さない"
+        );
+    }
+
+    // --- 残り時間カウントダウン音 ---
+
+    #[test]
+    fn countdown_tick_does_not_sound_before_the_warning_threshold() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        // 待機イベント(ヤー/やっほー)が発生してResultに落ちないよう、待機を長く固定する。
+        // 詰み(is_unwinnable)判定にも引っかからないよう、ごはんをわずかだけ残す
+        game.phase = new_idle_phase(Duration::from_secs(3600), false);
+        game.rice = RICE_DRAIN_PER_SEC;
+        let just_before_warning =
+            TIME_LIMIT.saturating_sub(Duration::from_secs(TIME_LIMIT_WARNING_SECONDS + 1));
+        game.update(just_before_warning);
+        assert_eq!(
+            game.last_countdown_tick_second, None,
+            "残り11秒より前は鳴らさない"
+        );
+    }
+
+    #[test]
+    fn countdown_tick_sounds_once_per_second_down_to_one() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        game.phase = new_idle_phase(Duration::from_secs(3600), false);
+        game.rice = RICE_DRAIN_PER_SEC;
+        game.update(TIME_LIMIT.saturating_sub(Duration::from_secs(TIME_LIMIT_WARNING_SECONDS)));
+        assert_eq!(
+            game.last_countdown_tick_second,
+            Some(TIME_LIMIT_WARNING_SECONDS),
+            "残り10秒になった瞬間に鳴らす"
+        );
+        for expected in (1..TIME_LIMIT_WARNING_SECONDS).rev() {
+            game.update(ms(500));
+            game.update(ms(500));
+            assert_eq!(
+                game.last_countdown_tick_second,
+                Some(expected),
+                "残り{expected}秒でも鳴らす"
+            );
+        }
+    }
+
+    #[test]
+    fn countdown_tick_does_not_sound_twice_within_the_same_second() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        game.phase = new_idle_phase(Duration::from_secs(3600), false);
+        game.rice = RICE_DRAIN_PER_SEC;
+        // 残り10.5秒(まだ切り捨てで10秒)の状態を作り、そこから500ms進めても
+        // 残り10.0秒(引き続き切り捨てで10秒)のままであることを確認する
+        game.update(
+            TIME_LIMIT.saturating_sub(Duration::from_secs(TIME_LIMIT_WARNING_SECONDS)) - ms(500),
+        );
+        assert_eq!(game.last_countdown_tick_second, Some(TIME_LIMIT_WARNING_SECONDS));
+        game.update(ms(500));
+        assert_eq!(
+            game.last_countdown_tick_second,
+            Some(TIME_LIMIT_WARNING_SECONDS),
+            "同じ秒の間は変化しない"
+        );
+    }
+
+    #[test]
+    fn countdown_tick_does_not_sound_while_abandon_prompt_is_shown() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        game.rice = RICE_FULL;
+        let time_needed = Duration::from_secs_f32(RICE_FULL / RICE_DRAIN_PER_SEC);
+        game.elapsed_total = TIME_LIMIT.saturating_sub(time_needed);
+        game.update(ms(2));
+        assert!(game.abandon_prompt_shown, "詰みダイアログが出ているはず");
+        let before = game.last_countdown_tick_second;
+        game.update(ms(500));
+        assert_eq!(
+            game.last_countdown_tick_second, before,
+            "ダイアログ表示中は時間が進まないのでカウントダウン音も鳴らない"
         );
     }
 
