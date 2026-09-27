@@ -1609,6 +1609,7 @@ impl Game for LookAwayGame {
             }
             if started_eating {
                 self.eating_variant = choose_eating_variant(&mut rand::thread_rng());
+                audio::play_se(SeKind::LookAwayStartEatingVoice);
             }
             return;
         }

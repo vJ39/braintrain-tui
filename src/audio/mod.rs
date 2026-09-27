@@ -75,6 +75,8 @@ pub enum SeKind {
     LookAwayYahhoReply,
     /// 「やっほー」で食事中に「ヤー」で襲われた時のプレイヤー側の声(親父のヤーSE・ブーイングと同時再生)
     LookAwayCaughtEatingVoice,
+    /// 「やっほー」で食事を始めた(再開した)瞬間の声(複数候補からランダムに1つ)
+    LookAwayStartEatingVoice,
     /// スタジアムの歓声(TTR選曲時・プレイ後など、複数の場面で使い回す)
     Cheer,
     /// 勝利ジングル(「やっほー」完食クリア時、Cheerと同時に鳴らす)
@@ -183,6 +185,12 @@ const LOOK_AWAY_YAHHO_REPLY_VOICES: [&str; 2] = [
     "voice_look_away_yahho_reply_2.mp3",
 ];
 
+/// 「やっほー」で食事を始めた(再開した)瞬間の声の候補(1つをランダムに再生)
+const LOOK_AWAY_START_EATING_VOICES: [&str; 2] = [
+    "voice_look_away_start_eating_1.mp3",
+    "voice_look_away_start_eating_2.mp3",
+];
+
 /// 「べー」で軽トラのスキール音の候補(1つをランダムに再生)
 const BEIGOMA_SKID_VOICES: [&str; 4] = [
     "voice_beigoma_skid_1.mp3",
@@ -218,7 +226,8 @@ impl SeKind {
             SeKind::LookAwayYahho
             | SeKind::LookAwayShout
             | SeKind::BeigomaSkid
-            | SeKind::LookAwayYahhoReply => None,
+            | SeKind::LookAwayYahhoReply
+            | SeKind::LookAwayStartEatingVoice => None,
             SeKind::LookAwayExplosion => Some("se_look_away_explosion.mp3"),
             SeKind::LookAwayGuardSuccess => Some("se_look_away_guard_success.mp3"),
             SeKind::LookAwayBoo => Some("se_look_away_boo.mp3"),
@@ -237,6 +246,7 @@ impl SeKind {
             SeKind::BeigomaSkid => Some(&BEIGOMA_SKID_VOICES),
             SeKind::LookAwayShout => Some(&LOOK_AWAY_SHOUT_VOICES),
             SeKind::LookAwayYahhoReply => Some(&LOOK_AWAY_YAHHO_REPLY_VOICES),
+            SeKind::LookAwayStartEatingVoice => Some(&LOOK_AWAY_START_EATING_VOICES),
             _ => None,
         }
     }
@@ -575,7 +585,7 @@ pub fn playing_typewriter_kind() -> Option<TypewriterSeKind> {
 mod tests {
     use super::*;
 
-    const ALL_SE_KINDS: [SeKind; 31] = [
+    const ALL_SE_KINDS: [SeKind; 32] = [
         SeKind::Correct,
         SeKind::Incorrect,
         SeKind::Transition,
@@ -603,6 +613,7 @@ mod tests {
         SeKind::LookAwayBoo,
         SeKind::LookAwayYahhoReply,
         SeKind::LookAwayCaughtEatingVoice,
+        SeKind::LookAwayStartEatingVoice,
         SeKind::Cheer,
         SeKind::VictoryJingle,
         SeKind::ConfirmPrompt,
@@ -645,6 +656,7 @@ mod tests {
             SeKind::LookAwayShout,
             SeKind::BeigomaSkid,
             SeKind::LookAwayYahhoReply,
+            SeKind::LookAwayStartEatingVoice,
         ] {
             let candidates = se.voice_candidates().expect("候補一覧を持つこと");
             assert!(candidates.len() >= 2, "{se:?}: ランダムに選ぶ意味がある数の候補");
