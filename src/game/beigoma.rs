@@ -8,7 +8,7 @@
 //! - 盤の縁に壁は無く、盤から落ちても(場外)即GAME OVER
 //! - 吹っ飛び・場外のGAME OVERでは、ゴールで待機中のもの以外の全ベーゴマが盤の外へ加速しながら吹っ飛んでいき
 //!   (速く回りながら左右に振れる)、盤の外へ出たところから星の演出(キラーン)になる。
-//!   音は「ふいっ」(SeKind::Star)の少し後にブブー(SeKind::Incorrect)を鳴らす
+//!   音は「ふいっ」(SeKind::Star)の少し後にブーイング(SeKind::Boo)を鳴らす
 //! - 1セッションは2ROUND(ROUND1=やさしい、ROUND2=むずかしい)。盤の配置は共通で、
 //!   ROUND1のゴールは投入位置から最も遠い位置に固定、ROUND2のゴールはランダム
 //! - ROUND2はベーゴマ2個を共通の傾きで同時に操作する。どちらか1個でも吹っ飛び・場外になったら即GAME OVER、
@@ -74,7 +74,7 @@ const FLY_WOBBLE: f64 = 0.8;
 const FLY_WOBBLE_PERIOD: Duration = Duration::from_millis(120);
 
 /// 吹っ飛び・場外のGAME OVERで「ふいっ」(SeKind::Star、約110ms)を鳴らしてから、
-/// ブブー(SeKind::Incorrect)を鳴らすまでの間。2つの音が重なって濁らないようにずらす
+/// ブーイング(SeKind::Boo)を鳴らすまでの間。2つの音が重なって濁らないようにずらす
 const OFF_BOARD_BUZZ_DELAY: Duration = Duration::from_millis(150);
 
 /// 画面左の軽トラ視点の幅(%)。残りを盤面に使う
@@ -481,13 +481,16 @@ impl BeigomaGame {
         };
         self.tracker.record(success, latency.as_millis() as f64);
         // 場外落下は専用の落下音、吹っ飛びは「ふいっ」という音
-        // (どちらもブブーはOFF_BOARD_BUZZ_DELAY後に鳴らす)、時間切れは従来のブザー音のまま
+        // (どちらもブーイングはOFF_BOARD_BUZZ_DELAY後に鳴らす)、時間切れは即座にブーイング
         self.play_se(match outcome {
             Outcome::Cleared { .. } => SeKind::BeigomaGoal,
             Outcome::Flown if fell_off => SeKind::BeigomaFalloff,
             Outcome::Flown => SeKind::Star,
-            Outcome::TimeUp => SeKind::Incorrect,
+            Outcome::TimeUp => SeKind::Boo,
         });
+        if let Outcome::Cleared { .. } = outcome {
+            self.play_se(SeKind::Cheer);
+        }
         if outcome == Outcome::Flown {
             // 共通の傾きで一蓮托生のため、原因になった1個だけでなく、ゴールで待機中のもの以外を全部吹っ飛ばす
             for slot in self.tops.iter_mut().filter(|slot| !slot.settled) {
@@ -502,7 +505,7 @@ impl BeigomaGame {
 
     /// 終了表示の間に時間がdt進み、表示してからの時間がbeforeからafterになった。
     /// 吹っ飛び・場外なら、ベーゴマを盤の外へ飛ばし続け(小さなステップに分けて、盤の外へ出た時刻を正しく取る)、
-    /// OFF_BOARD_BUZZ_DELAYを過ぎた時に1回だけブブーを鳴らす
+    /// OFF_BOARD_BUZZ_DELAYを過ぎた時に1回だけブーイングを鳴らす
     fn update_ended(&mut self, outcome: Outcome, before: Duration, after: Duration, dt: Duration) {
         if outcome != Outcome::Flown {
             return;
@@ -516,7 +519,7 @@ impl BeigomaGame {
             remaining -= step;
         }
         if before < OFF_BOARD_BUZZ_DELAY && after >= OFF_BOARD_BUZZ_DELAY {
-            self.play_se(SeKind::Incorrect);
+            self.play_se(SeKind::Boo);
         }
     }
 
@@ -2173,7 +2176,7 @@ mod tests {
     }
 
     #[test]
-    fn game_over_plays_its_first_sound_then_the_buzzer() {
+    fn game_over_plays_its_first_sound_then_the_boo() {
         const {
             assert!(OFF_BOARD_BUZZ_DELAY.as_millis() >= 100);
             assert!(OFF_BOARD_BUZZ_DELAY.as_millis() <= 300);
@@ -2185,20 +2188,21 @@ mod tests {
             game.on_step_event(event);
             assert_eq!(game.se_log, vec![first], "{event:?}: まず専用の落下音/「ふいっ」");
             game.update(OFF_BOARD_BUZZ_DELAY - Duration::from_millis(1));
-            assert_eq!(game.se_log, vec![first], "{event:?}: ブブーはまだ");
+            assert_eq!(game.se_log, vec![first], "{event:?}: ブーイングはまだ");
             game.update(Duration::from_millis(1));
             assert_eq!(
                 game.se_log,
-                vec![first, SeKind::Incorrect],
-                "{event:?}: 少し遅れてブブー"
+                vec![first, SeKind::Boo],
+                "{event:?}: 少し遅れてブーイング"
             );
             game.update(END_HOLD);
             assert_eq!(
-                count_se(&game, SeKind::Incorrect),
+                count_se(&game, SeKind::Boo),
                 1,
-                "{event:?}: ブブーは1回だけ"
+                "{event:?}: ブーイングは1回だけ"
             );
             assert_eq!(count_se(&game, first), 1, "{event:?}");
+            assert_eq!(count_se(&game, SeKind::Incorrect), 0, "{event:?}: ブザーは鳴らさない");
         }
     }
 
@@ -2216,16 +2220,16 @@ mod tests {
     }
 
     #[test]
-    fn the_buzzer_rings_once_even_if_the_end_display_passes_in_one_update() {
+    fn the_boo_rings_once_even_if_the_end_display_passes_in_one_update() {
         let mut game = calm_game();
         clear_se_log(&mut game);
         game.on_step_event(StepEvent::FellOff);
         game.update(END_HOLD * 2);
-        assert_eq!(game.se_log, vec![SeKind::BeigomaFalloff, SeKind::Incorrect]);
+        assert_eq!(game.se_log, vec![SeKind::BeigomaFalloff, SeKind::Boo]);
     }
 
     #[test]
-    fn one_top_failing_in_round2_plays_the_buzzer_once() {
+    fn one_top_failing_in_round2_plays_the_boo_once() {
         let mut game = calm_round2();
         clear_se_log(&mut game);
         game.on_step_events(vec![
@@ -2233,26 +2237,26 @@ mod tests {
             (1, StepEvent::Landed(Landing::Flown)),
         ]);
         game.update(END_HOLD);
-        assert_eq!(game.se_log, vec![SeKind::BeigomaFalloff, SeKind::Incorrect]);
+        assert_eq!(game.se_log, vec![SeKind::BeigomaFalloff, SeKind::Boo]);
     }
 
     #[test]
-    fn time_up_and_clear_do_not_add_the_delayed_buzzer() {
+    fn time_up_plays_boo_and_clear_plays_goal_and_cheer() {
         let mut timeup = calm_game();
         clear_se_log(&mut timeup);
         timeup.update(TIME_LIMIT + STEP);
         timeup.update(END_HOLD);
         assert_eq!(
             timeup.se_log,
-            vec![SeKind::Incorrect],
-            "時間切れはブザー1回のまま"
+            vec![SeKind::Boo],
+            "時間切れはブーイング1回のまま、ブザーは鳴らさない"
         );
 
         let mut cleared = calm_game();
         clear_se_log(&mut cleared);
         clear_round(&mut cleared);
         cleared.update(OFF_BOARD_BUZZ_DELAY * 2);
-        assert_eq!(cleared.se_log, vec![SeKind::BeigomaGoal]);
+        assert_eq!(cleared.se_log, vec![SeKind::BeigomaGoal, SeKind::Cheer]);
     }
 
     #[test]

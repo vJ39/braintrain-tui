@@ -77,6 +77,8 @@ pub enum SeKind {
     VictoryJingle,
     /// 確認ダイアログ(捨てゲー確認・終了確認)が表示された瞬間に鳴らす音
     ConfirmPrompt,
+    /// 観客のブーイング(複数の場面で使い回す汎用版。「やっほー」専用はLookAwayBoo)
+    Boo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +210,7 @@ impl SeKind {
             SeKind::Cheer => Some("se_cheer.mp3"),
             SeKind::VictoryJingle => Some("se_victory_jingle.mp3"),
             SeKind::ConfirmPrompt => Some("se_confirm_prompt.mp3"),
+            SeKind::Boo => Some("se_boo.mp3"),
         }
     }
 
@@ -555,7 +558,7 @@ pub fn playing_typewriter_kind() -> Option<TypewriterSeKind> {
 mod tests {
     use super::*;
 
-    const ALL_SE_KINDS: [SeKind; 28] = [
+    const ALL_SE_KINDS: [SeKind; 29] = [
         SeKind::Correct,
         SeKind::Incorrect,
         SeKind::Transition,
@@ -584,6 +587,7 @@ mod tests {
         SeKind::Cheer,
         SeKind::VictoryJingle,
         SeKind::ConfirmPrompt,
+        SeKind::Boo,
     ];
 
     #[test]
