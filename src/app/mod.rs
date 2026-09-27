@@ -22,7 +22,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 use ratatui::Frame;
 
-use crate::audio::{self, BgmCategory};
+use crate::audio::{self, BgmCategory, SeKind};
 use crate::game::{Difficulty, Game, GameResult};
 use crate::ui::background::BackgroundRenderer;
 use crate::ui::beigoma_splash_anim::AnimatedSplash;
@@ -158,7 +158,10 @@ impl App {
         // カウントダウン中も特例として受け付ける(カウントダウンを中断する)
         if key.code == KeyCode::Char('q') {
             match self.screen {
-                Screen::Menu => self.screen = Screen::ConfirmQuit,
+                Screen::Menu => {
+                    self.screen = Screen::ConfirmQuit;
+                    audio::play_se(SeKind::ConfirmPrompt);
+                }
                 // 終了確認中の[q]は無視する(y/Enter・n/Escでのみ閉じる)
                 Screen::ConfirmQuit => {}
                 _ => self.quit_to_menu(),

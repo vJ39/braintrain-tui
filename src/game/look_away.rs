@@ -798,6 +798,7 @@ impl LookAwayGame {
             && self.is_unwinnable()
         {
             self.abandon_prompt_shown = true;
+            audio::play_se(SeKind::ConfirmPrompt);
         }
         self.tick_time_limit_warning();
     }
