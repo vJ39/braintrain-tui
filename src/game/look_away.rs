@@ -1435,6 +1435,7 @@ impl Game for LookAwayGame {
                     };
                 }
                 KeyCode::Char('n') | KeyCode::Esc => {
+                    audio::play_se(SeKind::Confirm);
                     self.abandon_prompt_shown = false;
                     self.abandon_prompt_dismissed = true;
                 }
