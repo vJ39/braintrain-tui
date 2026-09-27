@@ -915,16 +915,27 @@ impl LookAwayGame {
                 return;
             }
         }
+        let action_prompt = self.action_prompt_text();
+        let banner_height = if action_prompt.is_some() { 1.min(area.height) } else { 0 };
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(banner_height)])
+            .split(area);
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(area);
+            .split(rows[0]);
         self.render_opponent_stage(frame, cols[0]);
         self.render_player_stage(frame, cols[1]);
+        if let Some(text) = action_prompt {
+            render_action_prompt_banner(frame, rows[1], text);
+        }
     }
 
     /// 親父のアクション中、プレイヤーが今すべき操作をでかく示す文言。
-    /// 親父側パネルのテキストに追加行として重ねる(render_opponent_stage参照)
+    /// 親父・自分の画像パネルの外側、ステージ下端の専用スペースに表示する
+    /// (render_stage参照。画像プロトコルで描いた絵の上にテキストを重ねると
+    /// 実機で表示されない端末があるため、area自体を分けている)
     fn action_prompt_text(&self) -> Option<&'static str> {
         match &self.phase {
             Phase::Yahho { .. } => Some("ヤッホーを押せ"),
@@ -932,14 +943,6 @@ impl LookAwayGame {
             Phase::Shout { side: Side::Right, .. } => Some("右ガード"),
             _ => None,
         }
-    }
-
-    /// linesの末尾に、いまの操作指示(あれば)を空行を挿んで追加する
-    fn with_action_prompt(&self, mut lines: Vec<String>) -> Vec<String> {
-        if let Some(prompt) = self.action_prompt_text() {
-            lines.push(prompt.to_string());
-        }
-        lines
     }
 
     /// カウンター越しの親父を描く(Countdownと、催促表示に切り替わった後のWaitingToEat以外の全フェーズ)
@@ -1005,19 +1008,23 @@ impl LookAwayGame {
                 } else {
                     StageKind::ShoutRight(*variant)
                 };
-                let lines = self.with_action_prompt(vec![
-                    pointing_line(Some(*side)),
-                    SHOUT_TEXT.to_string(),
-                ]);
-                self.render_scene(frame, area, SHOUT_BG, Color::Black, kind, lines)
+                self.render_scene(
+                    frame,
+                    area,
+                    SHOUT_BG,
+                    Color::Black,
+                    kind,
+                    vec![pointing_line(Some(*side)), SHOUT_TEXT.to_string()],
+                )
             }
-            Phase::Yahho { .. } => {
-                let lines = self.with_action_prompt(vec![
-                    pointing_line(None),
-                    YAHHO_CALL_TEXT.to_string(),
-                ]);
-                self.render_scene(frame, area, YAHHO_BG, Color::Black, StageKind::Yahho, lines)
-            }
+            Phase::Yahho { .. } => self.render_scene(
+                frame,
+                area,
+                YAHHO_BG,
+                Color::Black,
+                StageKind::Yahho,
+                vec![pointing_line(None), YAHHO_CALL_TEXT.to_string()],
+            ),
         }
     }
 
@@ -1058,9 +1065,6 @@ impl LookAwayGame {
         texts: Vec<String>,
     ) {
         if self.stage_renderer.render(frame, area, kind) {
-            if let Some(prompt) = self.action_prompt_text() {
-                render_action_prompt_overlay(frame, area, prompt);
-            }
             return;
         }
         render_character(frame, area, background, text_color, texts);
@@ -1289,28 +1293,19 @@ fn render_character(
 
 /// 画像表示時、画像の下部に操作指示を帯状の背景色パネルで重ねて出す(テキスト表示時は
 /// render_scene側でtextsに追加済みなのでこちらは通らない)
-fn render_action_prompt_overlay(frame: &mut Frame, area: Rect, text: &str) {
-    let height = 1.min(area.height.saturating_sub(2));
-    if height == 0 {
+fn render_action_prompt_banner(frame: &mut Frame, area: Rect, text: &str) {
+    if area.is_empty() {
         return;
     }
-    let banner_area = Rect::new(
-        area.x + 1,
-        area.bottom().saturating_sub(1 + height),
-        area.width.saturating_sub(2),
-        height,
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme::HIGHLIGHT)),
+        area,
     );
-    let block = Block::default().style(Style::default().bg(theme::HIGHLIGHT));
-    let inner = block.inner(banner_area);
-    frame.render_widget(block, banner_area);
     let line = Line::from(Span::styled(
         text,
         Style::default().fg(Color::Black).add_modifier(Modifier::BOLD),
     ));
-    frame.render_widget(
-        Paragraph::new(line).alignment(Alignment::Center),
-        theme::vertical_center(inner, 1),
-    );
+    frame.render_widget(Paragraph::new(line).alignment(Alignment::Center), area);
 }
 
 /// 端末の画像プロトコルを調べる。sixel/kitty/iTerm2のどれかが使える時だけSome。
