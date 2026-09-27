@@ -40,6 +40,8 @@ pub const TRUCK_DRIFT_RIGHT_IMAGE: &str = "beigoma/truck_drift_right.png";
 pub const TRUCK_DRIFT_LEFT_IMAGE: &str = "beigoma/truck_drift_left.png";
 /// 急ブレーキ中の絵
 pub const TRUCK_HARD_BRAKE_IMAGE: &str = "beigoma/truck_hard_brake.png";
+/// ゴールインした瞬間の絵
+pub const TRUCK_GOAL_IMAGE: &str = "beigoma/truck_goal.png";
 pub const BOARD_IMAGE: &str = "beigoma/board.png";
 pub const TOP_IMAGE: &str = "beigoma/top.png";
 
@@ -1064,6 +1066,8 @@ pub struct TruckViewInfo {
     pub elapsed: Duration,
     /// 軽トラの走り方の種類。ドリフト・急ブレーキの絵を出し分けるのに使う
     pub motion: MotionKind,
+    /// ベーゴマがゴールインしたか(ゴールしたら他の状態によらずゴールの絵を最優先で出す)
+    pub cleared: bool,
 }
 
 impl TruckViewInfo {
@@ -1081,11 +1085,15 @@ enum PictureKind {
     DriftRight,
     DriftLeft,
     HardBrake,
+    Cleared,
 }
 
-/// infoから出すべき絵の種類を決める。ブレーキ・ドリフトが最優先、それ以外は
+/// infoから出すべき絵の種類を決める。ゴールインが最優先、次にブレーキ・ドリフト、それ以外は
 /// Gの大きさで通常/踏ん張りを決める(#135等の従来通り)
 fn picture_kind(info: &TruckViewInfo) -> PictureKind {
+    if info.cleared {
+        return PictureKind::Cleared;
+    }
     match info.motion {
         MotionKind::Braking => PictureKind::HardBrake,
         MotionKind::Steering => {
@@ -1183,16 +1191,17 @@ const GIRL_BRACE: [&str; 5] = [
     " _/     \\_ ",
 ];
 
-/// 軽トラ視点の女の子の静止画5種(通常時・踏ん張り時・右ドリフト・左ドリフト・急ブレーキ)
+/// 軽トラ視点の女の子の静止画6種(通常時・踏ん張り時・右ドリフト・左ドリフト・急ブレーキ・ゴールイン)
 struct TruckImages {
     normal: StatefulProtocol,
     brace: StatefulProtocol,
     drift_right: StatefulProtocol,
     drift_left: StatefulProtocol,
     hard_brake: StatefulProtocol,
+    goal: StatefulProtocol,
 }
 
-/// 軽トラ視点の描画器。女の子の静止画5種が全て読めた時だけ画像で描く
+/// 軽トラ視点の描画器。女の子の静止画6種が全て読めた時だけ画像で描く
 pub struct TruckViewRenderer {
     images: Option<RefCell<TruckImages>>,
 }
@@ -1205,12 +1214,14 @@ impl TruckViewRenderer {
             let drift_right = splash::load_embedded_image(TRUCK_DRIFT_RIGHT_IMAGE)?;
             let drift_left = splash::load_embedded_image(TRUCK_DRIFT_LEFT_IMAGE)?;
             let hard_brake = splash::load_embedded_image(TRUCK_HARD_BRAKE_IMAGE)?;
+            let goal = splash::load_embedded_image(TRUCK_GOAL_IMAGE)?;
             Some(RefCell::new(TruckImages {
                 normal: picker.new_resize_protocol(normal),
                 brace: picker.new_resize_protocol(brace),
                 drift_right: picker.new_resize_protocol(drift_right),
                 drift_left: picker.new_resize_protocol(drift_left),
                 hard_brake: picker.new_resize_protocol(hard_brake),
+                goal: picker.new_resize_protocol(goal),
             }))
         });
         Self { images }
@@ -1271,6 +1282,7 @@ impl TruckViewRenderer {
         self.render_picture(frame, shaken_picture, kind);
 
         let brace_label = match kind {
+            PictureKind::Cleared => Some("ゴール!"),
             PictureKind::HardBrake => Some("急ブレーキ!"),
             PictureKind::DriftRight | PictureKind::DriftLeft => Some("ドリフト!"),
             PictureKind::Brace => Some("ふんばり!"),
@@ -1323,6 +1335,7 @@ impl TruckViewRenderer {
                 PictureKind::DriftRight => &mut images.drift_right,
                 PictureKind::DriftLeft => &mut images.drift_left,
                 PictureKind::HardBrake => &mut images.hard_brake,
+                PictureKind::Cleared => &mut images.goal,
             };
             let widget = StatefulImage::default().resize(Resize::Fit(Some(FilterType::Triangle)));
             frame.render_stateful_widget(widget, area, protocol);
@@ -1462,6 +1475,7 @@ mod tests {
             upcoming,
             elapsed: Duration::ZERO,
             motion: MotionKind::Cruise,
+            cleared: false,
         }
     }
 
@@ -3575,12 +3589,22 @@ mod tests {
             TRUCK_DRIFT_RIGHT_IMAGE,
             TRUCK_DRIFT_LEFT_IMAGE,
             TRUCK_HARD_BRAKE_IMAGE,
+            TRUCK_GOAL_IMAGE,
         ] {
             assert!(
                 splash::load_embedded_image(path).is_some(),
                 "{path}が埋め込まれデコードできること"
             );
         }
+    }
+
+    #[test]
+    fn truck_view_shows_the_goal_label_when_cleared() {
+        let renderer = TruckViewRenderer::new();
+        let mut cleared_info = info(GForce::default(), None);
+        cleared_info.cleared = true;
+        let text = draw_truck(&renderer, &cleared_info, Rect::new(0, 0, 30, 14));
+        assert!(text.contains("ゴール!"), "{text}");
     }
 
     #[test]
@@ -3677,6 +3701,24 @@ mod tests {
         let mut normal = info(GForce::default(), None);
         normal.motion = MotionKind::Cruise;
         assert_eq!(picture_kind(&normal), PictureKind::Normal);
+    }
+
+    #[test]
+    fn picture_kind_is_cleared_regardless_of_g_or_motion() {
+        let mut cleared = info(
+            GForce {
+                longitudinal: -0.5,
+                lateral: 0.1,
+            },
+            None,
+        );
+        cleared.motion = MotionKind::Braking;
+        cleared.cleared = true;
+        assert_eq!(
+            picture_kind(&cleared),
+            PictureKind::Cleared,
+            "ゴールインしたらブレーキ・Gによらずゴールの絵を最優先で出す"
+        );
     }
 
     #[test]

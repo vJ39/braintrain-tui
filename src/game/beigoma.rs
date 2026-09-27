@@ -704,6 +704,7 @@ impl Game for BeigomaGame {
             upcoming: self.truck.upcoming(),
             elapsed: self.elapsed,
             motion: self.truck.motion_kind(),
+            cleared: matches!(self.outcome(), Some(Outcome::Cleared { .. })),
         };
         self.truck_view.render(frame, truck_inner, &info);
 
