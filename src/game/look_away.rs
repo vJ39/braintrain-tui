@@ -57,6 +57,8 @@ pub const RICE_DRAIN_PER_SEC: f32 = 0.1 / 3.0;
 /// 待機(相手が何もしていない)の長さの範囲(最小, 最大)ms。
 /// 最低でも5秒は待たせ、「来るか来るか」という緊張感を持続させる
 pub const IDLE_WAIT_MS: (u64, u64) = (5000, 9000);
+/// フッター(ライフ・ごはん・操作説明)の外側の高さ(枠線込み)
+const FOOTER_HEIGHT: u16 = 6;
 /// これ以内に正しい入力ができれば正解(♥は減らない)
 pub const RESPONSE_SAFE_WINDOW: Duration = Duration::from_millis(800);
 /// RESPONSE_SAFE_WINDOWを超えた経過時間をこの単位で区切り、超過1区分ごとに♥をもう1つ失う
@@ -1061,7 +1063,7 @@ impl LookAwayGame {
         self.mark_renderer.render(frame, area, is_correct, background);
     }
 
-    /// ライフと操作説明のフッター
+    /// ライフ・ごはんゲージと操作説明のフッター
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         let block = theme::sub_panel();
         let inner = block.inner(area);
@@ -1069,6 +1071,7 @@ impl LookAwayGame {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Min(1),
@@ -1099,13 +1102,25 @@ impl LookAwayGame {
             Paragraph::new(hearts_line).alignment(Alignment::Center),
             rows[0],
         );
+        let rice_percent = (self.rice.clamp(0.0, 1.0) * 100.0).round() as u32;
+        let rice_line = Line::from(vec![
+            Span::styled(" ごはん ", theme::title_style()),
+            Span::styled(
+                theme::progress_bar(rice_percent, 100, 10),
+                Style::default().fg(theme::ACCENT),
+            ),
+        ]);
+        frame.render_widget(
+            Paragraph::new(rice_line).alignment(Alignment::Center),
+            rows[1],
+        );
         let help_line = Line::from(Span::styled(
             "←→:ヤーを防御 / Space:やっほー",
             Style::default().fg(theme::MUTED),
         ));
         frame.render_widget(
             Paragraph::new(help_line).alignment(Alignment::Center),
-            rows[1],
+            rows[2],
         );
         let is_eating = matches!(self.phase, Phase::Idle { is_eating: true, .. });
         let eat_hint = if is_eating {
@@ -1116,7 +1131,7 @@ impl LookAwayGame {
         let eat_line = Line::from(Span::styled(eat_hint, Style::default().fg(theme::MUTED)));
         frame.render_widget(
             Paragraph::new(eat_line).alignment(Alignment::Center),
-            rows[2],
+            rows[3],
         );
     }
 }
@@ -1460,25 +1475,18 @@ impl Game for LookAwayGame {
 
     fn render(&self, frame: &mut Frame, area: Rect) {
         let (hud_area, body) = theme::split_hud(area);
-        let rice_percent = (self.rice.clamp(0.0, 1.0) * 100.0).round() as u32;
-        let progress = Line::from(vec![
-            Span::styled(" ごはん ", theme::title_style()),
-            Span::styled(
-                theme::progress_bar(rice_percent, 100, 10),
-                Style::default().fg(theme::ACCENT),
-            ),
-        ]);
+        // ごはん・ライフはフッターにまとめて表示するので、HUD左欄は空にする
         theme::render_hud_with_progress_line(
             frame,
             hud_area,
             DISPLAY_NAME,
             SESSION_DIFFICULTY,
             &self.feedback,
-            progress,
+            Line::default(),
         );
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(5)])
+            .constraints([Constraint::Min(3), Constraint::Length(FOOTER_HEIGHT)])
             .split(body);
         self.render_stage(frame, rows[0]);
         self.render_footer(frame, rows[1]);
@@ -1627,7 +1635,7 @@ mod tests {
     /// HUDとフッター(操作説明)を除いた、相手を表示するステージ部分だけの文字列
     fn stage_text(buffer: &Buffer) -> String {
         let (_, body) = theme::split_hud(AREA);
-        let stage_bottom = body.y + body.height.saturating_sub(3);
+        let stage_bottom = body.y + body.height.saturating_sub(FOOTER_HEIGHT);
         (body.y..stage_bottom)
             .flat_map(|y| (body.x..body.right()).map(move |x| (x, y)))
             .map(|pos| buffer[pos].symbol().to_string())
@@ -1641,10 +1649,21 @@ mod tests {
         buffer[(body.x + 2, body.y + 2)].bg
     }
 
+    /// HUDとステージを除いた、フッター(ライフ・ごはん・操作説明)部分だけの文字列
+    fn footer_text(buffer: &Buffer) -> String {
+        let (_, body) = theme::split_hud(AREA);
+        let footer_top = body.y + body.height.saturating_sub(FOOTER_HEIGHT);
+        (footer_top..body.bottom())
+            .flat_map(|y| (body.x..body.right()).map(move |x| (x, y)))
+            .map(|pos| buffer[pos].symbol().to_string())
+            .collect::<String>()
+            .replace(' ', "")
+    }
+
     /// HUDとフッターを除いた、プレイヤー自身を表示するステージ右半分だけの文字列
     fn player_stage_text(buffer: &Buffer) -> String {
         let (_, body) = theme::split_hud(AREA);
-        let stage_bottom = body.y + body.height.saturating_sub(3);
+        let stage_bottom = body.y + body.height.saturating_sub(FOOTER_HEIGHT);
         let mid_x = body.x + body.width / 2;
         (body.y..stage_bottom)
             .flat_map(|y| (mid_x..body.right()).map(move |x| (x, y)))
@@ -2470,10 +2489,24 @@ mod tests {
     // --- 描画 ---
 
     #[test]
-    fn hud_shows_display_name_and_rice_gauge() {
+    fn hud_shows_display_name() {
         let text = text_of(&rendered(&LookAwayGame::new()));
         assert!(text.contains(&compact(DISPLAY_NAME)), "{text}");
-        assert!(text.contains(&compact("ごはん")), "{text}");
+    }
+
+    #[test]
+    fn footer_shows_life_and_rice_gauge_together() {
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        let footer = footer_text(&rendered(&game));
+        assert!(
+            footer.contains(&compact("ライフ")),
+            "ライフはフッターにある: {footer}"
+        );
+        assert!(
+            footer.contains(&compact("ごはん")),
+            "ごはんもフッターにまとめる: {footer}"
+        );
     }
 
     #[test]
