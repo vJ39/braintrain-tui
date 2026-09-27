@@ -133,6 +133,7 @@ pub const PLAYER_DAMAGED_WATCHING_IMAGE: &str = "look_away/player_damaged_watchi
 /// 判定結果を強調する書道風テキスト画像(通常の✗マークの代わりに出す)
 pub const JUDGE_LATE_IMAGE: &str = "look_away/judge_late.png";
 pub const JUDGE_FALSE_START_IMAGE: &str = "look_away/judge_false_start.png";
+pub const JUDGE_RICE_REFILLED_IMAGE: &str = "look_away/judge_rice_refilled.png";
 
 /// プレイヤー自身の絵(画像プロトコル非対応環境のフォールバック表示)
 pub const PLAYER_EATING_TEXT: &str = "がつがつ食べる自分";
@@ -193,6 +194,8 @@ enum JudgeStamp {
     Late,
     /// 待機中のフライング
     FalseStart,
+    /// 食事中に「ヤー」または「やっほー」が来て、問答無用でごはんがおかわりされた
+    RiceRefilled,
 }
 
 impl Side {
@@ -357,8 +360,8 @@ impl Verdict {
         }
     }
 
-    /// 「やっほー」に失敗した時。♥は減らさず、ごはんがおかわりされて満タンに戻る。
-    /// プレイヤー側の絵・判定演出は専用のものが無いため変化させない
+    /// 「やっほー」に正しく応答できなかった時(食べていたかどうかに関わらず同じ判定)。
+    /// ♥は減らさず、ダメージなしでごはんがおかわりされる
     fn yahho_failed(detail: &str, elapsed: Duration) -> Self {
         Self {
             is_correct: false,
@@ -368,19 +371,19 @@ impl Verdict {
             message: Some(ResultMessage::RiceRefilled),
             is_guard_success: false,
             player_stage: PlayerStageKind::Watching,
-            judge_stamp: JudgeStamp::Default,
+            judge_stamp: JudgeStamp::RiceRefilled,
         }
     }
 
-    /// 食事中に「ヤー」で襲われた時。防御操作を受け付けず、問答無用で♥を1つ失い、
-    /// 喉に詰まらせてお茶漬けもおかわりになる
+    /// 食事中に「ヤー」で襲われた時。防御操作を受け付けず、通常の即時誤入力(1個)の
+    /// 2倍にあたる♥2個を問答無用で失う。おかわりは発生しない(ダメージのみ)
     fn caught_eating() -> Self {
         Self {
             is_correct: false,
             detail: "食事を邪魔された".to_string(),
             latency_ms: 0.0,
-            penalty: 1,
-            message: Some(ResultMessage::RiceRefilled),
+            penalty: 2,
+            message: None,
             is_guard_success: false,
             player_stage: PlayerStageKind::DamagedEating,
             judge_stamp: JudgeStamp::Default,
@@ -587,7 +590,8 @@ impl LookAwayGame {
     }
 
     /// 待機が終わった時に、次のイベントを始める。was_eatingは待機中に食事していたか
-    /// (「ヤー」の場合、食事中なら防御操作を受け付けず問答無用で♥を失う)
+    /// (「ヤー」の場合、食事中なら防御操作を受け付けず問答無用で♥を失う。
+    /// 「ヤッホー」は食事中かどうかに関わらず、正しく返せたかどうかだけで判定する)
     fn begin_event(&mut self, event: Event, was_eating: bool) {
         match event {
             Event::Yahho => {
@@ -619,17 +623,17 @@ impl LookAwayGame {
     fn finish_question(&mut self, verdict: Verdict) {
         self.tracker.record(verdict.is_correct, verdict.latency_ms);
         self.lives = self.lives.saturating_sub(verdict.penalty);
-        // 既に満タンなら実際にはおかわりされていないので、メッセージも出さない
+        // 既に満タンなら実際にはおかわりされていないので、メッセージも演出画像も出さない
         let was_already_full = self.rice >= RICE_FULL;
-        let message = if verdict.message == Some(ResultMessage::RiceRefilled) {
+        let (message, judge_stamp) = if verdict.message == Some(ResultMessage::RiceRefilled) {
             self.rice = RICE_FULL;
             if was_already_full {
-                None
+                (None, JudgeStamp::Default)
             } else {
-                verdict.message
+                (verdict.message, verdict.judge_stamp)
             }
         } else {
-            verdict.message
+            (verdict.message, verdict.judge_stamp)
         };
         self.feedback.record(verdict.is_correct, verdict.detail);
         audio::play_se(if verdict.is_correct {
@@ -640,7 +644,7 @@ impl LookAwayGame {
         if verdict.is_guard_success {
             audio::play_se(SeKind::LookAwayGuardSuccess);
         }
-        if verdict.judge_stamp == JudgeStamp::Late {
+        if judge_stamp == JudgeStamp::Late {
             audio::play_se(SeKind::LookAwayBoo);
         }
         self.phase = Phase::Result {
@@ -648,7 +652,7 @@ impl LookAwayGame {
             elapsed: Duration::ZERO,
             message,
             player_stage: verdict.player_stage,
-            judge_stamp: verdict.judge_stamp,
+            judge_stamp,
         };
     }
 
@@ -1068,11 +1072,12 @@ struct PlayerImages {
     damaged_watching: StatefulProtocol,
 }
 
-/// 判定結果を強調する書道風テキスト画像(遅い/フライング)。JudgeStamp::Defaultには
-/// 対応する画像が無いので持たない
+/// 判定結果を強調する書道風テキスト画像(遅い/フライング/おかわり)。
+/// JudgeStamp::Defaultには対応する画像が無いので持たない
 struct JudgeStampImages {
     late: StatefulProtocol,
     false_start: StatefulProtocol,
+    rice_refilled: StatefulProtocol,
 }
 
 /// カウンター越しの親父とプレイヤー自身の描画器。それぞれ静止画が全て読めた
@@ -1140,9 +1145,11 @@ impl StageRenderer {
         let judge_stamp_images = picker.and_then(|picker| {
             let late = splash::load_embedded_image(JUDGE_LATE_IMAGE)?;
             let false_start = splash::load_embedded_image(JUDGE_FALSE_START_IMAGE)?;
+            let rice_refilled = splash::load_embedded_image(JUDGE_RICE_REFILLED_IMAGE)?;
             Some(RefCell::new(JudgeStampImages {
                 late: picker.new_resize_protocol(late),
                 false_start: picker.new_resize_protocol(false_start),
+                rice_refilled: picker.new_resize_protocol(rice_refilled),
             }))
         });
         Self {
@@ -1227,6 +1234,7 @@ impl StageRenderer {
         let protocol = match kind {
             JudgeStamp::Late => &mut images.late,
             JudgeStamp::FalseStart => &mut images.false_start,
+            JudgeStamp::RiceRefilled => &mut images.rice_refilled,
             JudgeStamp::Default => return false,
         };
         let widget = StatefulImage::default().resize(Resize::Fit(Some(FilterType::Triangle)));
@@ -1808,26 +1816,10 @@ mod tests {
         press(&mut game, KeyCode::Char(' '));
         assert!(is_result(&game, false), "800msを1msでも過ぎたら不正解");
         assert_eq!(game.lives, MAX_LIVES, "やっほー失敗では♥は減らない");
-        assert_eq!(game.rice, RICE_FULL, "やっほー失敗でごはんがおかわりされる");
+        assert_eq!(game.rice, RICE_FULL, "やっほーに応答できないとごはんがおかわりされる");
         assert!(
             text_of(&rendered(&game)).contains(&compact(RICE_REFILLED_TEXT)),
             "実際におかわりされた時はメッセージを出す"
-        );
-    }
-
-    #[test]
-    fn yahho_failure_while_rice_is_already_full_shows_no_refill_message() {
-        let mut game = LookAwayGame::new();
-        finish_countdown(&mut game);
-        // riceは初期値のまま満タン
-        yahho(&mut game);
-        game.update(RESPONSE_SAFE_WINDOW + ms(1));
-        press(&mut game, KeyCode::Char(' '));
-        assert!(is_result(&game, false));
-        assert_eq!(game.rice, RICE_FULL);
-        assert!(
-            !text_of(&rendered(&game)).contains(&compact(RICE_REFILLED_TEXT)),
-            "既に満タンならおかわりされていないのでメッセージを出さない"
         );
     }
 
@@ -2039,15 +2031,19 @@ mod tests {
     }
 
     #[test]
-    fn caught_eating_also_refills_rice() {
+    fn caught_eating_deals_double_damage_without_refilling_rice() {
         let mut game = LookAwayGame::new();
         finish_countdown(&mut game);
         game.rice = 0.3;
         game.begin_event(Event::Shout(Side::Left), true);
         assert!(is_result(&game, false));
-        assert_eq!(game.lives, MAX_LIVES - 1, "食事を邪魔されると♥を1つ失う");
-        assert_eq!(game.rice, RICE_FULL, "食事を邪魔されるとお茶漬けはおかわりになる");
-        assert!(text_of(&rendered(&game)).contains(&compact(RICE_REFILLED_TEXT)));
+        assert_eq!(
+            game.lives,
+            MAX_LIVES - 2,
+            "食事中に襲われると通常の即時誤入力(1個)の2倍、♥を2つ失う"
+        );
+        assert_eq!(game.rice, 0.3, "食事中に襲われてもおかわりはされない(ダメージのみ)");
+        assert!(!text_of(&rendered(&game)).contains(&compact(RICE_REFILLED_TEXT)));
     }
 
     #[test]
@@ -2152,7 +2148,11 @@ mod tests {
 
     #[test]
     fn judge_stamp_images_are_embedded_and_decodable() {
-        let paths = [JUDGE_LATE_IMAGE, JUDGE_FALSE_START_IMAGE];
+        let paths = [
+            JUDGE_LATE_IMAGE,
+            JUDGE_FALSE_START_IMAGE,
+            JUDGE_RICE_REFILLED_IMAGE,
+        ];
         for path in paths {
             assert!(
                 splash::load_embedded_image(path).is_some(),
@@ -2349,7 +2349,11 @@ mod tests {
         press(&mut game, KeyCode::Char(' '));
         assert!(is_result(&game, false));
         assert_eq!(result_player_stage(&game), PlayerStageKind::Watching);
-        assert_eq!(result_judge_stamp(&game), JudgeStamp::Default);
+        assert_eq!(
+            result_judge_stamp(&game),
+            JudgeStamp::RiceRefilled,
+            "やっほー失敗はおかわり演出を出す"
+        );
     }
 
     #[test]
