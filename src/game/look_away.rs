@@ -106,6 +106,10 @@ pub const YAHHO_BG: Color = Color::Rgb(0, 170, 230);
 pub const EATING_TEXT: &str = "むしゃむしゃ...";
 /// 待機中(食べていない)に表示する演出テキスト
 pub const WATCHING_TEXT: &str = "様子を見ている";
+/// 食べ始めるまでの間、催促として表示する書道風テキスト画像
+pub const WAITING_TO_EAT_IMAGE: &str = "look_away/waiting_to_eat.png";
+/// 上の画像が無い場合のフォールバックテキスト
+pub const WAITING_TO_EAT_TEXT: &str = "食べよ";
 
 /// 画像アセット(assets/image/からの相対パス)。無ければテキストで描く
 /// 通常時(何もしていない)の顔
@@ -380,7 +384,7 @@ impl Verdict {
 fn judge(phase: &Phase, input: Input) -> Option<Verdict> {
     match (phase, input) {
         (_, Input::Eat) => None,
-        (Phase::Countdown { .. } | Phase::Result { .. }, _) => None,
+        (Phase::WaitingToEat | Phase::Countdown { .. } | Phase::Result { .. }, _) => None,
         (Phase::Idle { .. }, _) => Some(Verdict::incorrect(
             FALSE_START_TEXT,
             Duration::ZERO,
@@ -436,6 +440,9 @@ enum ResultMessage {
 
 /// 問題内の状態
 enum Phase {
+    /// セッション開始直後、プレイヤーが「食べる」操作をするまでの待機。
+    /// この間はゲームが始まっておらず、経過時間も進まない
+    WaitingToEat,
     /// 問題冒頭の「3.2.1.GO!!」。この間の入力は受け付けない
     Countdown { state: CountdownState },
     /// 相手が何もしていない待機。残りの待機時間と、食事中かどうか。
@@ -569,11 +576,9 @@ fn pointing_line(side: Option<Side>) -> String {
 
 impl LookAwayGame {
     pub fn new() -> Self {
-        let mut game = Self {
+        Self {
             tracker: ScoreTracker::new(),
-            phase: Phase::Countdown {
-                state: CountdownState::new(),
-            },
+            phase: Phase::WaitingToEat,
             lives: MAX_LIVES,
             rice: RICE_FULL,
             elapsed_total: Duration::ZERO,
@@ -586,9 +591,7 @@ impl LookAwayGame {
             abandon_prompt_shown: false,
             abandon_prompt_dismissed: false,
             last_countdown_tick_second: None,
-        };
-        game.start_round();
-        game
+        }
     }
 
     /// ライフが尽きたか、制限時間内に完食できなかったか
@@ -719,8 +722,9 @@ impl LookAwayGame {
         if self.abandon_prompt_shown {
             return;
         }
-        // カウントダウン演出中はプレイヤーが操作できないので、制限時間には含めない
-        if !matches!(self.phase, Phase::Countdown { .. }) {
+        // カウントダウン演出中・食べ始めるまでの待機中はプレイヤーが操作できないので、
+        // 制限時間には含めない
+        if !matches!(self.phase, Phase::WaitingToEat | Phase::Countdown { .. }) {
             self.elapsed_total += dt;
         }
         if self.is_game_over() && !matches!(self.phase, Phase::Result { .. }) {
@@ -734,6 +738,7 @@ impl LookAwayGame {
             return;
         }
         match &mut self.phase {
+            Phase::WaitingToEat => {}
             Phase::Countdown { state } => {
                 if let Some(phase) = state.tick(dt) {
                     if let Some(se) = self.go_se.se_for(phase) {
@@ -742,8 +747,9 @@ impl LookAwayGame {
                 }
                 if state.is_finished() {
                     self.shown_countdown_once = true;
+                    // 食べる操作をしたことでカウントダウンが始まったので、食事中から始める
                     self.phase =
-                        new_idle_phase(random_between(&mut rand::thread_rng(), IDLE_WAIT_MS), false);
+                        new_idle_phase(random_between(&mut rand::thread_rng(), IDLE_WAIT_MS), true);
                 }
             }
             Phase::Idle {
@@ -838,6 +844,19 @@ impl LookAwayGame {
             countdown::render(frame, area, state);
             return;
         }
+        if matches!(self.phase, Phase::WaitingToEat) {
+            if self.stage_renderer.render_waiting_to_eat(frame, area) {
+                return;
+            }
+            render_character(
+                frame,
+                area,
+                IDLE_BG,
+                theme::TEXT,
+                vec![WAITING_TO_EAT_TEXT.to_string()],
+            );
+            return;
+        }
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -846,10 +865,11 @@ impl LookAwayGame {
         self.render_player_stage(frame, cols[1]);
     }
 
-    /// カウンター越しの親父を描く(Countdown以外の全フェーズ)
+    /// カウンター越しの親父を描く(Countdown・WaitingToEat以外の全フェーズ)
     fn render_opponent_stage(&self, frame: &mut Frame, area: Rect) {
         match &self.phase {
             Phase::Countdown { .. } => unreachable!("render_stageでCountdownは処理済み"),
+            Phase::WaitingToEat => unreachable!("render_stageでWaitingToEatは処理済み"),
             Phase::Result {
                 is_correct,
                 message,
@@ -908,7 +928,7 @@ impl LookAwayGame {
     /// いまの局面でプレイヤー自身に見せる絵の種類
     fn player_stage_kind(&self) -> PlayerStageKind {
         match &self.phase {
-            Phase::Countdown { .. } => PlayerStageKind::Watching,
+            Phase::WaitingToEat | Phase::Countdown { .. } => PlayerStageKind::Watching,
             Phase::Idle { is_eating, .. } => {
                 if *is_eating {
                     PlayerStageKind::Eating
@@ -1159,6 +1179,8 @@ struct StageRenderer {
     images: Option<RefCell<StageImages>>,
     player_images: Option<RefCell<PlayerImages>>,
     judge_stamp_images: Option<RefCell<JudgeStampImages>>,
+    /// 食べ始めるまでの間、催促として表示する書道風テキスト画像
+    waiting_to_eat_image: Option<RefCell<StatefulProtocol>>,
 }
 
 impl StageRenderer {
@@ -1208,7 +1230,7 @@ impl StageRenderer {
                 damaged_watching: picker.new_resize_protocol(damaged_watching),
             }))
         });
-        let judge_stamp_images = picker.and_then(|picker| {
+        let judge_stamp_images = picker.clone().and_then(|picker| {
             let late = splash::load_embedded_image(JUDGE_LATE_IMAGE)?;
             let false_start = splash::load_embedded_image(JUDGE_FALSE_START_IMAGE)?;
             let rice_refilled = splash::load_embedded_image(JUDGE_RICE_REFILLED_IMAGE)?;
@@ -1218,10 +1240,15 @@ impl StageRenderer {
                 rice_refilled: picker.new_resize_protocol(rice_refilled),
             }))
         });
+        let waiting_to_eat_image = picker.and_then(|picker| {
+            let image = splash::load_embedded_image(WAITING_TO_EAT_IMAGE)?;
+            Some(RefCell::new(picker.new_resize_protocol(image)))
+        });
         Self {
             images,
             player_images,
             judge_stamp_images,
+            waiting_to_eat_image,
         }
     }
 
@@ -1241,6 +1268,26 @@ impl StageRenderer {
     #[cfg(test)]
     fn uses_judge_stamp_image(&self) -> bool {
         self.judge_stamp_images.is_some()
+    }
+
+    /// 食べ始めるまでの催促画像を持っているか。テストでの確認用
+    #[cfg(test)]
+    fn uses_waiting_to_eat_image(&self) -> bool {
+        self.waiting_to_eat_image.is_some()
+    }
+
+    /// areaに食べ始めるまでの催促画像を描いたか(true=描いた、false=画像が無いので
+    /// 呼び出し元がテキストで描く)
+    fn render_waiting_to_eat(&self, frame: &mut Frame, area: Rect) -> bool {
+        let Some(image) = &self.waiting_to_eat_image else {
+            return false;
+        };
+        if area.is_empty() {
+            return true;
+        }
+        let widget = StatefulImage::default().resize(Resize::Fit(Some(FilterType::Triangle)));
+        frame.render_stateful_widget(widget, area, &mut *image.borrow_mut());
+        true
     }
 
     /// areaに画像を描いたか(true=描いた、false=画像が無いので呼び出し元がテキストで描く)
@@ -1346,8 +1393,10 @@ impl Game for LookAwayGame {
             return;
         };
         if input == Input::Eat {
-            if let Phase::Idle { is_eating, .. } = &mut self.phase {
-                *is_eating = !*is_eating;
+            match &mut self.phase {
+                Phase::Idle { is_eating, .. } => *is_eating = !*is_eating,
+                Phase::WaitingToEat => self.start_round(),
+                _ => {}
             }
             return;
         }
@@ -1453,10 +1502,14 @@ mod tests {
         }
     }
 
-    /// 問題冒頭のカウントダウンを最後まで進め、待機にする。フェーズ(PHASE_DURATION)ごとに
+    /// 問題冒頭のカウントダウンを最後まで進め、待機にする。まだ食べ始めていなければ
+    /// 先にEnterを押してカウントダウンを開始させる。フェーズ(PHASE_DURATION)ごとに
     /// 分けて進める(実機のフレームループと同じく、一度に全部進めるとGO!!への遷移自体を
     /// 検出できずSEが鳴らないため)
     fn finish_countdown(game: &mut LookAwayGame) {
+        if matches!(game.phase, Phase::WaitingToEat) {
+            press(game, KeyCode::Enter);
+        }
         assert!(is_countdown(game), "カウントダウン中のはず");
         for _ in 0..(COUNTDOWN_TOTAL.as_millis() / PHASE_DURATION.as_millis()) {
             game.update(PHASE_DURATION);
@@ -1493,7 +1546,7 @@ mod tests {
     /// (1問目ならカウントダウンを終えて)「ヤー!!」を出し、correctに応じて正解/不正解のキーを
     /// 即座に(elapsed≈0で)押す。不正解の場合はpenalty=1になる
     fn answer_round(game: &mut LookAwayGame, correct: bool) {
-        if is_countdown(game) {
+        if matches!(game.phase, Phase::WaitingToEat | Phase::Countdown { .. }) {
             finish_countdown(game);
         }
         shout(game, Side::Left);
@@ -1577,6 +1630,7 @@ mod tests {
     fn time_limit_expiry_without_finishing_the_meal_is_game_over() {
         let mut game = LookAwayGame::new();
         finish_countdown(&mut game);
+        press(&mut game, KeyCode::Enter); // 食べるのをやめる
         assert!(!game.is_game_over());
         // 何も食べていないので、TIME_LIMITに達するより先に詰みダイアログが出る。
         // 「続ける」を選んで進行させ、それでも60秒経てばGAME OVERになることを確認する
@@ -1637,6 +1691,7 @@ mod tests {
     fn tick_shows_abandon_prompt_and_pauses_once_unwinnable() {
         let mut game = LookAwayGame::new();
         finish_countdown(&mut game);
+        press(&mut game, KeyCode::Enter); // 食べるのをやめる
         let time_needed = Duration::from_secs_f32(RICE_FULL / RICE_DRAIN_PER_SEC);
         let just_before_unwinnable = TIME_LIMIT.saturating_sub(time_needed);
         game.update(just_before_unwinnable);
@@ -1837,8 +1892,9 @@ mod tests {
     // --- カウントダウン ---
 
     #[test]
-    fn new_game_starts_with_countdown_from_three() {
-        let game = LookAwayGame::new();
+    fn pressing_eat_while_waiting_starts_the_countdown_from_three() {
+        let mut game = LookAwayGame::new();
+        press(&mut game, KeyCode::Enter);
         assert!(is_countdown(&game));
         match &game.phase {
             Phase::Countdown { state } => {
@@ -1851,15 +1907,17 @@ mod tests {
     }
 
     #[test]
-    fn countdown_finishes_into_idle_within_wait_range() {
+    fn countdown_finishes_into_idle_eating_within_wait_range() {
         for _ in 0..30 {
             let mut game = LookAwayGame::new();
+            press(&mut game, KeyCode::Enter);
             game.update(COUNTDOWN_TOTAL - ms(1));
             assert!(is_countdown(&game), "GO!!が終わるまではカウントダウン");
             game.update(ms(1));
             match game.phase {
-                Phase::Idle { remaining, .. } => {
-                    assert!((ms(IDLE_WAIT_MS.0)..=ms(IDLE_WAIT_MS.1)).contains(&remaining))
+                Phase::Idle { remaining, is_eating } => {
+                    assert!((ms(IDLE_WAIT_MS.0)..=ms(IDLE_WAIT_MS.1)).contains(&remaining));
+                    assert!(is_eating, "食べる操作をしたので食事中から始まる");
                 }
                 _ => panic!("カウントダウンの後は待機"),
             }
@@ -1870,6 +1928,7 @@ mod tests {
     fn keys_during_countdown_are_ignored() {
         // カウントダウン中の入力は受け付けない(フライングにもしない)
         let mut game = LookAwayGame::new();
+        press(&mut game, KeyCode::Enter);
         game.update(PHASE_DURATION * 3); // GO!!の表示中
         for code in GAME_KEYS {
             press(&mut game, code);
@@ -1878,6 +1937,46 @@ mod tests {
         assert_eq!(game.tracker.total(), 0, "記録されない");
         assert_eq!(game.lives, MAX_LIVES, "ライフも減らない");
         assert!(game.feedback.current().is_none());
+    }
+
+    // --- 食べ始めるまでの待機 ---
+
+    #[test]
+    fn new_game_starts_in_waiting_to_eat_phase() {
+        let game = LookAwayGame::new();
+        assert!(matches!(game.phase, Phase::WaitingToEat));
+        assert!(!game.is_finished());
+        assert_eq!(game.tracker.total(), 0);
+    }
+
+    #[test]
+    fn time_does_not_pass_while_waiting_to_eat() {
+        let mut game = LookAwayGame::new();
+        game.update(Duration::from_secs(10));
+        assert!(
+            matches!(game.phase, Phase::WaitingToEat),
+            "食べ始めるまではゲームが進行しない"
+        );
+        assert_eq!(game.elapsed_total, Duration::ZERO);
+    }
+
+    #[test]
+    fn other_keys_are_ignored_while_waiting_to_eat() {
+        let mut game = LookAwayGame::new();
+        for code in GAME_KEYS {
+            press(&mut game, code);
+            assert!(
+                matches!(game.phase, Phase::WaitingToEat),
+                "{code:?}: 食べる操作以外は無視する"
+            );
+        }
+        assert_eq!(game.tracker.total(), 0);
+    }
+
+    #[test]
+    fn waiting_to_eat_shows_prompt_text() {
+        let game = LookAwayGame::new();
+        assert!(text_of(&rendered(&game)).contains(&compact(WAITING_TO_EAT_TEXT)));
     }
 
     // --- 待機 ---
@@ -2147,7 +2246,8 @@ mod tests {
     #[test]
     fn countdown_is_shown_on_the_first_round_only() {
         let mut game = LookAwayGame::new();
-        assert!(is_countdown(&game), "1問目はカウントダウンから");
+        press(&mut game, KeyCode::Enter);
+        assert!(is_countdown(&game), "食べ始めたら1問目のカウントダウンが始まる");
         for _ in 0..3 {
             answer_round(&mut game, true);
             game.update(RESULT_HOLD);
@@ -2329,7 +2429,9 @@ mod tests {
 
     #[test]
     fn countdown_renders_big_glyph() {
-        let buffer = rendered(&LookAwayGame::new());
+        let mut game = LookAwayGame::new();
+        press(&mut game, KeyCode::Enter);
+        let buffer = rendered(&game);
         assert!(text_of(&buffer).contains('█'), "カウントダウンの大きな文字");
         assert!(!stage_text(&buffer).contains(&compact(SHOUT_TEXT)));
     }
@@ -2352,6 +2454,15 @@ mod tests {
         assert!(!renderer.uses_image());
         assert!(!renderer.uses_player_image());
         assert!(!renderer.uses_judge_stamp_image());
+        assert!(!renderer.uses_waiting_to_eat_image());
+    }
+
+    #[test]
+    fn waiting_to_eat_image_is_embedded_and_decodable() {
+        assert!(
+            splash::load_embedded_image(WAITING_TO_EAT_IMAGE).is_some(),
+            "{WAITING_TO_EAT_IMAGE}が埋め込まれデコードできること"
+        );
     }
 
     #[test]
@@ -2405,6 +2516,8 @@ mod tests {
     fn idle_shows_the_face_without_pointing_or_shout() {
         let mut game = LookAwayGame::new();
         finish_countdown(&mut game);
+        // 食べ始めた直後から始まるので、食べるのをやめて待機の見た目にする
+        press(&mut game, KeyCode::Enter);
         let buffer = rendered(&game);
         let text = text_of(&buffer);
         assert!(text.contains(&compact(FACE_TEXT)), "{text}");
@@ -2417,6 +2530,8 @@ mod tests {
     fn idle_while_not_eating_shows_watching_text() {
         let mut game = LookAwayGame::new();
         finish_countdown(&mut game);
+        // 食べ始めた直後から始まるので、食べるのをやめて待機の見た目にする
+        press(&mut game, KeyCode::Enter);
         assert!(matches!(
             game.phase,
             Phase::Idle {
@@ -2437,14 +2552,15 @@ mod tests {
     fn footer_hint_switches_between_start_and_stop_eating() {
         let mut game = LookAwayGame::new();
         finish_countdown(&mut game);
-        assert!(
-            text_of(&rendered(&game)).contains(&compact("Enterで食べ始める")),
-            "食べていない時は「食べ始める」と案内する"
-        );
-        press(&mut game, KeyCode::Enter);
+        // 食べ始めた直後から始まるので、まず「やめる」の案内が出る
         assert!(
             text_of(&rendered(&game)).contains(&compact("Enterで食べるのをやめる")),
             "食べている時は「やめる」と案内する"
+        );
+        press(&mut game, KeyCode::Enter);
+        assert!(
+            text_of(&rendered(&game)).contains(&compact("Enterで食べ始める")),
+            "食べていない時は「食べ始める」と案内する"
         );
     }
 
@@ -2452,7 +2568,6 @@ mod tests {
     fn idle_while_eating_shows_eating_text_and_background() {
         let mut game = LookAwayGame::new();
         finish_countdown(&mut game);
-        press(&mut game, KeyCode::Enter);
         assert!(matches!(
             game.phase,
             Phase::Idle {
@@ -2475,11 +2590,12 @@ mod tests {
     fn player_stage_matches_eating_state_while_idle() {
         let mut game = LookAwayGame::new();
         finish_countdown(&mut game);
-        assert_eq!(game.player_stage_kind(), PlayerStageKind::Watching);
-        assert!(player_stage_text(&rendered(&game)).contains(&compact(PLAYER_WATCHING_TEXT)));
-        press(&mut game, KeyCode::Enter);
+        // 食べ始めた直後から始まる
         assert_eq!(game.player_stage_kind(), PlayerStageKind::Eating);
         assert!(player_stage_text(&rendered(&game)).contains(&compact(PLAYER_EATING_TEXT)));
+        press(&mut game, KeyCode::Enter);
+        assert_eq!(game.player_stage_kind(), PlayerStageKind::Watching);
+        assert!(player_stage_text(&rendered(&game)).contains(&compact(PLAYER_WATCHING_TEXT)));
     }
 
     #[test]

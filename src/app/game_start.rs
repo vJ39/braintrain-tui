@@ -389,8 +389,9 @@ mod tests {
 
     // --- ヤッホー ---
 
-    /// ヤッホーが始まり、ごはんゲージ満タンでゲーム内カウントダウンが表示されていることを確かめる。
-    /// 問題ごとに自前のカウントダウンを持つため、画面遷移側のカウントダウン(Screen::Countdown)は経由しない
+    /// ヤッホーが始まり、ごはんゲージ満タンで食べ始めるまでの催促画面が表示されていることを
+    /// 確かめる。食べ始めたらゲーム内カウントダウンが始まる。問題ごとに自前のカウントダウンを
+    /// 持つため、画面遷移側のカウントダウン(Screen::Countdown)は経由しない
     fn assert_look_away_round1_is_playing(app: &mut App) {
         let Screen::Playing(game) = &app.screen else {
             panic!("外側のカウントダウンを挟まず直接Playing画面になるはず");
@@ -405,16 +406,23 @@ mod tests {
         );
         assert!(text.contains("ごはん"), "ごはんゲージが表示される: {text}");
         assert!(
-            text.contains('█'),
-            "ゲーム内のカウントダウンを大きな文字で出す"
+            text.contains(&crate::game::look_away::WAITING_TO_EAT_TEXT.replace(' ', "")),
+            "食べ始めるまでの催促画面を出す: {text}"
         );
-        // カウントダウン中のキーは記録されない
+        // 食べ始めていないので入力は記録されない
         app.handle_key(KeyEvent::from(KeyCode::Left));
         app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
         let Screen::Playing(game) = &app.screen else {
             panic!("Playing画面のまま");
         };
         assert_eq!(game.result().total, 0);
+        // Enterで食べ始めるとゲーム内カウントダウンが大きな文字で始まる
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        let text = rendered_text(app).replace(' ', "");
+        assert!(
+            text.contains('█'),
+            "食べ始めたらゲーム内のカウントダウンを大きな文字で出す: {text}"
+        );
     }
 
     #[test]
