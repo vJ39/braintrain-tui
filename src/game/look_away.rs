@@ -63,9 +63,9 @@ pub const IDLE_WAIT_MS: (u64, u64) = (3000, 9000);
 /// 1ROUND(TIME_LIMIT=60秒)あたりの目安イベント回数。平均6秒に1回のペース
 pub const TARGET_EVENT_COUNT: u32 = 10;
 /// フッター(残り秒数・ライフ・ごはん・操作説明)の外側の高さ(枠線込み)。
-/// 残り秒数を大きな数字で見せるため、内訳は大きな数字5+ライフ1+
-/// ごはんゲージ2+操作説明1の9行に、上下の枠線2行を足した11行
-const FOOTER_HEIGHT: u16 = 11;
+/// 残り秒数を大きな数字で見せるため、内訳は大きな数字5+食事状態バッジ1+ライフ1+
+/// ごはんゲージ2+操作説明1の10行に、上下の枠線2行を足した12行
+const FOOTER_HEIGHT: u16 = 12;
 /// これ以内に正しい入力ができれば正解(♥は減らない)
 pub const RESPONSE_SAFE_WINDOW: Duration = Duration::from_millis(800);
 /// RESPONSE_SAFE_WINDOWを超えた経過時間をこの単位で区切り、超過1区分ごとに♥をもう1つ失う
@@ -1126,14 +1126,16 @@ impl LookAwayGame {
             .constraints([
                 Constraint::Length(5),
                 Constraint::Length(1),
+                Constraint::Length(1),
                 Constraint::Length(2),
                 Constraint::Length(1),
             ])
             .split(inner);
-        self.render_remaining_time_big(frame, rows[0]);
-        self.render_lives(frame, rows[1]);
-        self.render_rice_gauge(frame, rows[2]);
         let is_eating = matches!(self.phase, Phase::Idle { is_eating: true, .. });
+        self.render_remaining_time_big(frame, rows[0]);
+        self.render_eating_status_badge(frame, rows[1], is_eating);
+        self.render_lives(frame, rows[2]);
+        self.render_rice_gauge(frame, rows[3]);
         let eat_hint = if is_eating {
             "食べるのをやめる"
         } else {
@@ -1145,8 +1147,27 @@ impl LookAwayGame {
         ));
         frame.render_widget(
             Paragraph::new(help_line).alignment(Alignment::Center),
-            rows[3],
+            rows[4],
         );
+    }
+
+    /// 食べているかどうかがひと目でわかるバッジ。背景色はステージの食事中/待機中の
+    /// 背景色(EATING_BG/IDLE_BG)と揃え、行全体を塗って視認性を上げる
+    fn render_eating_status_badge(&self, frame: &mut Frame, area: Rect, is_eating: bool) {
+        let (background, text) = if is_eating {
+            (EATING_BG, "● 食事中")
+        } else {
+            (IDLE_BG, "○ 様子見中")
+        };
+        let line = Line::from(Span::styled(
+            text,
+            Style::default()
+                .fg(theme::TEXT)
+                .bg(background)
+                .add_modifier(Modifier::BOLD),
+        ));
+        frame.render_widget(Block::default().style(Style::default().bg(background)), area);
+        frame.render_widget(Paragraph::new(line).alignment(Alignment::Center), area);
     }
 
     /// 残り秒数を大きな数字(5x5ドットフォント)で見せる。残りが少ない時は警告色にする
@@ -1758,6 +1779,17 @@ mod tests {
             .map(|pos| buffer[pos].symbol().to_string())
             .collect::<String>()
             .replace(' ', "")
+    }
+
+    /// フッター内、食事状態バッジ行(大きな残り秒数の直後)のセル背景。
+    /// バッジのレイアウト(render_footer)と対応させて求める
+    fn eating_badge_bg(buffer: &Buffer) -> Color {
+        let (_, body) = theme::split_hud(AREA);
+        let footer_top = body.y + body.height.saturating_sub(FOOTER_HEIGHT);
+        let border = 1; // sub_panelの上枠線
+        let big_number_rows = 5;
+        let badge_y = footer_top + border + big_number_rows;
+        buffer[(body.x + 2, badge_y)].bg
     }
 
     /// HUDとフッターを除いた、プレイヤー自身を表示するステージ右半分だけの文字列
@@ -2839,6 +2871,37 @@ mod tests {
             text_of(&rendered(&game)).contains(&compact("Enter:食べ始める")),
             "食べていない時は「食べ始める」と案内する"
         );
+    }
+
+    #[test]
+    fn footer_shows_eating_status_badge() {
+        // 操作説明の文言だけでなく、食事中かどうかがひと目でわかるバッジ表示も欲しい
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        assert!(
+            text_of(&rendered(&game)).contains(&compact("食事中")),
+            "食べている間はそれと分かるバッジが出る"
+        );
+        press(&mut game, KeyCode::Enter);
+        let text = text_of(&rendered(&game));
+        assert!(
+            text.contains(&compact("様子見中")),
+            "食べていない間はそれと分かるバッジが出る: {text}"
+        );
+        assert!(
+            !text.contains(&compact("食事中")),
+            "食べていない時は食事中バッジを出さない: {text}"
+        );
+    }
+
+    #[test]
+    fn eating_status_badge_uses_the_same_colors_as_the_background() {
+        // バッジの背景色は、ひと目でわかるようEATING_BG/IDLE_BGと揃える
+        let mut game = LookAwayGame::new();
+        finish_countdown(&mut game);
+        assert_eq!(eating_badge_bg(&rendered(&game)), EATING_BG);
+        press(&mut game, KeyCode::Enter);
+        assert_eq!(eating_badge_bg(&rendered(&game)), IDLE_BG);
     }
 
     #[test]
