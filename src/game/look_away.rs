@@ -662,6 +662,19 @@ impl LookAwayGame {
         }
     }
 
+    /// 判定結果に対して観客のブーイング(LookAwayBoo)を鳴らすべきか。
+    /// 反応遅れ・食事中に襲われた大ダメージ・ヤッホー失敗のいずれか
+    fn should_play_boo(
+        judge_stamp: JudgeStamp,
+        player_stage: PlayerStageKind,
+        message: Option<ResultMessage>,
+    ) -> bool {
+        judge_stamp == JudgeStamp::Late
+            || player_stage == PlayerStageKind::DamagedEating
+            || (player_stage == PlayerStageKind::Watching
+                && message == Some(ResultMessage::RiceRefilled))
+    }
+
     /// 1問の正誤を記録して結果表示に入る。不正解ならverdict.penalty個ぶん♥を減らす。
     /// message==Some(RiceRefilled)ならごはんゲージを満タンに戻す(おかわり)
     fn finish_question(&mut self, verdict: Verdict) {
@@ -688,7 +701,7 @@ impl LookAwayGame {
         if verdict.is_guard_success {
             audio::play_se(SeKind::LookAwayGuardSuccess);
         }
-        if judge_stamp == JudgeStamp::Late {
+        if Self::should_play_boo(judge_stamp, verdict.player_stage, message) {
             audio::play_se(SeKind::LookAwayBoo);
         }
         self.phase = Phase::Result {
@@ -2521,6 +2534,60 @@ mod tests {
         assert_eq!(result_player_stage(&game), PlayerStageKind::DamagedEating);
         assert_eq!(result_judge_stamp(&game), JudgeStamp::Default);
         assert!(player_stage_text(&rendered(&game)).contains(&compact(PLAYER_DAMAGED_EATING_TEXT)));
+    }
+
+    // --- ブーイングSEを鳴らすべき判定 ---
+
+    #[test]
+    fn should_play_boo_for_late_reaction() {
+        assert!(LookAwayGame::should_play_boo(
+            JudgeStamp::Late,
+            PlayerStageKind::DamagedWatching,
+            None
+        ));
+    }
+
+    #[test]
+    fn should_play_boo_for_caught_eating_double_damage() {
+        assert!(LookAwayGame::should_play_boo(
+            JudgeStamp::Default,
+            PlayerStageKind::DamagedEating,
+            None
+        ));
+    }
+
+    #[test]
+    fn should_play_boo_for_yahho_failure() {
+        assert!(LookAwayGame::should_play_boo(
+            JudgeStamp::RiceRefilled,
+            PlayerStageKind::Watching,
+            Some(ResultMessage::RiceRefilled)
+        ));
+        // ごはんが既に満タンでjudge_stampがDefaultに落ちても、ヤッホー失敗自体は変わらず鳴らす
+        assert!(LookAwayGame::should_play_boo(
+            JudgeStamp::Default,
+            PlayerStageKind::Watching,
+            Some(ResultMessage::RiceRefilled)
+        ));
+    }
+
+    #[test]
+    fn should_not_play_boo_for_false_start_or_success() {
+        assert!(!LookAwayGame::should_play_boo(
+            JudgeStamp::FalseStart,
+            PlayerStageKind::Watching,
+            None
+        ));
+        assert!(!LookAwayGame::should_play_boo(
+            JudgeStamp::Default,
+            PlayerStageKind::YahhoReply,
+            None
+        ));
+        assert!(!LookAwayGame::should_play_boo(
+            JudgeStamp::Default,
+            PlayerStageKind::GuardLeft,
+            None
+        ));
     }
 
     #[test]
