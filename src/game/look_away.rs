@@ -124,7 +124,11 @@ pub const STAGE_SHOUT_LEFT_IMAGES: [&str; 2] =
 pub const STAGE_YAHHO_IMAGE: &str = "look_away/yahho.png";
 
 /// プレイヤー自身を映した絵。カウンター越しの親父とは別に、画面のもう半分に表示する
-pub const PLAYER_EATING_IMAGE: &str = "look_away/player_eating.png";
+/// 食べている絵の候補(食べ始める度にランダムに1枚選ぶ)
+pub const PLAYER_EATING_IMAGES: [&str; 2] = [
+    "look_away/player_eating.png",
+    "look_away/player_eating_2.png",
+];
 pub const PLAYER_WATCHING_IMAGE: &str = "look_away/player_watching.png";
 pub const PLAYER_GUARD_LEFT_IMAGE: &str = "look_away/player_guard_left.png";
 pub const PLAYER_GUARD_RIGHT_IMAGE: &str = "look_away/player_guard_right.png";
@@ -156,8 +160,8 @@ pub enum Side {
 /// どうか、結果表示中はその判定に応じた絵を見せる
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlayerStageKind {
-    /// がつがつ食べている
-    Eating,
+    /// がつがつ食べている。引数は食べ始めた時にランダムに決めた絵のバリエーション番号
+    Eating(usize),
     /// 食べずに身構えている(待機中のデフォルト。フライング・やっほー失敗もこのまま)
     Watching,
     /// 「ヤー」を左方向に防いだ
@@ -175,7 +179,7 @@ enum PlayerStageKind {
 /// 画像プロトコル非対応環境で、プレイヤー自身の絵の代わりに出すテキスト
 fn player_fallback_text(kind: PlayerStageKind) -> &'static str {
     match kind {
-        PlayerStageKind::Eating => PLAYER_EATING_TEXT,
+        PlayerStageKind::Eating(_) => PLAYER_EATING_TEXT,
         PlayerStageKind::Watching => PLAYER_WATCHING_TEXT,
         PlayerStageKind::GuardLeft => PLAYER_GUARD_LEFT_TEXT,
         PlayerStageKind::GuardRight => PLAYER_GUARD_RIGHT_TEXT,
@@ -247,6 +251,11 @@ fn choose_event(rng: &mut impl Rng) -> Event {
     } else {
         Event::Shout(Side::random(rng))
     }
+}
+
+/// 食べている絵のバリエーションをランダムに選ぶ
+fn choose_eating_variant(rng: &mut impl Rng) -> usize {
+    rng.gen_range(0..PLAYER_EATING_IMAGES.len())
 }
 
 /// ゲームで使うキー(←→Space・Enter)。それ以外のキーは無視する
@@ -500,6 +509,8 @@ pub struct LookAwayGame {
     abandon_prompt_dismissed: bool,
     /// 直前にカウントダウン音を鳴らした時の残り秒数。同じ秒内での重複再生を防ぐ
     last_countdown_tick_second: Option<u64>,
+    /// 食べている絵のバリエーション番号。食べ始める度にランダムに選び直す
+    eating_variant: usize,
 }
 
 /// 捨てゲー確認ダイアログの文言(y/Enterで確定・n/Escで続行)
@@ -591,6 +602,7 @@ impl LookAwayGame {
             abandon_prompt_shown: false,
             abandon_prompt_dismissed: false,
             last_countdown_tick_second: None,
+            eating_variant: 0,
         }
     }
 
@@ -748,6 +760,7 @@ impl LookAwayGame {
                 if state.is_finished() {
                     self.shown_countdown_once = true;
                     // 食べる操作をしたことでカウントダウンが始まったので、食事中から始める
+                    self.eating_variant = choose_eating_variant(&mut rand::thread_rng());
                     self.phase =
                         new_idle_phase(random_between(&mut rand::thread_rng(), IDLE_WAIT_MS), true);
                 }
@@ -766,7 +779,7 @@ impl LookAwayGame {
                             is_correct: true,
                             elapsed: Duration::ZERO,
                             message: None,
-                            player_stage: PlayerStageKind::Eating,
+                            player_stage: PlayerStageKind::Eating(self.eating_variant),
                             judge_stamp: JudgeStamp::Default,
                         };
                         return;
@@ -931,7 +944,7 @@ impl LookAwayGame {
             Phase::WaitingToEat | Phase::Countdown { .. } => PlayerStageKind::Watching,
             Phase::Idle { is_eating, .. } => {
                 if *is_eating {
-                    PlayerStageKind::Eating
+                    PlayerStageKind::Eating(self.eating_variant)
                 } else {
                     PlayerStageKind::Watching
                 }
@@ -1156,7 +1169,7 @@ struct StageImages {
 
 /// プレイヤー自身の静止画(食べている/身構え/防御左右/やっほー返答/被弾2種)
 struct PlayerImages {
-    eating: StatefulProtocol,
+    eating: Vec<StatefulProtocol>,
     watching: StatefulProtocol,
     guard_left: StatefulProtocol,
     guard_right: StatefulProtocol,
@@ -1213,7 +1226,11 @@ impl StageRenderer {
             }))
         });
         let player_images = picker.clone().and_then(|picker| {
-            let eating = splash::load_embedded_image(PLAYER_EATING_IMAGE)?;
+            let eating: Option<Vec<_>> = PLAYER_EATING_IMAGES
+                .iter()
+                .map(|path| splash::load_embedded_image(path))
+                .collect();
+            let eating = eating?;
             let watching = splash::load_embedded_image(PLAYER_WATCHING_IMAGE)?;
             let guard_left = splash::load_embedded_image(PLAYER_GUARD_LEFT_IMAGE)?;
             let guard_right = splash::load_embedded_image(PLAYER_GUARD_RIGHT_IMAGE)?;
@@ -1221,7 +1238,10 @@ impl StageRenderer {
             let damaged_eating = splash::load_embedded_image(PLAYER_DAMAGED_EATING_IMAGE)?;
             let damaged_watching = splash::load_embedded_image(PLAYER_DAMAGED_WATCHING_IMAGE)?;
             Some(RefCell::new(PlayerImages {
-                eating: picker.new_resize_protocol(eating),
+                eating: eating
+                    .into_iter()
+                    .map(|img| picker.new_resize_protocol(img))
+                    .collect(),
                 watching: picker.new_resize_protocol(watching),
                 guard_left: picker.new_resize_protocol(guard_left),
                 guard_right: picker.new_resize_protocol(guard_right),
@@ -1321,7 +1341,7 @@ impl StageRenderer {
         }
         let mut images = images.borrow_mut();
         let protocol = match kind {
-            PlayerStageKind::Eating => &mut images.eating,
+            PlayerStageKind::Eating(i) => &mut images.eating[i],
             PlayerStageKind::Watching => &mut images.watching,
             PlayerStageKind::GuardLeft => &mut images.guard_left,
             PlayerStageKind::GuardRight => &mut images.guard_right,
@@ -1393,10 +1413,17 @@ impl Game for LookAwayGame {
             return;
         };
         if input == Input::Eat {
+            let mut started_eating = false;
             match &mut self.phase {
-                Phase::Idle { is_eating, .. } => *is_eating = !*is_eating,
+                Phase::Idle { is_eating, .. } => {
+                    *is_eating = !*is_eating;
+                    started_eating = *is_eating;
+                }
                 Phase::WaitingToEat => self.start_round(),
                 _ => {}
+            }
+            if started_eating {
+                self.eating_variant = choose_eating_variant(&mut rand::thread_rng());
             }
             return;
         }
@@ -2480,8 +2507,7 @@ mod tests {
 
     #[test]
     fn player_images_are_embedded_and_decodable() {
-        let paths = [
-            PLAYER_EATING_IMAGE,
+        let mut paths = vec![
             PLAYER_WATCHING_IMAGE,
             PLAYER_GUARD_LEFT_IMAGE,
             PLAYER_GUARD_RIGHT_IMAGE,
@@ -2489,6 +2515,7 @@ mod tests {
             PLAYER_DAMAGED_EATING_IMAGE,
             PLAYER_DAMAGED_WATCHING_IMAGE,
         ];
+        paths.extend(PLAYER_EATING_IMAGES);
         for path in paths {
             assert!(
                 splash::load_embedded_image(path).is_some(),
@@ -2591,7 +2618,10 @@ mod tests {
         let mut game = LookAwayGame::new();
         finish_countdown(&mut game);
         // 食べ始めた直後から始まる
-        assert_eq!(game.player_stage_kind(), PlayerStageKind::Eating);
+        assert!(matches!(
+            game.player_stage_kind(),
+            PlayerStageKind::Eating(_)
+        ));
         assert!(player_stage_text(&rendered(&game)).contains(&compact(PLAYER_EATING_TEXT)));
         press(&mut game, KeyCode::Enter);
         assert_eq!(game.player_stage_kind(), PlayerStageKind::Watching);
